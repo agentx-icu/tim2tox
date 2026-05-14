@@ -1561,49 +1561,14 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
             });
 
             if (targetMessageExists) {
-              // Message already exists in target conversation, notify as modified
-              // CRITICAL: Ensure message is saved to persistence
-              final existingHistory =
-                  ffiService.getHistory(targetConversationID);
-              final existingMsg = existingHistory.firstWhere(
-                (msg) {
-                  if (chatMsg.msgID != null && msg.msgID == chatMsg.msgID)
-                    return true;
-                  if (chatMsg.text.isNotEmpty && msg.text == chatMsg.text) {
-                    final timeDiff =
-                        chatMsg.timestamp.difference(msg.timestamp).abs();
-                    if (timeDiff.inSeconds <= 5 &&
-                        chatMsg.isSelf == msg.isSelf) {
-                      return true;
-                    }
-                  }
-                  return false;
-                },
-                orElse: () => ChatMessage(
-                  text: '',
-                  fromUserId: '',
-                  isSelf: false,
-                  timestamp: DateTime.now(),
-                ),
-              );
-
-              if (existingMsg.text.isNotEmpty) {
-                final msgIndex = existingHistory.indexOf(existingMsg);
-                if (msgIndex >= 0) {
-                  existingHistory[msgIndex] = chatMsg;
-                  unawaited(ffiService.messageHistoryPersistence
-                      .saveHistory(targetConversationID, existingHistory));
-                  if (_debugLog)
-                    print(
-                        '[Tim2ToxSdkPlatform] Updated pending message in persistence: conversationId=$targetConversationID, msgID=${chatMsg.msgID}');
-                }
-              } else {
-                unawaited(ffiService.messageHistoryPersistence
-                    .appendHistory(targetConversationID, chatMsg));
-                if (_debugLog)
-                  print(
-                      '[Tim2ToxSdkPlatform] Added pending message to persistence: conversationId=$targetConversationID, msgID=${chatMsg.msgID}');
-              }
+              // Message already exists in the forward target conversation,
+              // notify as modified. Persistence dedup-and-merge happens
+              // centrally in MessageHistoryPersistence.appendHistory.
+              unawaited(ffiService.messageHistoryPersistence
+                  .appendHistory(targetConversationID, chatMsg));
+              if (_debugLog)
+                print(
+                    '[Tim2ToxSdkPlatform] Persisted pending message in forward target: conversationId=$targetConversationID, msgID=${chatMsg.msgID}');
 
               await _setFaceUrlForMsg(v2Msg);
               _notifyAdvancedMsgListeners((listener) {
