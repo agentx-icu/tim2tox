@@ -799,15 +799,32 @@ class TestNode {
     });
   }
 
-  /// Get the actual Tox ID for this node
-  /// In multi-instance scenarios, this returns the Tox ID from the current instance
+  /// Get the actual Tox ID for this node (76 hex characters: public key +
+  /// nospam + checksum). In multi-instance scenarios, this returns the Tox
+  /// ID for the current instance.
+  ///
+  /// Previously this called [TIMManager.instance.getLoginUser], but that
+  /// returns the login alias (the userID passed to `Login()`), not the Tox
+  /// address. Switched to the `tim2tox_ffi_get_self_tox_id` FFI export so
+  /// callers like [establishFriendship] get the real address.
   String getToxId() {
-    // Use cache if available (Tox ID doesn't change after login)
-    if (_toxIdCache != null) {
+    if (_toxIdCache != null && _toxIdCache!.isNotEmpty) {
       return _toxIdCache!;
     }
-    final toxId = runWithInstance(() => TIMManager.instance.getLoginUser());
-    _toxIdCache = toxId;
+    final ffiInstance = ffi_lib.Tim2ToxFfi.open();
+    final toxId = runWithInstance(() {
+      final buf = pkgffi.malloc.allocate<ffi.Int8>(256);
+      try {
+        final n = ffiInstance.getSelfToxId(buf, 256);
+        if (n <= 0) return '';
+        return buf.cast<pkgffi.Utf8>().toDartString();
+      } finally {
+        pkgffi.malloc.free(buf);
+      }
+    });
+    if (toxId.isNotEmpty) {
+      _toxIdCache = toxId;
+    }
     return toxId;
   }
 

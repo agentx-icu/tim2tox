@@ -99,12 +99,11 @@ void main() {
       // Wait for connection to be restored after re-login.
       await alice.waitForConnection(timeout: const Duration(seconds: 15));
       
-      // Connection should be restored
-      // In tim2tox, getLoginUser() returns Tox ID, not the original userId
+      // Connection should be restored. V2TIMManagerImpl::GetLoginUser()
+      // returns the login alias (userID passed to Login), not the Tox
+      // public key — use FfiChatService.selfId for the Tox ID.
       final loginUser = alice.runWithInstance(() => TIMManager.instance.getLoginUser());
-      expect(loginUser.isNotEmpty, isTrue);
-      expect(loginUser.length, equals(76)); // Tox ID is 76 hex characters
-      expect(loginUser, matches(RegExp(r'^[0-9A-F]{76}$'))); // Valid Tox ID format
+      expect(loginUser, equals(alice.userId));
     }, timeout: const Timeout(Duration(seconds: 60)));
   });
 }

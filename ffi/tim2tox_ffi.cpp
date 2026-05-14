@@ -1083,6 +1083,23 @@ int tim2tox_ffi_get_login_user(char* buffer, int buffer_len) {
     return n;
 }
 
+// Returns the self Tox address (76-hex public key + nospam + checksum) for
+// the current instance, written into `buffer` as a NUL-terminated string.
+// Returns the number of bytes written (excluding NUL), or 0 if the address
+// is not yet populated (e.g. before the first DHT connection establishes).
+// Use this — not tim2tox_ffi_get_login_user — when a caller actually needs
+// the Tox identity (e.g. auto_tests passing it to AddFriend).
+int tim2tox_ffi_get_self_tox_id(char* buffer, int buffer_len) {
+    if (!IsCurrentInstanceInited() || !buffer || buffer_len <= 0) return 0;
+    V2TIMManagerImpl* manager_impl = GetCurrentInstance();
+    auto addr = manager_impl->GetSelfToxAddress();
+    std::string s = addr.CString();
+    int n = (int)std::min(s.size(), (size_t)(buffer_len - 1));
+    if (n > 0) memcpy(buffer, s.data(), n);
+    buffer[n] = 0;
+    return n;
+}
+
 void tim2tox_ffi_uninit(void) {
     if (!IsInstanceInited(0)) return;
     V2TIMManagerImpl* manager_impl = GetCurrentInstance();

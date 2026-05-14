@@ -947,7 +947,7 @@ packages:
     source: hosted
     version: "3.3.1"
   tencent_cloud_chat_common:
-    dependency: transitive
+    dependency: "direct overridden"
     description:
       path: "../../chat-uikit-flutter/tencent_cloud_chat_common"
       relative: true
@@ -964,7 +964,7 @@ packages:
   tencent_cloud_chat_sdk:
     dependency: "direct main"
     description:
-      path: "../../tencent_cloud_chat_sdk-8.7.7201"
+      path: "../../tencent_cloud_chat_sdk"
       relative: true
     source: path
     version: "8.7.7201"

@@ -35,26 +35,26 @@ void main() {
     test('Normal login flow', () async {
       await node.login();
       expect(node.loggedIn, isTrue);
-      
-      // In tim2tox, getLoginUser() returns Tox ID (76 hex characters), not the original userId.
-      // Must use node context: getLoginUser() is per-instance.
+
+      // V2TIMManagerImpl::GetLoginUser() returns `login_user_alias_`, the
+      // userID passed at Login(). It is NOT the Tox public key — for that
+      // use FfiChatService.selfId (which is what toxee itself uses). Older
+      // comments in this test claimed the call returns "Tox ID (76 hex
+      // characters)"; that was aspirational and never matched the C++
+      // implementation.
       final loginUser = node.runWithInstance(() => TIMManager.instance.getLoginUser());
-      expect(loginUser.isNotEmpty, isTrue);
-      expect(loginUser.length, equals(76)); // Tox ID is 76 hex characters
-      expect(loginUser, matches(RegExp(r'^[0-9A-F]{76}$'))); // Valid Tox ID format
+      expect(loginUser, equals(node.userId));
     }, timeout: const Timeout(Duration(seconds: 60)));
-    
+
     test('Login state verification', () async {
       expect(node.loggedIn, isFalse);
-      
+
       await node.login();
       expect(node.loggedIn, isTrue);
-      
-      // In tim2tox, getLoginUser() returns Tox ID. Must use node context (per-instance).
+
+      // See "Normal login flow" above for why this is the alias, not a Tox ID.
       final loginUser = node.runWithInstance(() => TIMManager.instance.getLoginUser());
-      expect(loginUser.isNotEmpty, isTrue);
-      expect(loginUser.length, equals(76)); // Tox ID is 76 hex characters
-      expect(loginUser, matches(RegExp(r'^[0-9A-F]{76}$'))); // Valid Tox ID format
+      expect(loginUser, equals(node.userId));
     }, timeout: const Timeout(Duration(seconds: 60)));
     
     test('Logout flow', () async {

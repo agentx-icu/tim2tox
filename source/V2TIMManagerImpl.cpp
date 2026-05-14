@@ -1561,6 +1561,11 @@ V2TIMString V2TIMManagerImpl::GetLoginUser() {
     return login_user_alias_;
 }
 
+V2TIMString V2TIMManagerImpl::GetSelfToxAddress() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return logged_in_user_;
+}
+
 V2TIMLoginStatus V2TIMManagerImpl::GetLoginStatus() {
     std::lock_guard<std::mutex> lock(mutex_);
     bool is_empty = login_user_alias_.Empty();

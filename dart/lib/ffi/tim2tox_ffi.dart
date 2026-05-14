@@ -305,6 +305,11 @@ class Tim2ToxFfi {
       _lib.lookupFunction<_poll_custom_c, int Function(ffi.Pointer<ffi.Uint8>, int)>('tim2tox_ffi_poll_custom');
   late final int Function(ffi.Pointer<ffi.Int8>, int) getLoginUser =
       _lib.lookupFunction<_get_login_user_c, int Function(ffi.Pointer<ffi.Int8>, int)>('tim2tox_ffi_get_login_user');
+  /// Returns the 76-hex-char Tox address (self public key + nospam + checksum)
+  /// for the current instance, or empty until the first DHT connection lands.
+  /// Use this — not [getLoginUser] — when callers need the Tox identity.
+  late final int Function(ffi.Pointer<ffi.Int8>, int) getSelfToxId =
+      _lib.lookupFunction<_get_login_user_c, int Function(ffi.Pointer<ffi.Int8>, int)>('tim2tox_ffi_get_self_tox_id');
   late final void Function() uninit = _lib.lookupFunction<_uninit_c, void Function()>('tim2tox_ffi_uninit');
   late final void Function() saveToxProfile = _lib.lookupFunction<_save_tox_profile_c, void Function()>('tim2tox_ffi_save_tox_profile');
   late final int Function(ffi.Pointer<ffi.Int8>, int) getFriendList =

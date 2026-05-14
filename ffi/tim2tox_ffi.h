@@ -101,6 +101,12 @@ int tim2tox_ffi_poll_custom(unsigned char* buffer, int buffer_len);
 // Get current login user id into buffer; returns bytes written
 int tim2tox_ffi_get_login_user(char* buffer, int buffer_len);
 
+// Get the self Tox address (76-hex public key + nospam + checksum) for the
+// current instance into buffer; returns bytes written, or 0 if the address
+// is not yet known (e.g. before the first DHT connection establishes).
+// Distinct from tim2tox_ffi_get_login_user, which returns the login alias.
+int tim2tox_ffi_get_self_tox_id(char* buffer, int buffer_len);
+
 // Shutdown SDK
 void tim2tox_ffi_uninit(void);
 

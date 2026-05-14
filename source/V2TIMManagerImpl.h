@@ -66,6 +66,13 @@ public:
     V2TIMString GetLoginUser() override;
     V2TIMLoginStatus GetLoginStatus() override;
 
+    /// Returns the actual self Tox address (76-hex-char public key + nospam +
+    /// checksum), populated by HandleSelfConnectionStatus once the Tox stack
+    /// establishes a connection. Distinct from GetLoginUser(), which returns
+    /// the login alias (the userID passed to Login). Returns an empty string
+    /// when not yet known.
+    V2TIMString GetSelfToxAddress();
+
     /** Return true if this instance has group_id in its group mapping (used for join/peer sync). */
     bool HasGroup(const V2TIMString& group_id) const;
 

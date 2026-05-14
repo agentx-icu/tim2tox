@@ -107,12 +107,13 @@ void main() {
       alice.runWithInstance(() => TIMManager.instance.removeSDKListener(listener: listener));
     }, timeout: const Timeout(Duration(seconds: 60)));
     
-    test('Query self info (Tox ID)', () async {
+    test('Query self info (login alias)', () async {
       await alice.waitForConnection(timeout: const Duration(seconds: 5));
+      // V2TIMManagerImpl::GetLoginUser() returns the login alias (the
+      // userID passed at Login()), not the 76-hex Tox public key. For the
+      // Tox ID, use FfiChatService.selfId instead. Test renamed accordingly.
       final loginUser = alice.runWithInstance(() => TIMManager.instance.getLoginUser());
-      expect(loginUser.isNotEmpty, isTrue);
-      expect(loginUser.length, equals(76));
-      expect(loginUser, matches(RegExp(r'^[0-9A-F]{76}$')));
+      expect(loginUser, equals(alice.userId));
     }, timeout: const Timeout(Duration(seconds: 60)));
     
     test('Friend list query with multiple friends', () async {
