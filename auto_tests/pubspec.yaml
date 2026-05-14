@@ -12,7 +12,10 @@ dependencies:
     sdk: flutter
   test: ^1.24.0
   tencent_cloud_chat_sdk:
-    path: ../../tencent_cloud_chat_sdk-8.7.7201
+    # Bootstrap vendors the SDK into third_party/tencent_cloud_chat_sdk (no
+    # version suffix); the legacy sibling-dir path used a hardcoded
+    # `-8.7.7201` suffix that no longer exists post-bootstrap.
+    path: ../../tencent_cloud_chat_sdk
   tim2tox_dart:
     path: ../dart
   path_provider: ^2.1.3
@@ -27,4 +30,7 @@ dev_dependencies:
 
 dependency_overrides:
   tencent_cloud_chat_sdk:
-    path: ../../tencent_cloud_chat_sdk-8.7.7201
+    # Bootstrap vendors the SDK into third_party/tencent_cloud_chat_sdk (no
+    # version suffix); the legacy sibling-dir path used a hardcoded
+    # `-8.7.7201` suffix that no longer exists post-bootstrap.
+    path: ../../tencent_cloud_chat_sdk

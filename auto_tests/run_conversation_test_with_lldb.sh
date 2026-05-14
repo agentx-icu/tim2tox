@@ -14,6 +14,11 @@
 # We start "flutter test" in background, then attach lldb to the flutter_tester process.
 
 set -e
+if [[ "$(uname -s)" != "Darwin" ]]; then
+  echo "Error: this debug script is macOS-only (lldb + flutter_tester Mach-O)."
+  echo "       Got OS: $(uname -s). Use platform-native debugger tooling for non-Darwin hosts."
+  exit 1
+fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 

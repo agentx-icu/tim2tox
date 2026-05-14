@@ -420,7 +420,13 @@ class TestNode {
     clearToxIdCache();
   }
 
-  /// Uninitialize SDK
+  /// Uninitialize SDK.
+  ///
+  /// Wrapped in try/finally so that if logout() throws (slow Tox shutdown,
+  /// pending file transfers, etc.) the native test instance is still
+  /// destroyed and the polling registry is still cleared. Without this, a
+  /// single failing logout would leak a Tox instance for the rest of the
+  /// process and the next scenario would poll a stale handle.
   Future<void> unInitSDK() async {
     if (!initialized) {
       return;
@@ -429,7 +435,13 @@ class TestNode {
     // Disable auto-accept before cleanup
     disableAutoAccept();
 
-    await logout();
+    try {
+      await logout();
+    } catch (e) {
+      print(
+          '[Test] Node $alias: logout() threw during unInitSDK, continuing with cleanup: $e');
+    }
+
     // Cancel platform timer and subscriptions before native unInitSDK to avoid
     // Timer.periodic (friend status) firing after instance is destroyed (segfault).
     try {
@@ -438,33 +450,40 @@ class TestNode {
         p.dispose();
       }
     } catch (_) {}
-    // Uninit current instance (DartUnitSDK uninits whichever instance is current)
-    if (_testInstanceHandle != null) {
-      final ffiInstance = ffi_lib.Tim2ToxFfi.open();
-      final handle = _testInstanceHandle!;
-      // Uninit THIS node's instance
-      ffiInstance.setCurrentInstance(handle);
-      timManager!.unInitSDK();
-      // Reset to default instance before destroying test instance
-      ffiInstance.setCurrentInstance(0);
-      final result = ffiInstance.destroyTestInstance(handle);
-      // Always unregister polling id so later scenarios won't poll stale instance IDs.
-      FfiChatService.unregisterInstanceForPolling(handle);
-      if (result == 0) {
-        print(
-            'Warning: Failed to destroy test instance $handle for node $alias');
+
+    try {
+      // Uninit current instance (DartUnitSDK uninits whichever instance is current)
+      if (_testInstanceHandle != null) {
+        final ffiInstance = ffi_lib.Tim2ToxFfi.open();
+        final handle = _testInstanceHandle!;
+        try {
+          // Uninit THIS node's instance
+          ffiInstance.setCurrentInstance(handle);
+          timManager!.unInitSDK();
+          // Reset to default instance before destroying test instance
+          ffiInstance.setCurrentInstance(0);
+          final result = ffiInstance.destroyTestInstance(handle);
+          if (result == 0) {
+            print(
+                'Warning: Failed to destroy test instance $handle for node $alias');
+          } else {
+            print('[Test] Destroyed test instance $handle for node $alias');
+          }
+        } finally {
+          // Always unregister polling id and clear the handle so later
+          // scenarios won't poll stale instance IDs even if destroyTestInstance
+          // crashed.
+          FfiChatService.unregisterInstanceForPolling(handle);
+          _testInstanceHandle = null;
+        }
       } else {
-        print('[Test] Destroyed test instance $handle for node $alias');
+        timManager!.unInitSDK();
       }
-      _testInstanceHandle = null;
-    } else {
-      timManager!.unInitSDK();
+    } finally {
+      initialized = false;
+      // Clear Tox ID cache when uninitialized
+      clearToxIdCache();
     }
-
-    initialized = false;
-
-    // Clear Tox ID cache when uninitialized
-    clearToxIdCache();
   }
 
   /// Wait for a specific callback to be received
@@ -937,6 +956,30 @@ Future<void> waitUntil(
   try {
     condition();
   } catch (e) {}
+  throw TimeoutException('Timeout waiting for $desc (timeout: $actualTimeout)');
+}
+
+/// Async sibling of [waitUntil]: polls an `async` predicate until it returns
+/// true or the timeout elapses. Use when the condition requires an awaited
+/// call (e.g. `getFriendList`, `getFriendApplicationList`, network state).
+/// A fixed `await Future.delayed(...)` would wait the worst-case duration
+/// every time; this returns as soon as the condition holds.
+Future<void> waitUntilAsync(
+  Future<bool> Function() condition, {
+  Duration? timeout,
+  Duration pollInterval = const Duration(milliseconds: 200),
+  String? description,
+}) async {
+  final actualTimeout = timeout ?? const Duration(seconds: 10);
+  final deadline = DateTime.now().add(actualTimeout);
+  final desc = description ?? 'async condition';
+  while (DateTime.now().isBefore(deadline)) {
+    if (await condition()) return;
+    await Future.delayed(pollInterval);
+  }
+  // Final attempt so failure messages reflect the latest probe rather than a
+  // stale view from one poll interval ago.
+  if (await condition()) return;
   throw TimeoutException('Timeout waiting for $desc (timeout: $actualTimeout)');
 }
 

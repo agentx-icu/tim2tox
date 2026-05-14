@@ -3,6 +3,7 @@
 /// Provides test data factories, mock objects, and test environment setup
 
 import 'dart:io';
+import 'dart:math' as math;
 import 'package:flutter_test/flutter_test.dart';
 import 'package:flutter/services.dart';
 import 'package:path/path.dart' as path;
@@ -467,16 +468,21 @@ class TestScenario {
 }
 
 /// Create a test node with default configuration
+final _idRandom = math.Random();
+String _uniqueSuffix() =>
+    '${DateTime.now().microsecondsSinceEpoch}_${_idRandom.nextInt(1 << 32).toRadixString(16)}';
+
 Future<TestNode> createTestNode(
   String alias, {
   String? userId,
   String? userSig,
 }) async {
-  // Generate default user ID and sig if not provided
-  final defaultUserId =
-      userId ?? 'test_user_${alias}_${DateTime.now().millisecondsSinceEpoch}';
-  final defaultUserSig =
-      userSig ?? 'test_sig_${alias}_${DateTime.now().millisecondsSinceEpoch}';
+  // Generate default user ID and sig if not provided.
+  // millisecondsSinceEpoch alone can collide when several nodes are created in
+  // a tight loop (e.g. multi-instance scenarios); switch to microseconds plus
+  // a random suffix so IDs are unique even within the same Dart microtask.
+  final defaultUserId = userId ?? 'test_user_${alias}_${_uniqueSuffix()}';
+  final defaultUserSig = userSig ?? 'test_sig_${alias}_${_uniqueSuffix()}';
 
   return TestNode(
     userId: defaultUserId,
@@ -516,12 +522,19 @@ Future<FfiChatService> createTestFfiChatService({
 }
 
 /// Get a temporary directory for test data.
-/// [subdir] if provided (e.g. 'scenario_file_seek') returns a scenario-specific path
-/// so one scenario's teardown does not delete another's files when tests run interleaved.
+/// [subdir] if provided (e.g. 'scenario_file_seek') returns a scenario-specific
+/// path so one scenario's teardown does not delete another's files when tests
+/// run interleaved.
+///
+/// When [subdir] is null the path is suffixed with the current process pid, so
+/// two concurrent runs of the suite (CI matrix, local re-run while another
+/// `flutter test` is still running) don't share `tim2tox_tests/default` and
+/// trample each other's tox profiles / friend lists / known-groups state.
 Future<String> getTestDataDir([String? subdir]) async {
   final base = path.join(Directory.systemTemp.path, 'tim2tox_tests');
-  final testDir =
-      subdir != null ? path.join(base, subdir) : path.join(base, 'default');
+  final testDir = subdir != null
+      ? path.join(base, subdir)
+      : path.join(base, 'default-$pid');
   final dir = Directory(testDir);
   if (!await dir.exists()) {
     await dir.create(recursive: true);

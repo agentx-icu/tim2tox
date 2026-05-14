@@ -430,15 +430,26 @@ void main() {
       // Handle "already sent" error - if request was already sent, check if it's in the application list
       if (addResult.code != 0 && addResult.desc.contains('already sent')) {
         print('Note: Friend request already sent (code=${addResult.code}), checking application list...');
-        // Wait a bit for the request to propagate
-        await Future.delayed(const Duration(seconds: 2));
       } else {
         expect(addResult.code, equals(0), reason: 'Friend request should succeed');
       }
-      
-      // Wait for friend request to propagate in Tox network
-      await Future.delayed(const Duration(seconds: 2));
-      
+
+      // Poll Bob's application list instead of a fixed sleep — returns as
+      // soon as the request has propagated through the Tox network.
+      await waitUntilAsync(
+        () async {
+          final list = await bob.runWithInstanceAsync(() async =>
+              TIMFriendshipManager.instance.getFriendApplicationList());
+          return list.data?.friendApplicationList?.isNotEmpty ?? false;
+        },
+        timeout: const Duration(seconds: 10),
+        description: "Bob's friend application list is populated",
+      ).catchError((_) {
+        // Timeout is recoverable here: a previous run may have already
+        // accepted, leaving an empty application list with the friendship in
+        // place. The downstream branch handles that case.
+      });
+
       // Bob gets friend application list
       final appListResult = await bob.runWithInstanceAsync(() async => TIMFriendshipManager.instance.getFriendApplicationList());
       expect(appListResult.code, equals(0));
@@ -460,15 +471,23 @@ void main() {
           ));
           
           // Accept should succeed (even if already accepted, it should return success)
-          expect(acceptResult.code, equals(0), 
+          expect(acceptResult.code, equals(0),
               reason: 'Accept friend application should succeed');
-          
-          // Verify friendship is established
-          await Future.delayed(const Duration(seconds: 2));
+
+          // Poll until Alice shows up in Bob's friend list (replaces 2s sleep).
+          await waitUntilAsync(
+            () async {
+              final list = await bob.runWithInstanceAsync(() async =>
+                  TIMFriendshipManager.instance.getFriendList());
+              return list.data?.any((f) => f.userID == alicePublicKey) ?? false;
+            },
+            timeout: const Duration(seconds: 10),
+            description: "Alice appears in Bob's friend list after acceptance",
+          );
           final friendListResult = await bob.runWithInstanceAsync(() async => TIMFriendshipManager.instance.getFriendList());
           expect(friendListResult.code, equals(0));
           expect(friendListResult.data, isNotNull);
-          
+
           // Verify Alice is in Bob's friend list (using public key)
           if (friendListResult.data != null) {
             final aliceInList = friendListResult.data!.any((friend) => friend.userID == alicePublicKey);
@@ -476,9 +495,19 @@ void main() {
           }
         }
       } else {
-        // If application list is empty, it might have been auto-accepted or already processed
-        // Check if friendship is already established
-        await Future.delayed(const Duration(seconds: 2));
+        // If application list is empty, it might have been auto-accepted or already processed.
+        // Give the auto-accept callback a brief poll window before checking.
+        await waitUntilAsync(
+          () async {
+            final list = await bob.runWithInstanceAsync(() async =>
+                TIMFriendshipManager.instance.getFriendList());
+            return list.data?.any((f) => f.userID == alicePublicKey) ?? false;
+          },
+          timeout: const Duration(seconds: 5),
+          description: "Alice appears in Bob's friend list (auto-accept path)",
+        ).catchError((_) {
+          // Acceptable: friendship may still be in-flight; the explicit check below logs the state.
+        });
         final friendListResult = await bob.runWithInstanceAsync(() async => TIMFriendshipManager.instance.getFriendList());
         if (friendListResult.data != null) {
           final aliceInList = friendListResult.data!.any((friend) => friend.userID == alicePublicKey);

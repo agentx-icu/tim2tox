@@ -2,8 +2,17 @@
 # Run scenario_conversation_pin_test under lldb; on SIGSEGV run "bt" and save to lldb_pin_crash.log.
 # Usage: ./run_pin_test_with_lldb.sh
 # Then inspect lldb_pin_crash.log for native backtrace.
+#
+# macOS-only: uses lldb + the darwin-x64 Flutter engine cache layout. On
+# Linux, use a gdb-based equivalent (not provided); on Windows, attach the
+# Visual Studio debugger to flutter_tester.exe instead.
 
 set -e
+if [[ "$(uname -s)" != "Darwin" ]]; then
+  echo "Error: this debug script is macOS-only (relies on lldb + darwin-x64 Flutter engine cache layout)."
+  echo "       Got OS: $(uname -s). Use platform-native debugger tooling for non-Darwin hosts."
+  exit 1
+fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
