@@ -558,15 +558,12 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
     });
   }
 
-  // TODO(tim2tox-refactor): This method is ~1300 lines and contains four
-  // inline message-existence checks (search for `final existingHistory =`).
-  // Each block does "look up by msgID-or-content; if found, saveHistory(full
-  // list); else appendHistory". MessageHistoryPersistence.appendHistory now
-  // performs that same dedup-and-merge centrally with a safer 2s + fromUserId
-  // content-fallback, so each block could collapse to a single
-  // `appendHistory(conversationId, chatMsg)` call. Doing this safely needs
-  // manual receive/file_done/forward verification per block; track as a
-  // separate follow-up commit rather than rolling into the audit pass.
+  // _setupMessageListener subscribes to ffiService.messages and dispatches
+  // each ChatMessage into the appropriate UIKit V2Tim listener callback
+  // (onRecvNewMessage, onRecvMessageModified). Persistence dedup-and-merge
+  // is delegated to MessageHistoryPersistence.appendHistory throughout (an
+  // earlier version had four inline 5s/isSelf-only dedup blocks that have
+  // since been collapsed into single appendHistory calls).
   void _setupMessageListener() {
     _messagesSubscription?.cancel();
     _messagesSubscription = ffiService.messages.listen((chatMsg) async {
@@ -1661,35 +1658,19 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
           print(
               '[Tim2ToxSdkPlatform] v2Msg details: sender=${v2Msg.sender}, isSelf=${v2Msg.isSelf}, timestamp=${v2Msg.timestamp}, elemType=${v2Msg.elemType}');
 
-        // CRITICAL: Ensure message is saved to persistence
-        // Check if message already exists in history (it might have been saved by _onNativeEvent)
+        // Ensure message is saved to persistence. The previous "look it up
+        // with an inline 5s window, then conditionally appendHistory" dance
+        // is unnecessary: MessageHistoryPersistence.appendHistory itself
+        // dedups by msgID (merging via _mergeMessages) and falls back to a
+        // safer 2s + fromUserId content match, so calling it directly is
+        // idempotent when the same message was already saved by
+        // _onNativeEvent.
         final conversationId = finalConversationIDAfterFix;
-        final existingHistory = ffiService.getHistory(conversationId);
-        final messageExistsInHistory = existingHistory.any((msg) {
-          // Check by msgID first (most reliable)
-          if (chatMsg.msgID != null && msg.msgID == chatMsg.msgID) return true;
-          // Check by content (text + timestamp) as fallback
-          if (chatMsg.text.isNotEmpty && msg.text == chatMsg.text) {
-            final timeDiff = chatMsg.timestamp.difference(msg.timestamp).abs();
-            if (timeDiff.inSeconds <= 5 && chatMsg.isSelf == msg.isSelf) {
-              return true;
-            }
-          }
-          return false;
-        });
-
-        if (!messageExistsInHistory) {
-          // Message not in history, save it to persistence
-          if (_debugLog)
-            print(
-                '[Tim2ToxSdkPlatform] Message not found in history, saving to persistence: conversationId=$conversationId, msgID=${chatMsg.msgID}');
-          unawaited(ffiService.messageHistoryPersistence
-              .appendHistory(conversationId, chatMsg));
-        } else {
-          if (_debugLog)
-            print(
-                '[Tim2ToxSdkPlatform] Message already exists in history, skipping persistence save');
-        }
+        unawaited(ffiService.messageHistoryPersistence
+            .appendHistory(conversationId, chatMsg));
+        if (_debugLog)
+          print(
+              '[Tim2ToxSdkPlatform] Persisted new message: conversationId=$conversationId, msgID=${chatMsg.msgID}');
         ffiService.refreshConversationCacheFromHistory(conversationId);
 
         if (_debugLog)
