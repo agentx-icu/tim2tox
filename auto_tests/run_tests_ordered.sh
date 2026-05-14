@@ -461,12 +461,20 @@ run_single_test() {
   local start_time=$(date +%s)
   local output_file="/tmp/test_${test_name}_$(date +%s).log"
   
-  # Use 300s timeout for tests that need more time (conference, nospam, group_create_debug)
+  # Use 300s timeout for tests that need more time (conference, nospam, group_create_debug).
+  # Group moderation runs 4 sub-tests that each need a fresh group + invite +
+  # join + member-discovery cycle (~90s each on local bootstrap), totalling
+  # ~360s — easily over the default 180s. Even when individual sub-tests
+  # fail fast, setUpAll/tearDownAll between them adds up. Give the whole
+  # file 600s so timeouts surface as real assertion failures, not runner
+  # kills.
   local test_timeout=180
   if [[ "$test_name" == "scenario_conference_test" ]] || \
      [[ "$test_name" == "scenario_nospam_test" ]] || \
      [[ "$test_name" == "scenario_group_create_debug_test" ]]; then
     test_timeout=300
+  elif [[ "$test_name" == "scenario_group_moderation_test" ]]; then
+    test_timeout=600
   fi
   
   # Run test with timeout, capture output
