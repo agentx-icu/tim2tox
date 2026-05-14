@@ -195,7 +195,14 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
   final Map<String, V2TimUIKitListener> _uikitListeners = {};
   final List<V2TimSignalingListener> _signalingListeners = [];
 
-  // Per-instance listeners for strict multi-instance routing (instance_id != 0)
+  // Per-instance listeners for strict multi-instance routing
+  // (instance_id != 0). Only exercised by tim2tox/auto_tests, which spins
+  // up multiple Tox instances in one process for end-to-end tests. The
+  // production toxee client runs single-instance (instance_id == 0) and
+  // never populates these maps. Keep populated by addSDKListener etc. for
+  // test parity, but treat as test-only state in code review — the broadcast
+  // dispatch path through _sdkListeners / _advancedMsgListeners / etc. is
+  // what handles real traffic.
   final Map<int, List<V2TimSDKListener>> _instanceSdkListeners = {};
   final Map<int, List<V2TimAdvancedMsgListener>> _instanceAdvancedMsgListeners =
       {};
@@ -547,7 +554,16 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
   @override
   Future<V2TimCallback> logout() async {
     try {
-      // Call FfiChatService.logout
+      // Intentional no-op against the underlying FfiChatService: real
+      // teardown (cancel subscriptions, dispose FakeUIKit, restore
+      // TencentCloudChatSdkPlatform.instance to the default
+      // MethodChannel impl, drop UIKit provider registries, re-encrypt
+      // profile) is centralized in
+      // toxee/lib/util/account_service.dart::teardownCurrentSession,
+      // which drives
+      // toxee/lib/runtime/session_runtime_coordinator.dart::disposeRuntime.
+      // This method only flips local flags so subsequent SDK calls
+      // know there is no active session.
       _isLoggedIn = false;
       _currentUserID = null;
 
@@ -2386,6 +2402,12 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
 
   /// Dispatches a globalCallback to listeners registered for [instanceId] only.
   /// Called by NativeLibraryManager when instance_id != 0 and platform is Tim2ToxSdkPlatform.
+  ///
+  /// Multi-instance dispatch is only exercised by tim2tox/auto_tests; in
+  /// single-instance toxee usage [instanceId] is always 0 and traffic
+  /// follows the broadcast path in NativeLibraryManager._handleGlobalCallback
+  /// instead of routing here. See the comment on [_instanceSdkListeners]
+  /// for the reasoning.
   void dispatchInstanceGlobalCallback(int instanceId, int callbackType,
       Map<String, dynamic> dataFromNativeMap) {
     if (callbackType == 67) {
