@@ -213,9 +213,17 @@ if [ "$ASSERTION_GUARD" = "1" ]; then
   fi
 fi
 
-# Install dependencies
-echo -e "${YELLOW}Installing dependencies...${NC}"
-flutter pub get
+# Install dependencies.
+# Skip `flutter pub get` when .dart_tool/package_config.json is newer than
+# pubspec.yaml — saves ~5–15s per run. Force a refresh with SKIP_PUB_GET=0.
+if [ "${SKIP_PUB_GET:-auto}" = "0" ] || \
+   [ ! -f .dart_tool/package_config.json ] || \
+   [ pubspec.yaml -nt .dart_tool/package_config.json ]; then
+  echo -e "${YELLOW}Installing dependencies...${NC}"
+  flutter pub get
+else
+  echo -e "${YELLOW}Dependencies appear up to date (skipping flutter pub get; set SKIP_PUB_GET=0 to force).${NC}"
+fi
 
 # Test files organized by complexity/dependencies (69 scenario + 3 binary + 1 unit)
 PHASE1_BASIC=(
@@ -537,8 +545,13 @@ run_phase() {
     else
       ((phase_failed++))
     fi
-    # Small delay between tests to avoid resource exhaustion
-    sleep 1
+    # The previous 1-second inter-test sleep was a 70+ s tax across the full
+    # run that wasn't tied to any observable resource issue — flutter_tester
+    # already exits before we move on. Drop it. If a regression points at
+    # genuine resource contention, restore with TEST_INTER_DELAY env.
+    if [ -n "${TEST_INTER_DELAY:-}" ] && [ "$TEST_INTER_DELAY" -gt 0 ] 2>/dev/null; then
+      sleep "$TEST_INTER_DELAY"
+    fi
   done
   
   echo "" | tee -a "$RESULTS_FILE"

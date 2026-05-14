@@ -363,7 +363,12 @@ class TestNode {
               '[Test] Node $alias: First check - connectionStatus=$connectionStatus (0=NONE,1=TCP,2=UDP), loggedIn=$loggedIn');
         }
         if (connectionStatus == 1 || connectionStatus == 2) {
-          await Future.delayed(const Duration(milliseconds: 500));
+          // Short stabilization wait: getSelfConnectionStatus has confirmed
+          // TCP/UDP, but Tox's first announce/handshake hasn't always
+          // completed yet, and removing this entirely broke multi-node
+          // tests that race the bootstrap setup. Kept at 200ms (was 500ms)
+          // so we still save ~0.3s/node × 80+ tests across the suite.
+          await Future.delayed(const Duration(milliseconds: 200));
           print(
               '[Test] Node $alias: ✅ Connection established after $checkCount checks, connectionStatus=$connectionStatus, loggedIn=$loggedIn');
           if (!loggedIn) {
@@ -717,7 +722,8 @@ class TestNode {
             if (isOnline == true) {
               print(
                   '[waitForFriendConnection] ✅ Friend $targetAbbrev is online after $checkCount checks (elapsed=${elapsed.inSeconds}s)');
-              await Future.delayed(const Duration(milliseconds: 500));
+              // No "stabilization" sleep — the next test step can react to
+              // role==1 immediately. Saves ~500ms per friendship setup.
               return;
             } else {
               if (checkCount <= 8 || checkCount % 10 == 0) {
@@ -1361,18 +1367,43 @@ Future<void> establishFriendship(TestNode alice, TestNode bob,
         '[establishFriendship] ✅ ${bob.alias} successfully added ${alice.alias} as friend');
   }
 
-  // Give Tox CPU time to deliver friend requests and run auto-accept callbacks
-  print(
-      '[establishFriendship] Pumping Tox so friend requests can be delivered and auto-accepted...');
-  await pumpFriendConnection(alice, bob,
-      duration: const Duration(seconds: 6),
-      stepDelay: const Duration(milliseconds: 25));
-  await Future.delayed(const Duration(seconds: 2)); // Allow listener processing
-
-  // Wait until both see each other as friends
-  // tim2tox may return 64-char public key or 76-char Tox ID in friend list
+  // The previous version paid a flat 6s pumpFriendConnection + 2s
+  // Future.delayed BEFORE checking the friend list. The Future.delayed was
+  // pure dead time, but the 6s pump was actually doing work: pumpFriendConnection
+  // uses 25ms step delay (~240 iterations/sec), while the polling loop
+  // below pumps at 400ms step (~2.5 iter/sec). Removing the pre-pump
+  // starved Tox of iterate time and broke friend-request propagation.
+  //
+  // Compromise: an aggressive *bounded* pre-pump that exits as soon as both
+  // friend lists converge. Worst case is still cheaper than the original
+  // (the original always paid 8s; this pays at most 3s and usually much
+  // less). The downstream polling loop is unchanged for the slow case.
   bool listContainsPublicKey(List<String> list, String publicKey) => list.any(
       (id) => id == publicKey || (id.length >= 64 && id.startsWith(publicKey)));
+  print(
+      '[establishFriendship] Pumping until friend lists converge or 3s elapses...');
+  {
+    final prePumpDeadline = DateTime.now().add(const Duration(seconds: 3));
+    final ffi = ffi_lib.Tim2ToxFfi.open();
+    bool converged = false;
+    while (DateTime.now().isBefore(prePumpDeadline)) {
+      ffi.iterateAllInstances(40);
+      await Future.delayed(const Duration(milliseconds: 25));
+      final aliceFriends = await alice.getFriendList();
+      final bobFriends = await bob.getFriendList();
+      if (listContainsPublicKey(aliceFriends, bobPublicKey) &&
+          listContainsPublicKey(bobFriends, alicePublicKey)) {
+        converged = true;
+        break;
+      }
+    }
+    if (converged) {
+      print(
+          '[establishFriendship] Friend lists converged during pre-pump (saved up to 8s of the old fixed wait)');
+    }
+  }
+
+  // Slower fallback polling loop (in case the 3s pre-pump didn't converge).
   int checkCount = 0;
   while (DateTime.now().isBefore(deadline)) {
     checkCount++;
@@ -1393,13 +1424,13 @@ Future<void> establishFriendship(TestNode alice, TestNode bob,
             '[establishFriendship] ⚠️ Little time left in timeout, skipping P2P wait');
         return;
       }
-      // Pump Tox so P2P can establish (local bootstrap: short pump is enough)
-      const pumpDuration = Duration(seconds: 3);
-      final actualPump = remaining.inSeconds > 10
+      // Short P2P warm-up pump (local bootstrap doesn't need the previous 3s).
+      const pumpDuration = Duration(milliseconds: 800);
+      final actualPump = remaining.inSeconds > 4
           ? pumpDuration
-          : Duration(seconds: remaining.inSeconds > 5 ? 2 : 1);
+          : Duration(milliseconds: remaining.inMilliseconds.clamp(200, 800));
       print(
-          '[establishFriendship] Pumping Tox for P2P connection (${actualPump.inSeconds}s)...');
+          '[establishFriendship] Pumping Tox for P2P connection (${actualPump.inMilliseconds}ms)...');
       await pumpFriendConnection(alice, bob, duration: actualPump);
       // Cap P2P wait by caller's remaining timeout; use at least 15s each so local bootstrap can establish
       final remainingForP2P = deadline.difference(DateTime.now());
@@ -1412,12 +1443,17 @@ Future<void> establishFriendship(TestNode alice, TestNode bob,
               : (halfRemaining < minWaitSec ? minWaitSec : halfRemaining))
           : remainingForP2P.inSeconds.clamp(1, 60);
       final waitEach = Duration(seconds: waitEachSec);
-      // Run sequentially to avoid instance switching. P2P wait is best-effort so callers can retry in tests.
+      // Run in parallel: each waitForFriendConnection is bottlenecked on
+      // tox_iterate progress, not on which Dart Future is awaited first.
+      // Previous version ran sequentially and paid the worst case twice;
+      // Future.wait collapses that to the slower side once.
       print(
-          '[establishFriendship] Waiting for Tox P2P connection (${waitEach.inSeconds}s each, remaining=${remainingForP2P.inSeconds}s)...');
+          '[establishFriendship] Waiting for Tox P2P connection in parallel (${waitEach.inSeconds}s each)...');
       try {
-        await alice.waitForFriendConnection(bobToxId, timeout: waitEach);
-        await bob.waitForFriendConnection(aliceToxId, timeout: waitEach);
+        await Future.wait([
+          alice.waitForFriendConnection(bobToxId, timeout: waitEach),
+          bob.waitForFriendConnection(aliceToxId, timeout: waitEach),
+        ], eagerError: false);
         print('[establishFriendship] ✅ Both sides see friend as ONLINE');
       } catch (e) {
         print(
@@ -1471,7 +1507,11 @@ Future<void> configureLocalBootstrap(TestScenario scenario) async {
   // First node acts as bootstrap node
   final bootstrapNode = scenario.nodes[0];
 
-  // Wait for bootstrap node to be connected
+  // Brief sleep to let the bootstrap node's UDP listener bind. Verified
+  // experimentally: dropping this caused 3-node friend_query setups to
+  // race ahead before the bootstrap had a stable port, and getUdpPort's
+  // retry loop (5×200ms) wasn't enough to recover before the per-node
+  // 10s DHT-connect timeouts piled up. Keep it but document why.
   await Future.delayed(const Duration(milliseconds: 500));
   print(
       '[Bootstrap] T+${stopwatch.elapsedMilliseconds}ms: after initial 500ms delay');
