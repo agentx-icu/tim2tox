@@ -1158,62 +1158,18 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
               '[Tim2ToxSdkPlatform] Message existence check result: $messageExists');
 
         if (messageExists) {
-          // Message exists, notify as modified
-          // CRITICAL: Ensure updated message is saved to persistence
-          // The message status might have changed (e.g., from SENDING to SEND_SUCC)
-          // NOTE: The inline "exists → saveHistory ; missing → appendHistory"
-          // logic below duplicates the dedup-and-merge that
-          // [MessageHistoryPersistence.appendHistory] now performs centrally
-          // (msgID match → _mergeMessages; otherwise a 2s content+sender
-          // fallback). A future cleanup should replace the inline block with a
-          // single appendHistory call. Left in place for now to minimize
-          // behavioural change in this pass.
+          // Message exists, notify as modified.
+          // Persistence: hand off to MessageHistoryPersistence.appendHistory,
+          // which dedups by msgID (and merges via _mergeMessages preserving
+          // final file paths etc.) and falls back to a 2s content+sender
+          // match. That replaces the previous inline "saveHistory full list
+          // when found / appendHistory when missing" branching.
           final conversationId = finalConversationID;
-          final existingHistory = ffiService.getHistory(conversationId);
-          final existingMsg = existingHistory.firstWhere(
-            (msg) {
-              // Check by msgID first
-              if (chatMsg.msgID != null && msg.msgID == chatMsg.msgID)
-                return true;
-              // Check by content as fallback
-              if (chatMsg.text.isNotEmpty && msg.text == chatMsg.text) {
-                final timeDiff =
-                    chatMsg.timestamp.difference(msg.timestamp).abs();
-                if (timeDiff.inSeconds <= 5 && chatMsg.isSelf == msg.isSelf) {
-                  return true;
-                }
-              }
-              return false;
-            },
-            orElse: () => ChatMessage(
-              text: '',
-              fromUserId: '',
-              isSelf: false,
-              timestamp: DateTime.now(),
-            ),
-          );
-
-          // Update the message in history if it exists, or add it if it doesn't
-          if (existingMsg.text.isNotEmpty) {
-            // Message exists, update it
-            final msgIndex = existingHistory.indexOf(existingMsg);
-            if (msgIndex >= 0) {
-              existingHistory[msgIndex] = chatMsg;
-              // Save updated history (fire-and-forget — listener can't propagate disk errors).
-              unawaited(ffiService.messageHistoryPersistence
-                  .saveHistory(conversationId, existingHistory));
-              if (_debugLog)
-                print(
-                    '[Tim2ToxSdkPlatform] Updated message in persistence: conversationId=$conversationId, msgID=${chatMsg.msgID}');
-            }
-          } else {
-            // Message not in history, add it
-            unawaited(ffiService.messageHistoryPersistence
-                .appendHistory(conversationId, chatMsg));
-            if (_debugLog)
-              print(
-                  '[Tim2ToxSdkPlatform] Added message to persistence: conversationId=$conversationId, msgID=${chatMsg.msgID}');
-          }
+          unawaited(ffiService.messageHistoryPersistence
+              .appendHistory(conversationId, chatMsg));
+          if (_debugLog)
+            print(
+                '[Tim2ToxSdkPlatform] Persisted modified message: conversationId=$conversationId, msgID=${chatMsg.msgID}');
 
           await _setFaceUrlForMsg(v2Msg);
           _notifyAdvancedMsgListeners((listener) {
