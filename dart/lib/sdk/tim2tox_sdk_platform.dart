@@ -3226,13 +3226,18 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
 
   /// Notify all SDK listeners
   void _notifySDKListeners(void Function(V2TimSDKListener) callback) {
-    print(
-        '[Tim2ToxSdkPlatform] _notifySDKListeners: ${_sdkListeners.length} listeners registered');
-    for (final listener in _sdkListeners) {
+    // Snapshot before iterating: a listener callback may add or remove
+    // listeners (e.g. one-shot subscriptions), which would otherwise throw
+    // ConcurrentModificationError.
+    final listeners = List.of(_sdkListeners);
+    if (_debugLog) {
+      print(
+          '[Tim2ToxSdkPlatform] _notifySDKListeners: ${listeners.length} listeners registered');
+    }
+    for (final listener in listeners) {
       try {
         callback(listener);
-      } catch (e, stackTrace) {
-        // Log error but continue with other listeners
+      } catch (e) {
         print('Error notifying SDK listener: $e');
       }
     }
@@ -3241,19 +3246,23 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
   /// Notify all Advanced Message listeners
   void _notifyAdvancedMsgListeners(
       void Function(V2TimAdvancedMsgListener) callback) {
+    final listeners = List.of(_advancedMsgListeners);
     if (_debugLog) {
       print(
-          '[Tim2ToxSdkPlatform] _notifyAdvancedMsgListeners: ${_advancedMsgListeners.length} listeners registered');
+          '[Tim2ToxSdkPlatform] _notifyAdvancedMsgListeners: ${listeners.length} listeners registered');
     }
-    if (_advancedMsgListeners.isEmpty) {
+    if (listeners.isEmpty) {
+      // Always warn — no UIKit listener means messages disappear, which is
+      // almost always a startup-ordering bug worth surfacing in release logs.
       print(
           '[Tim2ToxSdkPlatform] WARNING: No AdvancedMsg listeners registered! Messages will not be delivered to UIKit.');
     }
-    for (final listener in _advancedMsgListeners) {
+    for (final listener in listeners) {
       try {
-        if (_debugLog)
+        if (_debugLog) {
           print(
               '[Tim2ToxSdkPlatform] Notifying listener: ${listener.runtimeType}');
+        }
         callback(listener);
       } catch (e, stackTrace) {
         print('[Tim2ToxSdkPlatform] Error notifying AdvancedMsg listener: $e');
@@ -3265,7 +3274,8 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
   /// Notify all Conversation listeners
   void _notifyConversationListeners(
       void Function(V2TimConversationListener) callback) {
-    for (final listener in _conversationListeners) {
+    final listeners = List.of(_conversationListeners);
+    for (final listener in listeners) {
       try {
         callback(listener);
       } catch (e) {
@@ -3277,7 +3287,8 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
   /// Notify all Friendship listeners
   void _notifyFriendshipListeners(
       void Function(V2TimFriendshipListener) callback) {
-    for (final listener in _friendshipListeners) {
+    final listeners = List.of(_friendshipListeners);
+    for (final listener in listeners) {
       try {
         callback(listener);
       } catch (e) {
@@ -3288,7 +3299,8 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
 
   /// Notify all Group listeners
   void _notifyGroupListeners(void Function(V2TimGroupListener) callback) {
-    for (final listener in _groupListeners) {
+    final listeners = List.of(_groupListeners);
+    for (final listener in listeners) {
       try {
         callback(listener);
       } catch (e) {
