@@ -5291,7 +5291,10 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
           if (!matched) {
             final timestampStr =
                 chatMsg.timestamp.millisecondsSinceEpoch.toString();
-            for (final searchID in remainingIDs) {
+            // Snapshot the set: `remainingIDs.remove(searchID)` below mutates
+            // the same collection we're iterating and throws
+            // "Concurrent modification during iteration".
+            for (final searchID in remainingIDs.toList()) {
               if (searchID.startsWith(timestampStr) ||
                   searchID.contains(timestampStr)) {
                 // Extract userID from searchID
@@ -5420,7 +5423,10 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
           print(
               '[Tim2ToxSdkPlatform] Conversation keys: ${messageListMap.keys.take(10).join(", ")}');
 
-          for (final msgID in remainingIDs) {
+          // Snapshot — `remainingIDs.remove(msgID)` below mutates the set
+          // we're iterating and trips the "Concurrent modification during
+          // iteration" guard.
+          for (final msgID in remainingIDs.toList()) {
             print(
                 '[Tim2ToxSdkPlatform] Trying to find message $msgID in messageData');
             V2TimMessage? found;

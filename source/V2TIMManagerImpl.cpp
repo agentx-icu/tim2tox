@@ -5316,6 +5316,14 @@ void V2TIMManagerImpl::HandleSelfConnectionStatus(TOX_CONNECTION connection_stat
                     V2TIMConversationManagerImpl* cm = static_cast<V2TIMConversationManagerImpl*>(GetConversationManager());
                     if (cm) {
                         cm->RefreshCache();
+                        // Reap the previous run's thread handle. The worker resets
+                        // refresh_task_running_ at the very end, so the thread has
+                        // either already exited or is unwinding — but the std::thread
+                        // object is still joinable, and operator= on a joinable
+                        // target calls std::terminate.
+                        if (refresh_task_.joinable()) {
+                            refresh_task_.join();
+                        }
                         refresh_task_ = std::thread([this]() {
                             auto refresh_once = [this]() {
                                 if (!running_.load(std::memory_order_acquire)) return;
@@ -5387,6 +5395,13 @@ void V2TIMManagerImpl::HandleSelfConnectionStatus(TOX_CONNECTION connection_stat
                 
                 V2TIM_LOG(kInfo, "HandleSelfConnectionStatus: Connection established, triggering RejoinKnownGroups");
                 rejoin_stop_requested_.store(false, std::memory_order_release);
+                // Reap the previous run's thread handle before reassigning;
+                // assigning to a joinable std::thread calls std::terminate.
+                // The previous task may have finished long ago (rejoin_triggered_
+                // is reset on disconnect, so a reconnect re-enters this branch).
+                if (rejoin_task_.joinable()) {
+                    rejoin_task_.join();
+                }
                 rejoin_task_ = std::thread([this]() {
                     for (int i = 0; i < 50 && !rejoin_stop_requested_.load(std::memory_order_acquire); ++i) {
                         std::this_thread::sleep_for(std::chrono::milliseconds(10));
