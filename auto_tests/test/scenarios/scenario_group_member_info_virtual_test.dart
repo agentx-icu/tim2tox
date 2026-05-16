@@ -1,7 +1,9 @@
-/// Group Member Info Test
-///
-/// Tests modifying member information: nameCard, role, etc.
-/// Verifies member info changes are synchronized
+// Group Member Info Test — virtual-clock variant
+//
+// Mirrors scenario_group_member_info_test.dart 1:1 but drives the harness
+// via the virtual-clock helpers (VirtualClock + pumpTestTick + *Virtual
+// helpers). Tests modifying member information: nameCard, role,
+// multi-modifications.
 
 import 'package:test/test.dart';
 import 'package:tencent_cloud_chat_sdk/native_im/adapter/tim_manager.dart';
@@ -13,7 +15,7 @@ import '../test_helper.dart';
 import '../test_fixtures.dart';
 
 void main() {
-  group('Group Member Info Tests', () {
+  group('Group Member Info Tests (Virtual)', () {
     late TestScenario scenario;
     late TestNode alice;
     late TestNode bob;
@@ -21,17 +23,23 @@ void main() {
 
     setUpAll(() async {
       await setupTestEnvironment();
+      // Enable test mode BEFORE scenario creation so event_thread never
+      // starts (canonical optimal pattern; saves the 10s DHT-wait in login()
+      // since event_thread suppression prevents DHT connect during login).
+      await VirtualClock.enableEarly();
       scenario = await createTestScenario(['alice', 'bob', 'charlie']);
       alice = scenario.getNode('alice')!;
       bob = scenario.getNode('bob')!;
       charlie = scenario.getNode('charlie')!;
 
       await scenario.initAllNodes();
-      // Parallelize login
+      // Idempotent — seeds virtual clock + reinforces per-instance flag.
+      await VirtualClock.enableForScenario(scenario);
+
       await Future.wait([
-        alice.login(),
-        bob.login(),
-        charlie.login(),
+        alice.login(timeout: const Duration(milliseconds: 500)),
+        bob.login(timeout: const Duration(milliseconds: 500)),
+        charlie.login(timeout: const Duration(milliseconds: 500)),
       ]);
 
       await waitUntil(
@@ -40,21 +48,24 @@ void main() {
         description: 'all nodes logged in',
       );
 
-      await configureLocalBootstrap(scenario);
+      await configureLocalBootstrapVirtual(scenario);
       await Future.wait([
-        alice.waitForConnection(timeout: const Duration(seconds: 15)),
-        bob.waitForConnection(timeout: const Duration(seconds: 15)),
-        charlie.waitForConnection(timeout: const Duration(seconds: 15)),
+        waitForConnectionVirtual(scenario, alice,
+            timeout: const Duration(seconds: 15)),
+        waitForConnectionVirtual(scenario, bob,
+            timeout: const Duration(seconds: 15)),
+        waitForConnectionVirtual(scenario, charlie,
+            timeout: const Duration(seconds: 15)),
       ]);
       await Future.wait([
-        establishFriendship(alice, bob,
+        establishFriendshipVirtual(scenario, alice, bob,
             timeout: const Duration(seconds: 90)),
-        establishFriendship(alice, charlie,
+        establishFriendshipVirtual(scenario, alice, charlie,
             timeout: const Duration(seconds: 90)),
       ]);
-      await pumpFriendConnection(alice, bob,
+      await pumpFriendConnectionVirtual(scenario, alice, bob,
           duration: const Duration(seconds: 4));
-      await pumpFriendConnection(alice, charlie,
+      await pumpFriendConnectionVirtual(scenario, alice, charlie,
           duration: const Duration(seconds: 4));
     });
 
@@ -63,9 +74,7 @@ void main() {
       await teardownTestEnvironment();
     });
 
-    // Lightweight setUp for per-test cleanup if needed
     setUp(() async {
-      // Reset any per-test state if necessary
       // Most tests don't need cleanup since they use shared scenario
     });
 
@@ -74,23 +83,41 @@ void main() {
       TestNode invitee, {
       required String context,
     }) async {
-      invitee.clearCallbackReceived('onGroupInvited');
-      final inviteResult = await alice.runWithInstanceAsync(
-          () async => TIMGroupManager.instance.inviteUserToGroup(
-                groupID: groupId,
-                userList: [invitee.getPublicKey()],
-              ));
-      expect(inviteResult.code, equals(0),
+      // Retry invite + wait: inviteUserToGroup returns code=0 even when the
+      // underlying tox_group_invite_friend packet was dropped, and the first
+      // invite often races with friend P2P bring-up in virtual mode.
+      var inviteArrived = false;
+      final inviteePublicKey = invitee.getPublicKey();
+      for (var attempt = 0; !inviteArrived && attempt < 3; attempt++) {
+        invitee.clearCallbackReceived('onGroupInvited');
+        final inviteResult = await alice.runWithInstanceAsync(
+            () async => TIMGroupManager.instance.inviteUserToGroup(
+                  groupID: groupId,
+                  userList: [inviteePublicKey],
+                ));
+        expect(inviteResult.code, equals(0),
+            reason:
+                'inviteUserToGroup failed for ${invitee.alias}: ${inviteResult.desc}');
+        try {
+          await waitUntilWithVirtualPump(
+            scenario,
+            () => invitee.callbackReceived['onGroupInvited'] == true,
+            timeout: const Duration(seconds: 15),
+            description:
+                '${invitee.alias} onGroupInvited ($context, attempt ${attempt + 1})',
+            advanceMs: 50,
+            iterationsPerInstance: 1,
+          );
+          inviteArrived = true;
+        } catch (_) {
+          // Retry: friend P2P may not have been ONLINE for the first attempt.
+        }
+      }
+      expect(inviteArrived, isTrue,
           reason:
-              'inviteUserToGroup failed for ${invitee.alias}: ${inviteResult.code}');
-
-      await waitUntilWithPump(
-        () => invitee.callbackReceived['onGroupInvited'] == true,
-        timeout: const Duration(seconds: 12),
-        description: '${invitee.alias} receives onGroupInvited ($context)',
-        iterationsPerPump: 100,
-        stepDelay: const Duration(milliseconds: 200),
-      );
+              '${invitee.alias} never received onGroupInvited for $context after 3 retries');
+      // Settle ~300ms virtual so pending invite -> chat_id mapping completes.
+      await pumpTestTick(scenario, advanceMs: 300, iterationsPerInstance: 1);
 
       final joinGroupId =
           invitee.getLastCallbackGroupId('onGroupInvited') ?? groupId;
@@ -99,10 +126,10 @@ void main() {
       expect(joinResult.code, equals(0),
           reason: '${invitee.alias} joinGroup failed: ${joinResult.code}');
 
-      await pumpGroupPeerDiscovery(alice, invitee,
+      await pumpGroupPeerDiscoveryVirtual(scenario, alice, invitee,
           duration: const Duration(seconds: 3));
-      final inviteeInGroup = await waitUntilFounderSeesMemberInGroup(
-          alice, invitee, groupId,
+      final inviteeInGroup = await waitUntilFounderSeesMemberInGroupVirtual(
+          scenario, alice, invitee, groupId,
           timeout: const Duration(seconds: 25));
       expect(inviteeInGroup, isNotNull,
           reason: 'Alice must see ${invitee.alias} in group before $context');
@@ -121,7 +148,7 @@ void main() {
       final groupId = createResult.data!;
       await inviteAndJoinMember(groupId, bob,
           context: 'modify member nameCard');
-      await Future.delayed(const Duration(milliseconds: 500));
+      await pumpTestTick(scenario, advanceMs: 500, iterationsPerInstance: 1);
       final bobPublicKey = bob.getPublicKey();
       final setMemberInfoResult = await alice.runWithInstanceAsync(
           () async => TIMGroupManager.instance.setGroupMemberInfo(
@@ -130,7 +157,7 @@ void main() {
                 nameCard: 'Bob\'s Name Card',
               ));
       expect(setMemberInfoResult.code, equals(0));
-      await Future.delayed(const Duration(milliseconds: 500));
+      await pumpTestTick(scenario, advanceMs: 500, iterationsPerInstance: 1);
       final memberListResult = await alice.runWithInstanceAsync(
           () async => TIMGroupManager.instance.getGroupMemberList(
                 groupID: groupId,
@@ -164,7 +191,7 @@ void main() {
       final groupId = createResult.data!;
       final bobJoinGroupId = await inviteAndJoinMember(groupId, bob,
           context: 'modify own nameCard');
-      await Future.delayed(const Duration(milliseconds: 500));
+      await pumpTestTick(scenario, advanceMs: 500, iterationsPerInstance: 1);
       final bobPublicKey = bob.getPublicKey();
       final setMemberInfoResult = await bob.runWithInstanceAsync(
           () async => TIMGroupManager.instance.setGroupMemberInfo(
@@ -173,7 +200,7 @@ void main() {
                 nameCard: 'My Own Name Card',
               ));
       expect(setMemberInfoResult.code, equals(0));
-      await Future.delayed(const Duration(milliseconds: 500));
+      await pumpTestTick(scenario, advanceMs: 500, iterationsPerInstance: 1);
       final memberListResult = await bob.runWithInstanceAsync(
           () async => TIMGroupManager.instance.getGroupMemberList(
                 groupID: bobJoinGroupId,
@@ -207,9 +234,10 @@ void main() {
       await inviteAndJoinMember(groupId, bob,
           context: 'set member role to admin');
       final bobPublicKey = bob.getPublicKey();
-      // Wait until Alice sees Bob in the group (DHT/peer list sync) so setGroupMemberRole does not return 8500
-      final bobUserIdForRole = await waitUntilFounderSeesMemberInGroup(
-          alice, bob, groupId,
+      // Wait until Alice sees Bob in the group (DHT/peer list sync) so
+      // setGroupMemberRole does not return 8500.
+      final bobUserIdForRole = await waitUntilFounderSeesMemberInGroupVirtual(
+          scenario, alice, bob, groupId,
           timeout: const Duration(seconds: 25));
       expect(bobUserIdForRole, isNotNull,
           reason: 'Alice must see Bob in group before setGroupMemberRole');
@@ -220,7 +248,7 @@ void main() {
                 role: GroupMemberRoleTypeEnum.V2TIM_GROUP_MEMBER_ROLE_ADMIN,
               ));
       expect(setRoleResult.code, equals(0));
-      await Future.delayed(const Duration(milliseconds: 500));
+      await pumpTestTick(scenario, advanceMs: 500, iterationsPerInstance: 1);
       final memberListResult = await alice.runWithInstanceAsync(
           () async => TIMGroupManager.instance.getGroupMemberList(
                 groupID: groupId,
@@ -256,7 +284,7 @@ void main() {
           context: 'multiple member info modifications (bob)');
       await inviteAndJoinMember(groupId, charlie,
           context: 'multiple member info modifications (charlie)');
-      await Future.delayed(const Duration(milliseconds: 500));
+      await pumpTestTick(scenario, advanceMs: 500, iterationsPerInstance: 1);
       final bobPublicKey = bob.getPublicKey();
       final charliePublicKey = charlie.getPublicKey();
       await alice.runWithInstanceAsync(() async {
@@ -267,7 +295,7 @@ void main() {
             userID: charliePublicKey,
             nameCard: 'Charlie Card');
       });
-      await Future.delayed(const Duration(milliseconds: 500));
+      await pumpTestTick(scenario, advanceMs: 500, iterationsPerInstance: 1);
       final memberListResult = await alice.runWithInstanceAsync(
           () async => TIMGroupManager.instance.getGroupMemberList(
                 groupID: groupId,
@@ -289,11 +317,13 @@ void main() {
           orElse: () => V2TimGroupMemberFullInfo(userID: ''),
         );
         if (bobMember.userID.startsWith(bobPublicKey) ||
-            bobMember.userID == bobPublicKey)
+            bobMember.userID == bobPublicKey) {
           expect(bobMember.nameCard, equals('Bob Card'));
+        }
         if (charlieMember.userID.startsWith(charliePublicKey) ||
-            charlieMember.userID == charliePublicKey)
+            charlieMember.userID == charliePublicKey) {
           expect(charlieMember.nameCard, equals('Charlie Card'));
+        }
       }
     }, timeout: const Timeout(Duration(seconds: 60)));
 
@@ -308,7 +338,7 @@ void main() {
       final conferenceId = createResult.data!;
       await inviteAndJoinMember(conferenceId, bob,
           context: 'conference member info');
-      await Future.delayed(const Duration(milliseconds: 500));
+      await pumpTestTick(scenario, advanceMs: 500, iterationsPerInstance: 1);
       final bobPublicKey = bob.getPublicKey();
       final setMemberInfoResult = await alice.runWithInstanceAsync(
           () async => TIMGroupManager.instance.setGroupMemberInfo(
@@ -317,7 +347,7 @@ void main() {
                 nameCard: 'Conference Name Card',
               ));
       expect(setMemberInfoResult.code, equals(0));
-      await Future.delayed(const Duration(milliseconds: 500));
+      await pumpTestTick(scenario, advanceMs: 500, iterationsPerInstance: 1);
       final memberListResult = await alice.runWithInstanceAsync(
           () async => TIMGroupManager.instance.getGroupMemberList(
                 groupID: conferenceId,

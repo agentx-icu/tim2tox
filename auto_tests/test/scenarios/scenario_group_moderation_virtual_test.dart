@@ -1,13 +1,9 @@
-// Group Moderation Test
+// Group Moderation Test — virtual-clock variant
 //
-// Tests group moderation: role setting, kick member, mute member, transfer owner.
-// Reference: c-toxcore/auto_tests/scenarios/scenario_group_moderation_test.c
-//
-// Uses Private groups + invite/join flow. The C reference uses Public groups,
-// but Dart auto_tests don't have an in-memory mock DHT — PUBLIC announce never
-// propagates over local-only TCP, so peer-join callbacks on the founder never
-// fire. Private groups route group sync through the already-established
-// friend connection, where peer-join works reliably.
+// Mirrors scenario_group_moderation_test.dart 1:1 but drives the harness via
+// the virtual-clock helpers (VirtualClock + pumpTestTick + *Virtual helpers).
+// Used as the gold standard for the virtual-mode harness while we migrate
+// the rest of Phase 4 / 10 / 12.
 
 import 'package:test/test.dart';
 import 'package:tencent_cloud_chat_sdk/native_im/adapter/tim_manager.dart';
@@ -18,11 +14,10 @@ import 'package:tencent_cloud_chat_sdk/models/v2_tim_callback.dart';
 import '../test_helper.dart';
 import '../test_fixtures.dart';
 
-/// Creates a Private group on [founder], invites [member], waits for the
-/// invite to arrive, has [member] join, and returns once [founder] sees
-/// [member] in the group member list. Returns the groupID and the userID
-/// founder uses to refer to [member] inside the group.
-Future<({String groupId, String memberUserID})> _prepareGroupWithMember(
+/// Same flow as moderation_test._prepareGroupWithMember but using
+/// pumpTestTick + waitUntilWithVirtualPump in place of wall-clock waits.
+Future<({String groupId, String memberUserID})> _prepareGroupWithMemberVirtual(
+  TestScenario scenario,
   TestNode founder,
   TestNode member, {
   required String label,
@@ -37,33 +32,47 @@ Future<({String groupId, String memberUserID})> _prepareGroupWithMember(
       reason: 'createGroup($label) failed: ${createResult.desc}');
   final groupId = createResult.data!;
 
-  member.clearCallbackReceived('onGroupInvited');
   final memberPublicKey = member.getPublicKey();
-  final inviteResult = await founder.runWithInstanceAsync(() async =>
-      TIMGroupManager.instance.inviteUserToGroup(
-        groupID: groupId,
-        userList: [memberPublicKey],
-      ));
-  expect(inviteResult.code, equals(0),
-      reason: 'inviteUserToGroup($label) failed: ${inviteResult.desc}');
-
-  await waitUntilWithPump(
-    () => member.callbackReceived['onGroupInvited'] == true,
-    timeout: const Duration(seconds: 30),
-    description: '${member.alias} onGroupInvited for $label',
-    iterationsPerPump: 80,
-    stepDelay: const Duration(milliseconds: 150),
-  );
-  // Small settle so the invite-side bookkeeping (pending invite -> chat_id
-  // mapping) completes before joinGroup is called.
-  await Future.delayed(const Duration(milliseconds: 300));
+  // Retry invite + wait: inviteUserToGroup returns code=0 even when the
+  // underlying tox_group_invite_friend packet was dropped (friend status=NONE),
+  // and the first invite often races with friend P2P bring-up in virtual mode.
+  var inviteArrived = false;
+  for (var attempt = 0; !inviteArrived && attempt < 3; attempt++) {
+    member.clearCallbackReceived('onGroupInvited');
+    final inviteResult = await founder.runWithInstanceAsync(() async =>
+        TIMGroupManager.instance.inviteUserToGroup(
+          groupID: groupId,
+          userList: [memberPublicKey],
+        ));
+    expect(inviteResult.code, equals(0),
+        reason: 'inviteUserToGroup($label) failed: ${inviteResult.desc}');
+    try {
+      await waitUntilWithVirtualPump(
+        scenario,
+        () => member.callbackReceived['onGroupInvited'] == true,
+        timeout: const Duration(seconds: 15),
+        description: '${member.alias} onGroupInvited for $label (attempt ${attempt + 1})',
+        advanceMs: 50,
+        iterationsPerInstance: 1,
+      );
+      inviteArrived = true;
+    } catch (_) {
+      // Retry: friend P2P may not have been ONLINE for the first attempt.
+    }
+  }
+  expect(inviteArrived, isTrue,
+      reason: '${member.alias} never received onGroupInvited for $label after 3 retries');
+  // Settle ~300ms virtual so pending invite -> chat_id mapping completes
+  // before joinGroup is called.
+  await pumpTestTick(scenario, advanceMs: 300, iterationsPerInstance: 1);
 
   final joinResult = await member.runWithInstanceAsync(() async =>
       TIMManager.instance.joinGroup(groupID: groupId, message: ''));
   expect(joinResult.code, equals(0),
       reason: 'joinGroup($label) failed: ${joinResult.desc}');
 
-  final memberUserID = await waitUntilFounderSeesMemberInGroup(
+  final memberUserID = await waitUntilFounderSeesMemberInGroupVirtual(
+    scenario,
     founder,
     member,
     groupId,
@@ -76,7 +85,7 @@ Future<({String groupId, String memberUserID})> _prepareGroupWithMember(
 }
 
 void main() {
-  group('Group Moderation Tests', () {
+  group('Group Moderation Tests (Virtual)', () {
     late TestScenario scenario;
     late TestNode founder;
     late TestNode member1;
@@ -90,25 +99,27 @@ void main() {
       member2 = scenario.getNode('member2')!;
 
       await scenario.initAllNodes();
-      // Parallelize login
+      // Enable test mode BEFORE login so event_thread never starts.
+      await VirtualClock.enableForScenario(scenario);
+
+      // Logins still complete synchronously from Dart's POV (loggedIn flag
+      // flips in the Dart bookkeeping when InitSDK returns); no virtual time
+      // advance is required for them to "finish".
       await Future.wait([
         founder.login(),
         member1.login(),
         member2.login(),
       ]);
-
       await waitUntil(
           () => founder.loggedIn && member1.loggedIn && member2.loggedIn);
 
-      // Configure local bootstrap (full mesh — every node bootstraps to every
-      // other node so founder also has DHT peers).
-      await configureLocalBootstrap(scenario);
-      // Build both friendships in parallel: each call can wait up to 60s for
-      // P2P, so running them sequentially doubles setUp time when one side
-      // is slow to come online.
+      // Full-mesh bootstrap with virtual-time DHT-connect wait.
+      await configureLocalBootstrapVirtual(scenario);
+      // Both friendships in parallel — virtual clock is global so both halves
+      // step in lockstep through the same pumpTestTick.
       await Future.wait([
-        establishFriendship(founder, member1),
-        establishFriendship(founder, member2),
+        establishFriendshipVirtual(scenario, founder, member1),
+        establishFriendshipVirtual(scenario, founder, member2),
       ]);
     });
 
@@ -122,8 +133,9 @@ void main() {
     });
 
     test('Set group member role', () async {
-      final ctx =
-          await _prepareGroupWithMember(founder, member1, label: 'role');
+      final ctx = await _prepareGroupWithMemberVirtual(
+          scenario, founder, member1,
+          label: 'role');
       // Retry setGroupMemberRole: Tox may list the peer slightly after
       // getGroupMemberList sees it.
       V2TimCallback? setRoleResult;
@@ -135,15 +147,16 @@ void main() {
               role: GroupMemberRoleTypeEnum.V2TIM_GROUP_MEMBER_ROLE_ADMIN,
             ));
         if (setRoleResult?.code == 0) break;
-        await Future.delayed(const Duration(seconds: 1));
+        await pumpTestTick(scenario, advanceMs: 1000, iterationsPerInstance: 1);
       }
       expect(setRoleResult?.code, equals(0),
           reason: 'setGroupMemberRole failed: ${setRoleResult?.desc}');
     }, timeout: const Timeout(Duration(seconds: 90)));
 
     test('Kick group member', () async {
-      final ctx =
-          await _prepareGroupWithMember(founder, member1, label: 'kick');
+      final ctx = await _prepareGroupWithMemberVirtual(
+          scenario, founder, member1,
+          label: 'kick');
       final kickResult = await founder.runWithInstanceAsync(() async =>
           TIMGroupManager.instance.kickGroupMember(
             groupID: ctx.groupId,
@@ -154,8 +167,9 @@ void main() {
     }, timeout: const Timeout(Duration(seconds: 90)));
 
     test('Mute group member', () async {
-      final ctx =
-          await _prepareGroupWithMember(founder, member1, label: 'mute');
+      final ctx = await _prepareGroupWithMemberVirtual(
+          scenario, founder, member1,
+          label: 'mute');
       final muteResult = await founder.runWithInstanceAsync(() async =>
           TIMGroupManager.instance.muteGroupMember(
             groupID: ctx.groupId,
@@ -167,8 +181,9 @@ void main() {
     }, timeout: const Timeout(Duration(seconds: 90)));
 
     test('Transfer group owner', () async {
-      final ctx =
-          await _prepareGroupWithMember(founder, member1, label: 'transfer');
+      final ctx = await _prepareGroupWithMemberVirtual(
+          scenario, founder, member1,
+          label: 'transfer');
       final transferResult = await founder.runWithInstanceAsync(() async =>
           TIMGroupManager.instance.transferGroupOwner(
             groupID: ctx.groupId,

@@ -23,33 +23,55 @@ void main() {
     late TestScenario scenario;
     late TestNode founder;
     late TestNode peer1;
-    
+    // Passive observer node: a 2-node local-bootstrap DHT is too small for
+    // Tox to bring friend connections online; adding a third online node
+    // unblocks routing without affecting the test logic.
+    late TestNode observer;
+
     setUpAll(() async {
       await setupTestEnvironment();
-      scenario = await createTestScenario(['founder', 'peer1']);
+      scenario = await createTestScenario(['founder', 'peer1', 'observer']);
       founder = scenario.getNode('founder')!;
       peer1 = scenario.getNode('peer1')!;
-      
+      observer = scenario.getNode('observer')!;
+
       await scenario.initAllNodes();
       // Parallelize login
       await Future.wait([
         founder.login(),
         peer1.login(),
+        observer.login(),
       ]);
-      
-      // Wait for both nodes to be connected
+
+      // Wait for all three nodes to be logged in
       await waitUntil(
-        () => founder.loggedIn && peer1.loggedIn,
+        () => founder.loggedIn && peer1.loggedIn && observer.loggedIn,
         timeout: const Duration(seconds: 10),
-        description: 'both nodes logged in',
+        description: 'all nodes logged in',
       );
-      
-      // Configure local bootstrap
+
+      // Configure local bootstrap (mesh)
       await configureLocalBootstrap(scenario);
-      
-      // Wait for DHT connection so createGroup/joinGroup do not block (same as group_create_debug / group_tcp)
-      await founder.waitForConnection(timeout: const Duration(seconds: 15));
-      await peer1.waitForConnection(timeout: const Duration(seconds: 15));
+
+      // Best-effort: don't fail setUpAll if DHT is slow to come up; friend
+      // connection often establishes anyway over TCP relay / iterate cycles.
+      try {
+        await Future.wait([
+          founder.waitForConnection(timeout: const Duration(seconds: 15)),
+          peer1.waitForConnection(timeout: const Duration(seconds: 15)),
+        ]);
+      } catch (_) {
+        // continue — establishFriendship below will retry the wait
+      }
+
+      // Establish founder↔peer1 friendship (also keep observer connected via a
+      // friendship so it stays an active DHT node, not just idle background).
+      await Future.wait([
+        establishFriendship(founder, peer1,
+            timeout: const Duration(seconds: 90)),
+        establishFriendship(founder, observer,
+            timeout: const Duration(seconds: 90)),
+      ]);
     });
     
     tearDownAll(() async {
@@ -130,8 +152,47 @@ void main() {
       
       peer1.runWithInstance(() => TIMManager.instance.addGroupListener(listener: groupListener));
       print('[Test] Added group listener for peer1');
-      
-      // Step 3: Peer1 joins the group via chat_id (in tim2tox, we use groupID)
+
+      // Step 3a: Founder invites peer1. tim2tox joinGroup needs a stored
+      // chat_id (creator-only) or a pending invite — invite is portable.
+      // inviteUserToGroup returns code=0 even when tox_group_invite_friend
+      // is dropped (friend offline at that instant), so retry a few times.
+      peer1.clearCallbackReceived('onGroupInvited');
+      final inviteResult = await founder.runWithInstanceAsync(() async =>
+          TIMGroupManager.instance.inviteUserToGroup(
+            groupID: groupId,
+            userList: [peer1.getPublicKey()],
+          ));
+      expect(inviteResult.code, equals(0),
+          reason: 'inviteUserToGroup failed: ${inviteResult.desc}');
+      var inviteArrived = false;
+      for (var attempt = 0; !inviteArrived && attempt < 3; attempt++) {
+        if (attempt > 0) {
+          peer1.clearCallbackReceived('onGroupInvited');
+          await founder.runWithInstanceAsync(() async =>
+              TIMGroupManager.instance.inviteUserToGroup(
+                groupID: groupId,
+                userList: [peer1.getPublicKey()],
+              ));
+        }
+        try {
+          await waitUntilWithPump(
+            () => peer1.callbackReceived['onGroupInvited'] == true,
+            timeout: const Duration(seconds: 30),
+            description: 'peer1 receives onGroupInvited',
+            iterationsPerPump: 100,
+            stepDelay: const Duration(milliseconds: 200),
+          );
+          inviteArrived = true;
+        } catch (_) {
+          // retry
+        }
+      }
+      expect(inviteArrived, isTrue,
+          reason: 'peer1 never received onGroupInvited after 3 retries');
+      await Future.delayed(const Duration(milliseconds: 300));
+
+      // Step 3b: Peer1 joins the group
       final joinStartTime = DateTime.now();
       print('[Test] Step 3: Peer1 joining group: $groupId (started at ${joinStartTime.toIso8601String()})');
       final joinResult = await peer1.runWithInstanceAsync(() async => TIMManager.instance.joinGroup(
@@ -418,11 +479,47 @@ void main() {
       );
       
       // Step 6: Founder rejoins the group
-      final rejoinResult = await founder.runWithInstanceAsync(() async => TIMManager.instance.joinGroup(
-        groupID: groupId,
-        message: '',
-      ));
-      expect(rejoinResult.code, equals(0), reason: 'rejoinGroup failed: ${rejoinResult.code}');
+      // tim2tox clears the stored chat_id mapping on quitGroup, so a direct
+      // joinGroup by the original groupID would return 6017. peer1 is still
+      // in the group — invite founder back from peer1's side.
+      founder.clearCallbackReceived('onGroupInvited');
+      final rejoinInvite = await peer1.runWithInstanceAsync(() async =>
+          TIMGroupManager.instance.inviteUserToGroup(
+            groupID: groupId,
+            userList: [founder.getPublicKey()],
+          ));
+      expect(rejoinInvite.code, equals(0),
+          reason: 'peer1.inviteUserToGroup (rejoin) failed: ${rejoinInvite.desc}');
+      var rejoinInviteArrived = false;
+      for (var attempt = 0; !rejoinInviteArrived && attempt < 3; attempt++) {
+        if (attempt > 0) {
+          founder.clearCallbackReceived('onGroupInvited');
+          await peer1.runWithInstanceAsync(() async =>
+              TIMGroupManager.instance.inviteUserToGroup(
+                groupID: groupId,
+                userList: [founder.getPublicKey()],
+              ));
+        }
+        try {
+          await waitUntilWithPump(
+            () => founder.callbackReceived['onGroupInvited'] == true,
+            timeout: const Duration(seconds: 30),
+            description: 'founder receives onGroupInvited (rejoin)',
+            iterationsPerPump: 100,
+            stepDelay: const Duration(milliseconds: 200),
+          );
+          rejoinInviteArrived = true;
+        } catch (_) {}
+      }
+      expect(rejoinInviteArrived, isTrue,
+          reason:
+              'founder never received onGroupInvited (rejoin) after 3 retries');
+      final rejoinGroupId =
+          founder.getLastCallbackGroupId('onGroupInvited') ?? groupId;
+      final rejoinResult = await founder.runWithInstanceAsync(() async =>
+          TIMManager.instance.joinGroup(groupID: rejoinGroupId, message: ''));
+      expect(rejoinResult.code, equals(0),
+          reason: 'rejoinGroup failed: ${rejoinResult.desc}');
       
       // Wait for rejoin to propagate
       // With local bootstrap, this should be fast - reduce to 1 second
@@ -485,6 +582,6 @@ void main() {
       print('  Peer joined: $peerJoined');
       print('  Peer nick updated: $peerNickUpdated');
       print('  Peer exit count: $peerExitCount');
-    }, timeout: const Timeout(Duration(seconds: 60)));
+    }, timeout: const Timeout(Duration(seconds: 240)));
   });
 }

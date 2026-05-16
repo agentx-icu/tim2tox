@@ -1432,16 +1432,20 @@ Future<void> establishFriendship(TestNode alice, TestNode bob,
       print(
           '[establishFriendship] Pumping Tox for P2P connection (${actualPump.inMilliseconds}ms)...');
       await pumpFriendConnection(alice, bob, duration: actualPump);
-      // Cap P2P wait by caller's remaining timeout; use at least 15s each so local bootstrap can establish
+      // Cap P2P wait. In local-bootstrap environments, friend connections
+      // either come ONLINE within ~10-15s or never within the test budget;
+      // waiting longer than 30s is pure overhead that makes setUpAll the
+      // dominant cost of every Phase 10/12 test. Floor 15s for jitter.
       final remainingForP2P = deadline.difference(DateTime.now());
       const minWaitSec = 15;
+      const maxWaitSec = 30;
       final halfRemaining =
           remainingForP2P.inSeconds >= 2 ? (remainingForP2P.inSeconds ~/ 2) : 0;
       final waitEachSec = remainingForP2P.inSeconds >= 4
-          ? (halfRemaining > 60
-              ? 60
+          ? (halfRemaining > maxWaitSec
+              ? maxWaitSec
               : (halfRemaining < minWaitSec ? minWaitSec : halfRemaining))
-          : remainingForP2P.inSeconds.clamp(1, 60);
+          : remainingForP2P.inSeconds.clamp(1, maxWaitSec);
       final waitEach = Duration(seconds: waitEachSec);
       // Run in parallel: each waitForFriendConnection is bottlenecked on
       // tox_iterate progress, not on which Dart Future is awaited first.
@@ -1504,71 +1508,68 @@ Future<void> configureLocalBootstrap(TestScenario scenario) async {
 
   print(
       '[Bootstrap] START (T+0ms) nodes=${scenario.nodes.map((n) => n.alias).join(', ')}');
-  // First node acts as bootstrap node
-  final bootstrapNode = scenario.nodes[0];
 
-  // Brief sleep to let the bootstrap node's UDP listener bind. Verified
-  // experimentally: dropping this caused 3-node friend_query setups to
-  // race ahead before the bootstrap had a stable port, and getUdpPort's
-  // retry loop (5×200ms) wasn't enough to recover before the per-node
-  // 10s DHT-connect timeouts piled up. Keep it but document why.
+  // Brief sleep to let UDP listeners bind. Verified experimentally:
+  // dropping this caused 3-node friend_query setups to race ahead before
+  // ports were stable, and getUdpPort's retry loop wasn't enough to
+  // recover before per-node 10s DHT-connect timeouts piled up.
   await Future.delayed(const Duration(milliseconds: 500));
   print(
       '[Bootstrap] T+${stopwatch.elapsedMilliseconds}ms: after initial 500ms delay');
 
-  // Get bootstrap node's UDP port and DHT ID (within bootstrap node's instance scope)
-  final portAndDhtId = await bootstrapNode.runWithInstanceAsync(() async {
-    final ffiInstance = ffi_lib.Tim2ToxFfi.open();
-    int port = 0;
-    for (int retry = 0; retry < 5; retry++) {
-      port = ffiInstance.getUdpPort(ffiInstance.getCurrentInstanceId());
-      if (retry % 2 == 0) {
-        print(
-            '[Bootstrap] T+${stopwatch.elapsedMilliseconds}ms: getUdpPort() attempt ${retry + 1} for ${bootstrapNode.alias}: $port');
-      }
-      if (port > 0) {
-        final loginStatus = TIMManager.instance.getLoginStatus();
-        if (loginStatus == 1) {
-          print(
-              '[Bootstrap] T+${stopwatch.elapsedMilliseconds}ms: Bootstrap node ${bootstrapNode.alias} ready port=$port loginStatus=$loginStatus');
-          break;
-        } else {
-          print(
-              '[Bootstrap] T+${stopwatch.elapsedMilliseconds}ms: ${bootstrapNode.alias} port=$port loginStatus=$loginStatus (not yet 1)');
+  Future<(int, String)> readPortAndDhtId(TestNode node) async {
+    return node.runWithInstanceAsync(() async {
+      final ffiInstance = ffi_lib.Tim2ToxFfi.open();
+      int port = 0;
+      for (int retry = 0; retry < 5; retry++) {
+        port = ffiInstance.getUdpPort(ffiInstance.getCurrentInstanceId());
+        if (port > 0) {
+          final loginStatus = TIMManager.instance.getLoginStatus();
+          if (loginStatus == 1) break;
         }
+        if (retry < 4) await Future.delayed(const Duration(milliseconds: 200));
       }
-      if (retry < 4) {
-        await Future.delayed(const Duration(milliseconds: 200));
+      if (port == 0) return (0, '');
+      final dhtIdBuf = pkgffi.malloc.allocate<ffi.Int8>(65);
+      try {
+        final dhtIdLen = ffiInstance.getDhtIdNative(dhtIdBuf, 65);
+        if (dhtIdLen == 0 || dhtIdLen > 64) return (0, '');
+        final dhtId = dhtIdBuf.cast<pkgffi.Utf8>().toDartString(length: dhtIdLen);
+        return (port, dhtId);
+      } finally {
+        pkgffi.malloc.free(dhtIdBuf);
       }
-    }
-    if (port == 0) return (0, '');
-    final dhtIdBuf = pkgffi.malloc.allocate<ffi.Int8>(65);
-    try {
-      final dhtIdLen = ffiInstance.getDhtIdNative(dhtIdBuf, 65);
-      if (dhtIdLen == 0 || dhtIdLen > 64) {
-        print(
-            '[Bootstrap] T+${stopwatch.elapsedMilliseconds}ms: getDhtIdNative returned len=$dhtIdLen');
-        return (0, '');
-      }
-      final dhtId = dhtIdBuf.cast<pkgffi.Utf8>().toDartString(length: dhtIdLen);
-      print(
-          '[Bootstrap] T+${stopwatch.elapsedMilliseconds}ms: Bootstrap node ${bootstrapNode.alias} port=$port dhtId=${dhtId.length}chars');
-      return (port, dhtId);
-    } finally {
-      pkgffi.malloc.free(dhtIdBuf);
-    }
-  });
+    });
+  }
 
-  final port = portAndDhtId.$1;
-  final dhtId = portAndDhtId.$2;
-  if (port == 0 || dhtId.isEmpty) {
+  // Read every node's (port, dhtId). Run sequentially to avoid clobbering
+  // current-instance state during runWithInstanceAsync.
+  final nodeEndpoints = <(int, String)>[];
+  for (final node in scenario.nodes) {
+    final pair = await readPortAndDhtId(node);
+    nodeEndpoints.add(pair);
     print(
-        '[Bootstrap] T+${stopwatch.elapsedMilliseconds}ms: ERROR cannot get port or dhtId (port=$port dhtIdLen=${dhtId.length})');
+        '[Bootstrap] T+${stopwatch.elapsedMilliseconds}ms: endpoint ${node.alias} port=${pair.$1} dhtIdLen=${pair.$2.length}');
+  }
+
+  bool atLeastOneEndpoint = false;
+  for (final ep in nodeEndpoints) {
+    if (ep.$1 != 0 && ep.$2.isNotEmpty) {
+      atLeastOneEndpoint = true;
+      break;
+    }
+  }
+  if (!atLeastOneEndpoint) {
+    print(
+        '[Bootstrap] T+${stopwatch.elapsedMilliseconds}ms: ERROR no usable endpoint on any node');
     return;
   }
 
-  // Configure all other nodes to bootstrap from the first node
-  for (int i = 1; i < scenario.nodes.length; i++) {
+  // Full mesh: every node bootstraps to every OTHER node. Previously only
+  // nodes[1..] bootstrapped to nodes[0], which left nodes[0] without any
+  // DHT peer to learn from on a 3-node local-only setup, killing PUBLIC
+  // group peer-discovery (peer_join callback never fires on founder).
+  for (int i = 0; i < scenario.nodes.length; i++) {
     final node = scenario.nodes[i];
     if (node.testInstanceHandle == null) {
       print(
@@ -1577,23 +1578,22 @@ Future<void> configureLocalBootstrap(TestScenario scenario) async {
     }
     await node.runWithInstanceAsync(() async {
       final ffiInstance = ffi_lib.Tim2ToxFfi.open();
-      final hostPtr = '127.0.0.1'.toNativeUtf8();
-      final dhtIdPtr = dhtId.toNativeUtf8();
-      try {
-        print(
-            '[Bootstrap] T+${stopwatch.elapsedMilliseconds}ms: Adding bootstrap for ${node.alias} 127.0.0.1:$port');
-        final success = ffiInstance.addBootstrapNode(
-            ffiInstance.getCurrentInstanceId(), hostPtr, port, dhtIdPtr);
-        if (success == 1) {
+      for (int j = 0; j < scenario.nodes.length; j++) {
+        if (i == j) continue;
+        final port = nodeEndpoints[j].$1;
+        final dhtId = nodeEndpoints[j].$2;
+        if (port == 0 || dhtId.isEmpty) continue;
+        final hostPtr = '127.0.0.1'.toNativeUtf8();
+        final dhtIdPtr = dhtId.toNativeUtf8();
+        try {
+          final success = ffiInstance.addBootstrapNode(
+              ffiInstance.getCurrentInstanceId(), hostPtr, port, dhtIdPtr);
           print(
-              '[Bootstrap] T+${stopwatch.elapsedMilliseconds}ms: OK ${node.alias} bootstrap added');
-        } else {
-          print(
-              '[Bootstrap] T+${stopwatch.elapsedMilliseconds}ms: FAIL ${node.alias} addBootstrapNode returned $success');
+              '[Bootstrap] T+${stopwatch.elapsedMilliseconds}ms: ${node.alias} -> ${scenario.nodes[j].alias} 127.0.0.1:$port success=$success');
+        } finally {
+          pkgffi.malloc.free(hostPtr);
+          pkgffi.malloc.free(dhtIdPtr);
         }
-      } finally {
-        pkgffi.malloc.free(hostPtr);
-        pkgffi.malloc.free(dhtIdPtr);
       }
     });
   }
@@ -1615,8 +1615,12 @@ Future<void> configureLocalBootstrap(TestScenario scenario) async {
   );
 
   print(
-      '[Bootstrap] T+${stopwatch.elapsedMilliseconds}ms: Waiting for all nodes real Tox connection (connection_status != 0, timeout 10s)...');
+      '[Bootstrap] T+${stopwatch.elapsedMilliseconds}ms: Waiting for all nodes real Tox connection (connection_status != 0, timeout 5s)...');
   try {
+    // Shorter cap: in successful runs all nodes hit non-zero connection_status
+    // within ~1s. In flaky runs some nodes never come online at all, so any
+    // wait longer than a few seconds is wasted before establishFriendship
+    // takes over anyway.
     await waitUntil(
       () {
         bool allConnected = true;
@@ -1629,7 +1633,7 @@ Future<void> configureLocalBootstrap(TestScenario scenario) async {
         }
         return allConnected;
       },
-      timeout: const Duration(seconds: 10),
+      timeout: const Duration(seconds: 5),
       pollInterval: const Duration(milliseconds: 200),
       description: 'all nodes connected to DHT (real connection_status)',
     );
@@ -1642,4 +1646,1055 @@ Future<void> configureLocalBootstrap(TestScenario scenario) async {
 
   stopwatch.stop();
   print('[Bootstrap] DONE at T+${stopwatch.elapsedMilliseconds}ms total');
+}
+
+// =============================================================================
+// Virtual-clock test harness.
+//
+// When enabled, the C++ side suspends each instance's event_thread and
+// consults a process-global virtual clock instead of wall time. The harness
+// drives Tox iteration manually via [pumpTestTick] / [waitUntilWithVirtualPump]
+// against that shared clock — letting tests advance "time" deterministically
+// without flaky sleeps.
+//
+// Lifecycle (after createTestScenario + initAllNodes, before loginAllNodes):
+//
+//   await VirtualClock.enableForScenario(scenario);
+//   ... loginAllNodes / establishFriendship etc, using pumpTestTick or
+//       waitUntilWithVirtualPump instead of the wall-clock variants.
+//
+// When [VirtualClock.enabled] is false the helpers below transparently fall
+// back to the legacy wall-clock pump so existing tests can opt in piecemeal.
+// =============================================================================
+
+/// Process-global shared virtual clock for test-mode tim2tox instances.
+///
+/// Stateful and intentionally static — there is exactly one C++ virtual clock
+/// per process, and every in-test-mode instance reads from it. Reset between
+/// scenarios is unnecessary because each scenario re-arms the clock from a
+/// known starting value when [enableForScenario] is called.
+class VirtualClock {
+  VirtualClock._();
+
+  static int _ms = 0;
+  static bool _enabled = false;
+
+  /// Enable test mode BEFORE any test instance is created. Sets the
+  /// process-global default test_mode flag so the V2TIMManagerImpl
+  /// constructor reads it, and InitSDK skips spawning event_thread entirely.
+  ///
+  /// Required for tests that depend on event_thread's task_queue being
+  /// suppressed — signaling flows in particular. Call this BEFORE
+  /// `scenario.initAllNodes()`. For group-only tests, [enableForScenario]
+  /// (which sets test_mode after InitSDK) is still sufficient because group
+  /// flows go through tox_iterate which both event_thread and pumpTestTick
+  /// drive.
+  static Future<void> enableEarly() async {
+    final ffi = ffi_lib.Tim2ToxFfi.open();
+    ffi.setDefaultTestMode(true);
+    _ms = 1000;
+    ffi.setVirtualTimeMs(_ms);
+    _enabled = true;
+  }
+
+  /// Enable test mode for every node in [scenario] and seed the virtual clock.
+  ///
+  /// Call after `scenario.initAllNodes()` but before any `login()`. For
+  /// signaling-style tests that need event_thread fully suppressed before
+  /// InitSDK runs, use [enableEarly] before initAllNodes instead.
+  ///
+  /// Seeds the clock at 1000ms (rather than 0) because some toxcore timers
+  /// treat 0 as "uninitialised" and re-arm on the first iteration.
+  static Future<void> enableForScenario(TestScenario scenario) async {
+    final ffi = ffi_lib.Tim2ToxFfi.open();
+    for (final node in scenario.nodes) {
+      final handle = node.testInstanceHandle;
+      if (handle == null) continue;
+      ffi.setTestMode(handle, true);
+    }
+    _ms = 1000;
+    ffi.setVirtualTimeMs(_ms);
+    _enabled = true;
+  }
+
+  /// Advance the shared virtual clock by [ms] milliseconds. Does NOT iterate;
+  /// callers must follow up with iteration (use [pumpTestTick] for the
+  /// combined advance-then-iterate pattern).
+  static void advance(int ms) {
+    _ms += ms;
+    final ffi = ffi_lib.Tim2ToxFfi.open();
+    ffi.setVirtualTimeMs(_ms);
+  }
+
+  /// Current virtual clock value (milliseconds).
+  static int get nowMs => _ms;
+
+  /// Whether test mode is currently enabled for this process.
+  static bool get enabled => _enabled;
+}
+
+/// Drive one tick of the virtual-clock harness: advance the shared clock by
+/// [advanceMs], then run [iterationsPerInstance] iterations on every node in
+/// [scenario] that has a test instance handle.
+///
+/// Falls back to [pumpAllInstancesOnce] when [VirtualClock.enabled] is false
+/// so callers can sprinkle this into existing helpers without breaking the
+/// wall-clock path.
+Future<void> pumpTestTick(
+  TestScenario scenario, {
+  int advanceMs = 50,
+  int iterationsPerInstance = 1,
+  Duration wallSleep = const Duration(milliseconds: 5),
+}) async {
+  if (!VirtualClock.enabled) {
+    // Fallback to legacy behaviour so tests that haven't opted in keep
+    // working unchanged.
+    pumpAllInstancesOnce(iterations: 50);
+    return;
+  }
+  VirtualClock.advance(advanceMs);
+  // Scale iterations with advanceMs so e.g. `pumpTestTick(advanceMs: 3000)`
+  // mimics what the suppressed event_thread would have done — a continuous
+  // ~50ms iterate cadence. Without this, a 3-second virtual advance with
+  // `iterationsPerInstance: 1` only fires a single tox_iterate, leaving
+  // Tox NGC peer discovery, friend P2P handshake, and group announce/connect
+  // under-driven; tests that rely on member-list convergence (e.g. group
+  // message sender matching) intermittently fail because the receiver sees
+  // only the founder's self peer when it queries getGroupMemberList. `max`
+  // with the explicit caller value preserves call sites that pass a higher
+  // count.
+  final iterationsForAdvance = (advanceMs / 50).floor();
+  final effectiveIterations =
+      iterationsPerInstance > iterationsForAdvance
+          ? iterationsPerInstance
+          : (iterationsForAdvance > 0 ? iterationsForAdvance : 1);
+  final ffi = ffi_lib.Tim2ToxFfi.open();
+  // Interleave iterations with small wall yields so loopback UDP packets
+  // between sibling instances actually get delivered between iterates.
+  // Without this every iterate burst sends packets that all sit in the
+  // OS socket buffer until the final wallSleep — which then only gives
+  // one chance to drain. For large effectiveIterations (e.g. 60), batch
+  // into ~10 chunks so each chunk gets a 5ms loopback window.
+  final batchCount = effectiveIterations >= 10 ? 10 : 1;
+  final perBatch = (effectiveIterations / batchCount).ceil();
+  for (var b = 0; b < batchCount; b++) {
+    for (final node in scenario.nodes) {
+      final handle = node.testInstanceHandle;
+      if (handle == null) continue;
+      for (var i = 0; i < perBatch; i++) {
+        ffi.iterateInstance(handle);
+      }
+    }
+    if (batchCount > 1 && b < batchCount - 1) {
+      // Mid-pump wall yield so loopback packets settle between batches.
+      await Future<void>.delayed(const Duration(milliseconds: 2));
+    }
+  }
+  // Real wall sleep so UDP/TCP packets sent by this iterate burst have a
+  // chance to be delivered to peer sockets before the next iterate. Virtual
+  // clock only fast-forwards Tox-internal timers; loopback socket round-trips
+  // still need real time. ~5ms is enough on macOS loopback for friend P2P
+  // handshake to make progress.
+  if (wallSleep.inMicroseconds > 0) {
+    await Future<void>.delayed(wallSleep);
+  } else {
+    await Future<void>.delayed(Duration.zero);
+  }
+}
+
+/// Same contract as [waitUntilWithPump], but drives the virtual clock when
+/// test mode is enabled. [timeout] is interpreted as virtual milliseconds in
+/// that case, real milliseconds otherwise.
+///
+/// When [VirtualClock.enabled] is false this delegates directly to
+/// [waitUntilWithPump] so existing call sites keep their wall-clock semantics.
+Future<void> waitUntilWithVirtualPump(
+  TestScenario scenario,
+  bool Function() condition, {
+  Duration timeout = const Duration(seconds: 60),
+  String description = 'condition',
+  int advanceMs = 50,
+  int iterationsPerInstance = 1,
+  Duration wallSleep = const Duration(milliseconds: 5),
+}) async {
+  if (!VirtualClock.enabled) {
+    return waitUntilWithPump(
+      condition,
+      timeout: timeout,
+      description: description,
+    );
+  }
+  final budgetMs = timeout.inMilliseconds;
+  final deadline = VirtualClock.nowMs + budgetMs;
+  while (VirtualClock.nowMs < deadline) {
+    if (condition()) return;
+    await pumpTestTick(
+      scenario,
+      advanceMs: advanceMs,
+      iterationsPerInstance: iterationsPerInstance,
+      wallSleep: wallSleep,
+    );
+  }
+  // Grace period: a native callback (e.g. OnRecvNewMessage) processed during
+  // the final pumpTestTick posts to the Dart ReceivePort, which schedules
+  // `Future.microtask(() async { await _setFaceUrlForMsg(...); ... listener })`.
+  // The await inside that microtask body means the listener may not have
+  // fired yet by the time the deadline-bound loop exits. Yield to the event
+  // loop a few times so any pending native callback → microtask → listener
+  // chains can drain before we declare timeout.
+  //
+  // We do NOT advance the virtual clock here — these are "drain" ticks, not
+  // logical progress. iterateInstance is also skipped to avoid spurious side
+  // effects after deadline. Each Future.delayed turn drains all pending
+  // microtasks and ReceivePort events queued earlier.
+  for (var i = 0; i < 10; i++) {
+    if (condition()) return;
+    await Future<void>.delayed(const Duration(milliseconds: 5));
+  }
+  if (condition()) return;
+  throw TimeoutException(
+      'Timeout waiting for $description (virtual: $budgetMs ms)');
+}
+
+/// AV-aware sibling of [pumpTestTick]. Drives one tick of the virtual harness
+/// AND calls `tim2tox_ffi_av_iterate` on each instance so ToxAV's separate
+/// iteration loop (call-state transitions, audio/video frame delivery) makes
+/// progress too. Use this for tests that depend on ToxAV state updates —
+/// regular [pumpTestTick] does not advance ToxAV's internal timers.
+///
+/// Falls back to [pumpAllInstancesOnce] when [VirtualClock.enabled] is false
+/// so non-virtual call sites keep working.
+Future<void> pumpTestTickAv(
+  TestScenario scenario, {
+  int advanceMs = 50,
+  int iterationsPerInstance = 1,
+  Duration wallSleep = const Duration(milliseconds: 5),
+}) async {
+  if (!VirtualClock.enabled) {
+    pumpAllInstancesOnce(iterations: 50);
+    return;
+  }
+  VirtualClock.advance(advanceMs);
+  final ffi = ffi_lib.Tim2ToxFfi.open();
+  for (final node in scenario.nodes) {
+    final handle = node.testInstanceHandle;
+    if (handle == null) continue;
+    for (var i = 0; i < iterationsPerInstance; i++) {
+      ffi.iterateInstance(handle);
+      // Also drive ToxAV iterate so call-state and frame callbacks fire.
+      // ToxAV may not be initialized on every node — swallow native errors.
+      try {
+        ffi.avIterate(handle);
+      } catch (_) {
+        // Instance has no ToxAV attached; ignore.
+      }
+    }
+  }
+  if (wallSleep.inMicroseconds > 0) {
+    await Future<void>.delayed(wallSleep);
+  } else {
+    await Future<void>.delayed(Duration.zero);
+  }
+}
+
+/// AV-aware sibling of [waitUntilWithVirtualPump]. Polls [condition] while
+/// driving [pumpTestTickAv] each iteration so ToxAV's iterate loop has a
+/// chance to fire call-state and frame callbacks.
+///
+/// When [VirtualClock.enabled] is false this delegates to [waitUntilWithPump]
+/// (wall-clock mode) so callers keep their existing semantics.
+Future<void> waitUntilWithAvVirtualPump(
+  TestScenario scenario,
+  bool Function() condition, {
+  Duration timeout = const Duration(seconds: 60),
+  String description = 'condition',
+  int advanceMs = 50,
+  int iterationsPerInstance = 1,
+  Duration wallSleep = const Duration(milliseconds: 5),
+}) async {
+  if (!VirtualClock.enabled) {
+    return waitUntilWithPump(
+      condition,
+      timeout: timeout,
+      description: description,
+    );
+  }
+  final budgetMs = timeout.inMilliseconds;
+  final deadline = VirtualClock.nowMs + budgetMs;
+  while (VirtualClock.nowMs < deadline) {
+    if (condition()) return;
+    await pumpTestTickAv(
+      scenario,
+      advanceMs: advanceMs,
+      iterationsPerInstance: iterationsPerInstance,
+      wallSleep: wallSleep,
+    );
+  }
+  if (condition()) return;
+  throw TimeoutException(
+      'Timeout waiting for $description (virtual AV: $budgetMs ms)');
+}
+
+// =============================================================================
+// Virtual-clock variants of the wall-clock helpers above.
+//
+// Every helper below mirrors the behaviour of its wall-clock twin but drives
+// time forward through [pumpTestTick] (which advances the shared virtual
+// clock and iterates each instance) instead of `Future.delayed`. The first
+// parameter is always the [TestScenario] so the helper knows which nodes to
+// iterate when ticking the clock.
+//
+// These functions are purely additive — the originals stay in place so callers
+// can opt in piecemeal.
+// =============================================================================
+
+/// Top-level virtual-clock variant of [TestNode.waitForConnection].
+///
+/// Polls the node's connection_status while advancing the shared virtual
+/// clock between samples. All timeouts are interpreted as virtual ms.
+Future<void> waitForConnectionVirtual(
+  TestScenario scenario,
+  TestNode node, {
+  Duration? timeout,
+}) async {
+  if (!node.loggedIn) {
+    throw Exception('Cannot wait for connection: node is not logged in');
+  }
+
+  final connectionTimeout = timeout ?? const Duration(seconds: 15);
+
+  await node.runWithInstanceAsync(() async {
+    final ffiInstance = ffi_lib.Tim2ToxFfi.open();
+    final deadline = VirtualClock.nowMs + connectionTimeout.inMilliseconds;
+    int checkCount = 0;
+
+    while (VirtualClock.nowMs < deadline) {
+      checkCount++;
+      int connectionStatus = 0;
+      try {
+        connectionStatus = ffiInstance.getSelfConnectionStatus();
+      } catch (e) {
+        final loginStatus = node.timManager!.getLoginStatus();
+        connectionStatus = loginStatus == 1 ? 2 : 0;
+      }
+
+      if (connectionStatus == 1 || connectionStatus == 2) {
+        // Give the network a beat to settle (virtual time, still progresses
+        // Tox internal timers).
+        await pumpTestTick(scenario,
+            advanceMs: 500, iterationsPerInstance: 1);
+        if (checkCount > 1) {
+          print(
+              '[Test] Node ${node.alias}: Connected to DHT! (connectionStatus=$connectionStatus)');
+        }
+        return;
+      }
+
+      if (checkCount % 10 == 0) {
+        print(
+            '[Test] Node ${node.alias}: Still waiting for connection (check $checkCount, connectionStatus=$connectionStatus)');
+      }
+
+      // Dense iteration with real wall pause for UDP round-trips.
+      await pumpTestTick(scenario,
+          advanceMs: 100,
+          iterationsPerInstance: 3,
+          wallSleep: const Duration(milliseconds: 10));
+    }
+
+    int finalConnectionStatus = 0;
+    try {
+      finalConnectionStatus = ffiInstance.getSelfConnectionStatus();
+    } catch (e) {
+      final loginStatus = node.timManager!.getLoginStatus();
+      finalConnectionStatus = loginStatus == 1 ? 2 : 0;
+    }
+
+    if (finalConnectionStatus == 1 || finalConnectionStatus == 2) {
+      print(
+          '[Test] Node ${node.alias}: Connection timeout after $checkCount checks, but connection was established (status=$finalConnectionStatus)');
+      return;
+    }
+
+    throw TimeoutException(
+        'Timeout waiting for connection (virtual timeout: $connectionTimeout, checkCount: $checkCount, finalConnectionStatus: $finalConnectionStatus)');
+  });
+}
+
+/// Virtual-clock variant of [pumpFriendConnection].
+///
+/// Iterates every node in [scenario] (not just nodeA/nodeB) so the shared
+/// virtual clock advances uniformly — friend P2P only needs nodeA/nodeB but
+/// ticking the whole scenario keeps every Tox instance's timers consistent.
+/// nodeA / nodeB are accepted for signature parity with the wall-clock helper.
+Future<void> pumpFriendConnectionVirtual(
+  TestScenario scenario,
+  TestNode nodeA,
+  TestNode nodeB, {
+  Duration duration = const Duration(seconds: 4),
+  int iterationsPerPump = 50,
+  int advanceMs = 50,
+}) async {
+  final deadline = VirtualClock.nowMs + duration.inMilliseconds;
+  while (VirtualClock.nowMs < deadline) {
+    await pumpTestTick(
+      scenario,
+      advanceMs: advanceMs,
+      iterationsPerInstance: iterationsPerPump,
+    );
+  }
+}
+
+/// Virtual-clock variant of [pumpGroupPeerDiscovery]. Same shape as
+/// [pumpFriendConnectionVirtual].
+Future<void> pumpGroupPeerDiscoveryVirtual(
+  TestScenario scenario,
+  TestNode nodeA,
+  TestNode nodeB, {
+  Duration duration = const Duration(seconds: 5),
+  int iterationsPerPump = 30,
+  int advanceMs = 50,
+}) async {
+  final deadline = VirtualClock.nowMs + duration.inMilliseconds;
+  while (VirtualClock.nowMs < deadline) {
+    await pumpTestTick(
+      scenario,
+      advanceMs: advanceMs,
+      iterationsPerInstance: iterationsPerPump,
+    );
+  }
+}
+
+/// Virtual-clock variant of [waitUntilFounderSeesMemberInGroup].
+///
+/// Same return contract as the original (returns the first non-founder
+/// userID seen by [founder], or null on timeout). Drives iteration through
+/// [pumpTestTick] so the virtual clock advances between polls.
+Future<String?> waitUntilFounderSeesMemberInGroupVirtual(
+  TestScenario scenario,
+  TestNode founder,
+  TestNode otherNode,
+  String groupId, {
+  Duration timeout = const Duration(seconds: 90),
+  Duration pumpDurationPerLoop = const Duration(milliseconds: 600),
+  int iterationsPerPump = 50,
+  int advanceMs = 50,
+  Duration delayAfterPump = const Duration(milliseconds: 150),
+  bool allowFallbackProceed = false,
+}) async {
+  final founderPublicKey = founder.getPublicKey();
+  final otherPublicKey = otherNode.getPublicKey();
+  final deadline = VirtualClock.nowMs + timeout.inMilliseconds;
+  while (VirtualClock.nowMs < deadline) {
+    await pumpGroupPeerDiscoveryVirtual(
+      scenario,
+      founder,
+      otherNode,
+      duration: pumpDurationPerLoop,
+      iterationsPerPump: iterationsPerPump,
+      advanceMs: advanceMs,
+    );
+    await pumpTestTick(scenario,
+        advanceMs: delayAfterPump.inMilliseconds,
+        iterationsPerInstance: 1);
+    final listResult = await founder.runWithInstanceAsync(
+        () async => TIMGroupManager.instance.getGroupMemberList(
+              groupID: groupId,
+              filter: GroupMemberFilterTypeEnum.V2TIM_GROUP_MEMBER_FILTER_ALL,
+              nextSeq: '0',
+              count: 100,
+            ));
+    if (listResult.code == 0 && listResult.data?.memberInfoList != null) {
+      final nonFounder = listResult.data!.memberInfoList!
+          .where((m) => !_matchesPublicKeyOrToxId(m.userID, founderPublicKey))
+          .toList();
+      if (nonFounder.isNotEmpty) {
+        return nonFounder.first.userID;
+      }
+    }
+  }
+
+  // Diagnostics/fallback (mirrors wall-clock variant).
+  try {
+    final otherListResult = await otherNode.runWithInstanceAsync(
+        () async => TIMGroupManager.instance.getGroupMemberList(
+              groupID: groupId,
+              filter: GroupMemberFilterTypeEnum.V2TIM_GROUP_MEMBER_FILTER_ALL,
+              nextSeq: '0',
+              count: 100,
+            ));
+    final otherMembers = otherListResult.data?.memberInfoList;
+    if (otherListResult.code == 0 && otherMembers != null) {
+      final selfVisible = otherMembers
+          .any((m) => _matchesPublicKeyOrToxId(m.userID, otherPublicKey));
+      final founderVisibleFromOther = otherMembers
+          .any((m) => _matchesPublicKeyOrToxId(m.userID, founderPublicKey));
+      if (selfVisible) {
+        if (allowFallbackProceed) {
+          print(
+              '[waitUntilFounderSeesMemberInGroupVirtual] founder visibility timeout for $groupId, but ${otherNode.alias} can see self in member list; proceeding due to allowFallbackProceed');
+          return otherPublicKey;
+        }
+        print(
+            '[waitUntilFounderSeesMemberInGroupVirtual] founder visibility timeout for $groupId: ${founder.alias} still cannot see any non-self member. '
+            '${otherNode.alias} selfVisible=true founderVisibleFromOther=$founderVisibleFromOther');
+      }
+    }
+  } catch (_) {
+    // Ignore diagnostic errors.
+  }
+
+  try {
+    final joinedResult = await otherNode.runWithInstanceAsync(
+        () async => TIMGroupManager.instance.getJoinedGroupList());
+    final joined = joinedResult.code == 0 &&
+        (joinedResult.data?.any((g) => g.groupID == groupId) ?? false);
+    if (joined) {
+      if (allowFallbackProceed) {
+        print(
+            '[waitUntilFounderSeesMemberInGroupVirtual] founder visibility timeout for $groupId, but ${otherNode.alias} joined list contains group; proceeding due to allowFallbackProceed');
+        return otherPublicKey;
+      }
+      print(
+          '[waitUntilFounderSeesMemberInGroupVirtual] founder visibility timeout for $groupId: ${otherNode.alias} joined list contains group, but ${founder.alias} still cannot see any non-self member');
+    }
+  } catch (_) {
+    // Timeout returns null; keep contract.
+  }
+
+  return null;
+}
+
+/// Top-level virtual-clock variant of [TestNode.waitForFriendConnection].
+///
+/// Polls getFriendList while advancing the shared virtual clock between
+/// samples. Times are virtual ms.
+Future<void> waitForFriendConnectionVirtual(
+  TestScenario scenario,
+  TestNode node,
+  String friendUserId, {
+  Duration? timeout,
+}) async {
+  final connectionTimeout = timeout ?? const Duration(seconds: 45);
+  final deadline = VirtualClock.nowMs + connectionTimeout.inMilliseconds;
+  final startedAtMs = VirtualClock.nowMs;
+  int checkCount = 0;
+
+  final friendPublicKey = friendUserId.length >= 64
+      ? friendUserId.substring(0, 64)
+      : friendUserId;
+  final targetAbbrev = friendPublicKey.length > 16
+      ? '${friendPublicKey.substring(0, 16)}...'
+      : friendPublicKey;
+
+  print(
+      '[waitForFriendConnectionVirtual] ENTRY node=${node.alias} target=$targetAbbrev timeout=${connectionTimeout.inSeconds}s');
+  bool friendInList = false;
+  int? lastRole;
+
+  await node.runWithInstanceAsync(() async {
+    // Ensure self is connected to DHT first.
+    try {
+      await waitForConnectionVirtual(scenario, node,
+          timeout: const Duration(seconds: 10));
+    } catch (e) {
+      print(
+          '[waitForFriendConnectionVirtual] Warning: self not yet connected to DHT: $e');
+    }
+
+    while (VirtualClock.nowMs < deadline) {
+      checkCount++;
+      final elapsedMs = VirtualClock.nowMs - startedAtMs;
+      final friendListResult =
+          await TIMFriendshipManager.instance.getFriendList();
+
+      if (friendListResult.code != 0) {
+        if (friendListResult.code == 6013) {
+          throw TimeoutException(
+              'getFriendList returned 6013 (sdk not init). Teardown may have started; aborting waitForFriendConnectionVirtual.');
+        }
+        if (checkCount <= 3 || checkCount % 10 == 0) {
+          print(
+              '[waitForFriendConnectionVirtual] Check $checkCount (elapsed=${elapsedMs ~/ 1000}s): getFriendList code=${friendListResult.code} desc=${friendListResult.desc}');
+        }
+      } else if (friendListResult.data != null) {
+        final list = friendListResult.data!;
+        bool matchesFriend(String uid) =>
+            uid == friendPublicKey ||
+            (uid.length >= 64 && uid.startsWith(friendPublicKey));
+        final matchingFriends =
+            list.where((f) => matchesFriend(f.userID)).toList();
+
+        if (checkCount <= 2 || checkCount % 10 == 1) {
+          print(
+              '[waitForFriendConnectionVirtual] Check $checkCount (elapsed=${elapsedMs ~/ 1000}s): listLen=${list.length} '
+              'friendIds=[${list.map((f) => f.userID.length > 12 ? '${f.userID.substring(0, 12)}...' : f.userID).join(', ')}]');
+        }
+
+        if (matchingFriends.isNotEmpty) {
+          final friendInfo = matchingFriends.first;
+          friendInList = true;
+          final role = friendInfo.userProfile?.role;
+          lastRole = role;
+          final userProfile = friendInfo.userProfile;
+
+          if (checkCount <= 3 || checkCount % 5 == 0) {
+            print(
+                '[waitForFriendConnectionVirtual] Check $checkCount (elapsed=${elapsedMs ~/ 1000}s): Friend IN LIST '
+                'role=$role (1=ONLINE, 2=OFFLINE) userProfile?.role=${userProfile?.role}');
+          }
+
+          final isOnline = friendInfo.userProfile?.role == 1;
+
+          if (isOnline == true) {
+            print(
+                '[waitForFriendConnectionVirtual] Friend $targetAbbrev is online after $checkCount checks (elapsed=${elapsedMs ~/ 1000}s)');
+            return;
+          } else {
+            if (checkCount <= 8 || checkCount % 10 == 0) {
+              print(
+                  '[waitForFriendConnectionVirtual] (elapsed=${elapsedMs ~/ 1000}s) Friend in list but OFFLINE role=$role checkCount=$checkCount');
+            }
+          }
+        } else {
+          if (friendInList) {
+            if (checkCount % 10 == 0) {
+              print(
+                  '[waitForFriendConnectionVirtual] WARNING (elapsed=${elapsedMs ~/ 1000}s): Friend was in list but now NOT FOUND');
+            }
+          } else {
+            if (checkCount <= 5 || checkCount % 10 == 0) {
+              print(
+                  '[waitForFriendConnectionVirtual] Check $checkCount (elapsed=${elapsedMs ~/ 1000}s): Friend NOT in list '
+                  'availableIds=[${list.map((f) => f.userID.length > 12 ? '${f.userID.substring(0, 12)}...' : f.userID).join(', ')}]');
+            }
+          }
+        }
+      } else {
+        if (checkCount <= 3 || checkCount % 10 == 0) {
+          print(
+              '[waitForFriendConnectionVirtual] Check $checkCount (elapsed=${elapsedMs ~/ 1000}s): getFriendList code=0 but data=null');
+        }
+      }
+
+      if (checkCount % 20 == 0) {
+        print(
+            '[waitForFriendConnectionVirtual] PROGRESS elapsed=${elapsedMs ~/ 1000}s checkCount=$checkCount friendInList=$friendInList lastRole=$lastRole');
+      }
+
+      // Iterate so Tox can establish P2P + advance the virtual clock.
+      // Real wall sleep is critical: friend P2P handshake needs UDP/TCP
+      // round-trips between iterates, which loopback OS scheduling needs
+      // a few ms to deliver.
+      await pumpTestTick(scenario,
+          advanceMs: 250,
+          iterationsPerInstance: 5,
+          wallSleep: const Duration(milliseconds: 10));
+    }
+
+    final elapsedTotalMs = VirtualClock.nowMs - startedAtMs;
+    final finalFriendListResult =
+        await TIMFriendshipManager.instance.getFriendList();
+    if (finalFriendListResult.code == 6013) {
+      throw TimeoutException(
+          'getFriendList returned 6013 (sdk not init) at end of waitForFriendConnectionVirtual. Teardown may have started.');
+    }
+    bool matchesFriend(String uid) =>
+        uid == friendPublicKey ||
+        (uid.length >= 64 && uid.startsWith(friendPublicKey));
+    final hasFriend = finalFriendListResult.code == 0 &&
+        finalFriendListResult.data != null &&
+        finalFriendListResult.data!.any((f) => matchesFriend(f.userID));
+
+    print(
+        '[waitForFriendConnectionVirtual] TIMEOUT after ${elapsedTotalMs ~/ 1000}s checkCount=$checkCount');
+    print(
+        '[waitForFriendConnectionVirtual] FINAL getFriendList code=${finalFriendListResult.code} '
+        'dataLen=${finalFriendListResult.data?.length ?? 0}');
+    if (finalFriendListResult.data != null &&
+        finalFriendListResult.data!.isNotEmpty) {
+      for (int i = 0; i < finalFriendListResult.data!.length; i++) {
+        final f = finalFriendListResult.data![i];
+        final uid = f.userID;
+        final role = f.userProfile?.role;
+        final match = matchesFriend(uid);
+        print(
+            '[waitForFriendConnectionVirtual]   friend[$i] userID=${uid.length > 20 ? '${uid.substring(0, 20)}...' : uid} '
+            'role=$role (1=ONLINE,2=OFFLINE) matchesTarget=$match');
+      }
+    } else {
+      print(
+          '[waitForFriendConnectionVirtual]   (no friends in list or data null)');
+    }
+    print(
+        '[waitForFriendConnectionVirtual] FINAL hasFriend=$hasFriend lastRole=$lastRole');
+
+    throw TimeoutException(
+        'Timeout waiting for friend connection: $friendPublicKey (virtual timeout: $connectionTimeout). '
+        'Final state: friend in list=$hasFriend lastRole=$lastRole elapsed=${elapsedTotalMs ~/ 1000}s. '
+        'This may indicate that nodes are not connected to each other (check bootstrap configuration).');
+  });
+}
+
+/// Virtual-clock variant of [establishFriendship].
+///
+/// Same multi-stage behaviour: friend-list converge pre-pump → fallback
+/// polling → P2P wait — but every wall-clock delay is driven through the
+/// virtual clock so total elapsed time is virtual ms.
+Future<void> establishFriendshipVirtual(
+  TestScenario scenario,
+  TestNode alice,
+  TestNode bob, {
+  Duration? timeout,
+}) async {
+  final friendshipTimeout = timeout ?? const Duration(seconds: 200);
+  final deadline = VirtualClock.nowMs + friendshipTimeout.inMilliseconds;
+
+  print(
+      '[establishFriendshipVirtual] Starting friendship establishment between ${alice.alias} and ${bob.alias}');
+
+  if (!alice.loggedIn || !bob.loggedIn) {
+    throw Exception(
+        'Cannot establish friendship: nodes must be logged in first');
+  }
+
+  alice.enableAutoAccept();
+  bob.enableAutoAccept();
+
+  try {
+    await waitForConnectionVirtual(scenario, alice,
+        timeout: const Duration(seconds: 10));
+    await waitForConnectionVirtual(scenario, bob,
+        timeout: const Duration(seconds: 10));
+    if (alice.getConnectionStatus() == 0 || bob.getConnectionStatus() == 0) {
+      print(
+          '[establishFriendshipVirtual] Warning: One or both nodes still have connection_status=0 after wait');
+    }
+  } catch (e) {
+    print(
+        '[establishFriendshipVirtual] Warning: Nodes may not be fully connected: $e');
+  }
+
+  final aliceToxId = alice.getToxId();
+  final bobToxId = bob.getToxId();
+  print('[establishFriendshipVirtual] ${alice.alias} Tox ID: $aliceToxId');
+  print('[establishFriendshipVirtual] ${bob.alias} Tox ID: $bobToxId');
+
+  if (aliceToxId.isEmpty || aliceToxId.length != 76) {
+    throw Exception(
+        'Invalid Alice Tox ID: $aliceToxId (expected 76 hex characters)');
+  }
+  if (bobToxId.isEmpty || bobToxId.length != 76) {
+    throw Exception(
+        'Invalid Bob Tox ID: $bobToxId (expected 76 hex characters)');
+  }
+
+  final alicePublicKey = aliceToxId.substring(0, 64);
+  final bobPublicKey = bobToxId.substring(0, 64);
+  print(
+      '[establishFriendshipVirtual] ${alice.alias} Public Key: $alicePublicKey');
+  print('[establishFriendshipVirtual] ${bob.alias} Public Key: $bobPublicKey');
+
+  print(
+      '[establishFriendshipVirtual] ${alice.alias} adding ${bob.alias} as friend (Tox ID: $bobToxId)...');
+  final aliceAddResult = await alice.runWithInstanceAsync(
+      () async => TIMFriendshipManager.instance.addFriend(
+            userID: bobToxId,
+            addType: FriendTypeEnum.V2TIM_FRIEND_TYPE_BOTH,
+            addWording: 'Hello from Alice',
+          ));
+  if (aliceAddResult.code != 0) {
+    print(
+        '[establishFriendshipVirtual] Warning: ${alice.alias} addFriend returned code ${aliceAddResult.code}: ${aliceAddResult.desc}');
+  } else {
+    print(
+        '[establishFriendshipVirtual] ${alice.alias} successfully added ${bob.alias} as friend');
+  }
+
+  print(
+      '[establishFriendshipVirtual] ${bob.alias} adding ${alice.alias} as friend (Tox ID: $aliceToxId)...');
+  final bobAddResult = await bob.runWithInstanceAsync(
+      () async => TIMFriendshipManager.instance.addFriend(
+            userID: aliceToxId,
+            addType: FriendTypeEnum.V2TIM_FRIEND_TYPE_BOTH,
+            addWording: 'Hello from Bob',
+          ));
+  if (bobAddResult.code != 0) {
+    print(
+        '[establishFriendshipVirtual] Warning: ${bob.alias} addFriend returned code ${bobAddResult.code}: ${bobAddResult.desc}');
+  } else {
+    print(
+        '[establishFriendshipVirtual] ${bob.alias} successfully added ${alice.alias} as friend');
+  }
+
+  bool listContainsPublicKey(List<String> list, String publicKey) => list.any(
+      (id) => id == publicKey || (id.length >= 64 && id.startsWith(publicKey)));
+
+  print(
+      '[establishFriendshipVirtual] Pumping until friend lists converge or 3s elapses...');
+  {
+    final prePumpDeadline = VirtualClock.nowMs + 3000;
+    bool converged = false;
+    while (VirtualClock.nowMs < prePumpDeadline) {
+      await pumpTestTick(scenario,
+          advanceMs: 25, iterationsPerInstance: 40);
+      final aliceFriends = await alice.getFriendList();
+      final bobFriends = await bob.getFriendList();
+      if (listContainsPublicKey(aliceFriends, bobPublicKey) &&
+          listContainsPublicKey(bobFriends, alicePublicKey)) {
+        converged = true;
+        break;
+      }
+    }
+    if (converged) {
+      print(
+          '[establishFriendshipVirtual] Friend lists converged during pre-pump');
+    }
+  }
+
+  int checkCount = 0;
+  while (VirtualClock.nowMs < deadline) {
+    checkCount++;
+    await pumpTestTick(scenario,
+        advanceMs: 50, iterationsPerInstance: 120);
+    final aliceFriends = await alice.getFriendList();
+    final bobFriends = await bob.getFriendList();
+    final aliceHasBob = listContainsPublicKey(aliceFriends, bobPublicKey);
+    final bobHasAlice = listContainsPublicKey(bobFriends, alicePublicKey);
+
+    if (aliceHasBob && bobHasAlice) {
+      print(
+          '[establishFriendshipVirtual] Bidirectional friendship established after $checkCount checks');
+      final remainingMs = deadline - VirtualClock.nowMs;
+      if (remainingMs < 2000) {
+        print(
+            '[establishFriendshipVirtual] Little time left in timeout, skipping P2P wait');
+        return;
+      }
+      const pumpDurationMs = 800;
+      final actualPumpMs = remainingMs > 4000
+          ? pumpDurationMs
+          : remainingMs.clamp(200, 800);
+      print(
+          '[establishFriendshipVirtual] Pumping Tox for P2P connection (${actualPumpMs}ms)...');
+      await pumpFriendConnectionVirtual(
+        scenario,
+        alice,
+        bob,
+        duration: Duration(milliseconds: actualPumpMs),
+      );
+
+      final remainingForP2PMs = deadline - VirtualClock.nowMs;
+      const minWaitSec = 15;
+      const maxWaitSec = 30;
+      final remainingForP2PSec = remainingForP2PMs ~/ 1000;
+      final halfRemaining =
+          remainingForP2PSec >= 2 ? (remainingForP2PSec ~/ 2) : 0;
+      final waitEachSec = remainingForP2PSec >= 4
+          ? (halfRemaining > maxWaitSec
+              ? maxWaitSec
+              : (halfRemaining < minWaitSec ? minWaitSec : halfRemaining))
+          : remainingForP2PSec.clamp(1, maxWaitSec);
+      final waitEach = Duration(seconds: waitEachSec);
+      print(
+          '[establishFriendshipVirtual] Waiting for Tox P2P connection in parallel (${waitEach.inSeconds}s each)...');
+      try {
+        // Both halves share the same pumpTestTick path (which advances the
+        // global virtual clock), so they effectively co-iterate.
+        await Future.wait([
+          waitForFriendConnectionVirtual(scenario, alice, bobToxId,
+              timeout: waitEach),
+          waitForFriendConnectionVirtual(scenario, bob, aliceToxId,
+              timeout: waitEach),
+        ], eagerError: false);
+        print(
+            '[establishFriendshipVirtual] Both sides see friend as ONLINE');
+      } catch (e) {
+        print(
+            '[establishFriendshipVirtual] P2P wait timed out (friend list is established; tests may retry): $e');
+      }
+      return;
+    }
+
+    if (checkCount % 5 == 0) {
+      print(
+          '[establishFriendshipVirtual] Check $checkCount: alice has bob=$aliceHasBob, bob has alice=$bobHasAlice');
+      print(
+          '[establishFriendshipVirtual] Check $checkCount: aliceFriends=${aliceFriends.join(", ")}, bobFriends=${bobFriends.join(", ")}');
+    }
+
+    await pumpTestTick(scenario,
+        advanceMs: 400, iterationsPerInstance: 1);
+  }
+
+  final finalAliceFriends = await alice.getFriendList();
+  final finalBobFriends = await bob.getFriendList();
+  final finalAliceHasBob =
+      listContainsPublicKey(finalAliceFriends, bobPublicKey);
+  final finalBobHasAlice =
+      listContainsPublicKey(finalBobFriends, alicePublicKey);
+
+  throw TimeoutException(
+      'Timeout waiting for bidirectional friendship to be established (virtual timeout: $friendshipTimeout). '
+      'Final state: alice has bob=$finalAliceHasBob, bob has alice=$finalBobHasAlice. '
+      'aliceFriends=${finalAliceFriends.join(", ")}, bobFriends=${finalBobFriends.join(", ")}. '
+      'This may indicate that nodes are not connected to each other (check bootstrap configuration).');
+}
+
+/// Virtual-clock variant of [configureLocalBootstrap].
+///
+/// The initial 500ms UDP-bind sleep stays as real wall time because that's
+/// a real OS operation, not a Tox-protocol timer. Everything after that
+/// drives time forward through the virtual clock.
+Future<void> configureLocalBootstrapVirtual(TestScenario scenario) async {
+  final stopwatch = Stopwatch()..start();
+
+  if (scenario.nodes.length < 2) {
+    print(
+        '[BootstrapVirtual] SKIP: need at least 2 nodes, have ${scenario.nodes.length}');
+    return;
+  }
+
+  print(
+      '[BootstrapVirtual] START (T+0ms) nodes=${scenario.nodes.map((n) => n.alias).join(', ')}');
+
+  // Real wall-time sleep: UDP listener bind is a kernel operation, not a
+  // Tox-protocol timer. Virtualising it would race port readiness.
+  await Future.delayed(const Duration(milliseconds: 500));
+  print(
+      '[BootstrapVirtual] T+${stopwatch.elapsedMilliseconds}ms: after initial 500ms wall-time delay (UDP bind)');
+
+  Future<(int, String)> readPortAndDhtId(TestNode node) async {
+    return node.runWithInstanceAsync(() async {
+      final ffiInstance = ffi_lib.Tim2ToxFfi.open();
+      int port = 0;
+      for (int retry = 0; retry < 5; retry++) {
+        port = ffiInstance.getUdpPort(ffiInstance.getCurrentInstanceId());
+        if (port > 0) {
+          final loginStatus = TIMManager.instance.getLoginStatus();
+          if (loginStatus == 1) break;
+        }
+        if (retry < 4) {
+          // Advance virtual time + iterate so any pending login tasks make
+          // progress between port-readiness retries.
+          await pumpTestTick(scenario,
+              advanceMs: 200, iterationsPerInstance: 1);
+        }
+      }
+      if (port == 0) return (0, '');
+      final dhtIdBuf = pkgffi.malloc.allocate<ffi.Int8>(65);
+      try {
+        final dhtIdLen = ffiInstance.getDhtIdNative(dhtIdBuf, 65);
+        if (dhtIdLen == 0 || dhtIdLen > 64) return (0, '');
+        final dhtId =
+            dhtIdBuf.cast<pkgffi.Utf8>().toDartString(length: dhtIdLen);
+        return (port, dhtId);
+      } finally {
+        pkgffi.malloc.free(dhtIdBuf);
+      }
+    });
+  }
+
+  final nodeEndpoints = <(int, String)>[];
+  for (final node in scenario.nodes) {
+    final pair = await readPortAndDhtId(node);
+    nodeEndpoints.add(pair);
+    print(
+        '[BootstrapVirtual] T+${stopwatch.elapsedMilliseconds}ms: endpoint ${node.alias} port=${pair.$1} dhtIdLen=${pair.$2.length}');
+  }
+
+  bool atLeastOneEndpoint = false;
+  for (final ep in nodeEndpoints) {
+    if (ep.$1 != 0 && ep.$2.isNotEmpty) {
+      atLeastOneEndpoint = true;
+      break;
+    }
+  }
+  if (!atLeastOneEndpoint) {
+    print(
+        '[BootstrapVirtual] T+${stopwatch.elapsedMilliseconds}ms: ERROR no usable endpoint on any node');
+    return;
+  }
+
+  for (int i = 0; i < scenario.nodes.length; i++) {
+    final node = scenario.nodes[i];
+    if (node.testInstanceHandle == null) {
+      print(
+          '[BootstrapVirtual] T+${stopwatch.elapsedMilliseconds}ms: WARNING ${node.alias} has no test instance handle');
+      continue;
+    }
+    await node.runWithInstanceAsync(() async {
+      final ffiInstance = ffi_lib.Tim2ToxFfi.open();
+      for (int j = 0; j < scenario.nodes.length; j++) {
+        if (i == j) continue;
+        final port = nodeEndpoints[j].$1;
+        final dhtId = nodeEndpoints[j].$2;
+        if (port == 0 || dhtId.isEmpty) continue;
+        final hostPtr = '127.0.0.1'.toNativeUtf8();
+        final dhtIdPtr = dhtId.toNativeUtf8();
+        try {
+          final success = ffiInstance.addBootstrapNode(
+              ffiInstance.getCurrentInstanceId(), hostPtr, port, dhtIdPtr);
+          print(
+              '[BootstrapVirtual] T+${stopwatch.elapsedMilliseconds}ms: ${node.alias} -> ${scenario.nodes[j].alias} 127.0.0.1:$port success=$success');
+        } finally {
+          pkgffi.malloc.free(hostPtr);
+          pkgffi.malloc.free(dhtIdPtr);
+        }
+      }
+    });
+  }
+
+  print(
+      '[BootstrapVirtual] T+${stopwatch.elapsedMilliseconds}ms: Warmup pump (DHT handshake needs real UDP round-trips)');
+  // Tox onion routing requires ~3 successful announce-response cycles before
+  // tox_self_get_connection_status flips to non-zero. Each cycle needs real
+  // UDP round-trips (loopback is sub-ms but the protocol needs ~3-5 cycles).
+  // Drive ~3s of real wall time with dense iteration so all nodes see their
+  // announces succeed before we start polling connection status. Empirically
+  // 1.5s was enough to bring up 2 of 3 nodes; bumping to 3s catches the slow
+  // one too.
+  for (var i = 0; i < 300; i++) {
+    await pumpTestTick(scenario,
+        advanceMs: 50,
+        iterationsPerInstance: 3,
+        wallSleep: const Duration(milliseconds: 10));
+  }
+  print(
+      '[BootstrapVirtual] T+${stopwatch.elapsedMilliseconds}ms: Warmup done; waiting for all nodes to connect (virtual timeout 10s each)...');
+  await Future.wait(
+    scenario.nodes.map((node) async {
+      final nodeStopwatch = Stopwatch()..start();
+      try {
+        await waitForConnectionVirtual(scenario, node,
+            timeout: const Duration(seconds: 10));
+        print(
+            '[BootstrapVirtual] T+${stopwatch.elapsedMilliseconds}ms: Node ${node.alias} connected to Tox (took ${nodeStopwatch.elapsedMilliseconds}ms wall)');
+      } catch (e) {
+        print(
+            '[BootstrapVirtual] T+${stopwatch.elapsedMilliseconds}ms: Node ${node.alias} connection TIMEOUT after ${nodeStopwatch.elapsedMilliseconds}ms wall: $e');
+      }
+    }),
+  );
+
+  print(
+      '[BootstrapVirtual] T+${stopwatch.elapsedMilliseconds}ms: Waiting for all nodes real Tox connection (virtual timeout 5s)...');
+  try {
+    await waitUntilWithVirtualPump(
+      scenario,
+      () => scenario.nodes.every((n) => n.getConnectionStatus() != 0),
+      timeout: const Duration(seconds: 5),
+      description: 'all nodes connected to DHT',
+      advanceMs: 100,
+      iterationsPerInstance: 1,
+    );
+    print(
+        '[BootstrapVirtual] T+${stopwatch.elapsedMilliseconds}ms: All nodes connection_status != 0');
+  } catch (e) {
+    print(
+        '[BootstrapVirtual] waitUntil all connected failed: $e');
+  }
+
+  stopwatch.stop();
+  print('[BootstrapVirtual] DONE at T+${stopwatch.elapsedMilliseconds}ms total wall');
 }

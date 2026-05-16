@@ -36,6 +36,12 @@ Phase selector formats:
 Options:
   --merge-output   When exactly one phase is selected, write logs to merged_results/phase{N}_*
   -h, --help       Show this help
+
+Environment:
+  RUN_VIRTUAL=1    Swap each test file to its *_virtual_test.dart sibling
+                   when one exists (virtual-clock variants in test/scenarios/).
+                   Falls back to wall-clock original when no virtual variant
+                   has been authored. Use to accelerate Phase 4 / 10 / 12.
 EOF
 }
 
@@ -356,9 +362,15 @@ TOTAL_SKIPPED=0
 FAILED_TESTS=()
 SKIPPED_TESTS=()
 
-# Known unstable tests (native crash in current branch/environment)
-# Set RUN_NATIVE_CRASH_TESTS=1 to include them.
-RUN_NATIVE_CRASH_TESTS="${RUN_NATIVE_CRASH_TESTS:-0}"
+# Formerly-unstable native tests are now enabled by default.
+# scenario_dht_nodes_response_api_test was previously gated behind
+# RUN_NATIVE_CRASH_TESTS=1 because the trampoline crashed when invoked from
+# Tox's background event_thread. That root cause is fixed (NativeCallable.listener
+# marshals into the registering isolate; user_data is heap-allocated; the C
+# handler guards against destroyed instances). Verified stable on macOS over
+# repeated runs; flip default to 1 so the test runs as part of the default suite.
+# Set RUN_NATIVE_CRASH_TESTS=0 to opt out (escape hatch only).
+RUN_NATIVE_CRASH_TESTS="${RUN_NATIVE_CRASH_TESTS:-1}"
 apply_known_unstable_filters() {
   if [ "$RUN_NATIVE_CRASH_TESTS" = "1" ]; then
     return
@@ -458,14 +470,25 @@ run_single_test() {
   local phase_name=$2
   local test_num=$3
   local total_in_phase=$4
-  
+
+  # Virtual-mode toggle: when RUN_VIRTUAL=1, swap to the *_virtual_test.dart
+  # sibling if it exists. Falls back to the wall-clock original when no
+  # virtual variant has been authored yet. Set RUN_VIRTUAL=0 (default) for
+  # the legacy wall-clock run.
+  if [ "${RUN_VIRTUAL:-0}" = "1" ]; then
+    local virtual_file="${test_file%_test.dart}_virtual_test.dart"
+    if [ -f "$virtual_file" ]; then
+      test_file="$virtual_file"
+    fi
+  fi
+
   local test_name=$(basename "$test_file" .dart)
-  
+
   echo "" | tee -a "$RESULTS_FILE"
   echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}" | tee -a "$RESULTS_FILE"
   echo -e "${YELLOW}[$phase_name] Test $test_num/$total_in_phase: $test_name${NC}" | tee -a "$RESULTS_FILE"
   echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}" | tee -a "$RESULTS_FILE"
-  
+
   local start_time=$(date +%s)
   local output_file="/tmp/test_${test_name}_$(date +%s).log"
   
@@ -476,14 +499,22 @@ run_single_test() {
   # fail fast, setUpAll/tearDownAll between them adds up. Give the whole
   # file 600s so timeouts surface as real assertion failures, not runner
   # kills.
+  # Strip optional _virtual suffix for timeout matching so wall + virtual
+  # variants share the same per-file budget.
+  local test_basekey="${test_name%_virtual_test}"
+  test_basekey="${test_basekey%_test}"
   local test_timeout=180
-  if [[ "$test_name" == "scenario_conference_test" ]] || \
-     [[ "$test_name" == "scenario_nospam_test" ]] || \
-     [[ "$test_name" == "scenario_group_create_debug_test" ]]; then
-    test_timeout=300
-  elif [[ "$test_name" == "scenario_group_moderation_test" ]]; then
-    test_timeout=600
-  fi
+  case "$test_basekey" in
+    scenario_conference|scenario_nospam|scenario_group_create_debug)
+      test_timeout=300 ;;
+    scenario_group_large)
+      # 5 nodes + 4 friendships; each invite retry can wait 30s × 3 tries
+      # when Tox friend P2P is racy in local bootstrap. 5 sub-tests × worst-
+      # case 90s + setUpAll fits in 600s.
+      test_timeout=600 ;;
+    scenario_group_moderation)
+      test_timeout=600 ;;
+  esac
   
   # Run test with timeout, capture output
   if timeout ${test_timeout}s flutter test "$test_file" > "$output_file" 2>&1; then

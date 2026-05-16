@@ -37,6 +37,16 @@ void main() {
       );
       
       await configureLocalBootstrap(scenario);
+
+      // tim2tox inviteUserToGroup needs invitee as friend. Only one sub-test
+      // exercises the cross-instance join+sync flow, but doing it once in
+      // setUpAll keeps the friendship warm for all tests.
+      try {
+        await establishFriendship(alice, bob,
+            timeout: const Duration(seconds: 90));
+      } catch (e) {
+        print('[setUpAll] establishFriendship best-effort: $e');
+      }
     });
     
     tearDownAll(() async {
@@ -240,9 +250,30 @@ void main() {
       expect(createResult.code, equals(0));
       final groupId = createResult.data!;
       
-      await bob.runWithInstanceAsync(() async => TIMManager.instance.joinGroup(groupID: groupId, message: ''));
+      // Bob needs an invite before joinGroup can succeed (joinGroup wants a
+      // stored chat_id or pending invite; chat_id only lives on Alice's instance).
+      bob.clearCallbackReceived('onGroupInvited');
+      final inviteResult = await alice.runWithInstanceAsync(() async =>
+          TIMGroupManager.instance.inviteUserToGroup(
+            groupID: groupId,
+            userList: [bob.getPublicKey()],
+          ));
+      expect(inviteResult.code, equals(0),
+          reason: 'inviteUserToGroup failed: ${inviteResult.desc}');
+      await waitUntilWithPump(
+        () => bob.callbackReceived['onGroupInvited'] == true,
+        timeout: const Duration(seconds: 30),
+        description: 'bob receives onGroupInvited',
+        iterationsPerPump: 100,
+        stepDelay: const Duration(milliseconds: 200),
+      );
+      await Future.delayed(const Duration(milliseconds: 300));
+      final bobJoinResult = await bob.runWithInstanceAsync(() async =>
+          TIMManager.instance.joinGroup(groupID: groupId, message: ''));
+      expect(bobJoinResult.code, equals(0),
+          reason: 'bob joinGroup failed: ${bobJoinResult.desc}');
       await Future.delayed(const Duration(milliseconds: 500));
-      
+
       var bobReceivedInfoChange = false;
       final bobListener = V2TimGroupListener(
         onGroupInfoChanged: (groupID, changeInfos) {

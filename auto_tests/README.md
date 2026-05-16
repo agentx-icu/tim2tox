@@ -138,6 +138,46 @@ await configureLocalBootstrap(scenario);
 // 其他节点会从第一个节点 bootstrap
 ```
 
+## 虚拟时钟模式 (Virtual Clock Mode)
+
+虚拟时钟模式是一种加速测试套件运行的可选机制：通过在 C++ 侧挂起每个测试实例的 `event_thread`，并把 Tox 内部读取的 `mono_time` 重定向到一个**进程级共享的虚拟时钟**，让测试代码手动推进时间、手动调用 `tox_iterate`。一次"虚拟前进 60 秒"可以在毫秒级 wall time 内完成，绕过 Tox 协议中 60s ping / 122s BAD_NODE / 10s onion path 等慢节奏定时器。
+
+### 为什么需要
+
+Tox 协议层的多个常数（DHT 心跳、好友重连、群组 announce）以秒为单位。在 wall-clock 模式下，多实例 setUpAll 阶段会被这些定时器拖到几十秒甚至几分钟。虚拟时钟把 Tox 协议时间和 wall time 解耦：协议时间可任意压缩，UDP loopback 仍走真实 wall time（通过 `pumpTestTick` 内置的小段 `wallSleep` 让 loopback 包顺利投递）。
+
+### 核心模型
+
+- **共享虚拟 mono_time**：`VirtualClock` 在 Dart 侧维护，C++ 侧通过 `tim2tox_ffi_set_virtual_time_ms()` 同步
+- **手动 iterate**：每次 `pumpTestTick(scenario, ...)` 推进虚拟钟 + 在每个实例上调用 `tim2tox_ffi_iterate_instance()`
+- **task_queue 同步派发**：`tim2tox_ffi_iterate_instance` 在测试模式下顺带 drain task_queue，所以 `PostToEventThread`（信令派发等）依然会执行
+- **`RunOnEventThread` inline**：测试模式下 inline 执行，不会因等待 event_thread 而死锁
+
+### 如何使用
+
+```bash
+# 全部 Phase 用虚拟时钟运行（已存在虚拟变体的测试切换到 *_virtual_test.dart；否则回退到 wall-clock 原版）
+RUN_VIRTUAL=1 ./run_tests_ordered.sh
+
+# 单 Phase / 范围 / 逗号列表照常工作
+RUN_VIRTUAL=1 ./run_tests_ordered.sh 4
+RUN_VIRTUAL=1 ./run_tests_ordered.sh 10-12
+```
+
+`RUN_VIRTUAL=0`（默认）保持现有 wall-clock 行为不变。
+
+### Phase 覆盖
+
+Phase 1–12 已经有 `*_virtual_test.dart` 虚拟变体（共 65 个文件，详见 `test/scenarios/`），覆盖基础 / 好友 / 消息 / 群组 / ToxAV / Profile / 会话 / 文件 / 会议 / 群组扩展 / 网络 / 其他全部业务路径。Phase 13（Binary Replacement）和 Phase 14（unit_tests）不依赖 Tox 协议定时器，**无需**虚拟变体。
+
+### 关于 flakes
+
+虚拟模式的稳定性与 wall-clock 模式持平，但**不会修复 Tox 协议层本身的 flake**（DHT 抖动、好友 P2P 握手时序、群组 announce 收敛等）。如果某测试在 wall 模式偶发失败，切到虚拟模式不会让它稳定 —— 需要从测试逻辑或协议层定位根因。
+
+### 详细指南
+
+写虚拟变体或迁移已有测试时，请参考 [VIRTUAL_CLOCK.md](VIRTUAL_CLOCK.md)（包含核心 API、`*Virtual` 替换表、canonical setUpAll 模板、群邀请重试模式、性能数据、C++ 内部机制等）。
+
 ## 测试场景列表
 
 ### 基础测试 (5个)

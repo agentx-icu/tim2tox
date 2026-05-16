@@ -1,7 +1,9 @@
-/// Group Message Types Test
-///
-/// Tests different message types in groups: text, custom, etc.
-/// Verifies that various message types work correctly in group context
+// Group Message Types Test — virtual-clock variant
+//
+// Mirrors scenario_group_message_types_test.dart 1:1 but drives the harness
+// via the virtual-clock helpers (VirtualClock + pumpTestTick + *Virtual
+// helpers). Tests different message types in groups: text, custom,
+// multi-type, conference, broadcast.
 
 import 'package:test/test.dart';
 import 'package:tencent_cloud_chat_sdk/native_im/adapter/tim_manager.dart';
@@ -13,7 +15,7 @@ import '../test_helper.dart';
 import '../test_fixtures.dart';
 
 void main() {
-  group('Group Message Types Tests', () {
+  group('Group Message Types Tests (Virtual)', () {
     late TestScenario scenario;
     late TestNode alice;
     late TestNode bob;
@@ -21,17 +23,23 @@ void main() {
 
     setUpAll(() async {
       await setupTestEnvironment();
+      // Enable test mode BEFORE scenario creation so event_thread never
+      // starts (canonical optimal pattern; saves the 10s DHT-wait in login()
+      // since event_thread suppression prevents DHT connect during login).
+      await VirtualClock.enableEarly();
       scenario = await createTestScenario(['alice', 'bob', 'charlie']);
       alice = scenario.getNode('alice')!;
       bob = scenario.getNode('bob')!;
       charlie = scenario.getNode('charlie')!;
 
       await scenario.initAllNodes();
-      // Parallelize login
+      // Idempotent — seeds virtual clock + reinforces per-instance flag.
+      await VirtualClock.enableForScenario(scenario);
+
       await Future.wait([
-        alice.login(),
-        bob.login(),
-        charlie.login(),
+        alice.login(timeout: const Duration(milliseconds: 500)),
+        bob.login(timeout: const Duration(milliseconds: 500)),
+        charlie.login(timeout: const Duration(milliseconds: 500)),
       ]);
 
       await waitUntil(
@@ -40,24 +48,27 @@ void main() {
         description: 'all nodes logged in',
       );
 
-      await configureLocalBootstrap(scenario);
+      await configureLocalBootstrapVirtual(scenario);
 
       await Future.wait([
-        alice.waitForConnection(timeout: const Duration(seconds: 15)),
-        bob.waitForConnection(timeout: const Duration(seconds: 15)),
-        charlie.waitForConnection(timeout: const Duration(seconds: 15)),
+        waitForConnectionVirtual(scenario, alice,
+            timeout: const Duration(seconds: 15)),
+        waitForConnectionVirtual(scenario, bob,
+            timeout: const Duration(seconds: 15)),
+        waitForConnectionVirtual(scenario, charlie,
+            timeout: const Duration(seconds: 15)),
       ]);
       await Future.wait([
-        establishFriendship(alice, bob,
+        establishFriendshipVirtual(scenario, alice, bob,
             timeout: const Duration(seconds: 90)),
-        establishFriendship(alice, charlie,
+        establishFriendshipVirtual(scenario, alice, charlie,
             timeout: const Duration(seconds: 90)),
       ]);
-      await pumpFriendConnection(alice, bob,
+      await pumpFriendConnectionVirtual(scenario, alice, bob,
           duration: const Duration(seconds: 5));
-      await pumpFriendConnection(alice, charlie,
+      await pumpFriendConnectionVirtual(scenario, alice, charlie,
           duration: const Duration(seconds: 3));
-      await pumpFriendConnection(bob, charlie,
+      await pumpFriendConnectionVirtual(scenario, bob, charlie,
           duration: const Duration(seconds: 3));
     });
 
@@ -66,9 +77,7 @@ void main() {
       await teardownTestEnvironment();
     });
 
-    // Lightweight setUp for per-test cleanup if needed
     setUp(() async {
-      // Reset any per-test state if necessary
       // Most tests don't need cleanup since they use shared scenario
     });
 
@@ -77,23 +86,42 @@ void main() {
       TestNode invitee, {
       required String context,
     }) async {
-      invitee.clearCallbackReceived('onGroupInvited');
-      final inviteResult = await alice.runWithInstanceAsync(
-          () async => TIMGroupManager.instance.inviteUserToGroup(
-                groupID: groupId,
-                userList: [invitee.getPublicKey()],
-              ));
-      expect(inviteResult.code, equals(0),
+      // Retry invite + wait: inviteUserToGroup returns code=0 even when the
+      // underlying tox_group_invite_friend packet was dropped (friend status=NONE),
+      // and the first invite often races with friend P2P bring-up in virtual mode.
+      var inviteArrived = false;
+      final inviteePublicKey = invitee.getPublicKey();
+      for (var attempt = 0; !inviteArrived && attempt < 3; attempt++) {
+        invitee.clearCallbackReceived('onGroupInvited');
+        final inviteResult = await alice.runWithInstanceAsync(
+            () async => TIMGroupManager.instance.inviteUserToGroup(
+                  groupID: groupId,
+                  userList: [inviteePublicKey],
+                ));
+        expect(inviteResult.code, equals(0),
+            reason:
+                'inviteUserToGroup failed for ${invitee.alias}: ${inviteResult.desc}');
+        try {
+          await waitUntilWithVirtualPump(
+            scenario,
+            () => invitee.callbackReceived['onGroupInvited'] == true,
+            timeout: const Duration(seconds: 15),
+            description:
+                '${invitee.alias} onGroupInvited ($context, attempt ${attempt + 1})',
+            advanceMs: 50,
+            iterationsPerInstance: 1,
+          );
+          inviteArrived = true;
+        } catch (_) {
+          // Retry: friend P2P may not have been ONLINE for the first attempt.
+        }
+      }
+      expect(inviteArrived, isTrue,
           reason:
-              'inviteUserToGroup failed for ${invitee.alias}: ${inviteResult.code}');
-
-      await waitUntilWithPump(
-        () => invitee.callbackReceived['onGroupInvited'] == true,
-        timeout: const Duration(seconds: 12),
-        description: '${invitee.alias} receives onGroupInvited ($context)',
-        iterationsPerPump: 100,
-        stepDelay: const Duration(milliseconds: 200),
-      );
+              '${invitee.alias} never received onGroupInvited for $context after 3 retries');
+      // Settle ~300ms virtual so pending invite -> chat_id mapping completes
+      // before joinGroup is called.
+      await pumpTestTick(scenario, advanceMs: 300, iterationsPerInstance: 1);
 
       final joinGroupId =
           invitee.getLastCallbackGroupId('onGroupInvited') ?? groupId;
@@ -102,10 +130,10 @@ void main() {
       expect(joinResult.code, equals(0),
           reason: '${invitee.alias} joinGroup failed: ${joinResult.code}');
 
-      await pumpGroupPeerDiscovery(alice, invitee,
+      await pumpGroupPeerDiscoveryVirtual(scenario, alice, invitee,
           duration: const Duration(seconds: 3));
-      final inviteeInGroup = await waitUntilFounderSeesMemberInGroup(
-          alice, invitee, groupId,
+      final inviteeInGroup = await waitUntilFounderSeesMemberInGroupVirtual(
+          scenario, alice, invitee, groupId,
           timeout: const Duration(seconds: 25));
       expect(inviteeInGroup, isNotNull,
           reason: 'Alice must see ${invitee.alias} in group before $context');
@@ -157,13 +185,17 @@ void main() {
           );
         });
         expect(sendResult.code, equals(0));
-        pumpAllInstancesOnce(iterations: 150);
-        await Future.delayed(const Duration(milliseconds: 500));
-        await waitUntilWithPump(() => bobReceivedMessage,
-            timeout: const Duration(seconds: 25),
-            description: 'Bob receives text message',
-            iterationsPerPump: 120,
-            stepDelay: const Duration(milliseconds: 200));
+        await pumpTestTick(scenario,
+            advanceMs: 50, iterationsPerInstance: 150);
+        await pumpTestTick(scenario, advanceMs: 500, iterationsPerInstance: 1);
+        await waitUntilWithVirtualPump(
+          scenario,
+          () => bobReceivedMessage,
+          timeout: const Duration(seconds: 25),
+          description: 'Bob receives text message',
+          advanceMs: 50,
+          iterationsPerInstance: 1,
+        );
         expect(bobReceivedMessage, isTrue);
         expect(
             bob.receivedMessages.any((m) => m.textElem?.text == 'Hello group!'),
@@ -215,15 +247,17 @@ void main() {
           );
         });
         expect(sendResult.code, equals(0));
-        pumpAllInstancesOnce(iterations: 150);
-        await Future.delayed(const Duration(milliseconds: 500));
+        await pumpTestTick(scenario,
+            advanceMs: 50, iterationsPerInstance: 150);
+        await pumpTestTick(scenario, advanceMs: 500, iterationsPerInstance: 1);
         try {
-          await waitUntilWithPump(
+          await waitUntilWithVirtualPump(
+            scenario,
             () => bobReceivedMessage || bobReceivedAnyMessage,
             timeout: const Duration(seconds: 30),
             description: 'Bob receives custom message (or fallback payload)',
-            iterationsPerPump: 120,
-            stepDelay: const Duration(milliseconds: 200),
+            advanceMs: 50,
+            iterationsPerInstance: 1,
           );
           expect(bobReceivedMessage || bobReceivedAnyMessage, isTrue);
           if (!bobReceivedMessage) {
@@ -293,13 +327,17 @@ void main() {
               receiver: null,
               groupID: groupId);
         });
-        pumpAllInstancesOnce(iterations: 150);
-        await Future.delayed(const Duration(milliseconds: 500));
-        await waitUntilWithPump(() => receivedMessages.length >= 1,
-            timeout: const Duration(seconds: 30),
-            description: 'Bob receives at least one message',
-            iterationsPerPump: 120,
-            stepDelay: const Duration(milliseconds: 200));
+        await pumpTestTick(scenario,
+            advanceMs: 50, iterationsPerInstance: 150);
+        await pumpTestTick(scenario, advanceMs: 500, iterationsPerInstance: 1);
+        await waitUntilWithVirtualPump(
+          scenario,
+          () => receivedMessages.length >= 1,
+          timeout: const Duration(seconds: 30),
+          description: 'Bob receives at least one message',
+          advanceMs: 50,
+          iterationsPerInstance: 1,
+        );
         expect(receivedMessages.length, greaterThanOrEqualTo(1),
             reason: 'Bob should receive at least one of the two messages');
       } finally {
@@ -352,13 +390,17 @@ void main() {
               groupID: conferenceId);
         });
         expect(sendResult.code, equals(0));
-        pumpAllInstancesOnce(iterations: 150);
-        await Future.delayed(const Duration(milliseconds: 500));
-        await waitUntilWithPump(() => bobReceivedMessage,
-            timeout: const Duration(seconds: 25),
-            description: 'Bob receives conference message',
-            iterationsPerPump: 120,
-            stepDelay: const Duration(milliseconds: 200));
+        await pumpTestTick(scenario,
+            advanceMs: 50, iterationsPerInstance: 150);
+        await pumpTestTick(scenario, advanceMs: 500, iterationsPerInstance: 1);
+        await waitUntilWithVirtualPump(
+          scenario,
+          () => bobReceivedMessage,
+          timeout: const Duration(seconds: 25),
+          description: 'Bob receives conference message',
+          advanceMs: 50,
+          iterationsPerInstance: 1,
+        );
         expect(bobReceivedMessage, isTrue);
       } finally {
         bob.runWithInstance(() => TIMMessageManager.instance
@@ -418,15 +460,17 @@ void main() {
               receiver: null,
               groupID: groupId);
         });
-        pumpAllInstancesOnce(iterations: 150);
-        await Future.delayed(const Duration(milliseconds: 500));
+        await pumpTestTick(scenario,
+            advanceMs: 50, iterationsPerInstance: 150);
+        await pumpTestTick(scenario, advanceMs: 500, iterationsPerInstance: 1);
         try {
-          await waitUntilWithPump(
+          await waitUntilWithVirtualPump(
+            scenario,
             () => bobReceived.isNotEmpty || charlieReceived.isNotEmpty,
             timeout: const Duration(seconds: 30),
             description: 'members receive custom message',
-            iterationsPerPump: 120,
-            stepDelay: const Duration(milliseconds: 200),
+            advanceMs: 50,
+            iterationsPerInstance: 1,
           );
           expect(bobReceived.isNotEmpty || charlieReceived.isNotEmpty, isTrue,
               reason:
