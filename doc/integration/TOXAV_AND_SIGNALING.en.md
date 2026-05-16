@@ -1,8 +1,6 @@
 # Tim2Tox ToxAV and Signaling
 > Language: [Chinese](TOXAV_AND_SIGNALING.md) | [English](TOXAV_AND_SIGNALING.en.md)
 
-
-# Tim2Tox ToxAV and Signaling
 This document describes the current call link of tim2tox, focusing on `ToxAVService`, `CallBridgeService`, `TUICallKitAdapter` and multi-instance callback routing.
 
 ## 1. Goal
@@ -107,7 +105,7 @@ The client must create and initialize the call-related components (e.g. CallServ
 
 ## 7. Related documents
 
-- [ARCHITECTURE.md](ARCHITECTURE.en.md)
+- [ARCHITECTURE.en.md](../architecture/ARCHITECTURE.en.md)
 - [API Reference](../api/API_REFERENCE.en.md)
-- [MULTI_INSTANCE_SUPPORT.md](MULTI_INSTANCE_SUPPORT.en.md)
+- [MULTI_INSTANCE_SUPPORT.en.md](../development/MULTI_INSTANCE_SUPPORT.en.md)
 - For client-side calling and extensions implementation, see each client project’s documentation (e.g. when Tim2Tox is used as a submodule, the parent repo’s doc).

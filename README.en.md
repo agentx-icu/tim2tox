@@ -138,14 +138,14 @@ Tim2Tox supports **binary replacement** (minimal code change, swap library only)
 
 > For full build options, script behavior, and troubleshooting, use [README_BUILD.md](README_BUILD.md) as the single source of truth.
 
-1. **Build C++ / FFI library (recommended)**
+1. **Build C++ / FFI library (recommended; incremental)**
 
 ```bash
-cd tim2tox
+# Run from the repo root (under toxee that is third_party/tim2tox/)
 ./build_ffi.sh
 ```
 
-Typical outputs: `build/ffi/libtim2tox_ffi.dylib` (macOS), `build/source/libtim2tox.a`.
+Output: `build/ffi/libtim2tox_ffi.dylib` (macOS) or `build/ffi/libtim2tox_ffi.so` (Linux). Note that `build/source/libtim2tox.a` is **not** an output of `build_ffi.sh` — it is produced by `bash build.sh` (see [README_BUILD.en.md](README_BUILD.en.md)).
 
 2. **Dart package**
 
@@ -157,7 +157,7 @@ flutter pub get
 3. **Verify**
 
 - In a Flutter app that depends on this package, run `flutter run` and perform init → login → send message.
-- Or run automated tests: `cd auto_tests && ./run_all_tests.sh` (FFI library must be built first).
+- Or run the auto tests: `cd auto_tests && ./run_tests_ordered.sh` (FFI library must be built first; `run_all_tests.sh` is a compatibility entry point). See [auto_tests/README.en.md](auto_tests/README.en.md).
 
 ---
 

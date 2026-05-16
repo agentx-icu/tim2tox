@@ -106,7 +106,7 @@ native callback 到 Dart 的最后一跳由 trampoline 完成；它从 `userData
 
 ## 7. 相关文档
 
-- [ARCHITECTURE.md](ARCHITECTURE.md)
+- [ARCHITECTURE.md](../architecture/ARCHITECTURE.md)
 - [API 参考](../api/API_REFERENCE.md)
-- [MULTI_INSTANCE_SUPPORT.md](MULTI_INSTANCE_SUPPORT.md)
+- [MULTI_INSTANCE_SUPPORT.md](../development/MULTI_INSTANCE_SUPPORT.md)
 - 通话与扩展能力的客户端侧实现见各客户端项目文档（当 Tim2Tox 作为 submodule 使用时，常见于上层仓库的 doc）。

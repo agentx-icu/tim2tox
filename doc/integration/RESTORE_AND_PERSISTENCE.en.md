@@ -23,24 +23,26 @@ Tim2Tox needs to persist the following information to ensure that the group can 
 
 **Storage Timing**: When creating a group
 
-**Storage method**:
+**Storage**:
 ```cpp
-// C++ layer
-extern int tim2tox_ffi_set_group_type(const char* group_id, const char* group_type);
-tim2tox_ffi_set_group_type(groupID, "group");  // or "conference"
-
-// Dart layer (via callbacks)
-case "groupTypeStored":
-    await preferencesService.setGroupType(groupId, groupType);
-    break;
+// C++ side (multi-instance: first arg is int64_t instance_id; pass 0 for the production singleton)
+extern "C" int tim2tox_ffi_set_group_type(int64_t instance_id,
+                                          const char* group_id,
+                                          const char* group_type);
+tim2tox_ffi_set_group_type(/*instance=*/0, groupID, "group");  // or "conference"
 ```
 
-**Reading method**:
+Dart side: the current `Tim2ToxSdkPlatform` customCallback only handles `groupChatIdStored`, `clearHistoryMessage`, and `groupQuitNotification`. `groupType` is persisted by the C++ side directly through the injected `ExtendedPreferencesService.setGroupType(...)` — there is no separate `case "groupTypeStored"` on the Dart side.
+
+**Reading**:
 ```cpp
-// C++ layer
-extern int tim2tox_ffi_get_group_type_from_storage(const char* group_id, char* out_group_type, int out_len);
+extern "C" int tim2tox_ffi_get_group_type_from_storage(int64_t instance_id,
+                                                       const char* group_id,
+                                                       char* out_group_type,
+                                                       int out_len);
 char stored_type[16];
-if (tim2tox_ffi_get_group_type_from_storage(group_id, stored_type, sizeof(stored_type)) == 1) {
+if (tim2tox_ffi_get_group_type_from_storage(/*instance=*/0, group_id,
+                                            stored_type, sizeof(stored_type)) == 1) {
     std::string group_type = std::string(stored_type);
 }
 ```
@@ -53,25 +55,30 @@ if (tim2tox_ffi_get_group_type_from_storage(group_id, stored_type, sizeof(stored
 
 **Storage Timing**: When creating or joining a Group type group
 
-**Storage method**:
+**Storage**:
 ```cpp
-// C++ layer
-extern int tim2tox_ffi_set_group_chat_id(const char* group_id, const char* chat_id);
-tim2tox_ffi_set_group_chat_id(groupID, chat_id_hex);
+extern "C" int tim2tox_ffi_set_group_chat_id(int64_t instance_id,
+                                             const char* group_id,
+                                             const char* chat_id);
+tim2tox_ffi_set_group_chat_id(/*instance=*/0, groupID, chat_id_hex);
 
-// Dart layer (via callbacks)
+// Dart side: Tim2ToxSdkPlatform's customCallback handles "groupChatIdStored"
+// (see tim2tox_sdk_platform.dart)
 case "groupChatIdStored":
     await preferencesService.setGroupChatId(groupId, chatId);
     break;
 ```
 
-**Reading method**:
+**Reading**:
 ```cpp
-// C++ layer
-extern int tim2tox_ffi_get_group_chat_id_from_storage(const char* group_id, char* out_chat_id, int out_len);
+extern "C" int tim2tox_ffi_get_group_chat_id_from_storage(int64_t instance_id,
+                                                          const char* group_id,
+                                                          char* out_chat_id,
+                                                          int out_len);
 char stored_chat_id[65];
-if (tim2tox_ffi_get_group_chat_id_from_storage(group_id, stored_chat_id, sizeof(stored_chat_id)) == 1) {
-    // Use stored_chat_id
+if (tim2tox_ffi_get_group_chat_id_from_storage(/*instance=*/0, group_id,
+                                               stored_chat_id, sizeof(stored_chat_id)) == 1) {
+    // use stored_chat_id
 }
 ```
 
@@ -275,6 +282,6 @@ RejoinKnownGroups: Matched conference_number=<number> to groupID=<group_id>
 
 ## Related documents
 
-- [ARCHITECTURE.md](./ARCHITECTURE.en.md) - Tim2Tox architecture (including group chat implementation instructions)
+- [ARCHITECTURE.en.md](../architecture/ARCHITECTURE.en.md) - Tim2Tox architecture (including group-chat implementation notes)
 - [API_REFERENCE.en.md](../api/API_REFERENCE.en.md) - API reference documentation
 - For client-side group chat and UI, see each client project’s documentation (e.g. when Tim2Tox is used as a submodule, the parent repo’s doc).

@@ -1,6 +1,6 @@
 # Tim2Tox Auto Tests
 
-自动化测试套件，用于测试 tim2tox 在二进制替换方案下的 Dart 层接口。
+自动化测试套件，覆盖 tim2tox 的 Platform 路径和 Binary Replacement 路径下 UIKit/V2TIM 风格的接口。整体跑过的最新基线见 [VALIDATION_RESULTS.md](VALIDATION_RESULTS.md)。
 
 **目录**：[概述](#概述) · [目录结构](#目录结构) · [测试框架](#测试框架) · [测试场景列表](#测试场景列表) · [运行测试](#运行测试) · [测试覆盖范围](#测试覆盖范围) · [测试失败记录与修复状态](#测试失败记录与修复状态) · [已知问题](#已知问题和限制) · [故障排除](#故障排除) · [最佳实践](#测试最佳实践) · [参考文档](#参考文档)
 
@@ -20,30 +20,35 @@
 ```
 tim2tox/auto_tests/
 ├── pubspec.yaml                    # 包配置和依赖
-├── run_tests.sh                    # 基础测试运行脚本
-├── run_tests_verbose.sh            # 详细输出测试脚本
-├── run_tests_ordered.sh            # 按顺序运行测试 (Phase 1-14)
-├── run_all_tests.sh                # 兼容入口（内部调用 run_tests_ordered.sh）
-├── run_group_tests.sh              # 运行群组相关测试
-├── run_tests_with_lib.sh           # 带库构建的测试脚本
+├── run_tests.sh                    # 基础测试运行脚本（带按名字过滤）
+├── run_tests_verbose.sh            # 更啰嗦的输出
+├── run_tests_ordered.sh            # **推荐**：按 Phase 1-14 顺序运行，单测 180s 超时
+├── run_all_tests.sh                # 兼容入口，内部转给 run_tests_ordered.sh
+├── run_group_tests.sh              # 群组相关 phase 的别名
+├── run_tests_with_lib.sh           # 显式注入 DYLD_LIBRARY_PATH 的变体
+├── check_test_assertions.sh        # 防止引入永真断言/空 catch 的静态检查
 ├── test/
-│   ├── test_helper.dart            # 测试辅助库（TestNode, waitUntil 等）
-│   ├── test_fixtures.dart          # 测试数据和 Mock 对象
-│   ├── scenarios/                  # 场景测试文件（69 个）
+│   ├── test_helper.dart            # 测试辅助库（TestNode、waitUntil、TestScenario）
+│   ├── test_fixtures.dart          # 测试数据 / Mock
+│   ├── scenarios/                  # 业务场景（共 139：70 wall-clock + 69 *_virtual_test 变体）
 │   │   ├── scenario_sdk_init_test.dart
+│   │   ├── scenario_sdk_init_virtual_test.dart
 │   │   ├── scenario_login_test.dart
-│   │   ├── scenario_message_test.dart
-│   │   └── ... (其他场景测试)
-│   ├── scenarios_binary/           # Binary Replacement 路径测试（Phase 13，3 个）
+│   │   ├── scenario_login_virtual_test.dart
+│   │   ├── scenario_virtual_clock_smoke_test.dart   # 虚拟时钟基础冒烟
+│   │   └── ... (其余文件按相同命名规则成对存在)
+│   ├── scenarios_binary/           # Binary Replacement 路径专测（Phase 13，3 个）
 │   │   ├── scenario_native_callback_dispatch_test.dart  # NativeLibraryManager 静态 listener 分发
 │   │   ├── scenario_custom_callback_handler_test.dart   # customCallbackHandler 注册与触发
 │   │   └── scenario_library_loading_test.dart           # setNativeLibraryName 库加载验证
-│   └── unit_tests/                 # 单元测试
-│       └── test_listeners.dart     # Listener 接口测试
-├── RERUN_FAILURES_SUMMARY_*.md     # 失败用例重跑汇总
-├── DEBUG_NATIVE_CRASH.md           # 崩溃时用 lldb 查看 native 栈
-├── NATIVE_CRASH_COMMON_ISSUES.md   # Native 崩溃常见问题速查（先查此文）
-└── README.md                       # 本文档（含失败记录与修复状态）
+│   └── unit_tests/                 # 纯单元测试（Phase 14 当前只跑 test_listeners.dart）
+│       ├── test_listeners.dart                          # Listener 接口测试
+│       ├── ffi_chat_service_avatar_detection_test.dart  # 头像变更检测
+│       └── ffi_chat_service_avatar_sync_test.dart       # 头像同步
+├── VALIDATION_RESULTS.md           # 最近一次全量回归的通过/失败快照
+├── VIRTUAL_CLOCK.md                # 虚拟时钟原理 / 使用 / 性能数据
+├── DEBUG_NATIVE_CRASH.md           # 用 lldb 调试 native 栈
+└── README.md                       # 本文档
 ```
 
 ## 测试框架
@@ -168,7 +173,7 @@ RUN_VIRTUAL=1 ./run_tests_ordered.sh 10-12
 
 ### Phase 覆盖
 
-Phase 1–12 已经有 `*_virtual_test.dart` 虚拟变体（共 65 个文件，详见 `test/scenarios/`），覆盖基础 / 好友 / 消息 / 群组 / ToxAV / Profile / 会话 / 文件 / 会议 / 群组扩展 / 网络 / 其他全部业务路径。Phase 13（Binary Replacement）和 Phase 14（unit_tests）不依赖 Tox 协议定时器，**无需**虚拟变体。
+Phase 1–12 已经有 `*_virtual_test.dart` 虚拟变体（约 69 个文件，加上 `scenario_virtual_clock_smoke_test.dart` 共 70 个；wall-clock 原版另有 ~70 个，详见 `test/scenarios/`），覆盖基础 / 好友 / 消息 / 群组 / ToxAV / Profile / 会话 / 文件 / 会议 / 群组扩展 / 网络 / 其他全部业务路径。Phase 13（Binary Replacement）和 Phase 14（unit_tests）不依赖 Tox 协议定时器，**无需**虚拟变体。
 
 ### 关于 flakes
 
@@ -335,10 +340,9 @@ flutter pub get
 # 按顺序运行并跳过断言守卫（默认会先执行 ./check_test_assertions.sh）
 ASSERTION_GUARD=0 ./run_tests_ordered.sh
 
-# Phase 11 默认会隔离已知原生崩溃用例 scenario_dht_nodes_response_api_test
-./run_tests_ordered.sh 11
-# 如需显式包含该用例
-RUN_NATIVE_CRASH_TESTS=1 ./run_tests_ordered.sh 11
+# Phase 11 默认会**包含** scenario_dht_nodes_response_api_test（曾因 native trampoline
+# 崩溃被 gate 起来，现在默认放进 phase 11）。要在本地跳过它：
+RUN_NATIVE_CRASH_TESTS=0 ./run_tests_ordered.sh 11
 
 # 仅运行 PHASE5_TOXAV + PHASE6_PROFILE，失败不停止、全部跑完并汇总到本 README 下方「最近执行汇总」
 ./run_tests_ordered.sh 5,6
@@ -535,8 +539,8 @@ test('my test', () async {
 **症状**：测试进程退出码 139，或日志出现 `[callback_bridge] FATAL: end backtrace`。
 
 **排查顺序**：
-1. **先查常见问题**：[NATIVE_CRASH_COMMON_ISSUES.md](NATIVE_CRASH_COMMON_ISSUES.md) 列出会话回调 lastMessage 悬空、子线程里使用 user_data、多实例 instance_id 等常见原因与修复方式。
-2. **再抓 native 栈**：用 [DEBUG_NATIVE_CRASH.md](DEBUG_NATIVE_CRASH.md) 中的方式（如 `./run_conversation_test_with_lldb.sh`）在崩溃时停住，执行 `bt`、`frame variable` 定位具体帧。
+1. **抓 native 栈**：按 [DEBUG_NATIVE_CRASH.md](DEBUG_NATIVE_CRASH.md) 中的步骤用 lldb 跑（`./run_conversation_test_with_lldb.sh` 等脚本会自动 attach），崩溃时执行 `bt`、`frame variable` 看具体帧。
+2. **常见根因**：会话回调里 `lastMessage` 悬空、跨线程使用 `user_data` 字符串、多实例下 `instance_id` 没正确传到 trampoline、`Dart_PostCObject_DL` 在 isolate 被销毁后调用。可以用 `git log -- ffi/callback_bridge.cpp ffi/dart_compat_listeners.cpp` 翻历史修复点参考。
 
 ### 网络连接问题
 
@@ -580,7 +584,8 @@ test('my test', () async {
    ```
 2. 确保 native 库已编译：
    ```bash
-   cd ../tim2tox
+   # auto_tests 已在 tim2tox/ 内，回到上一级即可
+   cd ..
    ./build_ffi.sh
    ```
 3. 检查库路径配置
@@ -653,8 +658,9 @@ void main() {
 ## 编译与测试状态
 
 - ✅ **编译**：所有编译错误已修复，测试可正常编译。
-- ✅ **Phase 13 Binary Replacement**：15/15 通过（2026-02-10）。
-- **测试状态与失败记录**：见上文 **「测试失败记录与修复状态」**（按根因 Todo 映射、各 Phase 摘要、关键修复实施记录）。其他参考：[RERUN_FAILURES_SUMMARY_20260129.md](RERUN_FAILURES_SUMMARY_20260129.md)、[DEBUG_NATIVE_CRASH.md](DEBUG_NATIVE_CRASH.md)、[NATIVE_CRASH_COMMON_ISSUES.md](NATIVE_CRASH_COMMON_ISSUES.md)。
+- ✅ **Phase 13 Binary Replacement**：15/15 通过（2026-02-10 基线）。
+- **最新回归状态**：见 [VALIDATION_RESULTS.md](VALIDATION_RESULTS.md)。
+- **Native 崩溃调试**：见 [DEBUG_NATIVE_CRASH.md](DEBUG_NATIVE_CRASH.md)。
 
 ### 最近执行汇总
 

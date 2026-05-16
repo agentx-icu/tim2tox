@@ -12,8 +12,8 @@
 - **构建说明（唯一入口）**：[README_BUILD.md](../README_BUILD.md)
 - **排障索引（入口页）**：[troubleshooting/README.md](troubleshooting/README.md)
 - **自动化测试**：[auto_tests/README.md](../auto_tests/README.md)
-- **Native 崩溃排障**：[auto_tests/NATIVE_CRASH_COMMON_ISSUES.md](../auto_tests/NATIVE_CRASH_COMMON_ISSUES.md)、[auto_tests/DEBUG_NATIVE_CRASH.md](../auto_tests/DEBUG_NATIVE_CRASH.md)
-- **失败记录**：[auto_tests/FAILURE_RECORDS.md](../auto_tests/FAILURE_RECORDS.md)
+- **Native 崩溃排障**：[auto_tests/DEBUG_NATIVE_CRASH.md](../auto_tests/DEBUG_NATIVE_CRASH.md)
+- **回归基线**：[auto_tests/VALIDATION_RESULTS.md](../auto_tests/VALIDATION_RESULTS.md)（最近一次全量回归的通过/失败快照）
 
 ## 维护入口
 

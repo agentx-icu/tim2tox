@@ -17,17 +17,19 @@
 ```cpp
 // Forward declaration for FFI functions
 // NOTE: All tim2tox_ffi_* functions are defined in extern "C" blocks in tim2tox_ffi.cpp
-// They MUST be declared here with extern "C" to avoid C++ name mangling issues
+// They MUST be declared here with extern "C" to avoid C++ name mangling issues.
+// Tip: keep these in sync with ffi/tim2tox_ffi.h — note that many group / multi-instance
+// helpers take `int64_t instance_id` as their first parameter.
 extern "C" {
 int tim2tox_ffi_save_friend_nickname(const char* friend_id, const char* nickname);
 int tim2tox_ffi_save_friend_status_message(const char* friend_id, const char* status_message);
 int tim2tox_ffi_irc_forward_tox_message(const char* group_id, const char* sender, const char* message);
-int tim2tox_ffi_get_known_groups(char* buffer, int buffer_len);
-int tim2tox_ffi_set_group_chat_id(const char* group_id, const char* chat_id);
-int tim2tox_ffi_get_group_chat_id_from_storage(const char* group_id, char* out_chat_id, int out_len);
-int tim2tox_ffi_set_group_type(const char* group_id, const char* group_type);
-int tim2tox_ffi_get_group_type_from_storage(const char* group_id, char* out_group_type, int out_len);
-int tim2tox_ffi_get_auto_accept_group_invites(void);
+int tim2tox_ffi_get_known_groups(int64_t instance_id, char* buffer, int buffer_len);
+int tim2tox_ffi_set_group_chat_id(int64_t instance_id, const char* group_id, const char* chat_id);
+int tim2tox_ffi_get_group_chat_id_from_storage(int64_t instance_id, const char* group_id, char* out_chat_id, int out_len);
+int tim2tox_ffi_set_group_type(int64_t instance_id, const char* group_id, const char* group_type);
+int tim2tox_ffi_get_group_type_from_storage(int64_t instance_id, const char* group_id, char* out_group_type, int out_len);
+int tim2tox_ffi_get_auto_accept_group_invites(int64_t instance_id);
 }
 ```
 
@@ -38,8 +40,8 @@ int tim2tox_ffi_get_auto_accept_group_invites(void);
 ```cpp
 void SomeFunction() {
     // ❌ 错误：不要在函数内部声明
-    extern int tim2tox_ffi_set_group_chat_id(const char* group_id, const char* chat_id);
-    tim2tox_ffi_set_group_chat_id(group_id, chat_id);
+    extern int tim2tox_ffi_set_group_chat_id(int64_t instance_id, const char* group_id, const char* chat_id);
+    tim2tox_ffi_set_group_chat_id(instance_id, group_id, chat_id);
 }
 ```
 
@@ -49,7 +51,7 @@ void SomeFunction() {
 void SomeFunction() {
     // ✅ 正确：直接使用，函数已在文件顶部声明
     // Function is already declared with extern "C" at file scope
-    tim2tox_ffi_set_group_chat_id(group_id, chat_id);
+    tim2tox_ffi_set_group_chat_id(instance_id, group_id, chat_id);
 }
 ```
 

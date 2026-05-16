@@ -1,255 +1,90 @@
-# Tim2Tox Modularization
+# Tim2Tox FFI Layer Modularization
 > Language: [Chinese](MODULARIZATION.md) | [English](MODULARIZATION.en.md)
-
 
 ## Overview
 
-The Dart* function compatibility layer (`dart_compat_layer`) has been fully modularized and split from the original single large file (3200+ lines) into 13 functional modules, significantly improving the maintainability and readability of the code.
+The `Dart*` compatibility layer (loaded dynamically by `NativeLibraryManager` on the binary-replacement path) was historically a single file. It has been split by responsibility into **13 `.cpp` modules + 2 shared headers**. This document records each module's role and current size.
+
+> Line counts are snapshots from `wc -l ffi/dart_compat_*.{cpp,h}` at the time of writing and will drift as the implementation grows. If they look significantly off, just re-run `wc -l` and update this table.
 
 ## Module structure
 
-### Infrastructure module
+### Infrastructure modules
 
 #### dart_compat_internal.h
-- **Responsibilities**: Shared declarations and forward declarations
-- **Content**:
-  - All necessary header files included
-  - extern declaration of global variables
-  - Predeclaration of utility functions
-  - Forward declaration of Listener and Callback classes
-- **number of lines**: about 91 lines
+- **Role**: Shared declarations and forward declarations (global-variable `extern`s, utility-function prototypes, Listener / Callback class forward declarations, and a single point for shared `#include`s).
+- **Lines**: ~157
 
 #### dart_compat_utils.cpp
-- **Responsibilities**: Utility functions and global variables
-- **Content**:
-  - Global Listener instance definition
-  - Callback user_data storage (`g_callback_user_data`)
-  - Tool function implementation:
-    - `StoreCallbackUserData`: Store callback user_data
-    - `GetCallbackUserData`: Get callback user_data
-    - `UserDataToString`: Convert user_data pointer to string
-    - `SafeGetV2TIMManager`: Safely obtain V2TIMManager instance
-    - `CStringToString`: C string to std::string
-    - `SendApiCallbackResultWithString`: Send API callback result (string version)
-    - `SendApiCallbackResult`: Send API callback results
-    - `ParseJsonConfig`: Parse JSON configuration
-    - `SafeGetCString`: Safely obtain C strings
-    - `ConversationVectorToJson`: Convert conversation vector to JSON
-- **number of lines**: about 300 lines
+- **Role**: Utility functions and global state. Provides `StoreCallbackUserData` / `GetCallbackUserData` / `UserDataToString` / `SafeGetV2TIMManager` / `CStringToString` / `SendApiCallbackResult*` / `ParseJsonConfig` / `SafeGetCString` / `ConversationVectorToJson`, etc.
+- **Lines**: ~576
 
-### Listener and callback module
+### Listener / callback modules
 
 #### dart_compat_listeners.cpp
-- **Responsibilities**: Listener implementation and callback registration function
-- **Content**:
-  - `DartSDKListenerImpl`: SDK event listener
-  - `DartAdvancedMsgListenerImpl`: Message event listener
-  - `DartConversationListenerImpl`: Session event listener
-  - `DartGroupListenerImpl`: Group event listener
-  - `DartFriendshipListenerImpl`: Friend event listener
-  - `DartSignalingListenerImpl`: Signaling event listener
-  - `DartCommunityListenerImpl`: Community event listener
-  - All `DartSet*Callback` callback registration functions (66)
-- **number of lines**: about 1150 lines
+- **Role**: All `*ListenerImpl` classes plus `DartSet*Callback` registration functions.
+  - `DartSDKListenerImpl`, `DartAdvancedMsgListenerImpl`, `DartConversationListenerImpl`, `DartGroupListenerImpl`, `DartFriendshipListenerImpl`, `DartSignalingListenerImpl`, `DartCommunityListenerImpl`
+  - ~65 `DartSet*Callback` registration functions
+- **Lines**: ~2800
 
 #### dart_compat_callbacks.cpp
-- **Responsibilities**: Callback class implementation
-- **Content**:
-  - `DartCallback`: Basic callback class
-  - `DartSendCallback`: message sending callback
-  - `DartMessageVectorCallback`: message vector callback
-  - `DartFriendInfoVectorCallback`: Friend information vector callback
-  - `DartConversationResultCallback`: Session result callback
-  - `DartStringCallback`: String callback
-  - `DartGroupInfoVectorCallback`: Group information vector callback
-  - `DartConversationOperationResultVectorCallback`: Session operation result vector callback
-  - `DartFriendOperationResultCallback`: Friend operation result callback
-  - `DartFriendOperationResultVectorCallback`: Friend operation result vector callback
-  - `DartFriendInfoResultVectorCallback`: Friend information result vector callback
-  - `DartMessageCompleteCallback`: message completion callback
-  - Auxiliary functions: `MessageVectorToJson`, `FriendInfoVectorToJson`, `ConversationResultToJson`, `GroupInfoVectorToJson`, `FriendOperationResultToJson`, `FriendOperationResultVectorToJson`, `FriendInfoResultVectorToJson`
-- **number of lines**: about 590 lines
+- **Role**: The `Dart*Callback` callback-class family and the JSON serialization helpers (`MessageVectorToJson`, `FriendInfoVectorToJson`, `ConversationResultToJson`, `GroupInfoVectorToJson`, `FriendOperationResultToJson`, `FriendOperationResultVectorToJson`, `FriendInfoResultVectorToJson`, ...).
+- **Lines**: ~965
 
-### Function module
+### Functional modules
 
 #### dart_compat_sdk.cpp
-- **Responsibilities**: SDK initialization and authentication functions
-- **Main functions**:
-  - `DartInitSDK`: Initialize SDK
-  - `DartUnitSDK`: Deinitialization SDK
-  - `DartGetSDKVersion`: Get SDK version
-  - `DartGetServerTime`: Get server time
-  - `DartSetConfig`: Setup configuration
-  - `DartLogin`: Login
-  - `DartLogout`: Log out
-  - `DartGetLoginUserID`: Get login user ID
-  - `DartGetLoginStatus`: Get login status
-- **Number of lines**: about 200 lines
+- **Role**: SDK initialization and authentication. `DartInitSDK(uint64_t sdk_app_id, const char* json_sdk_config)`, `DartUnitSDK`, `DartGetSDKVersion`, `DartGetServerTime`, `DartSetConfig`, `DartLogin(const char* user_id, const char* user_sig, void* user_data)`, `DartLogout`, `DartGetLoginUserID`.
+- **Lines**: ~177
+
+> `DartGetLoginStatus` lives in `dart_compat_user.cpp`, not in `sdk.cpp`.
 
 #### dart_compat_message.cpp
-- **Responsibilities**: Message related functions
-- **Main functions**:
-  - `DartSendMessage`: Send message
-  - `DartFindMessages`: Find messages
-  - `DartRevokeMessage`: Withdraw message
-  - `DartModifyMessage`: Modify message
-  - `DartDeleteMessages`: Delete message
-  - `DartDeleteMessageFromLocalStorage`: Delete message from local storage
-  - `DartClearHistoryMessage`: Clear historical messages
-  - `DartSaveMessage`: Save message
-  - `DartGetHistoryMessageList`: Get a list of historical messages
-  - `DartGetMessageList`: Get message list
-  - `DartMarkMessageAsRead`: Mark message as read
-  - `DartMarkAllMessageAsRead`: Mark all messages as read
-  - `DartMarkC2CMessageAsRead`: Mark C2C message as read
-  - `DartMarkGroupMessageAsRead`: Mark group messages as read
-  - `DartSetLocalCustomData`: Set local custom data
-  - `DartDownloadElemToPath`: Download elements to path
-  - `DartDownloadMergerMessage`: Download merge message
-  - and other message-related functions
-- **number of lines**: about 1200 lines
+- **Role**: Message send / query / revoke / modify / delete / history / read-mark / local custom data / element download. Includes `DartSendMessage`, `DartFindMessages`, `DartRevokeMessage`, `DartModifyMessage`, `DartDeleteMessages`, `DartClearHistoryMessage`, `DartGetHistoryMessageList`, `DartGetMessageList`, `DartMarkAllMessageAsRead` / `DartMarkC2CMessageAsRead` / `DartMarkGroupMessageAsRead`, `DartSetLocalCustomData`, `DartDownloadElemToPath`, `DartDownloadMergerMessage`, and others.
+- **Lines**: ~1732
 
 #### dart_compat_friendship.cpp
-- **Responsibilities**: Friend related functions
-- **Main functions**:
-  - `DartGetFriendList`: Get friends list
-  - `DartAddFriend`: Add friends
-  - `DartDeleteFromFriendList`: Removed from friends list
-  - `DartGetFriendsInfo`: Get friend information
-  - `DartSetFriendInfo`: Set friend information
-  - `DartGetFriendApplicationList`: Get friend application list
-  - `DartAcceptFriendApplication`: Accept friend request
-  - `DartRefuseFriendApplication`: Reject friend request
-  - `DartCheckFriend`: Check friends
-  - `DartAddToBlackList`: Add to blacklist
-  - `DartDeleteFromBlackList`: Removed from blacklist
-  - `DartGetBlackList`: Get blacklist
-  - `DartSetFriendApplicationRead`: Set friend request as read
-  - and other friend-related functions
-- **number of lines**: about 630 lines#### dart_compat_conversation.cpp
-- **Responsibilities**: Session related functions
-- **Main functions**:
-  - `DartGetConversationList`: Get conversation list
-  - `DartGetConversation`: Get session
-  - `DartDeleteConversation`: Delete conversation
-  - `DartSetConversationDraft`: Set up conversation draft
-  - `DartCancelConversationDraft`: Cancel conversation draft
-  - `DartPinConversation`: Pinned conversation
-  - `DartMarkConversation`: Mark conversation
-  - `DartGetTotalUnreadMessageCount`: Get the total number of unread messages
-  - `DartGetUnreadMessageCountByFilter`: Get the number of unread messages according to filter conditions
-  - `DartGetConversationListByFilter`: Get conversation list by filter conditions
-  - `DartSetConversationCustomData`: Set session custom data
-  - `DartCreateConversationGroup`: Create conversation groups
-  - `DartDeleteConversationGroup`: Delete conversation group
-  - `DartRenameConversationGroup`: Rename session grouping
-  - `DartGetConversationGroupList`: Get the conversation group list
-  - `DartAddConversationsToGroup`: Add conversation to group
-  - `DartDeleteConversationsFromGroup`: Remove conversation from group
-- **number of lines**: about 400 lines
+- **Role**: Friend CRUD, friend applications, friend profile, blacklist. `DartGetFriendList`, `DartAddFriend`, `DartDeleteFromFriendList`, `DartGetFriendsInfo`, `DartSetFriendInfo`, `DartGetFriendApplicationList`, `DartAcceptFriendApplication`, `DartRefuseFriendApplication`, `DartCheckFriend`, `DartAddToBlackList`, `DartDeleteFromBlackList`, `DartGetBlackList`, `DartSetFriendApplicationRead`, ...
+- **Lines**: ~934
+
+#### dart_compat_conversation.cpp
+- **Role**: Conversation query / delete / pin / draft / mark / custom data / conversation groups. `DartGetConversationList`, `DartGetConversation`, `DartDeleteConversation`, `DartSetConversationDraft`, `DartCancelConversationDraft`, `DartPinConversation`, `DartMarkConversation`, `DartGetTotalUnreadMessageCount`, `DartGetUnreadMessageCountByFilter`, `DartGetConversationListByFilter`, `DartSetConversationCustomData`, `DartCreateConversationGroup`, `DartDeleteConversationGroup`, `DartRenameConversationGroup`, `DartGetConversationGroupList`, `DartAddConversationsToGroup`, `DartDeleteConversationsFromGroup`.
+- **Lines**: ~690
 
 #### dart_compat_group.cpp
-- **Responsibilities**: Group related functions
-- **Main functions**:
-  - `DartCreateGroup`: Create a group
-  - `DartJoinGroup`: Join the group
-  - `DartQuitGroup`: Exit the group
-  - `DartDeleteGroup`: Delete group
-  - `DartGetJoinedGroupList`: Get the list of joined groups
-  - `DartGetGroupsInfo`: Get group information
-  - `DartSetGroupInfo`: Set group information
-  - `DartGetGroupMemberList`: Get the list of group members
-  - `DartGetGroupMembersInfo`: Get group member information
-  - `DartInviteUserToGroup`: Invite user to group
-  - `DartKickGroupMember`: Kick out group members
-  - `DartModifyGroupMemberInfo`: Modify group member information
-  - `DartSetGroupAttributes`: Set group properties
-  - `DartGetGroupAttributes`: Get group attributes
-  - `DartInitGroupAttributes`: Initialize group properties
-  - `DartDeleteGroupAttributes`: Delete group attributes
-  - `DartSetGroupCounters`: Set group counter
-  - `DartGetGroupCounters`: Get group counter
-  - `DartIncreaseGroupCounter`: Increase group counter
-  - `DartDecreaseGroupCounter`: Decrement group counter
-  - `DartSearchGroups`: Search group
-  - `DartSearchCloudGroups`: Search cloud groups
-  - `DartSearchGroupMembers`: Search group members
-  - `DartSearchCloudGroupMembers`: Search cloud group members
-  - `DartGetOnlineMemberCount`: Get the number of online members
-  - `DartMarkGroupMemberList`: Tag group member list
-  - `DartGetGroupPendencyList`: Get group pending list
-  - `DartHandleGroupPendency`: Process group pending items
-  - `DartMarkGroupPendencyRead`: Mark group pending items as read
-- **number of lines**: about 900 lines
+- **Role**: Group lifecycle, members, attributes, counters, search. `DartCreateGroup`, `DartJoinGroup`, `DartQuitGroup`, `DartDeleteGroup`, `DartGetJoinedGroupList`, `DartGetGroupsInfo`, `DartSetGroupInfo`, `DartGetGroupMemberList`, `DartGetGroupMembersInfo`, `DartInviteUserToGroup`, `DartKickGroupMember`, `DartModifyGroupMemberInfo`, `DartSetGroupAttributes` / `DartGetGroupAttributes` / `DartInitGroupAttributes` / `DartDeleteGroupAttributes`, `DartSetGroupCounters` / `DartGetGroupCounters` / `DartIncreaseGroupCounter` / `DartDecreaseGroupCounter`, `DartSearchGroups`, ...
+- **Lines**: ~1818
+
+> Some methods that the V2TIM abstract class exposes (e.g. `DartGetOnlineMemberCount`, `DartMarkGroupMemberList`, `DartGetGroupPendencyList`, `DartHandleGroupPendency`, `DartSearchCloudGroups`, `DartSearchCloudGroupMembers`) are not implemented here today — calls fall through to default SDK behavior. The authoritative `Dart*` list is the `extern "C"` block of this module (`grep -hE '^\\s*(int|void|const char\\*) Dart[A-Z]' ffi/dart_compat_group.cpp`).
 
 #### dart_compat_user.cpp
-- **Responsibilities**: User related functions
-- **Main functions**:
-  - `DartGetUsersInfo`: Get user information
-  - `DartSetSelfInfo`: Set own information
-  - `DartSubscribeUserInfo`: Subscribe to user information
-  - `DartUnsubscribeUserInfo`: Unsubscribe user information
-  - `DartGetUserStatus`: Get user status
-  - `DartSetSelfStatus`: Set own status
-  - `DartSetC2CReceiveMessageOpt`: Set C2C message receiving options
-  - `DartGetC2CReceiveMessageOpt`: Get C2C message receiving options
-  - `DartSetAllReceiveMessageOpt`: Set all receiving message options
-  - `DartGetAllReceiveMessageOpt`: Get all receiving message options
-  - `DartGetLoginStatus`: Get login status
-  - and other user related functions
-- **number of lines**: about 550 lines
+- **Role**: User info / subscribe / status / login status / message receive opt. `DartGetUsersInfo`, `DartSetSelfInfo`, `DartSubscribeUserInfo`, `DartUnsubscribeUserInfo`, `DartGetUserStatus`, `DartSetSelfStatus`, `DartSetC2CReceiveMessageOpt` / `DartGetC2CReceiveMessageOpt`, `DartSetAllReceiveMessageOpt` / `DartGetAllReceiveMessageOpt`, `DartGetLoginStatus`.
+- **Lines**: ~765
 
 #### dart_compat_signaling.cpp
-- **Responsibilities**: Signaling related functions
-- **Main functions**:
-  - `DartInvite`: Invitation (1 to 1)
-  - `DartInviteInGroup`: Group invitation
-  - `DartGetSignalingInfo`: Get signaling information
-  - `DartModifyInvitation`: Modify invitation
-  - `DartCancel` (DartCancelInvitation): Cancel invitation
-  - `DartAccept` (DartAcceptInvitation): Accept invitation
-  - `DartReject` (DartRejectInvitation): Reject invitation
-- **Number of lines**: about 570 lines
+- **Role**: Signaling invite / modify / cancel / accept / reject. `DartInvite`, `DartInviteInGroup`, `DartGetSignalingInfo`, `DartModifyInvitation`, `DartCancel` (invitation), `DartAccept`, `DartReject`.
+- **Lines**: ~576
 
 #### dart_compat_community.cpp
-- **Responsibilities**: Community related functions
-- **Status**: ⏳ To be improved (currently a placeholder file)
-- **Function to be implemented**:
-  - `DartCreateCommunity`: Create a community
-  - `DartDeleteCommunity`: Delete community
-  - `DartSetCommunityInfo`: Set community information
-  - `DartGetCommunityInfoList`: Get community information list
-  - `DartGetJoinedCommunityList`: Get the list of joined communities
-  - `DartCreateTopicInCommunity`: Create a topic in the community
-  - `DartDeleteTopicFromCommunity`: Remove topic from community
-  - `DartSetTopicInfo`: Set topic information
-  - `DartGetTopicInfoList`: Get topic information list
-  - and other community related functions
-- **number of lines**: about 15 lines (to be improved)
+- **Role**: Community / topics / permission groups (placeholder).
+- **Status**: Currently a placeholder (header include + empty `extern "C"` block); no community `Dart*` implemented yet.
+- **Lines**: ~14
 
 #### dart_compat_other.cpp
-- **RESPONSIBILITIES**: Other miscellaneous functions
-- **Status**: ⏳ To be improved (currently a placeholder file)
-- **Function to be implemented**:
-  - `DartCallExperimentalAPI`: Call experimental API
-  - `DartCheckAbility`: Check ability
-  - `DartSetOfflinePushToken`: Set offline push token
-  - `DartDoBackground`: Enter the background
-  - `DartDoForeground`: Enter the front desk
-  - and other miscellaneous functions
-- **number of lines**: about 15 lines (to be improved)
+- **Role**: Other miscellany — primarily `DartCallExperimentalAPI`.
+- **Status**: `DartCallExperimentalAPI` is **implemented** and handles `set_ui_platform`, `set_network_info`, `write_log`, and `is_commercial_ability_enabled`; other experimental operations fall through with a success return.
+- **Lines**: ~98
 
-### Main entry file
+### Entry-point file
 
 #### dart_compat_layer.cpp
-- **Responsibilities**: Main entry file, ensure all modules are linked
-- **Content**: Only includes the headers for each dart_compat_*.cpp and comments; no business logic; actual Dart* implementations live in the feature modules
-- **Number of lines**: 29 lines
+- **Role**: Historically the "main entry"; has degenerated into a documentary file — only comments and includes, no `Dart*` implementations.
+- **Lines**: 28
 
-## Module dependencies
+## Module dependency graph
 
 ```
-dart_compat_internal.h (shared header file)
+dart_compat_internal.h (shared header)
     ↑
     ├── dart_compat_utils.cpp
     ├── dart_compat_listeners.cpp
@@ -261,66 +96,66 @@ dart_compat_internal.h (shared header file)
     ├── dart_compat_group.cpp
     ├── dart_compat_user.cpp
     ├── dart_compat_signaling.cpp
-    ├── dart_compat_community.cpp
+    ├── dart_compat_community.cpp (placeholder)
     ├── dart_compat_other.cpp
-    └── dart_compat_layer.cpp (main entrance)
+    └── dart_compat_layer.cpp (comments only)
 ```
 
-## Code statistics| module | row count | status |
-|------|------|------|
-| dart_compat_internal.h | ~91 | ✅ Completed |
-| dart_compat_utils.cpp | ~300 | ✅ Completed |
-| dart_compat_listeners.cpp | ~1150 | ✅ Completed |
-| dart_compat_callbacks.cpp | ~590 | ✅ Completed |
-| dart_compat_sdk.cpp | ~200 | ✅ Completed |
-| dart_compat_message.cpp | ~1200 | ✅ Completed |
-| dart_compat_friendship.cpp | ~630 | ✅ Completed |
-| dart_compat_conversation.cpp | ~400 | ✅ Completed |
-| dart_compat_group.cpp | ~900 | ✅ Complete |
-| dart_compat_user.cpp | ~550 | ✅ Completed |
-| dart_compat_signaling.cpp | ~570 | ✅ Completed |
-| dart_compat_community.cpp | ~15 | ⏳ To be improved |
-| dart_compat_other.cpp | ~15 | ⏳ To be improved |
-| dart_compat_layer.cpp | 29 | ✅ Complete |
-| **Total** | **~6764** | **~92% Complete** |
+## Code stats (snapshot)
 
-## Modular advantages
+| Module | Lines | Status |
+|--------|-------|--------|
+| dart_compat_internal.h | ~157 | ✅ |
+| dart_compat_utils.cpp | ~576 | ✅ |
+| dart_compat_listeners.cpp | ~2800 | ✅ |
+| dart_compat_callbacks.cpp | ~965 | ✅ |
+| dart_compat_sdk.cpp | ~177 | ✅ |
+| dart_compat_message.cpp | ~1732 | ✅ |
+| dart_compat_friendship.cpp | ~934 | ✅ |
+| dart_compat_conversation.cpp | ~690 | ✅ |
+| dart_compat_group.cpp | ~1818 | ✅ |
+| dart_compat_user.cpp | ~765 | ✅ |
+| dart_compat_signaling.cpp | ~576 | ✅ |
+| dart_compat_community.cpp | ~14 | ⏳ placeholder |
+| dart_compat_other.cpp | ~98 | ✅ |
+| dart_compat_layer.cpp | 28 | ℹ️ comments only |
+| **Total** | **~11,330** | — |
 
-1. **Maintainability**: Each module focuses on a specific function, making the code clearer
-2. **Compilation efficiency**: To modify a single module, you only need to recompile the module
-3. **Code Organization**: Related functions are grouped together for easy search and modification.
-4. **Team collaboration**: Different developers can develop different modules in parallel
-5. **File size**: The largest module is about 1150 lines, which is much smaller than the original 3200+ lines.
-6. **Test Friendly**: Each module can be tested independently
+> Refresh: `wc -l ffi/dart_compat_*.{cpp,h}`
 
-## Development Guide
+## Benefits of modularization
 
-### Add new function
+1. **Maintainability**: Each module focuses on a specific surface.
+2. **Build speed**: Editing one module only recompiles that module.
+3. **Code organization**: Related `Dart*` symbols are grouped.
+4. **Team workflow**: Multiple developers can edit different modules without conflict.
+5. **Testability**: Each module can be exercised independently.
 
-1. **Determine module**: Determine which module should be added based on the function function
-2. **Add implementation**: Add function implementation in the corresponding module file
-3. **Make sure to export**: Function must be declared in `extern "C"` block
-4. **Update Document**: Update the function list of this document
+## Development guide
 
-### Modify existing functions
+### Adding a new function
 
-1. **Locate module**: Use grep or IDE to search to find the module where the function is located
-2. **Modify implementation**: Modify in the corresponding module file
-3. **Test Verification**: Make sure the modification does not affect other functions
+1. **Pick the module** by responsibility (and add it to the right `.cpp`).
+2. **Add the implementation** inside that file's `extern "C"` block.
+3. **Update the doc** — this file's module entry.
+4. **Stay binary-compatible with Dart**: the signature must match the patched `native_imsdk_bindings_generated.dart`. This is an ABI; changes must be made on both sides.
+5. **Writing style**: see [doc/api/API_REFERENCE_TEMPLATE.en.md](../api/API_REFERENCE_TEMPLATE.en.md).
 
-### Add new module
+### Modifying an existing function
 
-If you need to add new functional modules:
+1. **Find it**: `grep -rn 'Dart<Name>' ffi/dart_compat_*.cpp`.
+2. **Modify** in the relevant `.cpp`.
+3. **Verify**: `auto_tests/scenarios_binary/` is the regression suite for the binary-replacement path.
 
-1. Create new file `dart_compat_<module>.cpp`
-2. Contains `dart_compat_internal.h`
-3. Implement the function in the `extern "C"` block
-4. Add new files in `CMakeLists.txt`
-5. Update the comments of `dart_compat_layer.cpp`
+### Adding a new module
+
+1. Create `dart_compat_<module>.cpp` with `#include "dart_compat_internal.h"` and an `extern "C" { ... }` block.
+2. Add the new file to the source list in `ffi/CMakeLists.txt`.
+3. Note it in the `dart_compat_layer.cpp` comments.
 
 ## Related documents
 
-- [Tim2Tox FFI compatibility layer](FFI_COMPAT_LAYER.en.md) - Dart* function compatibility layer detailed description
-- [Tim2Tox Architecture](ARCHITECTURE.en.md) - Overall architecture design
-- [Development Guide](DEVELOPMENT_GUIDE.en.md) - Development Guide
-- [FFI Function Declaration Guide](FFI_FUNCTION_DECLARATION_GUIDE.en.md) - Function declaration specifications and checklist
+- [Tim2Tox FFI Compatibility Layer](FFI_COMPAT_LAYER.en.md)
+- [Tim2Tox Architecture](ARCHITECTURE.en.md)
+- [Development Guide](../development/DEVELOPMENT_GUIDE.en.md)
+- [FFI Function Declaration Guide](../development/FFI_FUNCTION_DECLARATION_GUIDE.en.md)

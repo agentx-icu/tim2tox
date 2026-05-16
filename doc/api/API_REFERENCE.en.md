@@ -41,68 +41,75 @@ class V2TIMBuffer {
 
 ### V2TIMMessage
 
-Message object.
+Message object. Only the most common fields are shown — see `include/V2TIMMessage.h:302` for the full definition.
 
 ```cpp
-struct V2TIMMessage {
+struct V2TIMMessage : V2TIMBaseObject {
     V2TIMString msgID;
-    int64_t timestamp;
+    int64_t     timestamp;
     V2TIMString sender;
-    V2TIMString userID;
-    V2TIMString groupID;
-    V2TIMElemVector elemList;
-    // ...
+    V2TIMString groupID;        // Group ID for group messages (empty for C2C)
+    V2TIMString userID;         // Peer account ID (C2C scenario)
+    V2TIMElemVector elemList;   // Message elements (text / image / file / custom)
+    // ...(status, isSelf, isRead, cloudCustomData, localCustomData, etc.)
 };
 ```
 
 ### V2TIMFriendInfo
 
-Friend information.
+Friend information (`include/V2TIMFriendship.h:249`). Note that `nickName` and `faceURL` are not top-level — they live inside the nested `userFullInfo` field.
 
 ```cpp
 struct V2TIMFriendInfo {
-    V2TIMString userID;
-    V2TIMString nickName;
-    V2TIMString faceURL;
-    V2TIMFriendType friendType;
-    // ...
+    V2TIMString        userID;            // Friend ID
+    V2TIMString        friendRemark;       // Friend remark (≤ 96 bytes)
+    uint64_t           friendAddTime;      // UTC timestamp when added
+    V2TIMCustomInfo    friendCustomInfo;
+    V2TIMStringVector  friendGroups;       // Friend group memberships
+    V2TIMUserFullInfo  userFullInfo;       // Nested: holds nickName / faceURL / etc.
+    uint32_t           modifyFlag;         // Bitwise V2TIMFriendInfoModifyFlag
 };
 ```
 
 ### V2TIMGroupInfo
 
-Group information.
+Group information (`include/V2TIMGroup.h:324`; note the actual field order is groupID → groupType → groupName).
 
 ```cpp
 struct V2TIMGroupInfo {
     V2TIMString groupID;
+    V2TIMString groupType;      // "group" (new API) or "conference" (old API)
     V2TIMString groupName;
-    V2TIMString groupType; // "group" (new API) or "conference" (old API)
-    V2TIMString notification; // Group announcement (only supported by Group type, corresponding to tox_group_topic)
+    V2TIMString notification;   // Group announcement (Group type only; maps to tox_group_topic)
     V2TIMString introduction;
-    // ...
+    // ...(faceURL, owner, createTime, memberCount, ...)
 };
 ```
 
-**V2TIMGroupMemberFullInfo**:
+**V2TIMGroupMemberFullInfo** (`include/V2TIMGroup.h:211`, inherits from `V2TIMGroupMemberInfo`):
+
 ```cpp
-struct V2TIMGroupMemberFullInfo {
-    V2TIMString userID;
-    V2TIMString nickName; // User nickname (obtained from friend information)
-    V2TIMString nameCard; // Group nickname (obtained from tox_group_peer_get_name, only supported by Group type)
-    uint32_t role; // Role: OWNER, ADMIN, MEMBER
-    // ...
+// Parent V2TIMGroupMemberInfo provides: userID / nickName / friendRemark / nameCard / faceURL / onlineDevices
+struct V2TIMGroupMemberFullInfo : public V2TIMGroupMemberInfo {
+    V2TIMCustomInfo customInfo;
+    uint32_t        role;        // V2TIM_GROUP_MEMBER_ROLE_{OWNER,ADMIN,MEMBER}
+    uint32_t        muteUntil;   // Mute-until timestamp
+    int64_t         joinTime;
+    bool            isOnline;
+    uint32_t        modifyFlag;
 };
 ```
+
+> tim2tox specifics: `nickName` is taken from friend info; `nameCard` comes from `tox_group_peer_get_name` and is only meaningful for Group-type groups.
 
 ## Callback Types
 
 ### V2TIMCallback
 
-Universal callback interface.
+Universal callback interface (`include/V2TIMCallback.h:34`). It is an abstract class — subclass it and override the two virtual methods; you cannot construct it directly from a pair of lambdas.
 
 ```cpp
-class V2TIMCallback {
+class V2TIMCallback : public V2TIMBaseCallback {
     virtual void OnSuccess() = 0;
     virtual void OnError(int error_code, const V2TIMString& error_message) = 0;
 };
@@ -110,11 +117,11 @@ class V2TIMCallback {
 
 ### V2TIMValueCallback
 
-Callback interface with return value.
+Callback with a typed result (`include/V2TIMCallback.h:59`).
 
 ```cpp
 template<class T>
-class V2TIMValueCallback {
+class V2TIMValueCallback : public V2TIMBaseCallback {
     virtual void OnSuccess(const T& value) = 0;
     virtual void OnError(int error_code, const V2TIMString& error_message) = 0;
 };
@@ -122,12 +129,11 @@ class V2TIMValueCallback {
 
 ### V2TIMSendCallback
 
-Message sending callback interface.
+Message-sending callback (`include/V2TIMCallback.h:101`, inherits from `V2TIMValueCallback<V2TIMMessage>` — so `OnSuccess(const V2TIMMessage&)` comes from the base).
 
 ```cpp
-class V2TIMSendCallback {
-    virtual void OnSuccess(const V2TIMMessage& message) = 0;
-    virtual void OnError(int error_code, const V2TIMString& error_message) = 0;
+class V2TIMSendCallback : public V2TIMValueCallback<V2TIMMessage> {
+    // OnSuccess(const V2TIMMessage&) and OnError(...) are inherited
     virtual void OnProgress(uint32_t progress) = 0;
 };
 ```
@@ -137,8 +143,8 @@ class V2TIMSendCallback {
 Common error codes are defined in `include/V2TIMErrorCode.h`:
 
 - `ERR_SUCC` (0): Success
+- `ERR_SDK_NOT_INITIALIZED` (6013): SDK not initialized
 - `ERR_INVALID_PARAMETERS` (6017): Invalid parameter
-- `ERR_SDK_NOT_INITIALIZED` (6018): SDK not initialized
 - `ERR_USER_SIG_EXPIRED` (6206): User signature expired
 - `ERR_SDK_COMM_API_CALL_FREQUENCY_LIMIT` (7008): API call frequency limit
 
@@ -146,36 +152,51 @@ Common error codes are defined in `include/V2TIMErrorCode.h`:
 
 ### C++ Usage Example
 
+`V2TIMCallback` / `V2TIMSendCallback` are abstract — subclass them to provide the overrides:
+
 ```cpp
 #include <V2TIMManager.h>
+
+class MyCallback : public V2TIMCallback {
+public:
+    void OnSuccess() override { /* success */ }
+    void OnError(int code, const V2TIMString& msg) override { /* failed */ }
+};
 
 int main() {
     // Initialize SDK
     V2TIMSDKConfig config;
     config.logLevel = V2TIM_LOG_DEBUG;
     V2TIMManager::GetInstance()->InitSDK(123456, config);
-    
+
     // Login
     V2TIMManager::GetInstance()->Login(
         V2TIMString("user123"),
         V2TIMString("userSig"),
-        new V2TIMCallback(
-            []() { /* Success */ },
-            [](int code, const V2TIMString& msg) { /* failed */ }
-        )
+        new MyCallback()
     );
-    
+
     // Send message
-    auto msgMgr = V2TIMManager::GetInstance()->GetMessageManager();
+    // Real signature (include/V2TIMMessageManager.h:235):
+    //   virtual V2TIMString SendMessage(V2TIMMessage& message,
+    //                                   const V2TIMString& receiver,
+    //                                   const V2TIMString& groupID,
+    //                                   V2TIMMessagePriority priority,
+    //                                   bool onlineUserOnly,
+    //                                   const V2TIMOfflinePushInfo& offlinePushInfo,
+    //                                   V2TIMSendCallback* callback) = 0;
+    auto* msgMgr = V2TIMManager::GetInstance()->GetMessageManager();
     V2TIMMessage msg = msgMgr->CreateTextMessage(V2TIMString("Hello"));
-    msgMgr->SendMessage(
+    V2TIMOfflinePushInfo emptyPushInfo;
+    V2TIMString msgID = msgMgr->SendMessage(
         msg,
-        V2TIMString("friend123"),
-        V2TIMConversationType::V2TIM_C2C,
+        /*receiver=*/V2TIMString("friend123"),
+        /*groupID=*/V2TIMString(),                       // empty for C2C
         V2TIMMessagePriority::V2TIM_PRIORITY_NORMAL,
-        new V2TIMSendCallback(/* ... */)
+        /*onlineUserOnly=*/false,
+        emptyPushInfo,
+        new MySendCallback()                              // your subclass
     );
-    
     return 0;
 }
 ```
@@ -185,27 +206,29 @@ int main() {
 ```dart
 import 'package:tim2tox_dart/tim2tox_dart.dart';
 
-// Create service
+// Create the service
 final ffiService = FfiChatService(
-  preferencesService: prefsAdapter,
+  preferencesService: prefsAdapter,           // ExtendedPreferencesService impl
   loggerService: loggerAdapter,
   bootstrapService: bootstrapAdapter,
 );
 
-// initialization
+// Initialize
 await ffiService.init();
 
 // Login
 await ffiService.login(userId: userID, userSig: userSig);
 
-// send message
-await ffiService.sendMessage(peerId, "Hello");
+// Send a C2C text message (note: the method is sendText, not sendMessage)
+await ffiService.sendText(peerId, "Hello");
 
 // Listen for messages
 ffiService.messages.listen((message) {
   print('Received: ${message.text}');
 });
 ```
+
+> The Platform path (`Tim2ToxSdkPlatform`) exposes V2TIM-style names (`sendMessage` etc.) — see [API_REFERENCE_DART.en.md](API_REFERENCE_DART.en.md). `FfiChatService` itself uses the direct lower-level names (`sendText` / `sendTyping` / `sendC2CCustom` / ...); don't confuse the two.
 
 ## Related documents
 

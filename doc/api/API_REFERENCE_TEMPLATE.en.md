@@ -2,7 +2,7 @@
 
 > Language: [Chinese](API_REFERENCE_TEMPLATE.md) | [English](API_REFERENCE_TEMPLATE.en.md)
 
-This document defines the writing rules for Tim2Tox API reference entries, used when maintaining [API_REFERENCE.md](API_REFERENCE.en.md) or module-split API docs. Each API entry must include the required fields and clearly distinguish **client-facing APIs** from **internal maintenance APIs**, and **stable interfaces** from **implementation details**.
+This document defines the writing rules for Tim2Tox API reference entries, used when maintaining [API_REFERENCE.en.md](API_REFERENCE.en.md) or module-split API docs. Each API entry must include the required fields and clearly distinguish **client-facing APIs** from **internal maintenance APIs**, and **stable interfaces** from **implementation details**.
 
 ---
 

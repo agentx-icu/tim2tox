@@ -85,34 +85,30 @@ tim2tox/
 
 提供 C 接口，供 Dart FFI 调用。
 
-- **tim2tox_ffi.h/cpp**: 主要 FFI 接口
-- **dart_compat_layer.h/cpp**: Dart* 函数兼容层主入口（已模块化）
-- **dart_compat_internal.h**: 共享声明和前置声明
-- **模块化实现**（13个模块文件）:
-  - `dart_compat_utils.cpp`: 工具函数和全局变量
-  - `dart_compat_listeners.cpp`: 监听器实现和回调注册
-  - `dart_compat_callbacks.cpp`: 回调类实现
-  - `dart_compat_sdk.cpp`: SDK初始化和认证
-  - `dart_compat_message.cpp`: 消息相关功能
-  - `dart_compat_friendship.cpp`: 好友相关功能
-  - `dart_compat_conversation.cpp`: 会话相关功能
-  - `dart_compat_group.cpp`: 群组相关功能
-  - `dart_compat_user.cpp`: 用户相关功能
-  - `dart_compat_signaling.cpp`: 信令相关功能
-  - `dart_compat_community.cpp`: 社区相关功能
+- **tim2tox_ffi.h / tim2tox_ffi.cpp**：Platform 路径的高层 C API（`tim2tox_ffi_*`）
+- **dart_compat_layer.cpp**：Binary Replacement 路径兼容层的"主入口"，模块化后只剩注释（28 行）
+- **dart_compat_internal.h**：共享声明和前置声明
+- **callback_bridge.h / callback_bridge.cpp**：回调桥接（`SendCallbackToDart` / `DartInitDartApiDL` / `DartRegisterSendPort`）
+- **json_parser.h / json_parser.cpp**：JSON 消息构建与解析
+- **`Dart*` 兼容层（12 个功能模块）**：
+  - `dart_compat_utils.cpp` — 工具函数与全局变量
+  - `dart_compat_listeners.cpp` — Listener 实现与回调注册
+  - `dart_compat_callbacks.cpp` — 回调类实现
+  - `dart_compat_sdk.cpp` — SDK 初始化与认证
+  - `dart_compat_message.cpp` — 消息相关
+  - `dart_compat_friendship.cpp` — 好友相关
+  - `dart_compat_conversation.cpp` — 会话相关
+  - `dart_compat_group.cpp` — 群组相关
+  - `dart_compat_user.cpp` — 用户相关
+  - `dart_compat_signaling.cpp` — 信令相关
+  - `dart_compat_community.cpp` — 社区相关（占位）
+  - `dart_compat_other.cpp` — 其他杂项（`DartCallExperimentalAPI`）
+
+每个模块的当前规模与职责见 [MODULARIZATION.md](../architecture/MODULARIZATION.md)。
 
 ### 功能文档
 
-- [ARCHITECTURE.md](../architecture/ARCHITECTURE.md) - Tim2Tox 架构（包含群聊实现说明）
-  - 群聊实现（Group vs Conference API）
-  - 映射关系管理
-  - 恢复机制
-  - 回调机制
-  - 错误处理
-  - 性能优化
-  - `dart_compat_other.cpp`: 其他杂项功能
-- **callback_bridge.h/cpp**: 回调桥接机制
-- **json_parser.h/cpp**: JSON 消息构建和解析
+- [ARCHITECTURE.md](../architecture/ARCHITECTURE.md) — Tim2Tox 架构（包含群聊实现说明，覆盖 Group vs Conference API、映射关系管理、恢复机制、回调机制、错误处理、性能优化）
 
 详细说明请参考 [模块化文档](../architecture/MODULARIZATION.md)。
 

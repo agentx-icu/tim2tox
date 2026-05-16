@@ -138,14 +138,14 @@ Tim2Tox 支持**二进制替换**（最少改业务、仅换库）与 **Platform
 
 > 详细构建选项、脚本说明与故障排除请统一参考 [README_BUILD.md](README_BUILD.md)。
 
-1. **构建 C++ / FFI 库（推荐）**
+1. **构建 C++ / FFI 库（推荐，增量编译）**
 
 ```bash
-cd tim2tox
+# 从仓库根目录执行（在 toxee 中是 third_party/tim2tox/）
 ./build_ffi.sh
 ```
 
-产物示例：`build/ffi/libtim2tox_ffi.dylib`（macOS）、`build/source/libtim2tox.a`。
+产物：`build/ffi/libtim2tox_ffi.dylib`（macOS） / `build/ffi/libtim2tox_ffi.so`（Linux）。注意：`build/source/libtim2tox.a` **不是** `build_ffi.sh` 的产物 —— 它由 `bash build.sh` 生成（详见 [README_BUILD.md](README_BUILD.md)）。
 
 2. **Dart 包**
 
@@ -157,7 +157,7 @@ flutter pub get
 3. **验证**
 
 - 在依赖本库的 Flutter 工程中引用 `tim2tox_dart`（path 或 发布包），执行 `flutter run` 并完成一次 init → login → 发消息。
-- 或运行自动化测试：`cd auto_tests && ./run_all_tests.sh`（需先构建 FFI 库）。
+- 或运行自动化测试：`cd auto_tests && ./run_tests_ordered.sh`（需先构建 FFI 库；`run_all_tests.sh` 是其兼容入口）。详见 [auto_tests/README.md](auto_tests/README.md)。
 
 ---
 

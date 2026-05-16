@@ -27,7 +27,7 @@
 
 1. **Dependency**: Add `tim2tox_dart` to the client’s `pubspec.yaml` (path to this repo’s `dart` or a published version).
 2. **Binary replacement (optional)**: At the very start of `main()`, call `setNativeLibraryName('tim2tox_ffi')` and ensure the app can load `libtim2tox_ffi` (build output must be in the right place for your project).
-3. **Interfaces and FfiChatService**: Implement `ExtendedPreferencesService`, `LoggerService`, `BootstrapService`, etc. (see [dart/lib/interfaces/](../dart/lib/interfaces/)), construct `FfiChatService`, and `await ffiService.init()`.
+3. **Interfaces and FfiChatService**: Implement `ExtendedPreferencesService`, `LoggerService`, `BootstrapService`, etc. (see [`dart/lib/interfaces/`](../../dart/lib/interfaces/) and [API_REFERENCE_DART.en.md](../api/API_REFERENCE_DART.en.md)), construct `FfiChatService`, and `await ffiService.init()`.
 4. **Platform (if used)**: `TencentCloudChatSdkPlatform.instance = Tim2ToxSdkPlatform(ffiService: ffiService, ...)`.
 5. **UIKit**: Use Tencent Cloud Chat UIKit as usual; login, send message, conversation list, etc. will go through Tim2Tox to Tox.
 
@@ -38,7 +38,7 @@
 ## Further reading
 
 - [BINARY_REPLACEMENT.en.md](../architecture/BINARY_REPLACEMENT.en.md) — Binary replacement design and call chain
-- [dart/README.md](../../dart/README.md) — Dart package structure and minimal usage
+- [API_REFERENCE_DART.en.md](../api/API_REFERENCE_DART.en.md) — Dart package API (FfiChatService / Tim2ToxSdkPlatform / interfaces)
 - [BOOTSTRAP_AND_POLLING.en.md](BOOTSTRAP_AND_POLLING.en.md) — Bootstrap nodes and polling (if doing network/startup config)
 - [ARCHITECTURE.en.md](../architecture/ARCHITECTURE.en.md) §10 — Relationship with the integrating client
-- [README_BUILD.md](../../README_BUILD.md) — Build outputs and scripts
+- [README_BUILD.en.md](../../README_BUILD.en.md) — Build outputs and scripts

@@ -1,157 +1,128 @@
-# Echo Bot 测试客户端使用说明
+# Echo Bot 客户端使用说明
+> 语言 / Language: [中文](CLIENT_USAGE.md) | [English](CLIENT_USAGE.en.md)
 
-## 概述
+这里有**两个**客户端二进制，UX 完全不同：
 
-`echo_bot_client.c` 是一个简单的 Tox 客户端，用于测试 `echo_bot_server.c` 的功能。客户端可以连接到 echo bot 服务器，发送消息并接收回显。
+| 二进制 | 模式 | 用途 |
+|--------|------|------|
+| `echo_bot_client` (`echo_bot_client.cpp`) | **非交互**，只接受 `--auto <user_id> <message> [--extended]` | 一次性跑"加好友 → 等上线 → 发送 → 校验回显"，主要给脚本和 CI 用 |
+| `tim2tox_client` (`tim2tox_client.cpp`) | **交互**，REPL 命令 `connect / send / status / help / quit` | 手工调试。仅当主项目已生成 `../build/source/libtim2tox.a` 时才会被构建 |
+
+> 旧版本说明文档曾把 `echo_bot_client` 描述为带 `add / send / status / friends / help / quit` 命令的交互式 C 客户端 —— 那是误植。当前代码不是 C，也不是交互模式。
 
 ## 编译
 
 ```bash
-cd tim2tox/example
-mkdir -p build
-cd build
-cmake ..
-make
+# 1. 主项目（可选，只为产出 tim2tox_client 需要的 libtim2tox.a）
+cd ..
+./build.sh
+
+# 2. 示例
+cd example
+./build_examples.sh
 ```
 
-这将生成两个可执行文件：
-- `echo_bot_server` - Echo Bot 服务器
-- `echo_bot_client` - Echo Bot 测试客户端
+成功后 `example/build/` 下会有 `echo_bot_server` / `echo_bot_client`，以及（如果 `libtim2tox.a` 存在）`tim2tox_client`。
 
-## 使用方法
+## 使用 — `echo_bot_server` + `echo_bot_client --auto`
 
-### 1. 启动 Echo Bot 服务器
+### 1. 启动 Echo Bot 服务端
 
 ```bash
+cd example/build
 ./echo_bot_server
 ```
 
-服务器启动后会显示：
+启动后会打印（节选自 `echo_bot_server.cpp:118-122`）：
+
 ```
 === Echo Bot Server ===
-Tox ID: [服务器的 Tox ID]
+User ID: <64-char hex user id>
 Status: Echoing your messages
 =======================
 Server starting...
 Press Ctrl+C to stop
 ```
 
-**重要：** 记录下服务器显示的 Tox ID，客户端需要用它来连接。
+记下 `User ID:` 后那串十六进制串。
 
-### 2. 启动测试客户端
+### 2. 跑 `echo_bot_client --auto`
 
 ```bash
-./echo_bot_client
+cd example/build
+./echo_bot_client --auto <server_user_id> "ping"
+./echo_bot_client --auto <server_user_id> "ping" --extended   # 加跑 Unicode / 长文本 / Burst 验证
 ```
 
-客户端启动后会显示：
-```
-=== Echo Bot Client ===
-Tox ID: [客户端的 Tox ID]
-Status: Ready to test echo server
-=======================
-Client starting...
+也可以通过环境变量跳过 extended 套件：
 
-=== Commands ===
-add <tox_id> - Add friend by Tox ID
-send <message> - Send message to friend
-status - Show connection status
-friends - List friends
-help - Show this help
-quit/exit - Exit client
-=================
+```bash
+TIM2TOX_SKIP_EXTENDED=1 ./echo_bot_client --auto <server_user_id> "ping"
 ```
 
-### 3. 连接和测试
+执行流程（见 `echo_bot_client.cpp:124-229`）：
 
-#### 步骤 1：添加服务器为好友
-```
-add [服务器的 Tox ID]
-```
+1. 等本地客户端在 120 秒内上线（`wait_connected`）。
+2. `AddFriend`，自动接受由服务端那边处理。
+3. 等服务端这一侧也"上线"（V2TIM SDK `OnUserStatusChanged`）。
+4. 用 `SendC2CTextMessage` 发送 `<message>`，**重试最多 60 秒**直到 send 成功。
+5. 等 60 秒内收到对端原样回显。
+6. 如开启 extended：再跑 Unicode、长文本（1350 字节，靠近 Tox 文本单包上限）、5 条 burst。
 
-例如：
-```
-add F404ABAA1C99A9D37D61AB54898F56793E1DEF8BD46B1038B9D822E8460FAB67
-```
+退出码：
 
-#### 步骤 2：等待连接建立
-客户端会自动显示连接状态：
-```
-Client: Online (UDP)
-Friend request sent to Tox ID: [服务器 Tox ID] (friend number: 0)
-Friend 0 is online (UDP)
-Auto-selected friend 0 for messaging
-```
+| code | 含义 |
+|------|------|
+| 0 | 全部成功 |
+| 2 | 客户端未在 120 秒内上线 |
+| 6 | 基础消息未在 60 秒内收到回显 |
+| 7 | extended Unicode 失败 |
+| 9 | extended 长文本失败 |
+| 10 | extended Burst 失败 |
 
-#### 步骤 3：发送测试消息
-```
-Hello World!
-```
+## 使用 — `tim2tox_client`（交互模式）
 
-或者使用 send 命令：
-```
-send Hello World!
+```bash
+cd example/build
+./tim2tox_client <server_user_id>
 ```
 
-#### 步骤 4：查看回显
-客户端会显示：
-```
-Message sent to friend 0: Hello World! (message ID: 1)
-Echo received from friend 0: Hello World!
-```
+REPL 命令：
 
-### 4. 其他命令
+- `connect` — 发送好友请求
+- `send <message>` — 发送消息
+- `status` — 查看连接状态 / 好友列表
+- `help` — 帮助
+- `quit` / `exit` — 退出
 
-- `status` - 查看连接状态和好友列表
-- `friends` - 显示好友列表
-- `help` - 显示帮助信息
-- `quit` 或 `exit` - 退出客户端
+也可以直接键入文本，会按"普通消息"语义发送。
 
 ## 测试场景
 
-### 基本回显测试
-1. 发送文本消息，验证是否收到相同的回显
-2. 发送多行消息
-3. 发送特殊字符和表情符号
-
-### 连接测试
-1. 测试 TCP 和 UDP 连接
-2. 测试断线重连
-3. 测试多个客户端同时连接
-
-### 错误处理测试
-1. 发送空消息
-2. 发送超长消息
-3. 网络中断恢复
+- **基本回显**：`echo_bot_client --auto ... "hello"`，期望 60 秒内收回 `hello`。
+- **Unicode**：`--extended` 时自动验证 `"Hello/你好/Привет/😀"`。
+- **长文本**：`--extended` 时自动构造 1350 字节 `'L'` 测包，验证接近上限的分片不丢。
+- **连续消息**：`--extended` 时连发 5 条 `burst_<i>_<unix_ts>` 校验顺序。
 
 ## 故障排除
 
-### 连接问题
-- 确保服务器和客户端都连接到 Tox 网络
-- 检查防火墙设置
-- 验证 Tox ID 格式正确（64个十六进制字符）
+- **客户端 120 秒没连上网**：检查 Bootstrap 节点 / 防火墙；先用 `tim2tox_client` 交互模式 + `status` 命令观察。
+- **消息一直 send fail**：通常是服务端还没接受好友 —— `echo_bot_client` 已经做了 60 秒重试，仍失败说明对端没起来。
+- **收不到回显**：服务端是否打印了 `Echoing ...` 之类的日志？检查 `simpleListener::OnRecvC2CTextMessage` 是否被命中。
+- **编译跳过 `tim2tox_client`**：先 `bash ../build.sh` 产出 `../build/source/libtim2tox.a`。
+- **`libsodium` / `openssl` 找不到**：macOS 安装 `brew install libsodium openssl`；Linux 安装 `libsodium-dev` / `libssl-dev`。
 
-### 消息问题
-- 确保好友连接状态为在线
-- 检查消息长度限制
-- 验证网络连接稳定性
+## 相关文件
 
-### 编译问题
-- 确保已安装 libsodium
-- 检查 CMake 和编译器版本
-- 验证 toxcore 库路径正确
-
-## 文件说明
-
-- `echo_bot_server.c` - Echo Bot 服务器实现
-- `echo_bot_client.c` - Echo Bot 测试客户端实现
-- `echo_bot_savedata.tox` - 服务器保存数据文件
-- `echo_bot_client_savedata.tox` - 客户端保存数据文件
+- `echo_bot_server.cpp` — 服务端实现
+- `echo_bot_client.cpp` — 非交互客户端
+- `tim2tox_client.cpp` — 交互客户端
+- `test_echo.sh` — server + client 一体化烟雾测试
+- `build_examples.sh` — 构建包装脚本
 
 ## 注意事项
 
-1. 首次运行需要时间连接到 Tox 网络
-2. 保存数据文件用于保持 Tox ID 和好友列表
-3. 服务器会自动接受所有好友请求
-4. 客户端会自动选择第一个好友进行消息发送
-5. 使用 Ctrl+C 安全退出程序
+1. 首次连接 Tox 网络可能要数十秒。
+2. Tox profile（savedata）由 `V2TIMManager::GetInstance()->InitSDK(...)` 隐式管理，**默认实现没有显式写 `.tox` 文件**，除非通过 `tim2tox_ffi_init_with_path(...)` / `V2TIMSDKConfig.initPath` 指定持久化目录。旧文档提到的 `echo_bot_savedata.tox` / `echo_bot_client_savedata.tox` 在当前实现中**不一定存在**。
+3. 服务端通过 `V2TIMFriendshipListener` 默认接受全部好友请求。
+4. 用 Ctrl+C 退出；进程会调 `UnInitSDK`。

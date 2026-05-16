@@ -23,24 +23,26 @@ Tim2Tox 需要持久化以下信息以确保客户端重启后能正确恢复群
 
 **存储时机**: 创建群组时
 
-**存储方式**:
+**存储方式**：
 ```cpp
-// C++ 层
-extern int tim2tox_ffi_set_group_type(const char* group_id, const char* group_type);
-tim2tox_ffi_set_group_type(groupID, "group");  // 或 "conference"
-
-// Dart 层（通过回调）
-case "groupTypeStored":
-    await preferencesService.setGroupType(groupId, groupType);
-    break;
+// C++ 侧（多实例：首参是 int64_t instance_id；生产单例传 0）
+extern "C" int tim2tox_ffi_set_group_type(int64_t instance_id,
+                                          const char* group_id,
+                                          const char* group_type);
+tim2tox_ffi_set_group_type(/*instance=*/0, groupID, "group");  // 或 "conference"
 ```
 
-**读取方式**:
+Dart 侧：当前 `Tim2ToxSdkPlatform` 的 customCallback 默认会消费 `groupChatIdStored`、`clearHistoryMessage`、`groupQuitNotification` 三种事件；`groupType` 的持久化在 C++ 侧已**直接**写入 `ExtendedPreferencesService.setGroupType(...)`（通过注入的接口），不需要单独的 Dart-side `case "groupTypeStored"`。
+
+**读取方式**：
 ```cpp
-// C++ 层
-extern int tim2tox_ffi_get_group_type_from_storage(const char* group_id, char* out_group_type, int out_len);
+extern "C" int tim2tox_ffi_get_group_type_from_storage(int64_t instance_id,
+                                                       const char* group_id,
+                                                       char* out_group_type,
+                                                       int out_len);
 char stored_type[16];
-if (tim2tox_ffi_get_group_type_from_storage(group_id, stored_type, sizeof(stored_type)) == 1) {
+if (tim2tox_ffi_get_group_type_from_storage(/*instance=*/0, group_id,
+                                            stored_type, sizeof(stored_type)) == 1) {
     std::string group_type = std::string(stored_type);
 }
 ```
@@ -53,24 +55,29 @@ if (tim2tox_ffi_get_group_type_from_storage(group_id, stored_type, sizeof(stored
 
 **存储时机**: 创建或加入 Group 类型群组时
 
-**存储方式**:
+**存储方式**：
 ```cpp
-// C++ 层
-extern int tim2tox_ffi_set_group_chat_id(const char* group_id, const char* chat_id);
-tim2tox_ffi_set_group_chat_id(groupID, chat_id_hex);
+extern "C" int tim2tox_ffi_set_group_chat_id(int64_t instance_id,
+                                             const char* group_id,
+                                             const char* chat_id);
+tim2tox_ffi_set_group_chat_id(/*instance=*/0, groupID, chat_id_hex);
 
-// Dart 层（通过回调）
+// Dart 侧：Tim2ToxSdkPlatform 的 customCallback 处理 "groupChatIdStored"
+// （tim2tox_sdk_platform.dart）
 case "groupChatIdStored":
     await preferencesService.setGroupChatId(groupId, chatId);
     break;
 ```
 
-**读取方式**:
+**读取方式**：
 ```cpp
-// C++ 层
-extern int tim2tox_ffi_get_group_chat_id_from_storage(const char* group_id, char* out_chat_id, int out_len);
+extern "C" int tim2tox_ffi_get_group_chat_id_from_storage(int64_t instance_id,
+                                                          const char* group_id,
+                                                          char* out_chat_id,
+                                                          int out_len);
 char stored_chat_id[65];
-if (tim2tox_ffi_get_group_chat_id_from_storage(group_id, stored_chat_id, sizeof(stored_chat_id)) == 1) {
+if (tim2tox_ffi_get_group_chat_id_from_storage(/*instance=*/0, group_id,
+                                               stored_chat_id, sizeof(stored_chat_id)) == 1) {
     // 使用 stored_chat_id
 }
 ```
@@ -275,6 +282,6 @@ RejoinKnownGroups: Matched conference_number=<number> to groupID=<group_id>
 
 ## 相关文档
 
-- [ARCHITECTURE.md](./ARCHITECTURE.md) - Tim2Tox 架构（包含群聊实现说明）
+- [ARCHITECTURE.md](../architecture/ARCHITECTURE.md) - Tim2Tox 架构（包含群聊实现说明）
 - [API_REFERENCE.md](../api/API_REFERENCE.md) - API 参考文档
 - 客户端群聊功能与 UI 说明见各客户端项目文档（当 Tim2Tox 作为 submodule 使用时，常见于上层仓库的 doc）。

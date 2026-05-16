@@ -1,9 +1,11 @@
 # `running_` 标志问题详细分析
 
-> **归档说明（历史调查）**：本文为一次针对测试/日志现象的排障分析，用于定位“成员变量值与 getter 返回不一致”的成因。
+> **🗄 历史调查 / Chinese only / Historical investigation** — 本文档为一次针对测试/日志现象的排障分析（"成员变量值与 getter 返回不一致"成因定位），中文-only，无对应英文版本。
 >
-> - **是否仍适用**：待确认（请以当前代码与测试日志为准）。
-> - **建议入口**：若你在跑测试或排查 SDK 初始化/回调时序问题，先读 [auto_tests/README.md](../../auto_tests/README.md) 与 [ARCHITECTURE.md](../ARCHITECTURE.md) 的回调与轮询章节，再回看本文。
+> - **是否仍适用**：待确认 —— 请以当前 `source/V2TIMManagerImpl.{h,cpp}` 实现与最近测试日志为准。
+> - **建议入口**：若你在跑测试或排查 SDK 初始化/回调时序问题，先读 [auto_tests/README.md](../../auto_tests/README.md) 与 [ARCHITECTURE.md](../architecture/ARCHITECTURE.md) 的回调与轮询章节，再回看本文。
+> - **English readers**: this is a frozen Chinese-only investigation note kept for historical reference; the architecture / behavior changes it describes have likely been superseded.
+
 ## 问题现象
 
 从测试日志中观察到以下异常现象：

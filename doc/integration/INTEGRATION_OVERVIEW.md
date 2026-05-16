@@ -27,7 +27,7 @@
 
 1. **依赖**：在客户端 `pubspec.yaml` 中增加 `tim2tox_dart`（path 指向本仓库 `dart` 或使用发布版本）。
 2. **二进制替换（可选）**：在 `main()` 最早处调用 `setNativeLibraryName('tim2tox_ffi')`，并确保 App 能加载到 `libtim2tox_ffi`（构建产物需放入工程指定位置）。
-3. **接口与 FfiChatService**：实现 `ExtendedPreferencesService`、`LoggerService`、`BootstrapService` 等（见 [dart/lib/interfaces/](../dart/lib/interfaces/)），构造 `FfiChatService` 并 `await ffiService.init()`。
+3. **接口与 FfiChatService**：实现 `ExtendedPreferencesService`、`LoggerService`、`BootstrapService` 等（见 [`dart/lib/interfaces/`](../../dart/lib/interfaces/) 目录与 [API_REFERENCE_DART.md](../api/API_REFERENCE_DART.md)），构造 `FfiChatService` 并 `await ffiService.init()`。
 4. **Platform（若用）**：`TencentCloudChatSdkPlatform.instance = Tim2ToxSdkPlatform(ffiService: ffiService, ...)`。
 5. **UIKit**：按原有方式使用 Tencent Cloud Chat UIKit，登录、发消息、会话列表等会经 Tim2Tox 落到 Tox。
 
@@ -38,7 +38,7 @@
 ## 延伸阅读
 
 - [BINARY_REPLACEMENT.md](../architecture/BINARY_REPLACEMENT.md) — 二进制替换原理、配置方式与调用链路
-- [dart/README.md](../../dart/README.md) — Dart 包结构与最小用法
+- [API_REFERENCE_DART.md](../api/API_REFERENCE_DART.md) — Dart 包 API（FfiChatService / Tim2ToxSdkPlatform / 接口）
 - [BOOTSTRAP_AND_POLLING.md](BOOTSTRAP_AND_POLLING.md) — Bootstrap 节点与轮询（若做联网/启动配置）
 - [ARCHITECTURE.md](../architecture/ARCHITECTURE.md) §10 — 与接入客户端的关系
 - [README_BUILD.md](../../README_BUILD.md) — 构建产物与脚本

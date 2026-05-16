@@ -59,30 +59,38 @@ setNativeLibraryName('tim2tox_ffi');
 
 ### 2. 函数签名完全匹配
 
-**关键文件**: `tim2tox/ffi/dart_compat_layer.cpp`
+**关键文件**：`ffi/dart_compat_*.cpp`（注意：原来的 `dart_compat_layer.cpp` 已模块化为 13 个 `.cpp`，自身仅剩 28 行注释，无业务实现）
 
-所有 Dart* 函数的签名必须与 `native_imsdk_bindings_generated.dart` 中定义的完全一致：
+所有 `Dart*` 函数的签名必须与 `native_imsdk_bindings_generated.dart` 中声明的完全一致：
 
 ```cpp
-// 示例：DartInitSDK 函数
+// 真实签名（见 ffi/dart_compat_sdk.cpp:9）
 extern "C" {
-    int DartInitSDK(const char* json_init_param, void* user_data) {
-        // 1. 解析 JSON 参数
-        std::string json_str(json_init_param);
-        std::string sdk_app_id_str = ExtractJsonValue(json_str, "sdk_config_sdk_app_id");
-        // ...
-        
-        // 2. 调用 V2TIM SDK API
-        V2TIMManager::GetInstance()->InitSDK(sdkAppID, config);
-        
-        // 3. 通过回调返回结果
-        SendApiCallbackResult(user_data, 0, "OK");
-        return 0;
+    int DartInitSDK(uint64_t sdk_app_id, const char* json_sdk_config) {
+        std::string config_str = json_sdk_config ? std::string(json_sdk_config) : "{}";
+        std::string init_path = ExtractJsonValue(config_str, "sdk_config_config_file_path");
+        std::string log_path  = ExtractJsonValue(config_str, "sdk_config_log_file_path");
+
+        V2TIMSDKConfig sdk_config;
+        if (!init_path.empty()) sdk_config.initPath = V2TIMString(init_path.c_str());
+        if (!log_path.empty())  sdk_config.logPath  = V2TIMString(log_path.c_str());
+        sdk_config.logLevel = static_cast<V2TIMLogLevel>(
+            ExtractJsonInt(config_str, "sdk_config_log_level", /*default*/ 3, /*silent*/ true));
+
+        // Dart 端用 uint64_t，V2TIM::InitSDK 期望 uint32_t —— 显式裁剪
+        bool ok = SafeGetV2TIMManager()->InitSDK(static_cast<uint32_t>(sdk_app_id), sdk_config);
+        return ok ? 0 : 1; // 0 = TIM_SUCC
     }
 }
 ```
 
-**函数签名来源**: `native_imsdk_bindings_generated.dart` 是通过 `ffigen` 从原生 SDK 的头文件自动生成的，确保签名完全匹配。
+注意几点：
+
+- **真实签名是 `(uint64_t, const char*)`**，没有 `user_data` 参数。
+- 返回 `0 = success / 1 = failure`，符合 V2TIM `TIM_SUCC = 0` 的约定 —— 这与 `tim2tox_ffi_*` 那组 C API（`1 = success`）相反，是历史 ABI 差异。
+- `sdk_app_id` 通过 JSON 不是直接进入函数 —— 与某些早期文档不同。
+
+**函数签名来源**：`native_imsdk_bindings_generated.dart` 由 `ffigen` 从原生 SDK 头文件生成。tim2tox patches 后的 SDK 必须与 tim2tox 的实现保持二进制一致。
 
 ### 3. FFI 动态符号查找
 
@@ -115,19 +123,29 @@ class NativeImsdkBindings {
 C++ 层通过 `Dart_PostCObject_DL` 将事件发送回 Dart 层：
 
 ```cpp
+// 真实实现见 ffi/callback_bridge.cpp
 void SendCallbackToDart(const char* callback_type, const std::string& json_data, void* user_data) {
-    // 1. 构建 JSON 消息
-    std::string message = json_data; // 已包含 "callback" 字段
-    
-    // 2. 创建 Dart_CObject
+    std::lock_guard<std::mutex> lock(g_dart_port_mutex);
+    if (!g_dart_api_initialized || g_dart_port == ILLEGAL_PORT) return;
+
+    if (json_data.size() > 1 * 1024 * 1024) {       // 1MB 上限
+        V2TIM_LOG(kError, "message too large: {}", json_data.size());
+        return;
+    }
+
+    char* buf = static_cast<char*>(malloc(json_data.size() + 1));
+    if (!buf) return;
+    std::memcpy(buf, json_data.data(), json_data.size());
+    buf[json_data.size()] = '\0';
+
     Dart_CObject cobj;
     cobj.type = Dart_CObject_kString;
-    char* message_cstr = static_cast<char*>(malloc(message.length() + 1));
-    std::memcpy(message_cstr, message.c_str(), message.length());
-    cobj.value.as_string = message_cstr;
-    
-    // 3. 发送到 Dart 层
-    Dart_PostCObject_DL(g_dart_port, &cobj);
+    cobj.value.as_string = buf;
+
+    if (!Dart_PostCObject_DL(g_dart_port, &cobj)) {
+        free(buf);                                   // 投递失败时由调用方释放
+    }
+    // 成功后由 Dart 接收方负责释放
 }
 ```
 
@@ -147,7 +165,7 @@ NativeLibraryManager.bindings.DartInitSDK(...)
   ↓
 FFI 动态查找符号 'DartInitSDK' (在 libtim2tox_ffi.dylib 中)
   ↓
-C++ 层 (dart_compat_layer.cpp::DartInitSDK)
+C++ 层 (ffi/dart_compat_sdk.cpp::DartInitSDK)
   ↓
 解析 JSON 参数 (json_parser.cpp)
   ↓
@@ -173,7 +191,7 @@ Dart 层 (TIMMessageManager.sendMessage)
   ↓
 NativeLibraryManager.bindings.DartSendMessage(...)
   ↓
-C++ 层 (dart_compat_layer.cpp::DartSendMessage)
+C++ 层 (ffi/dart_compat_message.cpp::DartSendMessage)
   ↓
 V2TIMMessageManagerImpl::SendMessage(...)
   ↓
@@ -214,33 +232,33 @@ NativeLibraryManager._handleGlobalCallback()
 
 ## 关键组件
 
-### 1. dart_compat_layer.cpp/h
+### 1. dart_compat_*.cpp（拆分后的 `Dart*` 实现）
 
-**位置**: `tim2tox/ffi/dart_compat_layer.cpp`
+**位置**：`ffi/dart_compat_{sdk,message,friendship,conversation,group,user,signaling,community,other,listeners,callbacks,utils}.cpp`，以及说明性的 `ffi/dart_compat_layer.cpp`（仅 28 行注释）。
 
-**职责**: 实现所有 Dart* 函数，提供与原生 SDK 完全兼容的接口。
+**职责**：实现所有 `Dart*` 函数，提供与原生 SDK 完全兼容的 ABI 表面。
 
-**主要函数**:
-- `DartInitSDK`: SDK 初始化
-- `DartLogin`: 用户登录
-- `DartSendMessage`: 发送消息
-- `DartGetConversationList`: 获取会话列表
-- `DartGetFriendList`: 获取好友列表
-- 等等...
+**主要函数（节选）**：
+- `DartInitSDK`（`dart_compat_sdk.cpp`）：SDK 初始化
+- `DartLogin`（`dart_compat_sdk.cpp`）：用户登录
+- `DartSendMessage`（`dart_compat_message.cpp`）：发送消息
+- `DartGetConversationList`（`dart_compat_conversation.cpp`）：获取会话列表
+- `DartGetFriendList`（`dart_compat_friendship.cpp`）：获取好友列表
 
-**实现模式**:
+完整模块职责与行数清单见 [MODULARIZATION.md](MODULARIZATION.md)。
+
+**典型实现模式**：
 ```cpp
 int DartXXX(const char* json_param, void* user_data) {
-    // 1. 解析 JSON 参数
-    std::string json_str(json_param);
-    std::string field1 = ExtractJsonValue(json_str, "field1");
-    
-    // 2. 调用 V2TIM SDK API
+    std::string json_str = json_param ? json_param : "";
+    std::string field1   = ExtractJsonValue(json_str, "field1");
+
+    // 1. 调用 V2TIM SDK API
     V2TIMManager::GetInstance()->GetXXXManager()->XXX(...);
-    
-    // 3. 通过回调返回结果（异步）
-    SendApiCallbackResult(user_data, code, desc);
-    return 0;
+
+    // 2. 通过回调返回结果（异步）
+    SendApiCallbackResult(user_data, /*code=*/0, /*desc=*/"OK");
+    return 0; // TIM_SUCC
 }
 ```
 
@@ -269,7 +287,7 @@ int DartXXX(const char* json_param, void* user_data) {
 
 ### 4. Listener 实现
 
-**位置**: `tim2tox/ffi/dart_compat_layer.cpp`
+**位置**：`ffi/dart_compat_listeners.cpp`
 
 **职责**: 实现 V2TIM Listener 接口，将 Tox 事件转换为 JSON 消息。
 
@@ -389,7 +407,7 @@ c-toxcore (P2P 通信)
 
 **关键文件**:
 - `tencent_cloud_chat_sdk-8.7.7201/lib/native_im/bindings/native_library_manager.dart` - 动态库加载
-- `tim2tox/ffi/dart_compat_layer.cpp` - Dart* 函数实现
+- `tim2tox/ffi/dart_compat_*.cpp` - `Dart*` 函数实现（按职责拆分为 13 个模块）
 - `tim2tox/ffi/callback_bridge.cpp` - 回调桥接机制
 
 ## 使用 Dart API（tim2tox_ffi.dart）驱动同一后端
@@ -411,7 +429,7 @@ c-toxcore (P2P 通信)
 与二进制替换使用的是**同一动态库**（编译产物见上文「编译产物」）。Dart 侧通过 `Tim2ToxFfi.open()` 按平台查找并打开该库（macOS 下为 `libtim2tox_ffi.dylib` 等）：
 
 ```dart
-import 'package:tim2tox_ffi/ffi/tim2tox_ffi.dart';
+import 'package:tim2tox_dart/ffi/tim2tox_ffi.dart';
 
 final ffi = Tim2ToxFfi.open();
 ```
@@ -427,7 +445,7 @@ ffi.init();
 // 或指定 profile 目录：ffi.initWithPath('path/to/profile'.toNativeUtf8());
 
 // 注册事件回调：签名见 tim2tox_ffi.dart 中 event 回调类型（event_type, sender_utf8, payload_bytes, payload_len）
-ffi.setCallback(yourEventCallbackNative, ffi.Pointer.fromAddress(0));
+ffi.setCallback(yourEventCallbackNative, ffi.Pointer<ffi.Void>.fromAddress(0));
 ```
 
 ### 3. 登录

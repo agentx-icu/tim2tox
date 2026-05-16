@@ -12,8 +12,8 @@
 - **Build guide (single source of truth)**: [README_BUILD.md](../README_BUILD.md)
 - **Troubleshooting index (entry page)**: [troubleshooting/README.en.md](troubleshooting/README.en.md)
 - **Auto tests**: [auto_tests/README.md](../auto_tests/README.md)
-- **Native crash troubleshooting**: [auto_tests/NATIVE_CRASH_COMMON_ISSUES.md](../auto_tests/NATIVE_CRASH_COMMON_ISSUES.md), [auto_tests/DEBUG_NATIVE_CRASH.md](../auto_tests/DEBUG_NATIVE_CRASH.md)
-- **Failure records**: [auto_tests/FAILURE_RECORDS.md](../auto_tests/FAILURE_RECORDS.md)
+- **Native crash troubleshooting**: [auto_tests/DEBUG_NATIVE_CRASH.md](../auto_tests/DEBUG_NATIVE_CRASH.md)
+- **Regression baseline**: [auto_tests/VALIDATION_RESULTS.md](../auto_tests/VALIDATION_RESULTS.md) — most recent full-regression pass/fail snapshot
 
 ## Maintainer Index
 

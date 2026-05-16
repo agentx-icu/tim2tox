@@ -1,89 +1,99 @@
-# Tim2Tox Platform vs V2TIM and Conversation Listener
+# Tim2Tox and V2TIM
 > Language: [Chinese](PLATFORM_VS_V2TIM_AND_CONVERSATION_LISTENER.md) | [English](PLATFORM_VS_V2TIM_AND_CONVERSATION_LISTENER.en.md)
 
-
-## 1. Overall architecture (binary replacement)
+## 1. End-to-end architecture (hybrid)
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│App / UIKit / Testing │
+│  App / UIKit / tests                                                          │
 │  - TencentCloudChatSdkPlatform.instance = Tim2ToxSdkPlatform(...)             │
-│ - TIMConversationManager.instance.addConversationListener(...) etc. │
+│  - TIMConversationManager.instance.addConversationListener(...) etc.          │
 └───────────────────────────────────────────┬─────────────────────────────────┘
                                             │
 ┌───────────────────────────────────────────▼─────────────────────────────────┐
-│ tencent_cloud_chat_sdk (not replaced, still the original package) │
-│ - TencentCloudChatSdkPlatform (interface) │
-│ - TIMConversationManager / TIMMessageManager etc. adapter │
-│ - All APIs ultimately call platform.xxx() or NativeLibraryManager (FFI) │
+│  tencent_cloud_chat_sdk (not replaced; original package)                      │
+│  - TencentCloudChatSdkPlatform (interface)                                    │
+│  - TIMConversationManager / TIMMessageManager / ... adapters                  │
+│  - All APIs eventually call platform.xxx() or NativeLibraryManager (FFI)      │
 └───────────────────────────────────────────┬─────────────────────────────────┘
                     │                                    │
-        platform interface call FFI / Native call
+        Platform-interface call                Binary-replacement FFI call
                     │                                    │
 ┌───────────────────▼──────────────────┐   ┌────────────▼─────────────────────┐
-│  Tim2ToxSdkPlatform（Dart）           │   │  tim2tox_ffi / dart_compat（C++）  │
-│ - Implement TencentCloudChatSdkPlatform │ │ - SafeGetV2TIMManager() │
-│ - addConversationListener etc. │ │ - manager->GetConversationManager│
-│ - _conversationListeners etc. │ │ - conv_manager->AddConversation │
-│ - globalCallback distribution (instance_id) │ │ - SendCallbackToDart(globalCallback)│
+│  Tim2ToxSdkPlatform (Dart)            │   │  ffi/dart_compat_*.cpp (C++)      │
+│  - Implements TencentCloudChatSdkPlat │   │  - DartInitSDK / DartLogin / ...  │
+│  - addConversationListener, etc.      │   │  - SafeGetV2TIMManager()          │
+│  - _conversationListeners, etc.       │   │  - Drives V2TIM* implementations  │
+│  - globalCallback dispatch by inst.id │   │  - SendCallbackToDart             │
 └───────────────────┬──────────────────┘   └────────────┬─────────────────────┘
                     │                                    │
                     │         Dart_PostCObject_DL        │
                     └────────────────┬───────────────────┘
                                      │
 ┌────────────────────────────────────▼─────────────────────────────────────────┐
-│ Native layer (C++) │
-│ - V2TIMManagerImpl (one for each instance, distinguished by instance_id when there are multiple instances) │
-│ - V2TIMConversationManagerImpl::GetInstance() (singleton, but SetManagerImpl(this)) │
-│ - V2TIMSignalingManagerImpl (one per instance, GetSignalingManager() independent per instance) │
+│  Native (C++)                                                                 │
+│  - V2TIMManagerImpl (per instance; distinguished by instance_id)              │
+│  - V2TIMConversationManagerImpl (per instance; owned by V2TIMManagerImpl)     │
+│  - V2TIMSignalingManagerImpl (per instance)                                   │
 │  - ToxManager / toxcore                                                       │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
-- **Binary replacement**: Do not replace classes of tencent_cloud_chat_sdk, only replace **Platform instance** and **Native implementation**.  
-- **Tim2ToxSdkPlatform**: implements the `TencentCloudChatSdkPlatform` interface, and all "platform methods" (such as `addConversationListener`, `getConversationList`) are implemented by it; at the same time, it processes `globalCallback` from Native and distributes it to each listener according to `instance_id`.  
-- **V2TIM***: Business implementation in C++ (session, message, group, signaling, etc.). Dart calls Native through FFI, and Native uses `V2TIMManagerImpl`, `GetConversationManager()`, etc. internally; the callback sends `globalCallback` to Dart through dart_compat, which is distributed by instance by **Tim2ToxSdkPlatform**.
+- **Binary replacement** does not replace any class in `tencent_cloud_chat_sdk`; it only swaps the **platform instance** (`TencentCloudChatSdkPlatform.instance`) and the **native implementation** (the dylib is replaced by `libtim2tox_ffi`).
+- **Tim2ToxSdkPlatform** implements `TencentCloudChatSdkPlatform`; every "platform method" (e.g. `addConversationListener`, `getConversationList`) is fulfilled by it. It is also the receiver of `globalCallback` messages from native, dispatched to per-listener lists by `instance_id`.
+- **V2TIM*** are the C++ business implementations (conversation, message, group, signaling, etc.).
 
-## 2. Correspondence between Tim2ToxSdkPlatform and V2TIM*
+> Important: `V2TIMConversationManagerImpl` is **not** a singleton. It is a per-instance member that `V2TIMManagerImpl` constructs and owns via `V2TIMConversationManagerImpl(V2TIMManagerImpl* owner)` (see `source/V2TIMConversationManagerImpl.h:38` and the construction site in `source/V2TIMManagerImpl.cpp`). It references its owner through `manager_impl_`; there is no `GetInstance()` and no `SetManagerImpl()`. `V2TIMSignalingManagerImpl` is also a per-instance member.
 
-| Capabilities | Dart side (Platform/Adapter) | C++ side (V2TIM*) |
-|----------------|---------------------------------------------|------------------|
-| Conversation List | Platform.getConversationList/provider | V2TIMConversationManagerImpl(GetConversationList, Cache, Pin) |
-| Session listening | Platform.addConversationListener | V2TIMConversationManagerImpl::AddConversationListener + dart_compat registration DartConversationListenerImpl |
-| Session change callback | Platform._conversationListeners + globalCallback distribution | C++ call listeners → dart_compat → SendCallbackToDart(globalCallback) |
-| Message | Platform + FFI send/poll | V2TIMMessageManagerImpl + Tox |
-| Group | Platform + FFI | V2TIMGroupManagerImpl |
-| Signaling | Platform + FFI | V2TIMSignalingManagerImpl (per instance) |
+## 2. How Tim2ToxSdkPlatform maps to V2TIM*
 
-- **Session Monitoring**:
-  - **C++**: `V2TIMConversationManagerImpl` is a single instance, but every time `GetConversationManager()` will be `SetManagerImpl(this)`, the current instance will be used for subsequent operations. dart_compat uses the manager of the current instance to get `conv_manager`, and then `AddConversationListener(DartConversationListenerImpl)`; these listeners are notified when the C++ session changes, and then sent to Dart through globalCallback.  
-  - **Dart**: `Tim2ToxSdkPlatform.addConversationListener` saves listeners to `_conversationListeners` (and the list by instance); when receiving globalCallback(ConversationEvent), Platform distributes them to these listeners by instance_id.  
-- So: **The "source" of session listening is C++ V2TIMConversationManagerImpl + dart_compat; the "receiver and dispatch" are in Dart Tim2ToxSdkPlatform. **
+| Capability   | Dart side (Platform / adapter)             | C++ side (V2TIM*) |
+|--------------|--------------------------------------------|-------------------|
+| Conversation list   | `Platform.getConversationList` / provider | `V2TIMConversationManagerImpl` (`GetConversationList`, cache, `PinConversation`) |
+| Conversation listener | `Platform.addConversationListener`     | `V2TIMConversationManagerImpl::AddConversationListener` + dart_compat registers a `DartConversationListenerImpl` |
+| Conversation change callback | `Platform._conversationListeners` + globalCallback dispatch | C++ invokes the listener → dart_compat → `SendCallbackToDart("globalCallback", ...)` |
+| Messaging   | Platform + FFI send/poll                   | `V2TIMMessageManagerImpl` + Tox |
+| Groups      | Platform + FFI                             | `V2TIMGroupManagerImpl` |
+| Signaling   | Platform + FFI                             | `V2TIMSignalingManagerImpl` (per instance) |
 
-## 3. addConversationListener implements position evaluation
+- **Conversation listening**:
+  - **C++**: `V2TIMConversationManagerImpl::AddConversationListener` just appends the listener to `listeners_` (see `source/V2TIMConversationManagerImpl.cpp:73`). `dart_compat_listeners.cpp` lazily registers a `DartConversationListenerImpl` (via `GetOrCreateConversationListener()`) into the current instance the first time the Dart side asks for any `DartSetOnConvXxxCallback`.
+  - **Dart**: `Tim2ToxSdkPlatform.addConversationListener` stores the listener in `_conversationListeners` and in the per-instance map `_instanceConversationListeners[id]`. When `globalCallback(ConversationEvent)` arrives, it is dispatched to the matching list by `instance_id`.
+- Net effect: **the event source for conversation listeners is C++ `V2TIMConversationManagerImpl` + dart_compat; the reception and dispatch happen in Dart `Tim2ToxSdkPlatform`.**
 
-### 3.1 "Implement" AddConversationListener in V2TIMConversationManagerImpl?
+## 3. addConversationListener implementation site (historical bug)
 
-- **Status quo**: C++ implemented. `AddConversationListener` just puts `V2TIMConversationListener*` into `listeners_`; every time dart_compat sets various Conv callbacks on the Dart side, `GetOrCreateConversationListener()` will get a `DartConversationListenerImpl` and `conv_manager->AddConversationListener(listener)`.  
-- **Conclusion**: The C++ side no longer needs to "implement" AddConversationListener, it is satisfied: C++ session changes → notify listeners → dart_compat sends globalCallback → Dart distribution.
+> The original wording in this section described a bug; it has since been fixed. Kept here as background.
 
-### 3.2 Implement addConversationListener in Tim2ToxSdkPlatform?
+### 3.1 C++ already implements `AddConversationListener`
 
-- **Current situation**: The Platform interface requires the implementation of `addConversationListener`; Tim2ToxSdkPlatform **has been implemented**: put the listener into `_conversationListeners` and `_instanceConversationListeners[id]`.  
-- **Problem**: The **root cause** of the test error "addConversationListener() has not been implemented" is the **calling timing**:
-  - `_setupInternalConversationListener()` is called in the **constructor** of `Tim2ToxSdkPlatform`.  
-  - Which will execute `TIMConversationManager.instance.addConversationListener(listener: internalListener)`.  
-  - The adapter will adjust `TencentCloudChatSdkPlatform.instance.addConversationListener(...)` again.  
-  - At this time, the constructor has not yet returned, `TencentCloudChatSdkPlatform.instance` has not been assigned to the current `Tim2ToxSdkPlatform`, it is still the default platform (or old instance), and its default implementation directly throws UnimplementedError.  
-- **Conclusion**: The fix should be on the **Tim2ToxSdkPlatform** side, rather than implementing another layer in C++. Two options are available:
-  1. **No longer synchronize internalListener to adapter in the constructor**: only keep `this.addConversationListener(listener: internalListener)` and do not call `TIMConversationManager.instance.addConversationListener(internalListener)` (internal only needs to be in _conversationListeners of Platform for globalCallback distribution).  
-  2. **Delay synchronization**: Use `Future.microtask(() => TIMConversationManager.instance.addConversationListener(listener: internalListener))` and execute it after assigning `instance = Tim2ToxSdkPlatform(...)`, so that the adapter is transferred to the addConversationListener of the current Platform.
+The C++ side `V2TIMConversationManagerImpl::AddConversationListener` simply does `listeners_.push_back(listener)`. The Dart layer does not need to "re-implement" it.
 
-### 3.3 Recommended- **Implementation location**: Keep and use the addConversationListener implementation of **Tim2ToxSdkPlatform**; on the C++ side, **V2TIMConversationManagerImpl::AddConversationListener** can just keep the status quo.
-- **Fix point**: In `_setupInternalConversationListener` of Tim2ToxSdkPlatform, avoid calling platform.addConversationListener through adapter when "instance has not been assigned a value". Recommended practice: **Only call `this.addConversationListener(listener: internalListener)`, delete or postpone the call to `TIMConversationManager.instance.addConversationListener(internalListener)`** (if it needs to be consistent with the adapter list, you can use the above microtask to postpone).
+### 3.2 Historical bug — "addConversationListener has not been implemented"
+
+The original error did not come from C++; it came from a Dart-side call-ordering problem:
+
+- `Tim2ToxSdkPlatform`'s constructor called `_setupInternalConversationListener()` to register an internal listener.
+- That helper called `TIMConversationManager.instance.addConversationListener(internalListener)`.
+- The adapter forwarded back to `TencentCloudChatSdkPlatform.instance.addConversationListener(...)`.
+- But at that moment `TencentCloudChatSdkPlatform.instance = Tim2ToxSdkPlatform(...)` **had not been assigned yet** (the constructor had not returned). `.instance` was still the default platform, whose default implementation `throws UnimplementedError(...)`.
+
+### 3.3 Fix (**already applied**)
+
+The current implementation at `dart/lib/sdk/tim2tox_sdk_platform.dart:2266 / 2300-2305` only calls `this.addConversationListener(...)` and no longer detours through the adapter:
+
+```dart
+// Don't call TIMConversationManager.instance.addConversationListener here: during
+// construction, TencentCloudChatSdkPlatform.instance has not been assigned yet,
+// so the adapter would call the default platform's addConversationListener (which
+// throws UnimplementedError).
+addConversationListener(listener: internalListener);
+```
+
+If syncing back to the adapter is ever required, the recommended approach is to defer with `Future.microtask(...)` so `.instance = Tim2ToxSdkPlatform(...)` has time to land.
 
 ## 4. Summary
 
-- **Binary replacement**: Tim2ToxSdkPlatform is "platform implementation", V2TIM* is "Native capability implementation"; the two collaborate through FFI + globalCallback, and Platform is responsible for distributing back to Dart listener by instance_id.  
-- **Session Listening**: C++ has AddConversationListener and dart_compat registered; the Dart side is implemented by Tim2ToxSdkPlatform and holds the listener list, and distributes it when receiving globalCallback.  
-- **addConversationListener is not implemented. Error**: comes from "when the platform is called through the adapter in the constructor, the instance has not yet pointed to the current Platform"; it should be solved by adjusting the calling sequence or delaying synchronization in **Tim2ToxSdkPlatform** instead of implementing another layer in V2TIMConversationManagerImpl.
+- **In hybrid mode**, `Tim2ToxSdkPlatform` is the Platform implementation and `V2TIM*` are the native capability implementations. They cooperate over FFI + globalCallback; Platform dispatches back to per-instance Dart listeners by `instance_id`.
+- **Conversation-listener chain**: C++ `AddConversationListener` (already implemented in `V2TIMConversationManagerImpl`) + `dart_compat_listeners.cpp` registration → globalCallback → Dart `Tim2ToxSdkPlatform._conversationListeners` → business listener.
+- The historical "addConversationListener has not been implemented" failure came from constructor-time call ordering and is now fixed — the internal listener goes through `this.addConversationListener(...)`, avoiding the "adapter calls a not-yet-assigned `.instance`" loop.

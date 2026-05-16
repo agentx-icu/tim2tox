@@ -83,38 +83,32 @@ Manage Tox instances and lifecycle, and handle underlying P2P communication.
 
 #### 3. FFI interface layer (`ffi/`)
 
-Provides a C interface for Dart FFI to call.
+Provides the C interface that Dart FFI calls.
 
-- **tim2tox_ffi.h/cpp**: main FFI interface
-- **dart_compat_layer.h/cpp**: Main entrance of Dart* function compatibility layer (modularized)
-- **dart_compat_internal.h**: shared declarations and forward declarations
-- **Modular implementation** (13 module files):
-  - `dart_compat_utils.cpp`: Utility functions and global variables
-  - `dart_compat_listeners.cpp`: Listener implementation and callback registration
-  - `dart_compat_callbacks.cpp`: callback class implementation
-  - `dart_compat_sdk.cpp`: SDK initialization and authentication
-  - `dart_compat_message.cpp`: Message related functions
-  - `dart_compat_friendship.cpp`: Friend related functions
-  - `dart_compat_conversation.cpp`: Conversation related functions
-  - `dart_compat_group.cpp`: Group related functions
-  - `dart_compat_user.cpp`: User related functions
-  - `dart_compat_signaling.cpp`: Signaling related functions
-  - `dart_compat_community.cpp`: Community related functions
+- **tim2tox_ffi.h / tim2tox_ffi.cpp** — the high-level Platform-path C API (`tim2tox_ffi_*`)
+- **dart_compat_layer.cpp** — the "main entry" for the binary-replacement compat layer; after modularization it is just 28 lines of comments
+- **dart_compat_internal.h** — shared declarations and forward declarations
+- **callback_bridge.h / callback_bridge.cpp** — callback bridge (`SendCallbackToDart` / `DartInitDartApiDL` / `DartRegisterSendPort`)
+- **json_parser.h / json_parser.cpp** — JSON message construction and parsing
+- **`Dart*` compat layer (12 functional modules)**:
+  - `dart_compat_utils.cpp` — utility functions and globals
+  - `dart_compat_listeners.cpp` — listener impls and callback registration
+  - `dart_compat_callbacks.cpp` — callback classes
+  - `dart_compat_sdk.cpp` — SDK init and auth
+  - `dart_compat_message.cpp` — messaging
+  - `dart_compat_friendship.cpp` — friends
+  - `dart_compat_conversation.cpp` — conversations
+  - `dart_compat_group.cpp` — groups
+  - `dart_compat_user.cpp` — users
+  - `dart_compat_signaling.cpp` — signaling
+  - `dart_compat_community.cpp` — community (placeholder)
+  - `dart_compat_other.cpp` — miscellaneous (`DartCallExperimentalAPI`)
+
+For per-module sizes and responsibilities, see [MODULARIZATION.en.md](../architecture/MODULARIZATION.en.md).
 
 ### Functional documentation
 
-- [ARCHITECTURE.md](./ARCHITECTURE.en.md) - Tim2Tox architecture (including group chat implementation instructions)
-  - Group chat implementation (Group vs Conference API)
-  - Mapping relationship management
-  - Recovery mechanism
-  - Callback mechanism
-  - error handling
-  - Performance optimization
-  - `dart_compat_other.cpp`: Other miscellaneous functions
-- **callback_bridge.h/cpp**: callback bridge mechanism
-- **json_parser.h/cpp**: JSON message construction and parsing
-
-For detailed instructions, please refer to [Modular Documentation](MODULARIZATION.en.md).
+- [ARCHITECTURE.en.md](../architecture/ARCHITECTURE.en.md) — Tim2Tox architecture (covers group-chat implementation: Group vs Conference API, mapping management, recovery, callback mechanism, error handling, performance)
 
 ### Read before modifying FFI / dart_compat
 
@@ -648,5 +642,5 @@ loggerService?.error('Error message', error, stackTrace);
 ## Related documents
 
 - [API Reference](../api/API_REFERENCE.en.md) - Complete API documentation
-- [Tim2Tox Architecture](ARCHITECTURE.en.md) - Overall architecture design
-- [Tim2Tox FFI compatibility layer](FFI_COMPAT_LAYER.en.md) - Dart* function compatibility layer description
+- [Tim2Tox Architecture](../architecture/ARCHITECTURE.en.md) - Overall architecture design
+- [Tim2Tox FFI Compatibility Layer](../architecture/FFI_COMPAT_LAYER.en.md) - Dart* compat layer description
