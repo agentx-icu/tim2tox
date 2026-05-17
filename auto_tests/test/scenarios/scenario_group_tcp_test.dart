@@ -86,9 +86,10 @@ void main() {
       expect(createResult.code, equals(0), reason: 'createGroup failed: ${createResult.code}');
       expect(createResult.data, isNotNull);
       groupId = createResult.data;
-      
-      await Future.delayed(const Duration(seconds: 2));
-      
+
+      // Pump rather than fixed sleep — gives Tox a chance to publish the group without paying 2s flat.
+      pumpAllInstancesOnce(iterations: 80);
+
       // Step 2: tim2tox private group requires invite then join (join without invite returns 6017)
       bob.clearCallbackReceived('onGroupInvited');
       final inviteResult = await alice.runWithInstanceAsync(() async => TIMGroupManager.instance.inviteUserToGroup(
@@ -97,8 +98,8 @@ void main() {
       ));
       expect(inviteResult.code, equals(0), reason: 'inviteUserToGroup failed: ${inviteResult.code}');
       pumpAllInstancesOnce(iterations: 80);
-      await waitUntilWithPump(() => bob.callbackReceived['onGroupInvited'] == true, timeout: const Duration(seconds: 35), description: 'Bob onGroupInvited', iterationsPerPump: 100, stepDelay: const Duration(milliseconds: 200));
-      await Future.delayed(const Duration(milliseconds: 500));
+      await waitUntilWithPump(() => bob.callbackReceived['onGroupInvited'] == true, timeout: const Duration(seconds: 35), description: 'Bob onGroupInvited', iterationsPerPump: 100, stepDelay: const Duration(milliseconds: 100));
+      await Future.delayed(const Duration(milliseconds: 200));
       final joinGroupId = bob.getLastCallbackGroupId('onGroupInvited') ?? groupId!;
       final joinResult = await bob.runWithInstanceAsync(() async => TIMManager.instance.joinGroup(
         groupID: joinGroupId,
@@ -107,7 +108,8 @@ void main() {
       
       expect(joinResult.code, equals(0), reason: 'joinGroup failed: ${joinResult.code}');
       
-      await pumpGroupPeerDiscovery(alice, bob, duration: const Duration(seconds: 2));
+      // waitUntilFounderSeesMemberInGroup pumps internally each loop; skip the redundant upfront 2s pump.
+      await pumpGroupPeerDiscovery(alice, bob, duration: const Duration(milliseconds: 500));
       // Wait until Alice sees Bob in group before sending (avoids sending before peer is in group)
       final bobSeen = await waitUntilFounderSeesMemberInGroup(alice, bob, groupId!, timeout: const Duration(seconds: 35));
       expect(bobSeen, isNotNull, reason: 'Alice must see Bob in group before sending');
@@ -141,39 +143,35 @@ void main() {
       }
       
       bob.runWithInstance(() => TIMMessageManager.instance.removeAdvancedMsgListener(listener: bobListener));
-      
-      await Future.delayed(const Duration(seconds: 1));
-      
+
       final quitResult = await bob.runWithInstanceAsync(() async => TIMManager.instance.quitGroup(groupID: groupId!));
       expect(quitResult.code, equals(0), reason: 'quitGroup failed: ${quitResult.code}');
-      
-      // Wait for leave to propagate and Tox to sync (TCP may be slower)
-      await Future.delayed(const Duration(seconds: 3));
+
+      // Pump for quit to propagate (TCP may be slower); the pump itself is the work, no flat sleeps needed.
       pumpAllInstancesOnce(iterations: 150);
-      await Future.delayed(const Duration(seconds: 1));
-      
+      await Future.delayed(const Duration(milliseconds: 300));
+
       // Clear before re-invite so we don't clear a callback that was set during pump after invite
       bob.clearCallbackReceived('onGroupInvited');
       final reinviteResult = await alice.runWithInstanceAsync(() async => TIMGroupManager.instance.inviteUserToGroup(
         groupID: groupId!,
         userList: [bob.getPublicKey()],
       ));
-      
+
       expect(reinviteResult.code, equals(0), reason: 'inviteUserToGroup failed: ${reinviteResult.code}');
-      
+
       pumpAllInstancesOnce(iterations: 120);
-      await Future.delayed(const Duration(milliseconds: 300));
       // Bob must accept re-invite: pump while waiting so Bob's Tox can receive invite over TCP
       bool reInviteReceived = false;
       try {
-        await waitUntilWithPump(() => bob.callbackReceived['onGroupInvited'] == true, timeout: const Duration(seconds: 70), description: 'Bob onGroupInvited (re-invite)', iterationsPerPump: 150, stepDelay: const Duration(milliseconds: 200));
+        await waitUntilWithPump(() => bob.callbackReceived['onGroupInvited'] == true, timeout: const Duration(seconds: 70), description: 'Bob onGroupInvited (re-invite)', iterationsPerPump: 150, stepDelay: const Duration(milliseconds: 100));
         reInviteReceived = true;
       } on TimeoutException {
         print('Note: Re-invite onGroupInvited timed out (known TCP/re-invite delay); skipping re-join and second message.');
       }
-      
+
       if (reInviteReceived) {
-        await Future.delayed(const Duration(milliseconds: 500));
+        await Future.delayed(const Duration(milliseconds: 200));
         final rejoinGroupId = bob.getLastCallbackGroupId('onGroupInvited') ?? groupId;
         final rejoinResult = await bob.runWithInstanceAsync(() async => TIMManager.instance.joinGroup(
           groupID: rejoinGroupId,
@@ -181,7 +179,7 @@ void main() {
         ));
         expect(rejoinResult.code, equals(0), reason: 're-joinGroup failed: ${rejoinResult.code}');
         
-        await pumpGroupPeerDiscovery(alice, bob, duration: const Duration(seconds: 2));
+        await pumpGroupPeerDiscovery(alice, bob, duration: const Duration(milliseconds: 500));
         // Wait until Alice sees Bob in group again before sending (pump allows group state to sync)
         final bobSeenAgain = await waitUntilFounderSeesMemberInGroup(alice, bob, groupId, timeout: const Duration(seconds: 45));
         expect(bobSeenAgain, isNotNull, reason: 'Alice must see Bob in group after re-invite before sending');

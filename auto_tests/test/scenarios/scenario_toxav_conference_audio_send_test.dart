@@ -83,18 +83,24 @@ void main() {
         addWording: 'test',
       ));
 
-      // Friend requests may need time to propagate/auto-accept over the local DHT.
-      await Future.delayed(const Duration(seconds: 5));
-
-      // Friend list stores *public keys* (64 chars), not full Tox IDs
+      // Friend list stores *public keys* (64 chars), not full Tox IDs.
+      // Skip the fixed 5s presettle: waitForFriendsInList already polls and
+      // pump the Tox iterates in parallel to accelerate friend-list propagation.
       final alicePub = alice.getPublicKey();
       final bobPub = bob.getPublicKey();
       final charliePub = charlie.getPublicKey();
-      await waitForFriendsInList(alice, [bobPub, charliePub], timeout: const Duration(seconds: 120));
-      await waitForFriendsInList(bob, [alicePub], timeout: const Duration(seconds: 120));
-      await waitForFriendsInList(charlie, [alicePub], timeout: const Duration(seconds: 120));
-      // Extra delay for P2P/connection to stabilize before conference invites
-      await Future.delayed(const Duration(seconds: 5));
+      final friendListPump = pumpFriendConnection(alice, bob,
+          duration: const Duration(seconds: 4), iterationsPerPump: 60);
+      await Future.wait([
+        waitForFriendsInList(alice, [bobPub, charliePub], timeout: const Duration(seconds: 120)),
+        waitForFriendsInList(bob, [alicePub], timeout: const Duration(seconds: 120)),
+        waitForFriendsInList(charlie, [alicePub], timeout: const Duration(seconds: 120)),
+        friendListPump,
+      ]);
+      // Briefly pump for P2P/connection to stabilize before conference invites
+      // (was a fixed 5s sleep; the test body re-waits on friend-connection state).
+      await pumpFriendConnection(alice, bob,
+          duration: const Duration(seconds: 1), iterationsPerPump: 60);
     });
     
     tearDownAll(() async {
@@ -128,10 +134,10 @@ void main() {
       expect(createResult.code, equals(0));
       final conferenceId = createResult.data!;
       
-      await alice.waitForCallback('onGroupCreated', 
+      await alice.waitForCallback('onGroupCreated',
         timeout: const Duration(seconds: 10));
       pumpAllInstancesOnce(iterations: 80);
-      await Future.delayed(const Duration(seconds: 2));
+      await Future.delayed(const Duration(milliseconds: 400));
       
       var bobReceivedInvite = false;
       var charlieReceivedInvite = false;
@@ -196,9 +202,24 @@ void main() {
         message: '',
       ));
       expect(charlieJoinResult.code, equals(0));
-      
-      await Future.delayed(const Duration(seconds: 5));
-      
+
+      // Poll all three joined lists in a single 5s window instead of sleeping 5s flat.
+      Future<bool> allJoined() async {
+        final a = await alice.runWithInstanceAsync(() async => TIMGroupManager.instance.getJoinedGroupList());
+        if (a.data == null || !a.data!.any((g) => g.groupID == conferenceId)) return false;
+        final b = await bob.runWithInstanceAsync(() async => TIMGroupManager.instance.getJoinedGroupList());
+        if (b.data == null || !b.data!.any((g) => g.groupID == conferenceId || g.groupID == bobInvitedGroupId)) return false;
+        final c = await charlie.runWithInstanceAsync(() async => TIMGroupManager.instance.getJoinedGroupList());
+        if (c.data == null || !c.data!.any((g) => g.groupID == conferenceId || g.groupID == charlieInvitedGroupId)) return false;
+        return true;
+      }
+      final joinedDeadline = DateTime.now().add(const Duration(seconds: 5));
+      while (DateTime.now().isBefore(joinedDeadline)) {
+        if (await allJoined()) break;
+        pumpAllInstancesOnce(iterations: 60);
+        await Future.delayed(const Duration(milliseconds: 200));
+      }
+
       final aliceJoinedList = await alice.runWithInstanceAsync(() async => TIMGroupManager.instance.getJoinedGroupList());
       expect(aliceJoinedList.data, isNotNull);
       expect(aliceJoinedList.data!.any((g) => g.groupID == conferenceId), isTrue);

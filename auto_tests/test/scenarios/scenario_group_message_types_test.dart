@@ -53,12 +53,17 @@ void main() {
         establishFriendship(alice, charlie,
             timeout: const Duration(seconds: 90)),
       ]);
-      await pumpFriendConnection(alice, bob,
-          duration: const Duration(seconds: 5));
-      await pumpFriendConnection(alice, charlie,
-          duration: const Duration(seconds: 3));
-      await pumpFriendConnection(bob, charlie,
-          duration: const Duration(seconds: 3));
+      // pumpFriendConnection just drives `iterateAllInstances` on the shared
+      // FFI handle; running them in parallel still pumps every instance each
+      // step, so we just pay the max(duration), not the sum.
+      await Future.wait([
+        pumpFriendConnection(alice, bob,
+            duration: const Duration(seconds: 5)),
+        pumpFriendConnection(alice, charlie,
+            duration: const Duration(seconds: 3)),
+        pumpFriendConnection(bob, charlie,
+            duration: const Duration(seconds: 3)),
+      ]);
     });
 
     tearDownAll(() async {

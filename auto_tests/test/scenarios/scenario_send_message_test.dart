@@ -13,32 +13,15 @@ void main() {
     late TestNode bob;
     
     setUpAll(() async {
-      await setupTestEnvironment();
-      scenario = await createTestScenario(['alice', 'bob']);
+      scenario = await acquireSharedScenario(['alice', 'bob'],
+          withBootstrap: true, withFriendship: true);
       alice = scenario.getNode('alice')!;
       bob = scenario.getNode('bob')!;
-      await scenario.initAllNodes();
-      // Parallelize login
-      await Future.wait([
-        alice.login(),
-        bob.login(),
-      ]);
-      
-      // Wait for both nodes to be connected
-      await waitUntil(() => alice.loggedIn && bob.loggedIn, timeout: const Duration(seconds: 10));
-      
-      // Configure local bootstrap (like C test's tox_node_bootstrap)
-      await configureLocalBootstrap(scenario);
-      
-      // Establish bidirectional friendship (required for message delivery in Tox)
-      await establishFriendship(alice, bob);
-      // Pump so P2P connection is established before tests send messages
-      await pumpFriendConnection(alice, bob);
     });
-    
+
     tearDownAll(() async {
-      await scenario.dispose();
-      await teardownTestEnvironment();
+      releaseSharedScenario(['alice', 'bob'],
+          withBootstrap: true, withFriendship: true);
     });
     
     // Lightweight setUp for per-test cleanup if needed

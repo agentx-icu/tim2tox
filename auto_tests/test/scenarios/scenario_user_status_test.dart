@@ -20,47 +20,15 @@ void main() {
     late TestNode bob;
 
     setUpAll(() async {
-      await setupTestEnvironment();
-
-      scenario = await createTestScenario(['alice', 'bob']);
+      scenario = await acquireSharedScenario(['alice', 'bob'],
+          withBootstrap: true, withFriendship: true);
       alice = scenario.getNode('alice')!;
       bob = scenario.getNode('bob')!;
-
-      await scenario.initAllNodes();
-
-      await Future.wait([
-        alice.login(timeout: const Duration(seconds: 10)),
-        bob.login(timeout: const Duration(seconds: 10)),
-      ]);
-
-      await waitUntil(
-        () => alice.loggedIn && bob.loggedIn,
-        timeout: const Duration(seconds: 15),
-        description: 'both nodes logged in',
-      );
-
-      await configureLocalBootstrap(scenario);
-
-      await Future.wait([
-        alice.waitForConnection(timeout: const Duration(seconds: 15)),
-        bob.waitForConnection(timeout: const Duration(seconds: 15)),
-      ]);
-
-      await establishFriendship(alice, bob,
-          timeout: const Duration(seconds: 45));
-      final aliceToxId = alice.getToxId();
-      final bobToxId = bob.getToxId();
-      await Future.wait([
-        alice.waitForFriendConnection(bobToxId,
-            timeout: const Duration(seconds: 45)),
-        bob.waitForFriendConnection(aliceToxId,
-            timeout: const Duration(seconds: 45)),
-      ]);
     });
 
     tearDownAll(() async {
-      await scenario.dispose();
-      await teardownTestEnvironment();
+      releaseSharedScenario(['alice', 'bob'],
+          withBootstrap: true, withFriendship: true);
     });
 
     // Lightweight setUp for per-test cleanup if needed

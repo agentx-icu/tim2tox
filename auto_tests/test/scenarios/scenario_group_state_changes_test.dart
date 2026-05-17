@@ -3,6 +3,7 @@
 /// Tests group state change notifications: member join, leave, kick, etc.
 /// Verifies that all members receive state change notifications
 
+import 'dart:async';
 import 'package:test/test.dart';
 import 'package:tencent_cloud_chat_sdk/native_im/adapter/tim_manager.dart';
 import 'package:tencent_cloud_chat_sdk/native_im/adapter/tim_group_manager.dart';
@@ -89,10 +90,10 @@ void main() {
         timeout: const Duration(seconds: 30),
         description: 'Bob receives onGroupInvited (join notification)',
         iterationsPerPump: 100,
-        stepDelay: const Duration(milliseconds: 200),
+        stepDelay: const Duration(milliseconds: 100),
       );
       await Future.delayed(const Duration(
-          milliseconds: 500)); // allow pending invite to be stored
+          milliseconds: 200)); // allow pending invite to be stored
       var aliceReceivedJoin = false;
       final aliceListener = V2TimGroupListener(
         onMemberEnter: (groupID, memberList) {
@@ -114,7 +115,7 @@ void main() {
         timeout: const Duration(seconds: 30),
         description: 'Alice receives member join notification',
         iterationsPerPump: 80,
-        stepDelay: const Duration(milliseconds: 200),
+        stepDelay: const Duration(milliseconds: 100),
       );
       expect(aliceReceivedJoin, isTrue);
       alice.runWithInstance(() =>
@@ -139,10 +140,10 @@ void main() {
         timeout: const Duration(seconds: 30),
         description: 'Bob receives onGroupInvited (leave notification)',
         iterationsPerPump: 100,
-        stepDelay: const Duration(milliseconds: 200),
+        stepDelay: const Duration(milliseconds: 100),
       );
       await Future.delayed(const Duration(
-          milliseconds: 500)); // allow pending invite to be stored
+          milliseconds: 200)); // allow pending invite to be stored
       final joinGroupId =
           bob.getLastCallbackGroupId('onGroupInvited') ?? groupId;
       // The invitee's local mapping uses joinGroupId, not the creator's groupID.
@@ -150,7 +151,9 @@ void main() {
       final joinResult = await bob.runWithInstanceAsync(() async =>
           TIMManager.instance.joinGroup(groupID: joinGroupId, message: ''));
       expect(joinResult.code, equals(0));
-      await Future.delayed(const Duration(seconds: 2));
+      // Pump for join to propagate (faster than a flat 2s sleep).
+      pumpAllInstancesOnce(iterations: 120);
+      await Future.delayed(const Duration(milliseconds: 200));
       var aliceReceivedLeave = false;
       final aliceListener = V2TimGroupListener(
         onMemberLeave: (groupID, member) {
@@ -236,7 +239,7 @@ void main() {
         stepDelay: const Duration(milliseconds: 200),
       );
       await Future.delayed(const Duration(
-          milliseconds: 500)); // allow pending invites to be stored
+          milliseconds: 200)); // allow pending invites to be stored
       final bobJoinGroupId =
           bob.getLastCallbackGroupId('onGroupInvited') ?? groupId;
       final charlieJoinGroupId =
@@ -253,7 +256,9 @@ void main() {
               .joinGroup(groupID: charlieJoinGroupId, message: ''));
       expect(bobJoin.code, equals(0));
       expect(charlieJoin.code, equals(0));
-      await Future.delayed(const Duration(seconds: 2));
+      // Pump for joins to propagate before querying member list.
+      pumpAllInstancesOnce(iterations: 150);
+      await Future.delayed(const Duration(milliseconds: 200));
       final membersBeforeKick = await alice.runWithInstanceAsync(
           () async => TIMGroupManager.instance.getGroupMemberList(
                 groupID: groupId,
@@ -360,7 +365,7 @@ void main() {
         stepDelay: const Duration(milliseconds: 200),
       );
       await Future.delayed(const Duration(
-          milliseconds: 500)); // allow pending invites to be stored
+          milliseconds: 200)); // allow pending invites to be stored
       final stateChanges = <String>[];
       final aliceListener = V2TimGroupListener(
         onMemberEnter: (groupID, memberList) {
@@ -386,10 +391,23 @@ void main() {
               .joinGroup(groupID: charlieJoinGroupId, message: ''));
       expect(bobJoin.code, equals(0));
       expect(charlieJoin.code, equals(0));
-      await Future.delayed(const Duration(seconds: 2));
+      // Pump for joins to propagate so Alice's listener has a chance to record entries.
+      pumpAllInstancesOnce(iterations: 150);
+      await Future.delayed(const Duration(milliseconds: 200));
       await bob.runWithInstanceAsync(
           () async => TIMManager.instance.quitGroup(groupID: groupId));
-      await Future.delayed(const Duration(seconds: 2));
+      // Poll for any state change (join or leave); cap at 4s — the original 2+2s was a flat wait.
+      try {
+        await waitUntilWithPump(
+          () => stateChanges.isNotEmpty,
+          timeout: const Duration(seconds: 4),
+          description: 'any state change recorded',
+          iterationsPerPump: 120,
+          stepDelay: const Duration(milliseconds: 100),
+        );
+      } on TimeoutException {
+        // fall through; the expect below will surface the empty list.
+      }
       expect(stateChanges.length, greaterThan(0));
       alice.runWithInstance(() =>
           TIMManager.instance.removeGroupListener(listener: aliceListener));
@@ -413,10 +431,10 @@ void main() {
         timeout: const Duration(seconds: 30),
         description: 'Bob receives onGroupInvited (conference state changes)',
         iterationsPerPump: 100,
-        stepDelay: const Duration(milliseconds: 200),
+        stepDelay: const Duration(milliseconds: 100),
       );
       await Future.delayed(const Duration(
-          milliseconds: 500)); // allow pending invite to be stored
+          milliseconds: 200)); // allow pending invite to be stored
       var aliceReceivedJoin = false;
       final aliceListener = V2TimGroupListener(
         onMemberEnter: (groupID, memberList) {
@@ -436,7 +454,7 @@ void main() {
         timeout: const Duration(seconds: 30),
         description: 'Alice receives join notification',
         iterationsPerPump: 80,
-        stepDelay: const Duration(milliseconds: 200),
+        stepDelay: const Duration(milliseconds: 100),
       );
       expect(aliceReceivedJoin, isTrue);
       alice.runWithInstance(() =>
@@ -462,10 +480,10 @@ void main() {
         timeout: const Duration(seconds: 30),
         description: 'Bob receives onGroupInvited (role change)',
         iterationsPerPump: 100,
-        stepDelay: const Duration(milliseconds: 200),
+        stepDelay: const Duration(milliseconds: 100),
       );
       await Future.delayed(const Duration(
-          milliseconds: 500)); // allow pending invite to be stored
+          milliseconds: 200)); // allow pending invite to be stored
       final joinGroupId =
           bob.getLastCallbackGroupId('onGroupInvited') ?? groupId;
       final expectedGroupIds = <String>{groupId, joinGroupId};

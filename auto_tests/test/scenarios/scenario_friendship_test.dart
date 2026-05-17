@@ -16,20 +16,22 @@ void main() {
     late TestNode bob;
 
     setUpAll(() async {
-      await setupTestEnvironment();
-      scenario = await createTestScenario(['alice', 'bob']);
+      // Uses the SharedScenarioPool: when another test file in the same
+      // `flutter test` invocation already prepared an [alice, bob] scenario
+      // with the same options (bootstrap only, no friendship), we reuse it
+      // and skip the 10-22 s cold start. Standalone invocations still pay
+      // the cold start once.
+      scenario = await acquireSharedScenario(['alice', 'bob'],
+          withBootstrap: true, withFriendship: false);
       alice = scenario.getNode('alice')!;
       bob = scenario.getNode('bob')!;
-
-      await scenario.initAllNodes();
-      await Future.wait([alice.login(), bob.login()]);
-      await waitUntil(() => alice.loggedIn && bob.loggedIn);
-      await configureLocalBootstrap(scenario);
     });
 
     tearDownAll(() async {
-      await scenario.dispose();
-      await teardownTestEnvironment();
+      // No-op release: the pool keeps the scenario alive for the next
+      // test file in the bundle. Final teardown happens at process exit.
+      releaseSharedScenario(['alice', 'bob'],
+          withBootstrap: true, withFriendship: false);
     });
 
     setUp(() async {});

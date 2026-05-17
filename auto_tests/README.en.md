@@ -165,6 +165,18 @@ RUN_VIRTUAL=1 ./run_tests_ordered.sh 10-12
 
 `RUN_VIRTUAL=0` (default) keeps the existing wall-clock behavior.
 
+### Parallel execution (PARALLEL_WORKERS)
+
+```bash
+# Run 2 tests concurrently (each worker spawns its own flutter_tester)
+PARALLEL_WORKERS=2 ./run_tests_ordered.sh
+
+# 3 workers, restricted to specific phases
+PARALLEL_WORKERS=3 ./run_tests_ordered.sh 4 10
+```
+
+`PARALLEL_WORKERS=N` flattens all selected tests into a single queue and dispatches them across N concurrent `flutter test` processes. Default is 1 (sequential). Rule of thumb on a developer Mac: 2–3 workers stay reliable, 4+ tends to trip Tox DHT timeouts and friend P2P handshake failures under CPU pressure. Each test file already has its own `setUpAll` so no cross-phase ordering is assumed; results are still printed grouped by phase after the parallel batch completes.
+
 ### Phase coverage
 
 Phase 1–12 have `*_virtual_test.dart` siblings (~69 files plus `scenario_virtual_clock_smoke_test.dart`), covering basics / friendship / message / group / ToxAV / profile / conversation / file / conference / group-ext / network / other. Phase 13 (Binary Replacement) and Phase 14 (unit_tests) do not depend on Tox protocol timers and **do not need** virtual variants.
@@ -234,6 +246,36 @@ RUN_NATIVE_CRASH_TESTS=0 ./run_tests_ordered.sh 11
 flutter test test/scenarios/scenario_login_test.dart
 flutter test --name "login"                # by test name
 ```
+
+### Environment variables
+
+- `RUN_VIRTUAL=1` — swap each test for its `*_virtual_test.dart` sibling when present (see [Virtual clock mode](#virtual-clock-mode)).
+- `PARALLEL_WORKERS=N` — flatten selected tests into one queue and run N concurrently (see above).
+- `ASSERTION_GUARD=0` — skip the `check_test_assertions.sh` pre-flight.
+- `RUN_NATIVE_CRASH_TESTS=0` — exclude `scenario_dht_nodes_response_api_test` from Phase 11.
+- `RETRY_COUNT=N` — re-run each failed test up to N times before declaring failure. Tests that pass on retry are still counted as passing but are listed separately in a "Flaky" section of the summary. Used by Tier 2 CI (`RETRY_COUNT=1`).
+- `SKIP_PHASES=N1,N2,...` — drop these phases from the run even if they were otherwise selected (or implied by "all phases"). Used by Tier 3 nightly to skip Phase 11 (which is reserved for Tier 4).
+
+## Local smoke (Tier 1)
+
+Recommended before every `git push`. Runs Phases 1 (basic), 3 (message), 12 (other), and 14 (unit tests) under the virtual clock:
+
+```bash
+RUN_VIRTUAL=1 ./run_tests_ordered.sh 1,3,12 14
+# ~25 tests, ≤2 min on M-series. No CI workflow — this is the dev pre-push gate.
+```
+
+## CI pipeline (Tier 2 / 3 / 4)
+
+Three GitHub Actions workflows live in `toxee/.github/workflows/`. Virtual-clock tiers (2) give fast PR feedback; wall-clock tiers (3, 4) catch real-timing protocol regressions that the virtual clock can hide.
+
+| Tier | Workflow                  | Trigger                                                       | Mode                  | Phases             | Runner               | Budget |
+|------|---------------------------|---------------------------------------------------------------|-----------------------|--------------------|----------------------|--------|
+| 2    | `auto_tests.yml`          | every PR + push to `main` / `master`                          | virtual, `RETRY_COUNT=1` | 1–8, 10, 12–14   | ubuntu               | 30 min |
+| 3    | `auto_tests_nightly.yml`  | cron `02:00 UTC` + `workflow_dispatch`                        | wall-clock            | 1–10, 12–14 (Phase 11 skipped via `SKIP_PHASES=11`) | ubuntu | 90 min |
+| 4    | `auto_tests_full.yml`     | `workflow_dispatch`, PR label `ci:full`, push to `release/**` | wall-clock            | 1–14 (full, incl. 11) | ubuntu + macOS matrix | 120 min |
+
+Tier 4 is the only path that exercises Phase 11 (`scenario_dht_nodes_response_api_test`, real-DHT bootstrap, LAN discovery) — keep large protocol-layer changes behind a `ci:full`-labeled PR. `tool/ci/build_tim2tox.sh` builds the FFI lib for each tier; Tiers 2/3/4 pass `--toxav --dht-bootstrap` so the suite has the same feature surface as a developer build (production app builds keep both flags off).
 
 ## Troubleshooting
 

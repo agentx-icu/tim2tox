@@ -38,10 +38,38 @@ Options:
   -h, --help       Show this help
 
 Environment:
-  RUN_VIRTUAL=1    Swap each test file to its *_virtual_test.dart sibling
-                   when one exists (virtual-clock variants in test/scenarios/).
-                   Falls back to wall-clock original when no virtual variant
-                   has been authored. Use to accelerate Phase 4 / 10 / 12.
+  RUN_VIRTUAL=1       Swap each test file to its *_virtual_test.dart sibling
+                      when one exists (virtual-clock variants in test/scenarios/).
+                      Falls back to wall-clock original when no virtual variant
+                      has been authored.
+  PARALLEL_WORKERS=N  Run up to N tests concurrently (each spawns its own
+                      flutter_tester). Default 1 (sequential). 2-3 is usually
+                      safe on a developer Mac; higher values risk CPU
+                      contention and flaky timing-sensitive tests.
+                      In parallel mode, tests run in dispatch order (across
+                      all selected phases as a single queue) and the
+                      "Phase N: ..." banners are reconstructed from per-test
+                      logs after the run.
+  BUNDLE=1            Dispatch each phase as ONE `flutter test` invocation
+                      (every file in the phase passed as a positional arg).
+                      Tests that have been converted to call
+                      `acquireSharedScenario(...)` reuse a cached Tox
+                      bootstrap + friendship across files in the bundle,
+                      saving the cold-start cost (10-22 s per file). Tests
+                      still on the legacy `createTestScenario` path run
+                      independently inside the bundle and pay their normal
+                      cost. Bundle and PARALLEL_WORKERS can be combined,
+                      in which case each phase is one queue entry.
+  RETRY_COUNT=N       On failure, retry the same test up to N additional times
+                      (default 0 = no retry, legacy behavior). A test that
+                      passes on retry is counted as PASSED but also recorded
+                      in the "Flaky Tests" section of the summary. Only takes
+                      effect for the sequential path (PARALLEL_WORKERS=1).
+  SKIP_PHASES=LIST    Comma-separated phase selectors to skip entirely (same
+                      syntax as positional args: numbers or names). Tests in
+                      skipped phases are counted as SKIPPED. Example:
+                      SKIP_PHASES=11      # skip Phase 11 (Network)
+                      SKIP_PHASES=NETWORK,OTHER
 EOF
 }
 
@@ -185,6 +213,58 @@ if [ ${#SELECTED_PHASES[@]} -eq 0 ]; then
   exit 2
 fi
 
+# SKIP_PHASES: comma-separated phase selectors to drop from SELECTED_PHASES.
+# Tests in skipped phases are accounted for in TOTAL_SKIPPED / SKIPPED_TESTS
+# at the apply step below (after the phase arrays are defined).
+SKIP_PHASE_NUMS=()
+if [ -n "${SKIP_PHASES:-}" ]; then
+  IFS=',' read -r -a _skip_parts <<< "$SKIP_PHASES"
+  for raw_skip in "${_skip_parts[@]}"; do
+    skip_part=$(echo "$raw_skip" | sed -E 's/^[[:space:]]+//;s/[[:space:]]+$//')
+    if [ -z "$skip_part" ]; then
+      continue
+    fi
+    skip_num=$(resolve_phase_arg "$skip_part")
+    if [ -z "$skip_num" ]; then
+      echo -e "${RED}Unknown phase selector in SKIP_PHASES: $skip_part${NC}"
+      exit 2
+    fi
+    # Dedupe.
+    already=0
+    for existing in "${SKIP_PHASE_NUMS[@]}"; do
+      if [ "$existing" = "$skip_num" ]; then
+        already=1
+        break
+      fi
+    done
+    if [ "$already" -eq 0 ]; then
+      SKIP_PHASE_NUMS+=("$skip_num")
+    fi
+  done
+
+  if [ ${#SKIP_PHASE_NUMS[@]} -gt 0 ]; then
+    filtered_phases=()
+    for p in "${SELECTED_PHASES[@]}"; do
+      drop=0
+      for sp in "${SKIP_PHASE_NUMS[@]}"; do
+        if [ "$p" = "$sp" ]; then
+          drop=1
+          break
+        fi
+      done
+      if [ "$drop" -eq 0 ]; then
+        filtered_phases+=("$p")
+      fi
+    done
+    SELECTED_PHASES=("${filtered_phases[@]}")
+  fi
+fi
+
+if [ ${#SELECTED_PHASES[@]} -eq 0 ]; then
+  echo -e "${RED}No phase selected (after applying SKIP_PHASES).${NC}"
+  exit 2
+fi
+
 # Results file: use merged_results/ only when exactly one phase is selected.
 if [ "$MERGE_MODE" = "1" ] && [ ${#SELECTED_PHASES[@]} -eq 1 ]; then
   MERGED_DIR="$SCRIPT_DIR/merged_results"
@@ -274,6 +354,7 @@ PHASE4_GROUP=(
 PHASE5_TOXAV=(
   "test/scenarios/scenario_toxav_basic_test.dart"
   "test/scenarios/scenario_toxav_many_test.dart"
+  "test/scenarios/scenario_toxav_peer_offline_test.dart"
   "test/scenarios/scenario_toxav_conference_test.dart"
   "test/scenarios/scenario_toxav_conference_audio_test.dart"
   "test/scenarios/scenario_toxav_conference_invite_test.dart"
@@ -305,7 +386,9 @@ PHASE8_FILE=(
 PHASE9_CONFERENCE=(
   "test/scenarios/scenario_conference_test.dart"
   "test/scenarios/scenario_conference_simple_test.dart"
+  "test/scenarios/scenario_conference_two_test.dart"
   "test/scenarios/scenario_conference_offline_test.dart"
+  "test/scenarios/scenario_conference_double_invite_test.dart"
   "test/scenarios/scenario_conference_av_test.dart"
   "test/scenarios/scenario_conference_invite_merge_test.dart"
   "test/scenarios/scenario_conference_peer_nick_test.dart"
@@ -359,8 +442,19 @@ PHASE14_UNIT=(
 TOTAL_PASSED=0
 TOTAL_FAILED=0
 TOTAL_SKIPPED=0
+TOTAL_FLAKY=0
 FAILED_TESTS=()
 SKIPPED_TESTS=()
+FLAKY_TESTS=()
+
+# RETRY_COUNT: number of additional attempts after a first failure.
+# Default 0 preserves legacy "one shot" behavior. A pass on retry is counted
+# as PASSED but also recorded in FLAKY_TESTS for visibility.
+RETRY_COUNT="${RETRY_COUNT:-0}"
+if ! [[ "$RETRY_COUNT" =~ ^[0-9]+$ ]]; then
+  echo -e "${RED}RETRY_COUNT must be a non-negative integer (got: $RETRY_COUNT)${NC}"
+  exit 2
+fi
 
 # Formerly-unstable native tests are now enabled by default.
 # scenario_dht_nodes_response_api_test was previously gated behind
@@ -397,6 +491,40 @@ apply_known_unstable_filters() {
   fi
 }
 apply_known_unstable_filters
+
+# Account for phases dropped via SKIP_PHASES (env var parsed earlier).
+# Adds each skipped phase's test count to TOTAL_SKIPPED and records a single
+# "Phase N (SKIP_PHASES env)" entry per skipped phase. Done here (after the
+# PHASEN_* arrays are populated and unstable filters applied) so the counts
+# match what would have actually run.
+phase_array_size_for_num() {
+  case "$1" in
+    1)  echo "${#PHASE1_BASIC[@]}" ;;
+    2)  echo "${#PHASE2_FRIENDSHIP[@]}" ;;
+    3)  echo "${#PHASE3_MESSAGE[@]}" ;;
+    4)  echo "${#PHASE4_GROUP[@]}" ;;
+    5)  echo "${#PHASE5_TOXAV[@]}" ;;
+    6)  echo "${#PHASE6_PROFILE[@]}" ;;
+    7)  echo "${#PHASE7_CONVERSATION[@]}" ;;
+    8)  echo "${#PHASE8_FILE[@]}" ;;
+    9)  echo "${#PHASE9_CONFERENCE[@]}" ;;
+    10) echo "${#PHASE10_GROUP_EXT[@]}" ;;
+    11) echo "${#PHASE11_NETWORK[@]}" ;;
+    12) echo "${#PHASE12_OTHER[@]}" ;;
+    13) echo "${#PHASE13_BINARY_REPLACEMENT[@]}" ;;
+    14) echo "${#PHASE14_UNIT[@]}" ;;
+    *) echo 0 ;;
+  esac
+}
+
+if [ ${#SKIP_PHASE_NUMS[@]} -gt 0 ]; then
+  for skipped in "${SKIP_PHASE_NUMS[@]}"; do
+    skipped_count=$(phase_array_size_for_num "$skipped")
+    TOTAL_SKIPPED=$((TOTAL_SKIPPED + skipped_count))
+    SKIPPED_TESTS+=("Phase $skipped (SKIP_PHASES env)")
+    echo -e "${YELLOW}Skipping phase $skipped: $(phase_name_for_num "$skipped") (via SKIP_PHASES)${NC}"
+  done
+fi
 
 # Function to parse and display test case timings from Flutter test output
 parse_test_timings() {
@@ -489,9 +617,6 @@ run_single_test() {
   echo -e "${YELLOW}[$phase_name] Test $test_num/$total_in_phase: $test_name${NC}" | tee -a "$RESULTS_FILE"
   echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}" | tee -a "$RESULTS_FILE"
 
-  local start_time=$(date +%s)
-  local output_file="/tmp/test_${test_name}_$(date +%s).log"
-  
   # Use 300s timeout for tests that need more time (conference, nospam, group_create_debug).
   # Group moderation runs 4 sub-tests that each need a fresh group + invite +
   # join + member-discovery cycle (~90s each on local bootstrap), totalling
@@ -515,42 +640,71 @@ run_single_test() {
     scenario_group_moderation)
       test_timeout=600 ;;
   esac
-  
-  # Run test with timeout, capture output
-  if timeout ${test_timeout}s flutter test "$test_file" > "$output_file" 2>&1; then
-    local end_time=$(date +%s)
-    local duration=$((end_time - start_time))
-    echo -e "${GREEN}✅ PASSED: $test_name (${duration}s)${NC}" | tee -a "$RESULTS_FILE"
-    echo -e "${GREEN}  Test case timings:${NC}" | tee -a "$RESULTS_FILE"
-    parse_test_timings "$output_file" | tee -a "$RESULTS_FILE"
-    ((TOTAL_PASSED++))
-    rm -f "$output_file"
-    return 0
-  else
-    local exit_code=$?
-    local end_time=$(date +%s)
-    local duration=$((end_time - start_time))
-    
-    if [ $exit_code -eq 124 ]; then
-      # Timeout
-      echo -e "${RED}⏱️  TIMEOUT: $test_name (exceeded ${test_timeout}s)${NC}" | tee -a "$RESULTS_FILE"
-      FAILED_TESTS+=("$test_name (TIMEOUT)")
-    else
-      # Test failure
-      echo -e "${RED}❌ FAILED: $test_name (${duration}s)${NC}" | tee -a "$RESULTS_FILE"
-      echo -e "${YELLOW}  Test case timings:${NC}" | tee -a "$RESULTS_FILE"
-      parse_test_timings "$output_file" | tee -a "$RESULTS_FILE"
-      FAILED_TESTS+=("$test_name")
+
+  # Retry loop: attempt 0 is the first run; attempts 1..RETRY_COUNT are retries.
+  # On a retry pass, count PASSED + record in FLAKY_TESTS. On all-attempts-fail,
+  # fall through to the legacy FAILED accounting using the LAST attempt's output.
+  local max_attempts=$((RETRY_COUNT + 1))
+  local attempt=0
+  local last_exit_code=0
+  local last_output_file=""
+  local last_duration=0
+  while [ "$attempt" -lt "$max_attempts" ]; do
+    if [ "$attempt" -gt 0 ]; then
+      echo -e "${YELLOW}🔁 RETRY $attempt/$RETRY_COUNT: $test_name${NC}" | tee -a "$RESULTS_FILE"
     fi
-    
-    # Show last 30 lines of output for debugging
-    echo -e "${YELLOW}Last 30 lines of output:${NC}" | tee -a "$RESULTS_FILE"
-    tail -30 "$output_file" | tee -a "$RESULTS_FILE"
-    
-    ((TOTAL_FAILED++))
-    rm -f "$output_file"
-    return 1
+
+    local start_time=$(date +%s)
+    local output_file="/tmp/test_${test_name}_$(date +%s)_${attempt}_$$.log"
+
+    if timeout ${test_timeout}s flutter test "$test_file" > "$output_file" 2>&1; then
+      local end_time=$(date +%s)
+      local duration=$((end_time - start_time))
+      echo -e "${GREEN}✅ PASSED: $test_name (${duration}s)${NC}" | tee -a "$RESULTS_FILE"
+      echo -e "${GREEN}  Test case timings:${NC}" | tee -a "$RESULTS_FILE"
+      parse_test_timings "$output_file" | tee -a "$RESULTS_FILE"
+      ((TOTAL_PASSED++))
+      if [ "$attempt" -gt 0 ]; then
+        # Passed after at least one retry — record as flaky.
+        ((TOTAL_FLAKY++))
+        FLAKY_TESTS+=("$test_name (passed on retry $attempt/$RETRY_COUNT)")
+      fi
+      rm -f "$output_file"
+      return 0
+    fi
+    last_exit_code=$?
+    local end_time=$(date +%s)
+    last_duration=$((end_time - start_time))
+    # Clean up intermediate retry logs; only keep the last attempt's output
+    # for the FAILED tail dump below.
+    if [ -n "$last_output_file" ]; then
+      rm -f "$last_output_file"
+    fi
+    last_output_file="$output_file"
+    ((attempt++))
+  done
+
+  # All attempts failed — replicate the original failure handling using the
+  # LAST attempt's output_file / duration / exit_code.
+  if [ "$last_exit_code" -eq 124 ]; then
+    # Timeout
+    echo -e "${RED}⏱️  TIMEOUT: $test_name (exceeded ${test_timeout}s)${NC}" | tee -a "$RESULTS_FILE"
+    FAILED_TESTS+=("$test_name (TIMEOUT)")
+  else
+    # Test failure
+    echo -e "${RED}❌ FAILED: $test_name (${last_duration}s)${NC}" | tee -a "$RESULTS_FILE"
+    echo -e "${YELLOW}  Test case timings:${NC}" | tee -a "$RESULTS_FILE"
+    parse_test_timings "$last_output_file" | tee -a "$RESULTS_FILE"
+    FAILED_TESTS+=("$test_name")
   fi
+
+  # Show last 30 lines of output for debugging
+  echo -e "${YELLOW}Last 30 lines of output:${NC}" | tee -a "$RESULTS_FILE"
+  tail -30 "$last_output_file" | tee -a "$RESULTS_FILE"
+
+  ((TOTAL_FAILED++))
+  rm -f "$last_output_file"
+  return 1
 }
 
 # Function to run a phase of tests
@@ -558,17 +712,17 @@ run_phase() {
   local phase_name=$1
   shift
   local test_files=("$@")
-  
+
   echo "" | tee -a "$RESULTS_FILE"
   echo -e "${GREEN}═══════════════════════════════════════════════════════════${NC}" | tee -a "$RESULTS_FILE"
   echo -e "${GREEN}  Phase: $phase_name (${#test_files[@]} tests)${NC}" | tee -a "$RESULTS_FILE"
   echo -e "${GREEN}═══════════════════════════════════════════════════════════${NC}" | tee -a "$RESULTS_FILE"
-  
+
   local phase_passed=0
   local phase_failed=0
   local total=${#test_files[@]}
   local test_num=0
-  
+
   for test_file in "${test_files[@]}"; do
     ((test_num++))
     if run_single_test "$test_file" "$phase_name" "$test_num" "$total"; then
@@ -584,34 +738,342 @@ run_phase() {
       sleep "$TEST_INTER_DELAY"
     fi
   done
-  
+
   echo "" | tee -a "$RESULTS_FILE"
   echo -e "${YELLOW}=== $phase_name Summary: $phase_passed/$total passed, $phase_failed/$total failed ===${NC}" | tee -a "$RESULTS_FILE"
-  
+
   return $phase_failed
+}
+
+# Bundle-mode runner: dispatch all of [phase_name]'s test files into ONE
+# `flutter test` invocation so they can share the SharedScenarioPool
+# fixtures (see test_helper.dart). Test files that have been converted
+# to call `acquireSharedScenario(...)` reuse a cached scenario across
+# setUpAll boundaries; tests still on the legacy createTestScenario path
+# pay their original cold-start cost.
+#
+# Output parsing: flutter test prints each file's results as
+#   "<elapsed> +N -M: <abs/path/to/file.dart>: <group> <test>"
+# We grep for the "All tests passed!" terminator at the end and treat
+# the whole bundle as one pass/fail unit. Individual file granularity is
+# preserved in the bundle log file for post-mortem.
+run_phase_bundled() {
+  local phase_name=$1
+  shift
+  local test_files=("$@")
+
+  echo "" | tee -a "$RESULTS_FILE"
+  echo -e "${GREEN}═══════════════════════════════════════════════════════════${NC}" | tee -a "$RESULTS_FILE"
+  echo -e "${GREEN}  Phase: $phase_name (${#test_files[@]} tests, BUNDLED)${NC}" | tee -a "$RESULTS_FILE"
+  echo -e "${GREEN}═══════════════════════════════════════════════════════════${NC}" | tee -a "$RESULTS_FILE"
+
+  # Resolve each test_file through the same RUN_VIRTUAL swap that
+  # run_single_test does, so bundle mode honours the same flag.
+  local resolved_files=()
+  for tf in "${test_files[@]}"; do
+    if [ "${RUN_VIRTUAL:-0}" = "1" ]; then
+      local virtual_file="${tf%_test.dart}_virtual_test.dart"
+      if [ -f "$virtual_file" ]; then
+        tf="$virtual_file"
+      fi
+    fi
+    resolved_files+=("$tf")
+  done
+
+  # Bundle timeout: sum of per-file timeouts is overly pessimistic (the
+  # whole point of bundling is fixture reuse). Use a flat ceiling that
+  # scales with file count but caps at 1800s (30 min) for very large
+  # phases. Tunable via BUNDLE_TIMEOUT env.
+  local n=${#resolved_files[@]}
+  local bundle_timeout="${BUNDLE_TIMEOUT:-$((n * 60))}"
+  if [ "$bundle_timeout" -gt 1800 ]; then bundle_timeout=1800; fi
+  if [ "$bundle_timeout" -lt 180 ]; then bundle_timeout=180; fi
+
+  local bundle_log="/tmp/bundle_${phase_name// /_}_$(date +%s).log"
+  local start_time
+  start_time=$(date +%s)
+
+  echo -e "${BLUE}[Bundle] Dispatching ${n} files in one flutter test invocation (timeout ${bundle_timeout}s)${NC}" | tee -a "$RESULTS_FILE"
+  echo -e "${BLUE}[Bundle] Output: $bundle_log${NC}" | tee -a "$RESULTS_FILE"
+
+  # Capture exit code without `if` so we can branch correctly. The `set -e`
+  # at the top of the script would otherwise abort on the non-zero status;
+  # `|| true` pattern keeps the script going while preserving the code.
+  local exit_code=0
+  timeout "${bundle_timeout}s" flutter test "${resolved_files[@]}" > "$bundle_log" 2>&1 || exit_code=$?
+  local end_time
+  end_time=$(date +%s)
+  local duration=$((end_time - start_time))
+
+  if [ "$exit_code" -eq 0 ]; then
+    echo -e "${GREEN}✅ BUNDLE PASSED: $phase_name (${duration}s for ${n} files)${NC}" | tee -a "$RESULTS_FILE"
+    TOTAL_PASSED=$((TOTAL_PASSED + n))
+    rm -f "$bundle_log"
+    return 0
+  fi
+
+  if [ "$exit_code" -eq 124 ]; then
+    echo -e "${RED}⏱️  BUNDLE TIMEOUT: $phase_name (exceeded ${bundle_timeout}s)${NC}" | tee -a "$RESULTS_FILE"
+  else
+    echo -e "${RED}❌ BUNDLE FAILED: $phase_name (${duration}s, exit=$exit_code)${NC}" | tee -a "$RESULTS_FILE"
+  fi
+
+  # Try to extract per-file pass/fail from flutter test's output. Each
+  # failing test prints a line like:
+  #   "00:34 +5 -1: <file.dart>: <group> <test name> [E]"
+  # We grep the unique file paths that had failures and attribute them.
+  local failed_files
+  failed_files=$(grep -E "\-[0-9]+:.+\.dart:" "$bundle_log" 2>/dev/null \
+                  | grep -oE "/[^[:space:]]+\.dart" 2>/dev/null \
+                  | sort -u || true)
+  local bundle_failed=0
+  local bundle_passed=0
+  if [ -n "$failed_files" ]; then
+    for ff in $failed_files; do
+      FAILED_TESTS+=("$(basename "$ff" .dart) (BUNDLE)")
+      ((bundle_failed++))
+    done
+  fi
+  # Any file we sent that didn't appear in failed_files is treated as passed.
+  for tf in "${resolved_files[@]}"; do
+    local hit=0
+    for ff in $failed_files; do
+      if [ "$(basename "$tf")" = "$(basename "$ff")" ]; then
+        hit=1
+        break
+      fi
+    done
+    if [ "$hit" -eq 0 ]; then
+      ((bundle_passed++))
+    fi
+  done
+  TOTAL_PASSED=$((TOTAL_PASSED + bundle_passed))
+  TOTAL_FAILED=$((TOTAL_FAILED + bundle_failed))
+
+  echo -e "${YELLOW}[Bundle] $bundle_passed pass / $bundle_failed fail (attributed); see $bundle_log${NC}" | tee -a "$RESULTS_FILE"
+  # Show last 50 lines for diagnostics
+  echo -e "${YELLOW}Last 50 lines of bundle log:${NC}" | tee -a "$RESULTS_FILE"
+  tail -50 "$bundle_log" | tee -a "$RESULTS_FILE"
+
+  return 1
 }
 
 # Start logging
 echo "Test execution started at $(date)" > "$RESULTS_FILE"
 echo "========================================" >> "$RESULTS_FILE"
 
+# Return the per-test timeout (seconds) for a given test file path.
+# Mirrors the timeout case-block inside run_single_test so the parallel
+# path uses the same per-file budgets.
+get_test_timeout_for_file() {
+  local test_file=$1
+  local test_name=$(basename "$test_file" .dart)
+  local test_basekey="${test_name%_virtual_test}"
+  test_basekey="${test_basekey%_test}"
+  case "$test_basekey" in
+    scenario_conference|scenario_nospam|scenario_group_create_debug) echo 300 ;;
+    scenario_group_large|scenario_group_moderation) echo 600 ;;
+    *) echo 180 ;;
+  esac
+}
+
+# Worker entry point used by parallel mode (PARALLEL_WORKERS>1).
+# Writes <status> <test_name> <duration> <phase_label> to a per-test
+# status file in $PARALLEL_RESULT_DIR. The master aggregates these
+# after xargs returns.
+run_test_worker() {
+  local test_file=$1
+  local phase_label=$2
+
+  # Virtual-mode swap (same logic as run_single_test).
+  if [ "${RUN_VIRTUAL:-0}" = "1" ]; then
+    local virtual_file="${test_file%_test.dart}_virtual_test.dart"
+    if [ -f "$virtual_file" ]; then
+      test_file="$virtual_file"
+    fi
+  fi
+
+  local test_name=$(basename "$test_file" .dart)
+  local start_time=$(date +%s)
+  local output_file="$PARALLEL_RESULT_DIR/${test_name}.log"
+  local test_timeout
+  test_timeout=$(get_test_timeout_for_file "$test_file")
+  local status=""
+
+  if timeout "${test_timeout}s" flutter test "$test_file" > "$output_file" 2>&1; then
+    status="PASSED"
+  else
+    local rc=$?
+    if [ "$rc" -eq 124 ]; then status="TIMEOUT"; else status="FAILED"; fi
+  fi
+  local end_time=$(date +%s)
+  local duration=$((end_time - start_time))
+  # One line per test, phase label is single-token (no spaces) for easy parsing.
+  printf '%s %s %d %s\n' "$status" "$test_name" "$duration" "$phase_label" \
+    > "$PARALLEL_RESULT_DIR/${test_name}.status"
+}
+export -f get_test_timeout_for_file run_test_worker
+
+# Phase number -> single-token label used in parallel worker status output.
+phase_label_for_num() {
+  case "$1" in
+    1) echo "P1_BASIC" ;;
+    2) echo "P2_FRIENDSHIP" ;;
+    3) echo "P3_MESSAGE" ;;
+    4) echo "P4_GROUP" ;;
+    5) echo "P5_TOXAV" ;;
+    6) echo "P6_PROFILE" ;;
+    7) echo "P7_CONVERSATION" ;;
+    8) echo "P8_FILE" ;;
+    9) echo "P9_CONFERENCE" ;;
+    10) echo "P10_GROUP_EXT" ;;
+    11) echo "P11_NETWORK" ;;
+    12) echo "P12_OTHER" ;;
+    13) echo "P13_BINARY" ;;
+    14) echo "P14_UNIT" ;;
+    *) echo "P?" ;;
+  esac
+}
+
+# Build "test_file<TAB>phase_label" pairs for every test in the
+# selected phases. Used only by parallel mode.
+build_parallel_queue() {
+  local pn arr ref test
+  for pn in "${SELECTED_PHASES[@]}"; do
+    case "$pn" in
+      1)  arr=("${PHASE1_BASIC[@]}") ;;
+      2)  arr=("${PHASE2_FRIENDSHIP[@]}") ;;
+      3)  arr=("${PHASE3_MESSAGE[@]}") ;;
+      4)  arr=("${PHASE4_GROUP[@]}") ;;
+      5)  arr=("${PHASE5_TOXAV[@]}") ;;
+      6)  arr=("${PHASE6_PROFILE[@]}") ;;
+      7)  arr=("${PHASE7_CONVERSATION[@]}") ;;
+      8)  arr=("${PHASE8_FILE[@]}") ;;
+      9)  arr=("${PHASE9_CONFERENCE[@]}") ;;
+      10) arr=("${PHASE10_GROUP_EXT[@]}") ;;
+      11) arr=("${PHASE11_NETWORK[@]}") ;;
+      12) arr=("${PHASE12_OTHER[@]}") ;;
+      13) arr=("${PHASE13_BINARY_REPLACEMENT[@]}") ;;
+      14) arr=("${PHASE14_UNIT[@]}") ;;
+      *)  arr=() ;;
+    esac
+    local label
+    label=$(phase_label_for_num "$pn")
+    for test in "${arr[@]}"; do
+      printf '%s\t%s\n' "$test" "$label"
+    done
+  done
+}
+
+# Aggregate parallel status files back into the global counters and
+# print phase-grouped output, sorted by dispatch order.
+collect_parallel_results() {
+  local pn arr label total phase_total phase_passed phase_failed
+  for pn in "${SELECTED_PHASES[@]}"; do
+    case "$pn" in
+      1)  arr=("${PHASE1_BASIC[@]}") ;;
+      2)  arr=("${PHASE2_FRIENDSHIP[@]}") ;;
+      3)  arr=("${PHASE3_MESSAGE[@]}") ;;
+      4)  arr=("${PHASE4_GROUP[@]}") ;;
+      5)  arr=("${PHASE5_TOXAV[@]}") ;;
+      6)  arr=("${PHASE6_PROFILE[@]}") ;;
+      7)  arr=("${PHASE7_CONVERSATION[@]}") ;;
+      8)  arr=("${PHASE8_FILE[@]}") ;;
+      9)  arr=("${PHASE9_CONFERENCE[@]}") ;;
+      10) arr=("${PHASE10_GROUP_EXT[@]}") ;;
+      11) arr=("${PHASE11_NETWORK[@]}") ;;
+      12) arr=("${PHASE12_OTHER[@]}") ;;
+      13) arr=("${PHASE13_BINARY_REPLACEMENT[@]}") ;;
+      14) arr=("${PHASE14_UNIT[@]}") ;;
+      *)  arr=() ;;
+    esac
+    label=$(phase_name_for_num "$pn")
+    total=${#arr[@]}
+    phase_passed=0
+    phase_failed=0
+    echo "" | tee -a "$RESULTS_FILE"
+    echo -e "${GREEN}═══════════════════════════════════════════════════════════${NC}" | tee -a "$RESULTS_FILE"
+    echo -e "${GREEN}  Phase: $label ($total tests)${NC}" | tee -a "$RESULTS_FILE"
+    echo -e "${GREEN}═══════════════════════════════════════════════════════════${NC}" | tee -a "$RESULTS_FILE"
+
+    local tnum=0
+    local test_file test_basename effective_basename status_line status duration_sec
+    for test_file in "${arr[@]}"; do
+      ((tnum++))
+      effective_basename=$(basename "$test_file" .dart)
+      # Account for the virtual-mode rename.
+      if [ "${RUN_VIRTUAL:-0}" = "1" ]; then
+        local v="${test_file%_test.dart}_virtual_test.dart"
+        if [ -f "$v" ]; then
+          effective_basename=$(basename "$v" .dart)
+        fi
+      fi
+      test_basename="$effective_basename"
+      local status_file="$PARALLEL_RESULT_DIR/${test_basename}.status"
+      if [ ! -f "$status_file" ]; then
+        echo -e "${RED}❓ NO RESULT: $test_basename (worker did not produce status)${NC}" | tee -a "$RESULTS_FILE"
+        FAILED_TESTS+=("$test_basename (NO_RESULT)")
+        TOTAL_FAILED=$((TOTAL_FAILED + 1))
+        ((phase_failed++))
+        continue
+      fi
+      status_line=$(cat "$status_file")
+      status=$(echo "$status_line" | awk '{print $1}')
+      duration_sec=$(echo "$status_line" | awk '{print $3}')
+
+      case "$status" in
+        PASSED)
+          echo -e "${GREEN}✅ PASSED: $test_basename (${duration_sec}s)${NC}" | tee -a "$RESULTS_FILE"
+          TOTAL_PASSED=$((TOTAL_PASSED + 1))
+          ((phase_passed++))
+          ;;
+        TIMEOUT)
+          local to
+          to=$(get_test_timeout_for_file "$test_file")
+          echo -e "${RED}⏱️  TIMEOUT: $test_basename (exceeded ${to}s)${NC}" | tee -a "$RESULTS_FILE"
+          FAILED_TESTS+=("$test_basename (TIMEOUT)")
+          TOTAL_FAILED=$((TOTAL_FAILED + 1))
+          ((phase_failed++))
+          ;;
+        FAILED|*)
+          echo -e "${RED}❌ FAILED: $test_basename (${duration_sec}s)${NC}" | tee -a "$RESULTS_FILE"
+          if [ -f "$PARALLEL_RESULT_DIR/${test_basename}.log" ]; then
+            echo -e "${YELLOW}  Last 30 lines:${NC}" | tee -a "$RESULTS_FILE"
+            tail -30 "$PARALLEL_RESULT_DIR/${test_basename}.log" | tee -a "$RESULTS_FILE"
+          fi
+          FAILED_TESTS+=("$test_basename")
+          TOTAL_FAILED=$((TOTAL_FAILED + 1))
+          ((phase_failed++))
+          ;;
+      esac
+    done
+
+    echo "" | tee -a "$RESULTS_FILE"
+    echo -e "${YELLOW}=== $label Summary: $phase_passed/$total passed, $phase_failed/$total failed ===${NC}" | tee -a "$RESULTS_FILE"
+  done
+}
+
 run_phase_by_number() {
   local num="$1"
+  local runner=run_phase
+  if [ "${BUNDLE:-0}" = "1" ]; then
+    runner=run_phase_bundled
+  fi
   case "$num" in
-    1) run_phase "Phase 1: Basic Tests" "${PHASE1_BASIC[@]}" || true ;;
-    2) run_phase "Phase 2: Friendship Tests" "${PHASE2_FRIENDSHIP[@]}" || true ;;
-    3) run_phase "Phase 3: Message Tests" "${PHASE3_MESSAGE[@]}" || true ;;
-    4) run_phase "Phase 4: Group Tests" "${PHASE4_GROUP[@]}" || true ;;
-    5) run_phase "Phase 5: ToxAV Tests" "${PHASE5_TOXAV[@]}" || true ;;
-    6) run_phase "Phase 6: Profile Tests" "${PHASE6_PROFILE[@]}" || true ;;
-    7) run_phase "Phase 7: Conversation Tests" "${PHASE7_CONVERSATION[@]}" || true ;;
-    8) run_phase "Phase 8: File Tests" "${PHASE8_FILE[@]}" || true ;;
-    9) run_phase "Phase 9: Conference Tests" "${PHASE9_CONFERENCE[@]}" || true ;;
-    10) run_phase "Phase 10: Group Extended Tests" "${PHASE10_GROUP_EXT[@]}" || true ;;
-    11) run_phase "Phase 11: Network Tests" "${PHASE11_NETWORK[@]}" || true ;;
-    12) run_phase "Phase 12: Other Tests" "${PHASE12_OTHER[@]}" || true ;;
-    13) run_phase "Phase 13: Binary Replacement Tests" "${PHASE13_BINARY_REPLACEMENT[@]}" || true ;;
-    14) run_phase "Phase 14: Unit Tests" "${PHASE14_UNIT[@]}" || true ;;
+    1) "$runner" "Phase 1: Basic Tests" "${PHASE1_BASIC[@]}" || true ;;
+    2) "$runner" "Phase 2: Friendship Tests" "${PHASE2_FRIENDSHIP[@]}" || true ;;
+    3) "$runner" "Phase 3: Message Tests" "${PHASE3_MESSAGE[@]}" || true ;;
+    4) "$runner" "Phase 4: Group Tests" "${PHASE4_GROUP[@]}" || true ;;
+    5) "$runner" "Phase 5: ToxAV Tests" "${PHASE5_TOXAV[@]}" || true ;;
+    6) "$runner" "Phase 6: Profile Tests" "${PHASE6_PROFILE[@]}" || true ;;
+    7) "$runner" "Phase 7: Conversation Tests" "${PHASE7_CONVERSATION[@]}" || true ;;
+    8) "$runner" "Phase 8: File Tests" "${PHASE8_FILE[@]}" || true ;;
+    9) "$runner" "Phase 9: Conference Tests" "${PHASE9_CONFERENCE[@]}" || true ;;
+    10) "$runner" "Phase 10: Group Extended Tests" "${PHASE10_GROUP_EXT[@]}" || true ;;
+    11) "$runner" "Phase 11: Network Tests" "${PHASE11_NETWORK[@]}" || true ;;
+    12) "$runner" "Phase 12: Other Tests" "${PHASE12_OTHER[@]}" || true ;;
+    13) "$runner" "Phase 13: Binary Replacement Tests" "${PHASE13_BINARY_REPLACEMENT[@]}" || true ;;
+    14) "$runner" "Phase 14: Unit Tests" "${PHASE14_UNIT[@]}" || true ;;
     *)
       echo -e "${RED}Internal error: unsupported phase number: $num${NC}"
       exit 3
@@ -619,9 +1081,42 @@ run_phase_by_number() {
   esac
 }
 
-for phase_num in "${SELECTED_PHASES[@]}"; do
-  run_phase_by_number "$phase_num"
-done
+# PARALLEL_WORKERS=N runs the entire selected queue across N concurrent
+# `flutter test` invocations. Default 1 keeps the legacy sequential
+# behavior. Tox tests are timing-sensitive (60s DHT ping, 122s BAD_NODE);
+# 2-3 workers usually fit on a developer Mac without flaking, higher
+# values risk wall-clock-timer starvation.
+PARALLEL_WORKERS="${PARALLEL_WORKERS:-1}"
+if ! [[ "$PARALLEL_WORKERS" =~ ^[0-9]+$ ]] || [ "$PARALLEL_WORKERS" -lt 1 ]; then
+  echo -e "${RED}PARALLEL_WORKERS must be a positive integer (got: $PARALLEL_WORKERS)${NC}"
+  exit 2
+fi
+
+if [ "$PARALLEL_WORKERS" -gt 1 ]; then
+  PARALLEL_RESULT_DIR="$(mktemp -d /tmp/tim2tox_parallel.XXXXXX)"
+  export PARALLEL_RESULT_DIR RUN_VIRTUAL
+  echo -e "${GREEN}Parallel mode: PARALLEL_WORKERS=$PARALLEL_WORKERS, scratch dir: $PARALLEL_RESULT_DIR${NC}" | tee -a "$RESULTS_FILE"
+  PARALLEL_START=$(date +%s)
+  # Dispatch every test through xargs -P. Each line of the queue is one
+  # "<test_file>\t<phase_label>" pair; awk splits it back inside the
+  # worker so paths with spaces are handled defensively.
+  build_parallel_queue | \
+    xargs -P "$PARALLEL_WORKERS" -n 1 -I '{}' bash -c '
+      line="$1"
+      tf="${line%%	*}"
+      lbl="${line##*	}"
+      run_test_worker "$tf" "$lbl"
+    ' _ '{}'
+  PARALLEL_END=$(date +%s)
+  PARALLEL_ELAPSED=$((PARALLEL_END - PARALLEL_START))
+  echo -e "${GREEN}Parallel run finished in ${PARALLEL_ELAPSED}s wall-clock${NC}" | tee -a "$RESULTS_FILE"
+  collect_parallel_results
+  rm -rf "$PARALLEL_RESULT_DIR"
+else
+  for phase_num in "${SELECTED_PHASES[@]}"; do
+    run_phase_by_number "$phase_num"
+  done
+fi
 
 # Calculate totals
 TOTAL_TESTS=$((TOTAL_PASSED + TOTAL_FAILED + TOTAL_SKIPPED))
@@ -637,8 +1132,9 @@ TOTAL_TESTS=$((TOTAL_PASSED + TOTAL_FAILED + TOTAL_SKIPPED))
   echo "Passed: $TOTAL_PASSED"
   echo "Failed: $TOTAL_FAILED"
   echo "Skipped: $TOTAL_SKIPPED"
+  echo "Flaky:  $TOTAL_FLAKY"
   echo ""
-  
+
   if [ ${#FAILED_TESTS[@]} -gt 0 ]; then
     echo "Failed Tests:"
     for test in "${FAILED_TESTS[@]}"; do
@@ -646,7 +1142,15 @@ TOTAL_TESTS=$((TOTAL_PASSED + TOTAL_FAILED + TOTAL_SKIPPED))
     done
     echo ""
   fi
-  
+
+  if [ ${#FLAKY_TESTS[@]} -gt 0 ]; then
+    echo "Flaky Tests:"
+    for test in "${FLAKY_TESTS[@]}"; do
+      echo "  - $test"
+    done
+    echo ""
+  fi
+
   if [ ${#SKIPPED_TESTS[@]} -gt 0 ]; then
     echo "Skipped Tests:"
     for test in "${SKIPPED_TESTS[@]}"; do
@@ -654,7 +1158,7 @@ TOTAL_TESTS=$((TOTAL_PASSED + TOTAL_FAILED + TOTAL_SKIPPED))
     done
     echo ""
   fi
-  
+
   echo "═══════════════════════════════════════════════════════════"
 } > "$SUMMARY_FILE"
 cat "$SUMMARY_FILE"
@@ -668,6 +1172,7 @@ echo -e "Total Tests: ${BLUE}$TOTAL_TESTS${NC}"
 echo -e "Passed: ${GREEN}$TOTAL_PASSED${NC}"
 echo -e "Failed: ${RED}$TOTAL_FAILED${NC}"
 echo -e "Skipped: ${YELLOW}$TOTAL_SKIPPED${NC}"
+echo -e "Flaky:  ${YELLOW}$TOTAL_FLAKY${NC}"
 echo ""
 echo "Detailed results: $RESULTS_FILE"
 echo "Summary: $SUMMARY_FILE"

@@ -550,8 +550,8 @@ class TestNode {
       final deadline = DateTime.now().add(connectionTimeout);
       final ffiInstance = ffi_lib.Tim2ToxFfi.open();
       int checkCount = 0;
-      int pollDelayMs = 100;
-      const maxPollDelayMs = 300;
+      int pollDelayMs = 50;
+      const maxPollDelayMs = 150;
 
       while (DateTime.now().isBefore(deadline)) {
         checkCount++;
@@ -564,7 +564,13 @@ class TestNode {
         }
 
         if (connectionStatus == 1 || connectionStatus == 2) {
-          await Future.delayed(const Duration(milliseconds: 500));
+          // Previously slept 500ms here as a "stabilization" pause before
+          // returning. There's no callback or state-machine that needs that
+          // gap — the next test step (addFriend / iterate) is the very thing
+          // that consumes the just-online state. Drop the sleep: 500ms × 2
+          // nodes × ~30 setUpAlls ≈ 30s off the total suite. If you ever
+          // see a flake that re-introduces a need for this, prefer polling
+          // the specific predicate rather than restoring a fixed sleep.
           if (checkCount > 1) {
             print(
                 '[Test] Node $alias: Connected to DHT! (connectionStatus=$connectionStatus)');
@@ -578,7 +584,10 @@ class TestNode {
         }
 
         await Future.delayed(Duration(milliseconds: pollDelayMs));
-        pollDelayMs = (pollDelayMs * 1.2).round().clamp(100, maxPollDelayMs);
+        // Tighter ramp: poll every 50-150ms instead of 100-300ms so a node
+        // that comes online inside the first second is detected immediately
+        // (was paying up to one extra 300ms tick).
+        pollDelayMs = (pollDelayMs * 1.2).round().clamp(50, 150);
       }
 
       int finalConnectionStatus = 0;
@@ -757,9 +766,11 @@ class TestNode {
               '[waitForFriendConnection] PROGRESS elapsed=${elapsed.inSeconds}s checkCount=$checkCount friendInList=$friendInList lastRole=$lastRole');
         }
 
-        // Pump all instances so Tox can establish P2P (otherwise we only poll and connection never establishes)
+        // Pump all instances so Tox can establish P2P (otherwise we only poll and connection never establishes).
+        // 100ms step (was 250ms): when role flips to ONLINE the next poll lands within ~100ms instead of 250ms.
+        // Over ~30 setUpAlls × N polls per friendship this is ~5s suite-wide.
         pumpAllInstancesOnce(iterations: 150);
-        await Future.delayed(const Duration(milliseconds: 250));
+        await Future.delayed(const Duration(milliseconds: 100));
       }
 
       final elapsedTotal = DateTime.now().difference(startedAt);
@@ -1295,10 +1306,14 @@ Future<void> establishFriendship(TestNode alice, TestNode bob,
   alice.enableAutoAccept();
   bob.enableAutoAccept();
 
-  // Wait for both nodes to have real Tox DHT connection (tox_self_get_connection_status != NONE)
+  // Wait for both nodes to have real Tox DHT connection in parallel.
+  // Sequential wait paid each node's worst case in series (up to 20s);
+  // Future.wait collapses to the slower side and saves typical 1-2s.
   try {
-    await alice.waitForConnection(timeout: const Duration(seconds: 10));
-    await bob.waitForConnection(timeout: const Duration(seconds: 10));
+    await Future.wait([
+      alice.waitForConnection(timeout: const Duration(seconds: 10)),
+      bob.waitForConnection(timeout: const Duration(seconds: 10)),
+    ]);
     if (alice.getConnectionStatus() == 0 || bob.getConnectionStatus() == 0) {
       print(
           '[establishFriendship] Warning: One or both nodes still have connection_status=0 after wait');
@@ -1424,20 +1439,29 @@ Future<void> establishFriendship(TestNode alice, TestNode bob,
             '[establishFriendship] ⚠️ Little time left in timeout, skipping P2P wait');
         return;
       }
-      // Short P2P warm-up pump (local bootstrap doesn't need the previous 3s).
-      const pumpDuration = Duration(milliseconds: 800);
+      // Short P2P warm-up pump. Previous 800ms baseline was a leftover from
+      // before pumpFriendConnection got tighter iteration density. Local
+      // bootstrap converges in 100-300ms; 400ms is plenty as a guard and
+      // the actual waitForFriendConnection below polls and pumps further.
+      const pumpDuration = Duration(milliseconds: 400);
       final actualPump = remaining.inSeconds > 4
           ? pumpDuration
-          : Duration(milliseconds: remaining.inMilliseconds.clamp(200, 800));
+          : Duration(milliseconds: remaining.inMilliseconds.clamp(200, 400));
       print(
           '[establishFriendship] Pumping Tox for P2P connection (${actualPump.inMilliseconds}ms)...');
       await pumpFriendConnection(alice, bob, duration: actualPump);
       // Cap P2P wait. In local-bootstrap environments, friend connections
-      // either come ONLINE within ~10-15s or never within the test budget;
-      // waiting longer than 30s is pure overhead that makes setUpAll the
-      // dominant cost of every Phase 10/12 test. Floor 15s for jitter.
+      // either come ONLINE within ~2-5s sequentially or never within the
+      // test budget; waiting longer than 30s is pure overhead.
+      // Floor 12s: previously 15s; empirically the success path on local
+      // bootstrap is sub-5s under sequential load, but under PARALLEL_WORKERS>1
+      // CPU contention can push it past 8s, so 12s is the safe boundary that
+      // saves time on the happy path without introducing flakes under N=3.
+      // waitForFriendConnection pumps every iteration and exits the instant
+      // role flips to ONLINE, so a tight floor only costs cycles in the
+      // truly-stuck unhappy path.
       final remainingForP2P = deadline.difference(DateTime.now());
-      const minWaitSec = 15;
+      const minWaitSec = 12;
       const maxWaitSec = 30;
       final halfRemaining =
           remainingForP2P.inSeconds >= 2 ? (remainingForP2P.inSeconds ~/ 2) : 0;
@@ -1473,7 +1497,12 @@ Future<void> establishFriendship(TestNode alice, TestNode bob,
           '[establishFriendship] Check $checkCount: aliceFriends=${aliceFriends.join(", ")}, bobFriends=${bobFriends.join(", ")}');
     }
 
-    await Future.delayed(const Duration(milliseconds: 400));
+    // 200ms step (was 400ms): once we're in this fallback the pre-pump
+    // already gave Tox 3s of dense iteration; the friend-list update is
+    // typically only one iter+poll cycle behind. A tighter step exits the
+    // loop sooner without meaningfully costing CPU (each iter already
+    // does pumpAllInstancesOnce + 2× async getFriendList).
+    await Future.delayed(const Duration(milliseconds: 200));
   }
 
   final finalAliceFriends = await alice.getFriendList();
@@ -1489,6 +1518,171 @@ Future<void> establishFriendship(TestNode alice, TestNode bob,
       'aliceFriends=${finalAliceFriends.join(", ")}, bobFriends=${finalBobFriends.join(", ")}. '
       'This may indicate that nodes are not connected to each other (check bootstrap configuration).');
 }
+
+/// Process-level cache of fully-bootstrapped [TestScenario] instances, keyed
+/// by the (aliases × options) signature. Used when multiple test files are
+/// loaded into the same `flutter test` invocation and they share a node
+/// composition that's expensive to recreate (Tox cold start + DHT bootstrap
+/// + friendship handshake is 7–20 s per scenario).
+///
+/// The pool is opt-in: tests call [acquireSharedScenario] in `setUpAll` and
+/// [releaseSharedScenario] in `tearDownAll`. The fallback semantics match
+/// the original `createTestScenario → initAllNodes → login → bootstrap → …`
+/// chain, so a test file that runs in isolation pays the same cost it always
+/// did — the savings only materialize when multiple test files share an
+/// isolate and ask for the same signature.
+///
+/// State hygiene: on cache-hit, only **transient** per-test state is reset
+/// (callback flags, callback queue, received-message list). Tox-level state
+/// (friend list, DHT routing, saved nodes) is preserved by design — that's
+/// the whole point. Tests that mutate persistent state (creating groups,
+/// deleting friends, changing nospam) MUST clean up after themselves or
+/// explicitly opt out of sharing via [acquireSharedScenario] with a unique
+/// `signatureSalt`.
+///
+/// Disposal: scenarios stay alive until the Dart process exits — the OS
+/// reclaims the underlying Tox sockets/threads. For deterministic teardown
+/// inside long-running test bundles, call [SharedScenarioPool.disposeAll].
+class SharedScenarioPool {
+  SharedScenarioPool._();
+
+  static final Map<String, TestScenario> _cache = {};
+  static bool _envSetup = false;
+
+  static String _signatureFor(
+    List<String> aliases, {
+    required bool withFriendship,
+    required bool withBootstrap,
+    String? signatureSalt,
+  }) {
+    final salt = signatureSalt == null ? '' : '|salt=$signatureSalt';
+    return '${aliases.join(",")}|f=$withFriendship|b=$withBootstrap$salt';
+  }
+
+  static void _resetTransientState(TestScenario scenario) {
+    for (final n in scenario.nodes) {
+      n.callbackReceived.clear();
+      n.callbackQueue.clear();
+      n.receivedMessages.clear();
+    }
+  }
+
+  /// Returns a fully-prepared [TestScenario] for [aliases], reusing a cached
+  /// one when its signature matches.
+  ///
+  /// When [withBootstrap] is true the pool runs [configureLocalBootstrap]
+  /// for fresh scenarios. When [withFriendship] is true it establishes a
+  /// **mesh** friendship over all node pairs in parallel (so 3 nodes = 3
+  /// concurrent `establishFriendship` calls). Each call uses a 60 s timeout
+  /// — enough headroom for cold-start P2P handshake under parallel CPU load.
+  ///
+  /// Pass a [signatureSalt] when you want a fresh scenario for a particular
+  /// test (e.g. testing scenario.dispose behavior itself, or any test that
+  /// mutates Tox state in ways the pool can't safely reset).
+  static Future<TestScenario> acquire(
+    List<String> aliases, {
+    bool withFriendship = false,
+    bool withBootstrap = true,
+    String? signatureSalt,
+  }) async {
+    final key = _signatureFor(aliases,
+        withFriendship: withFriendship,
+        withBootstrap: withBootstrap,
+        signatureSalt: signatureSalt);
+    final cached = _cache[key];
+    if (cached != null) {
+      print('[SharedScenarioPool] HIT $key — reusing cached scenario');
+      _resetTransientState(cached);
+      return cached;
+    }
+    print(
+        '[SharedScenarioPool] MISS $key — bootstrapping fresh scenario (cold start)');
+    if (!_envSetup) {
+      await setupTestEnvironment();
+      _envSetup = true;
+    }
+    final scenario = await createTestScenario(aliases);
+    await scenario.initAllNodes();
+    await Future.wait(scenario.nodes.map((n) => n.login()));
+    await waitUntil(
+      () => scenario.nodes.every((n) => n.loggedIn),
+      timeout: const Duration(seconds: 10),
+      description: 'all ${aliases.length} nodes logged in (shared-pool)',
+    );
+    if (withBootstrap) {
+      await configureLocalBootstrap(scenario);
+    }
+    for (final n in scenario.nodes) {
+      n.enableAutoAccept();
+    }
+    if (withFriendship && scenario.nodes.length >= 2) {
+      // Mesh in parallel: every pair (i, j) where i < j.
+      final pairs = <Future<void>>[];
+      for (int i = 0; i < scenario.nodes.length; i++) {
+        for (int j = i + 1; j < scenario.nodes.length; j++) {
+          pairs.add(establishFriendship(scenario.nodes[i], scenario.nodes[j],
+              timeout: const Duration(seconds: 60)));
+        }
+      }
+      await Future.wait(pairs);
+    }
+    _cache[key] = scenario;
+    return scenario;
+  }
+
+  /// No-op by design — the scenario stays cached for the next [acquire].
+  /// Provided for API symmetry; tests that want hard teardown call
+  /// [disposeAll] from a top-level `tearDownAll` hook.
+  static void release(List<String> aliases,
+      {bool withFriendship = false,
+      bool withBootstrap = true,
+      String? signatureSalt}) {
+    // intentional no-op
+  }
+
+  /// Tear down every cached scenario. Call from a process-level
+  /// `tearDownAll` when running a bundled test file that knows it's the
+  /// last user of the pool.
+  static Future<void> disposeAll() async {
+    final snapshot = List<TestScenario>.from(_cache.values);
+    _cache.clear();
+    for (final s in snapshot) {
+      try {
+        await s.dispose();
+      } catch (_) {
+        // ignore: deliberate — best-effort cleanup at end of process
+      }
+    }
+  }
+
+  /// Diagnostic: number of cached scenarios. Useful in bundle sanity tests.
+  static int get cachedCount => _cache.length;
+}
+
+/// Convenience wrapper around [SharedScenarioPool.acquire]. Call from
+/// `setUpAll`. The returned scenario is ready to use — bootstrap is done,
+/// friendships are established (if [withFriendship]), auto-accept is on.
+Future<TestScenario> acquireSharedScenario(
+  List<String> aliases, {
+  bool withFriendship = false,
+  bool withBootstrap = true,
+  String? signatureSalt,
+}) =>
+    SharedScenarioPool.acquire(aliases,
+        withFriendship: withFriendship,
+        withBootstrap: withBootstrap,
+        signatureSalt: signatureSalt);
+
+/// Convenience wrapper around [SharedScenarioPool.release]. Call from
+/// `tearDownAll`. No-op by contract.
+void releaseSharedScenario(List<String> aliases,
+        {bool withFriendship = false,
+        bool withBootstrap = true,
+        String? signatureSalt}) =>
+    SharedScenarioPool.release(aliases,
+        withFriendship: withFriendship,
+        withBootstrap: withBootstrap,
+        signatureSalt: signatureSalt);
 
 /// Configure local bootstrap for test scenario
 /// Similar to C test's tox_node_bootstrap mechanism

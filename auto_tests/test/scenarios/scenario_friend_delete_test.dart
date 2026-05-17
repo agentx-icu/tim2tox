@@ -18,27 +18,15 @@ void main() {
     late TestNode bob;
     
     setUpAll(() async {
-      await setupTestEnvironment();
-      scenario = await createTestScenario(['alice', 'bob']);
+      scenario = await acquireSharedScenario(['alice', 'bob'],
+          withBootstrap: true, withFriendship: false);
       alice = scenario.getNode('alice')!;
       bob = scenario.getNode('bob')!;
-      
-      await scenario.initAllNodes();
-      // Parallelize login
-      await Future.wait([
-        alice.login(),
-        bob.login(),
-      ]);
-      
-      await waitUntil(() => alice.loggedIn && bob.loggedIn);
-      
-      // Configure local bootstrap
-      await configureLocalBootstrap(scenario);
     });
-    
+
     tearDownAll(() async {
-      await scenario.dispose();
-      await teardownTestEnvironment();
+      releaseSharedScenario(['alice', 'bob'],
+          withBootstrap: true, withFriendship: false);
     });
     
     // Lightweight setUp for per-test cleanup if needed

@@ -31,7 +31,6 @@ void main() {
     );
 
     setUpAll(() async {
-      await setupTestEnvironment();
       testDataDir = await getTestDataDir(_avatarSubdir);
 
       // Create avatar file (isolated dir so other scenarios' teardown won't wipe it)
@@ -39,29 +38,16 @@ void main() {
       avatarFile = File(avatarPath);
       await avatarFile.writeAsBytes(avatarData);
 
-      scenario = await createTestScenario(['alice', 'bob']);
+      scenario = await acquireSharedScenario(['alice', 'bob'],
+          withBootstrap: true, withFriendship: true);
       alice = scenario.getNode('alice')!;
       bob = scenario.getNode('bob')!;
-
-      await scenario.initAllNodes();
-      await Future.wait([
-        alice.login(),
-        bob.login(),
-      ]);
-      await waitUntil(
-        () => alice.loggedIn && bob.loggedIn,
-        timeout: const Duration(seconds: 10),
-        description: 'both nodes logged in',
-      );
-      await configureLocalBootstrap(scenario);
-      await establishFriendship(alice, bob);
-      await pumpFriendConnection(alice, bob);
     });
 
     tearDownAll(() async {
-      await scenario.dispose();
+      releaseSharedScenario(['alice', 'bob'],
+          withBootstrap: true, withFriendship: true);
       await cleanupTestDataDir(_avatarSubdir);
-      await teardownTestEnvironment();
     });
 
     // Lightweight setUp for per-test cleanup if needed

@@ -52,10 +52,13 @@ void main() {
         establishFriendship(alice, charlie,
             timeout: const Duration(seconds: 90)),
       ]);
-      await pumpFriendConnection(alice, bob,
-          duration: const Duration(seconds: 4));
-      await pumpFriendConnection(alice, charlie,
-          duration: const Duration(seconds: 4));
+      // Both pumps share the same global iterate, so run in parallel and shorten.
+      await Future.wait([
+        pumpFriendConnection(alice, bob,
+            duration: const Duration(seconds: 2)),
+        pumpFriendConnection(alice, charlie,
+            duration: const Duration(seconds: 2)),
+      ]);
     });
 
     tearDownAll(() async {
@@ -100,7 +103,7 @@ void main() {
           reason: '${invitee.alias} joinGroup failed: ${joinResult.code}');
 
       await pumpGroupPeerDiscovery(alice, invitee,
-          duration: const Duration(seconds: 3));
+          duration: const Duration(milliseconds: 800));
       final inviteeInGroup = await waitUntilFounderSeesMemberInGroup(
           alice, invitee, groupId,
           timeout: const Duration(seconds: 25));
@@ -121,7 +124,6 @@ void main() {
       final groupId = createResult.data!;
       await inviteAndJoinMember(groupId, bob,
           context: 'modify member nameCard');
-      await Future.delayed(const Duration(milliseconds: 500));
       final bobPublicKey = bob.getPublicKey();
       final setMemberInfoResult = await alice.runWithInstanceAsync(
           () async => TIMGroupManager.instance.setGroupMemberInfo(
@@ -130,7 +132,8 @@ void main() {
                 nameCard: 'Bob\'s Name Card',
               ));
       expect(setMemberInfoResult.code, equals(0));
-      await Future.delayed(const Duration(milliseconds: 500));
+      pumpAllInstancesOnce(iterations: 50);
+      await Future.delayed(const Duration(milliseconds: 200));
       final memberListResult = await alice.runWithInstanceAsync(
           () async => TIMGroupManager.instance.getGroupMemberList(
                 groupID: groupId,
@@ -164,7 +167,6 @@ void main() {
       final groupId = createResult.data!;
       final bobJoinGroupId = await inviteAndJoinMember(groupId, bob,
           context: 'modify own nameCard');
-      await Future.delayed(const Duration(milliseconds: 500));
       final bobPublicKey = bob.getPublicKey();
       final setMemberInfoResult = await bob.runWithInstanceAsync(
           () async => TIMGroupManager.instance.setGroupMemberInfo(
@@ -173,7 +175,8 @@ void main() {
                 nameCard: 'My Own Name Card',
               ));
       expect(setMemberInfoResult.code, equals(0));
-      await Future.delayed(const Duration(milliseconds: 500));
+      pumpAllInstancesOnce(iterations: 50);
+      await Future.delayed(const Duration(milliseconds: 200));
       final memberListResult = await bob.runWithInstanceAsync(
           () async => TIMGroupManager.instance.getGroupMemberList(
                 groupID: bobJoinGroupId,
@@ -220,7 +223,8 @@ void main() {
                 role: GroupMemberRoleTypeEnum.V2TIM_GROUP_MEMBER_ROLE_ADMIN,
               ));
       expect(setRoleResult.code, equals(0));
-      await Future.delayed(const Duration(milliseconds: 500));
+      pumpAllInstancesOnce(iterations: 50);
+      await Future.delayed(const Duration(milliseconds: 200));
       final memberListResult = await alice.runWithInstanceAsync(
           () async => TIMGroupManager.instance.getGroupMemberList(
                 groupID: groupId,
@@ -256,7 +260,6 @@ void main() {
           context: 'multiple member info modifications (bob)');
       await inviteAndJoinMember(groupId, charlie,
           context: 'multiple member info modifications (charlie)');
-      await Future.delayed(const Duration(milliseconds: 500));
       final bobPublicKey = bob.getPublicKey();
       final charliePublicKey = charlie.getPublicKey();
       await alice.runWithInstanceAsync(() async {
@@ -267,7 +270,8 @@ void main() {
             userID: charliePublicKey,
             nameCard: 'Charlie Card');
       });
-      await Future.delayed(const Duration(milliseconds: 500));
+      pumpAllInstancesOnce(iterations: 50);
+      await Future.delayed(const Duration(milliseconds: 200));
       final memberListResult = await alice.runWithInstanceAsync(
           () async => TIMGroupManager.instance.getGroupMemberList(
                 groupID: groupId,
@@ -308,7 +312,6 @@ void main() {
       final conferenceId = createResult.data!;
       await inviteAndJoinMember(conferenceId, bob,
           context: 'conference member info');
-      await Future.delayed(const Duration(milliseconds: 500));
       final bobPublicKey = bob.getPublicKey();
       final setMemberInfoResult = await alice.runWithInstanceAsync(
           () async => TIMGroupManager.instance.setGroupMemberInfo(
@@ -317,7 +320,8 @@ void main() {
                 nameCard: 'Conference Name Card',
               ));
       expect(setMemberInfoResult.code, equals(0));
-      await Future.delayed(const Duration(milliseconds: 500));
+      pumpAllInstancesOnce(iterations: 50);
+      await Future.delayed(const Duration(milliseconds: 200));
       final memberListResult = await alice.runWithInstanceAsync(
           () async => TIMGroupManager.instance.getGroupMemberList(
                 groupID: conferenceId,

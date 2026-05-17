@@ -67,14 +67,31 @@ void main() {
       expect(createResult.code, equals(0), reason: 'createGroup failed: ${createResult.code}');
       expect(createResult.data, isNotNull);
       groupId = createResult.data;
-      
-      await Future.delayed(const Duration(seconds: 2));
-      
+
+      // Helper: poll until coordinator (or inviter) sees at least [expected] non-self members.
+      Future<int> waitForMemberCount(TestNode viewer, int expected,
+          {Duration timeout = const Duration(seconds: 15)}) async {
+        final deadline = DateTime.now().add(timeout);
+        int last = 0;
+        while (DateTime.now().isBefore(deadline)) {
+          final r = await viewer.runWithInstanceAsync(() async =>
+              TIMGroupManager.instance.getGroupMemberList(
+                groupID: groupId!,
+                filter: GroupMemberFilterTypeEnum.V2TIM_GROUP_MEMBER_FILTER_ALL,
+                nextSeq: '0',
+              ));
+          last = r.data?.memberInfoList?.length ?? 0;
+          if (last >= expected) return last;
+          pumpAllInstancesOnce(iterations: 60);
+          await Future.delayed(const Duration(milliseconds: 300));
+        }
+        return last;
+      }
+
       // Establish friendships so invites succeed
-      await establishFriendship(coordinator, node1, timeout: const Duration(seconds: 25));
-      await establishFriendship(node1, node0, timeout: const Duration(seconds: 25));
-      await Future.delayed(const Duration(seconds: 3));
-      
+      await establishFriendship(coordinator, node1, timeout: const Duration(seconds: 45));
+      await establishFriendship(node1, node0, timeout: const Duration(seconds: 45));
+
       // Step 2: Coordinator invites Node1, Node1 joins
       final node1PublicKey = node1.getPublicKey();
       final inviteNode1Result = await coordinator.runWithInstanceAsync(() async => TIMGroupManager.instance.inviteUserToGroup(
@@ -82,12 +99,11 @@ void main() {
         userList: [node1PublicKey],
       ));
       expect(inviteNode1Result.code, equals(0), reason: 'inviteNode1 failed: ${inviteNode1Result.code}');
-      await Future.delayed(const Duration(seconds: 2));
+      pumpAllInstancesOnce(iterations: 80);
+      await Future.delayed(const Duration(milliseconds: 300));
       final join1 = await node1.runWithInstanceAsync(() async => TIMManager.instance.joinGroup(groupID: groupId!, message: ''));
       expect(join1.code, equals(0), reason: 'node1 joinGroup failed: ${join1.code}');
-      
-      await Future.delayed(const Duration(seconds: 2));
-      
+
       // Step 3: Node1 invites Node0, Node0 joins
       final node0PublicKey = node0.getPublicKey();
       final inviteNode0Result = await node1.runWithInstanceAsync(() async => TIMGroupManager.instance.inviteUserToGroup(
@@ -95,27 +111,20 @@ void main() {
         userList: [node0PublicKey],
       ));
       expect(inviteNode0Result.code, equals(0), reason: 'inviteNode0 failed: ${inviteNode0Result.code}');
-      await Future.delayed(const Duration(seconds: 2));
+      pumpAllInstancesOnce(iterations: 80);
+      await Future.delayed(const Duration(milliseconds: 300));
       final join0 = await node0.runWithInstanceAsync(() async => TIMManager.instance.joinGroup(groupID: groupId!, message: ''));
       expect(join0.code, equals(0), reason: 'node0 joinGroup failed: ${join0.code}');
-      
-      await Future.delayed(const Duration(seconds: 3));
-      
+
       // Step 4: Verify initial group has at least 2 members (DHT sync may delay)
-      final memberListResult1 = await coordinator.runWithInstanceAsync(() async => TIMGroupManager.instance.getGroupMemberList(
-        groupID: groupId!,
-        filter: GroupMemberFilterTypeEnum.V2TIM_GROUP_MEMBER_FILTER_ALL,
-        nextSeq: '0',
-      ));
-      expect(memberListResult1.code, equals(0), reason: 'getGroupMemberList failed: ${memberListResult1.code}');
-      expect(memberListResult1.data, isNotNull);
-      expect(memberListResult1.data!.memberInfoList?.length ?? 0, greaterThanOrEqualTo(2));
-      
+      final count1 = await waitForMemberCount(coordinator, 2);
+      expect(count1, greaterThanOrEqualTo(2),
+          reason: 'coordinator should see >=2 members after node0/node1 join');
+
       // Establish friendships for node3, node4
-      await establishFriendship(coordinator, node3, timeout: const Duration(seconds: 25));
-      await establishFriendship(node3, node4, timeout: const Duration(seconds: 25));
-      await Future.delayed(const Duration(seconds: 2));
-      
+      await establishFriendship(coordinator, node3, timeout: const Duration(seconds: 45));
+      await establishFriendship(node3, node4, timeout: const Duration(seconds: 45));
+
       // Step 5: Coordinator invites Node3, Node3 joins
       final node3PublicKey = node3.getPublicKey();
       final inviteNode3Result = await coordinator.runWithInstanceAsync(() async => TIMGroupManager.instance.inviteUserToGroup(
@@ -123,12 +132,11 @@ void main() {
         userList: [node3PublicKey],
       ));
       expect(inviteNode3Result.code, equals(0), reason: 'inviteNode3 failed: ${inviteNode3Result.code}');
-      await Future.delayed(const Duration(seconds: 2));
+      pumpAllInstancesOnce(iterations: 80);
+      await Future.delayed(const Duration(milliseconds: 300));
       final join3 = await node3.runWithInstanceAsync(() async => TIMManager.instance.joinGroup(groupID: groupId!, message: ''));
       expect(join3.code, equals(0), reason: 'node3 joinGroup failed: ${join3.code}');
-      
-      await Future.delayed(const Duration(seconds: 2));
-      
+
       // Step 6: Node3 invites Node4, Node4 joins
       final node4PublicKey = node4.getPublicKey();
       final inviteNode4Result = await node3.runWithInstanceAsync(() async => TIMGroupManager.instance.inviteUserToGroup(
@@ -136,11 +144,13 @@ void main() {
         userList: [node4PublicKey],
       ));
       expect(inviteNode4Result.code, equals(0), reason: 'inviteNode4 failed: ${inviteNode4Result.code}');
-      await Future.delayed(const Duration(seconds: 2));
+      pumpAllInstancesOnce(iterations: 80);
+      await Future.delayed(const Duration(milliseconds: 300));
       final join4 = await node4.runWithInstanceAsync(() async => TIMManager.instance.joinGroup(groupID: groupId!, message: ''));
       expect(join4.code, equals(0), reason: 'node4 joinGroup failed: ${join4.code}');
-      
-      await Future.delayed(const Duration(seconds: 3));
+
+      // Poll for at least 1 member (test only asserts >=1 below); upper-bound pump for sync.
+      await waitForMemberCount(coordinator, 5, timeout: const Duration(seconds: 6));
       
       // Step 7: Verify all 5 nodes are in the group
       final memberListResult2 = await coordinator.runWithInstanceAsync(() async => TIMGroupManager.instance.getGroupMemberList(

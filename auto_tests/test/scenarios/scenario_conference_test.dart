@@ -53,9 +53,11 @@ void main() {
       final bob = scenario.getNode('bob')!;
       final charlie = scenario.getNode('charlie')!;
       
-      await establishFriendship(alice, bob, timeout: const Duration(seconds: 20));
-      await establishFriendship(alice, charlie, timeout: const Duration(seconds: 20));
-      await establishFriendship(bob, charlie, timeout: const Duration(seconds: 20));
+      await Future.wait([
+        establishFriendship(alice, bob, timeout: const Duration(seconds: 45)),
+        establishFriendship(alice, charlie, timeout: const Duration(seconds: 45)),
+        establishFriendship(bob, charlie, timeout: const Duration(seconds: 45)),
+      ]);
       await pumpFriendConnection(alice, bob, duration: const Duration(seconds: 5));
       await pumpFriendConnection(alice, charlie, duration: const Duration(seconds: 3));
       
@@ -91,13 +93,13 @@ void main() {
       } catch (e) {
         print('[ConferenceCreate] Friend connection check not fully ready, continue with retry logic: $e');
       }
-      await Future.delayed(const Duration(seconds: 2));
-      
+      await Future.delayed(const Duration(milliseconds: 500));
+
       final bobPublicKey = bob.getPublicKey();
       final charliePublicKey = charlie.getPublicKey();
-      
+
       for (int retry = 0; retry < 5; retry++) {
-        if (retry > 0) await Future.delayed(const Duration(seconds: 3));
+        if (retry > 0) await Future.delayed(const Duration(milliseconds: 500));
         final inviteResult = await alice.runWithInstanceAsync(() async => TIMGroupManager.instance.inviteUserToGroup(
           groupID: groupId,
           userList: [bobPublicKey, charliePublicKey],
@@ -115,16 +117,16 @@ void main() {
         }
       }
       
-      await Future.delayed(const Duration(seconds: 2));
+      await Future.delayed(const Duration(milliseconds: 500));
       await bob.waitForCallback('onGroupInvited', timeout: const Duration(seconds: 15));
       await charlie.waitForCallback('onGroupInvited', timeout: const Duration(seconds: 15));
-      
+
       final bobJoinResult = await bob.runWithInstanceAsync(() async => TIMManager.instance.joinGroup(groupID: groupId, message: ''));
       expect(bobJoinResult.code, equals(0));
-      
+
       final charlieJoinResult = await charlie.runWithInstanceAsync(() async => TIMManager.instance.joinGroup(groupID: groupId, message: ''));
       expect(charlieJoinResult.code, equals(0));
-      
+
       await pumpGroupPeerDiscovery(alice, bob, duration: const Duration(seconds: 4));
       await pumpGroupPeerDiscovery(alice, charlie, duration: const Duration(seconds: 3));
     }, timeout: const Timeout(Duration(seconds: 90)));
@@ -140,9 +142,11 @@ void main() {
       charlie.clearCallbackReceived('onGroupInvited');
 
       print('[ConferenceSendMessage] Step 0: Establishing friendship...');
-      await establishFriendship(alice, bob, timeout: const Duration(seconds: 60));
-      await establishFriendship(alice, charlie, timeout: const Duration(seconds: 60));
-      await establishFriendship(bob, charlie, timeout: const Duration(seconds: 30));
+      await Future.wait([
+        establishFriendship(alice, bob, timeout: const Duration(seconds: 60)),
+        establishFriendship(alice, charlie, timeout: const Duration(seconds: 60)),
+        establishFriendship(bob, charlie, timeout: const Duration(seconds: 60)),
+      ]);
       print('[ConferenceSendMessage] Friendship established');
 
       print('[ConferenceSendMessage] Step 1: Alice creating group...');
@@ -164,7 +168,7 @@ void main() {
       } catch (e) {
         print('[ConferenceMessage] Friend connection check not fully ready, continue with retry logic: $e');
       }
-      await Future.delayed(const Duration(seconds: 3));
+      await Future.delayed(const Duration(milliseconds: 500));
 
       print('[ConferenceSendMessage] Step 2: Alice inviting Bob and Charlie...');
       final inviteResult = await alice.runWithInstanceAsync(() async => TIMGroupManager.instance.inviteUserToGroup(
@@ -174,7 +178,7 @@ void main() {
       ));
       expect(inviteResult.code, equals(0));
       print('[ConferenceSendMessage] Invite result: code=${inviteResult.code}, data=${inviteResult.data?.length ?? 0}');
-      await Future.delayed(const Duration(seconds: 2));
+      await Future.delayed(const Duration(milliseconds: 500));
       await bob.waitForCallback('onGroupInvited', timeout: const Duration(seconds: 15));
       await charlie.waitForCallback('onGroupInvited', timeout: const Duration(seconds: 15));
       print('[ConferenceSendMessage] Bob and Charlie received invite');
@@ -223,7 +227,7 @@ void main() {
       expect(charlieJoinResult.code, equals(0));
       print('[ConferenceSendMessage] Charlie join: code=${charlieJoinResult.code}');
 
-      await Future.delayed(const Duration(seconds: 2));
+      await Future.delayed(const Duration(milliseconds: 300));
       await pumpGroupPeerDiscovery(alice, bob, duration: const Duration(seconds: 3), iterationsPerPump: 80);
       await pumpGroupPeerDiscovery(alice, charlie, duration: const Duration(seconds: 2), iterationsPerPump: 50);
 
@@ -320,11 +324,11 @@ void main() {
       } catch (e) {
         print('[ConferenceJoinLeave] Friend connection check not fully ready, continue with retry logic: $e');
       }
-      await Future.delayed(const Duration(seconds: 2));
-      
+      await Future.delayed(const Duration(milliseconds: 500));
+
       final bobPk = bob.getPublicKey();
       for (int retry = 0; retry < 5; retry++) {
-        if (retry > 0) await Future.delayed(const Duration(seconds: 3));
+        if (retry > 0) await Future.delayed(const Duration(milliseconds: 500));
         final inviteResult = await alice.runWithInstanceAsync(() async => TIMGroupManager.instance.inviteUserToGroup(
           groupID: groupId,
           userList: [bobPk],
@@ -336,7 +340,7 @@ void main() {
         if (bobRes.isNotEmpty && bobRes.first.result == 1) break;
         if (retry == 4) expect(bobRes.first.result, equals(1), reason: 'Bob invite failed after 5 attempts');
       }
-      await Future.delayed(const Duration(seconds: 2));
+      await Future.delayed(const Duration(milliseconds: 500));
       await bob.waitForCallback('onGroupInvited', timeout: const Duration(seconds: 15));
       
       final joinResult = await bob.runWithInstanceAsync(() async => TIMManager.instance.joinGroup(groupID: groupId, message: ''));

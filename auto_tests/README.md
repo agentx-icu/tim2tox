@@ -171,6 +171,18 @@ RUN_VIRTUAL=1 ./run_tests_ordered.sh 10-12
 
 `RUN_VIRTUAL=0`（默认）保持现有 wall-clock 行为不变。
 
+### 并行运行（PARALLEL_WORKERS）
+
+```bash
+# 2 个 worker 并发执行（每个 worker 独立 spawn flutter_tester）
+PARALLEL_WORKERS=2 ./run_tests_ordered.sh
+
+# 3 个 worker 并发执行，限定 Phase
+PARALLEL_WORKERS=3 ./run_tests_ordered.sh 4 10
+```
+
+`PARALLEL_WORKERS=N` 把全部选中的测试合并成一条队列，跨 Phase 一起分发到 N 个并发的 `flutter test` 进程。默认值是 1（顺序执行）。开发机典型经验：2–3 个 worker 通常稳定，4+ 容易因 CPU 抢占触发 Tox DHT 超时和 friend P2P 握手失败。Phase 间不再有顺序依赖（每个测试文件已经各自 `setUpAll`），并行汇总后仍按 Phase 重新分组打印结果。
+
 ### Phase 覆盖
 
 Phase 1–12 已经有 `*_virtual_test.dart` 虚拟变体（约 69 个文件，加上 `scenario_virtual_clock_smoke_test.dart` 共 70 个；wall-clock 原版另有 ~70 个，详见 `test/scenarios/`），覆盖基础 / 好友 / 消息 / 群组 / ToxAV / Profile / 会话 / 文件 / 会议 / 群组扩展 / 网络 / 其他全部业务路径。Phase 13（Binary Replacement）和 Phase 14（unit_tests）不依赖 Tox 协议定时器，**无需**虚拟变体。
@@ -416,6 +428,36 @@ test('my test', () async {
   // test code
 }, timeout: const Timeout(Duration(seconds: 120)));
 ```
+
+### 环境变量
+
+- `RUN_VIRTUAL=1` — 存在虚拟变体时，把每个测试替换为对应的 `*_virtual_test.dart`（详见 [虚拟时钟模式](#虚拟时钟模式-virtual-clock-mode)）。
+- `PARALLEL_WORKERS=N` — 把所选测试拍平成一条队列，并发 N 路执行（详见上文）。
+- `ASSERTION_GUARD=0` — 跳过前置 `check_test_assertions.sh` 检查。
+- `RUN_NATIVE_CRASH_TESTS=0` — 在 Phase 11 中排除 `scenario_dht_nodes_response_api_test`。
+- `RETRY_COUNT=N` — 每个失败用例最多重跑 N 次后才判定为失败。重跑通过的用例仍计入通过，但会在汇总的 "Flaky" 段单独列出。Tier 2 CI 默认 `RETRY_COUNT=1`。
+- `SKIP_PHASES=N1,N2,...` — 即使所选范围（或"全部 phase"）包含这些 phase，也强制跳过。Tier 3 nightly 用它跳过 Phase 11（留给 Tier 4 跑）。
+
+## 本地冒烟 (Tier 1)
+
+每次 `git push` 之前推荐先跑一遍。覆盖 Phase 1 (basic)、3 (message)、12 (other) 与 14 (unit_tests)，全程用虚拟时钟：
+
+```bash
+RUN_VIRTUAL=1 ./run_tests_ordered.sh 1,3,12 14
+# 约 25 个用例，M 系列芯片 ≤2 分钟。无对应 CI workflow —— 这是开发者 push 前的本地闸门。
+```
+
+## CI Pipeline (Tier 2 / 3 / 4)
+
+三条 GitHub Actions 工作流位于 `toxee/.github/workflows/`。虚拟时钟层 (Tier 2) 负责 PR 的快反馈；wall-clock 层 (Tier 3、4) 用来抓虚拟模式会掩盖的协议层真实时序回归。
+
+| Tier | Workflow                  | 触发条件                                                       | 模式                  | Phase 范围           | Runner               | 预算   |
+|------|---------------------------|----------------------------------------------------------------|-----------------------|----------------------|----------------------|--------|
+| 2    | `auto_tests.yml`          | 每个 PR + 推送到 `main` / `master`                              | virtual, `RETRY_COUNT=1` | 1–8, 10, 12–14    | ubuntu               | 30 min |
+| 3    | `auto_tests_nightly.yml`  | cron `02:00 UTC` + `workflow_dispatch`                          | wall-clock            | 1–10, 12–14（通过 `SKIP_PHASES=11` 跳过 Phase 11） | ubuntu | 90 min |
+| 4    | `auto_tests_full.yml`     | `workflow_dispatch`、PR 标签 `ci:full`、推送到 `release/**`     | wall-clock            | 1–14（完整，含 Phase 11） | ubuntu + macOS matrix | 120 min |
+
+只有 Tier 4 会跑 Phase 11（`scenario_dht_nodes_response_api_test`、真实 DHT bootstrap、LAN discovery），涉及协议层大改动的 PR 请打 `ci:full` 标签触发。各 tier 都通过 `tool/ci/build_tim2tox.sh` 构建 FFI 库；Tier 2/3/4 都会传 `--toxav --dht-bootstrap`，以保证测试侧的特性面与开发构建一致（生产 App 构建两项均关）。
 
 ## 测试覆盖范围
 

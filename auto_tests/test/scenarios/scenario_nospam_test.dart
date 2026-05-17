@@ -49,6 +49,9 @@ void main() {
         bob.waitForConnection(timeout: const Duration(seconds: 45)),
       ]);
       print('[Nospam] waitForConnection(45s) completed for alice and bob');
+      // 2s DHT settle kept (not removed): test 2 ("Nospam change invalidates")
+      // is sensitive to DHT readiness in baseline, dropping this makes it
+      // intermittently miss the friend request.
       await Future.delayed(const Duration(seconds: 2));
       print('[Nospam] Post-connection delay 2s done (DHT settle)');
     });
@@ -73,6 +76,11 @@ void main() {
         int cleared = 0;
         final isFromBob = (String uid) =>
             uid == bobPublicKey || uid == bobToxId || (uid.length >= 64 && uid.startsWith(bobPublicKey));
+        final bobPubKeyMatch = (String id) =>
+            id == bobPublicKey || id == bobToxId || (id.length >= 64 && id.startsWith(bobPublicKey));
+        final alicePubKeyShort = aliceToxId.length >= 64 ? aliceToxId.substring(0, 64) : aliceToxId;
+        final aliceMatch = (String id) =>
+            id == alicePubKeyShort || id == aliceToxId || (id.length >= 64 && id.startsWith(alicePubKeyShort));
         for (final app in list) {
           if (app != null && isFromBob(app.userID)) {
             print('[Nospam] setUp: accept+delete application from Bob (userID prefix=${app.userID.length >= 16 ? app.userID.substring(0, 16) : app.userID}...)');
@@ -81,19 +89,62 @@ void main() {
                 userID: app.userID,
                 responseType: FriendResponseTypeEnum.V2TIM_FRIEND_ACCEPT_AGREE_AND_ADD,
               );
-              await Future.delayed(const Duration(seconds: 1));
+              // Poll until alice's friend list contains Bob (accept took
+              // effect) instead of waiting a flat 1s. Bounded to 2s — the
+              // local FFI call returns synchronously in practice.
+              try {
+                await waitUntilAsync(
+                  () async {
+                    final friends = await alice.getFriendList(useCache: false);
+                    return friends.any(bobPubKeyMatch);
+                  },
+                  timeout: const Duration(seconds: 2),
+                  pollInterval: const Duration(milliseconds: 100),
+                  description: 'alice friend list contains Bob after accept',
+                );
+              } catch (_) {/* fall through; the next delete is a no-op if not there */}
               await TIMFriendshipManager.instance.deleteFromFriendList(
                 userIDList: [bobToxId],
                 deleteType: FriendTypeEnum.V2TIM_FRIEND_TYPE_SINGLE,
               );
-              await Future.delayed(const Duration(seconds: 1));
+              try {
+                await waitUntilAsync(
+                  () async {
+                    final friends = await alice.getFriendList(useCache: false);
+                    return !friends.any(bobPubKeyMatch);
+                  },
+                  timeout: const Duration(seconds: 2),
+                  pollInterval: const Duration(milliseconds: 100),
+                  description: 'alice friend list excludes Bob after delete',
+                );
+              } catch (_) {}
             });
             // After accept, Bob has Alice in his list; delete Alice from Bob so Bob can send a new request in the next test.
             await bob.runWithInstanceAsync(() async => TIMFriendshipManager.instance.deleteFromFriendList(
               userIDList: [aliceToxId],
               deleteType: FriendTypeEnum.V2TIM_FRIEND_TYPE_SINGLE,
             ));
-            await Future.delayed(const Duration(seconds: 3));
+            // Wait for the Tox-level friendship reset on Bob's side
+            // (previously a flat 3s sleep). The local friend list flips
+            // immediately, but the Tox onion-routing state needs a moment
+            // to invalidate the prior "already_sent" record so the next
+            // test's addFriend gets through. Keep a small floor wait.
+            try {
+              await waitUntilAsync(
+                () async {
+                  final bobFriends = await bob.getFriendList(useCache: false);
+                  return !bobFriends.any(aliceMatch);
+                },
+                timeout: const Duration(seconds: 2),
+                pollInterval: const Duration(milliseconds: 100),
+                description: 'bob friend list excludes Alice after delete',
+              );
+            } catch (_) {}
+            // Floor wait for Tox onion/announce state to invalidate the
+            // prior add-friend record — kept at 2.5s. Going lower made the
+            // next test's bob.addFriend(alice) intermittently never reach
+            // alice in baseline runs.
+            await Future.delayed(const Duration(milliseconds: 2500));
             cleared++;
           } else if (app != null) {
             print('[Nospam] setUp: skip app userID prefix=${app.userID.length >= 16 ? app.userID.substring(0, 16) : app.userID}... (not Bob)');
@@ -114,17 +165,38 @@ void main() {
             userIDList: [bobToxId],
             deleteType: FriendTypeEnum.V2TIM_FRIEND_TYPE_SINGLE,
           ));
-          await Future.delayed(const Duration(seconds: 1));
         }
         if (aliceInBobList) {
           await bob.runWithInstanceAsync(() async => TIMFriendshipManager.instance.deleteFromFriendList(
             userIDList: [aliceToxId],
             deleteType: FriendTypeEnum.V2TIM_FRIEND_TYPE_SINGLE,
           ));
-          await Future.delayed(const Duration(seconds: 1));
         }
-        await Future.delayed(const Duration(seconds: 3));
-        print('[Nospam] setUp: friendship cleared, waited 3s for Tox state to reset');
+        // Replace the historical 1s + 1s + 3s sleeps with bounded polling on
+        // both sides observing the deletion, plus a small floor wait for
+        // Tox onion-routing state to settle (otherwise the next test's
+        // addFriend can hit a stale ALREADY_SENT record).
+        try {
+          await waitUntilAsync(
+            () async {
+              final aFriends = await alice.getFriendList(useCache: false);
+              final bFriends = await bob.getFriendList(useCache: false);
+              final stillInAlice = aFriends.any((id) => id == bobPublicKey || id == bobToxId || (id.length >= 64 && id.startsWith(bobPublicKey)));
+              final alicePubKeyShort2 = aliceToxId.length >= 64 ? aliceToxId.substring(0, 64) : aliceToxId;
+              final stillInBob = bFriends.any((id) => id == alicePubKeyShort2 || id == aliceToxId || (id.length >= 64 && id.startsWith(alicePubKeyShort2)));
+              return !stillInAlice && !stillInBob;
+            },
+            timeout: const Duration(seconds: 3),
+            pollInterval: const Duration(milliseconds: 150),
+            description: 'both sides observe friendship cleared',
+          );
+          print('[Nospam] setUp: friendship cleared (poll-confirmed)');
+        } catch (_) {
+          print('[Nospam] setUp: friendship cleanup poll did not converge; proceeding');
+        }
+        // Floor wait so Tox state has time to invalidate prior friend
+        // records — kept at 2.5s for the same reason as above.
+        await Future.delayed(const Duration(milliseconds: 2500));
       }
     });
 

@@ -153,17 +153,25 @@ void main() {
       expect(group2Result.data, isNot(equals(group3Result.data)));
       expect(group1Result.data, isNot(equals(group3Result.data)));
 
-      // Wait for groups to be fully initialized
-      await Future.delayed(const Duration(seconds: 3));
+      // Poll for joined list to contain all three groups (replaces fixed 3s wait).
+      List<String> groupIds = const [];
+      final initDeadline =
+          DateTime.now().add(const Duration(seconds: 8));
+      while (DateTime.now().isBefore(initDeadline)) {
+        final r = await alice.runWithInstanceAsync(
+            () async => TIMGroupManager.instance.getJoinedGroupList());
+        if (r.code == 0 && r.data != null) {
+          groupIds = r.data!.map((g) => g.groupID).toList();
+          if (groupIds.contains(group1Result.data) &&
+              groupIds.contains(group2Result.data) &&
+              groupIds.contains(group3Result.data)) {
+            break;
+          }
+        }
+        pumpAllInstancesOnce(iterations: 80);
+        await Future.delayed(const Duration(milliseconds: 200));
+      }
 
-      // Verify all groups are in joined list (alice's instance)
-      final joinedListResult = await alice.runWithInstanceAsync(
-          () async => TIMGroupManager.instance.getJoinedGroupList());
-      expect(joinedListResult.code, equals(0),
-          reason: 'getJoinedGroupList failed: ${joinedListResult.code}');
-      expect(joinedListResult.data, isNotNull);
-
-      final groupIds = joinedListResult.data!.map((g) => g.groupID).toList();
       expect(groupIds, contains(group1Result.data));
       expect(groupIds, contains(group2Result.data));
       expect(groupIds, contains(group3Result.data));
@@ -192,17 +200,24 @@ void main() {
       expect(conferenceResult.data, isNotNull,
           reason: 'conference data is null');
 
-      // Wait for groups to be fully initialized
-      await Future.delayed(const Duration(seconds: 3));
+      // Poll for joined list to contain both groups (replaces fixed 3s wait).
+      List<String> groupIds = const [];
+      final initDeadline =
+          DateTime.now().add(const Duration(seconds: 8));
+      while (DateTime.now().isBefore(initDeadline)) {
+        final r = await alice.runWithInstanceAsync(
+            () async => TIMGroupManager.instance.getJoinedGroupList());
+        if (r.code == 0 && r.data != null) {
+          groupIds = r.data!.map((g) => g.groupID).toList();
+          if (groupIds.contains(groupResult.data) &&
+              groupIds.contains(conferenceResult.data)) {
+            break;
+          }
+        }
+        pumpAllInstancesOnce(iterations: 80);
+        await Future.delayed(const Duration(milliseconds: 200));
+      }
 
-      // Verify both exist (alice's instance)
-      final joinedListResult = await alice.runWithInstanceAsync(
-          () async => TIMGroupManager.instance.getJoinedGroupList());
-      expect(joinedListResult.code, equals(0),
-          reason: 'getJoinedGroupList failed: ${joinedListResult.code}');
-      expect(joinedListResult.data, isNotNull);
-
-      final groupIds = joinedListResult.data!.map((g) => g.groupID).toList();
       expect(groupIds, contains(groupResult.data));
       expect(groupIds, contains(conferenceResult.data));
     }, timeout: const Timeout(Duration(seconds: 60)));
@@ -287,7 +302,6 @@ void main() {
         });
 
         pumpAllInstancesOnce(iterations: 150);
-        await Future.delayed(const Duration(milliseconds: 500));
         await waitUntilWithPump(
           () =>
               messagesByGroup.containsKey(group1Id) &&
@@ -421,8 +435,9 @@ void main() {
       expect(group2Result.data, isNotNull, reason: 'group2 data is null');
       final group2Id = group2Result.data!;
 
-      // Wait for groups to be initialized
-      await Future.delayed(const Duration(seconds: 2));
+      // Brief settle for group-create callbacks; inviteAndJoinMember polls anyway.
+      pumpAllInstancesOnce(iterations: 100);
+      await Future.delayed(const Duration(milliseconds: 300));
 
       final group1ExpectedIds = await inviteAndJoinMember(
         group1Id,
