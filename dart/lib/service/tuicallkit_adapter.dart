@@ -151,12 +151,22 @@ class TUICallKitAdapter {
 
     final inviteID = result.data!;
     _userToInviteId[userID] = inviteID;
+
+    // Resolve friend number BEFORE registering so the bridge gets the
+    // correct value on first write. Previously this method called
+    // `registerOutgoingCall` twice — once with `friendNumber: null` and
+    // again with the resolved number — and any state-machine lookup that
+    // landed in the gap (notably `onOutgoingCallInitiated` listeners that
+    // queried `getCallInfo(inviteID).friendNumber`) saw `null`.
+    final resolvedFriendNumber = _avService.getFriendNumberByUserId(userID);
+    final hasFriend = resolvedFriendNumber != 0xFFFFFFFF;
+
     _callBridge.registerOutgoingCall(
       inviteID: inviteID,
       inviter: 'self',
       invitee: userID,
       data: callData,
-      friendNumber: null,
+      friendNumber: hasFriend ? resolvedFriendNumber : null,
       groupID: groupID,
     );
 
@@ -167,25 +177,17 @@ class TUICallKitAdapter {
         'cb=${onOutgoingCallInitiated != null ? "SET" : "NULL"}');
     onOutgoingCallInitiated?.call(inviteID, userID, type ?? TYPE_AUDIO);
 
-    // Get friend number and start ToxAV call
-    final friendNumber = _avService.getFriendNumberByUserId(userID);
-    if (friendNumber == 0xFFFFFFFF) {
+    if (!hasFriend) {
       _logger?.logWarning(
           '[TUICallKitAdapter] Friend not found for userID=$userID; signaling-only call');
       return;
     }
 
-    _callBridge.registerOutgoingCall(
-      inviteID: inviteID,
-      inviter: 'self',
-      invitee: userID,
-      data: callData,
-      friendNumber: friendNumber,
-      groupID: groupID,
-    );
-
-    final audioBitRate = 48;
-    final videoBitRate = isVideo ? 5000 : 0;
+    // Mid-tier opening targets in kbit/s. Adaptive bitrate callbacks (see
+    // ToxAVService.setAudioBitrateChangedCallback / setVideoBitrateChangedCallback)
+    // can re-tune these per-call once the link is established.
+    const audioBitRate = 48;
+    final videoBitRate = isVideo ? 2000 : 0;
 
     // Initialize ToxAV if needed
     if (!_avService.isInitialized) {
@@ -198,22 +200,35 @@ class TUICallKitAdapter {
     final skipEndCall = isCallIdle != null && isCallIdle!();
     if (!skipEndCall) {
       try {
-        await _avService.endCall(friendNumber);
+        await _avService.endCall(resolvedFriendNumber);
       } catch (_) {
         // Ignore — no active call to end
       }
     }
 
     // Start the call
-    final callResult = await _avService.startCall(friendNumber,
+    final callResult = await _avService.startCall(resolvedFriendNumber,
         audioBitRate: audioBitRate, videoBitRate: videoBitRate);
     _logger?.log(
-        '[TUICallKitAdapter] _handleCall startCall result=$callResult friendNumber=$friendNumber');
+        '[TUICallKitAdapter] _handleCall startCall result=$callResult friendNumber=$resolvedFriendNumber');
   }
 
   /// Dispose
+  ///
+  /// Releases per-instance state and clears the static singleton holders so
+  /// the next [initialize] returns a fresh adapter. Required for clean
+  /// account-switch and logout/re-login flows: previously the static
+  /// `_instance` / `_globalAdapter` references were never cleared, and a
+  /// second `initialize()` call returned a stale adapter still holding
+  /// references to the disposed `ToxAVService` and `CallBridgeService`.
   void dispose() {
     _userToInviteId.clear();
+    if (identical(_instance, this)) {
+      _instance = null;
+    }
+    if (identical(_globalAdapter, this)) {
+      _globalAdapter = null;
+    }
   }
 }
 

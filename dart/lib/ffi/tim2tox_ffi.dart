@@ -258,6 +258,26 @@ typedef _av_set_video_receive_callback_c = ffi.Void Function(
   ffi.Pointer<ffi.NativeFunction<_av_video_receive_callback_native>>,
   ffi.Pointer<ffi.Void>,
 );
+typedef _av_audio_bitrate_callback_native = ffi.Void Function(
+  ffi.Uint32, // friend_number
+  ffi.Uint32, // audio_bit_rate
+  ffi.Pointer<ffi.Void>, // user_data
+);
+typedef _av_video_bitrate_callback_native = ffi.Void Function(
+  ffi.Uint32, // friend_number
+  ffi.Uint32, // video_bit_rate
+  ffi.Pointer<ffi.Void>, // user_data
+);
+typedef _av_set_audio_bitrate_callback_c = ffi.Void Function(
+  ffi.Int64,
+  ffi.Pointer<ffi.NativeFunction<_av_audio_bitrate_callback_native>>,
+  ffi.Pointer<ffi.Void>,
+);
+typedef _av_set_video_bitrate_callback_c = ffi.Void Function(
+  ffi.Int64,
+  ffi.Pointer<ffi.NativeFunction<_av_video_bitrate_callback_native>>,
+  ffi.Pointer<ffi.Void>,
+);
 typedef _get_friend_number_by_user_id_c = ffi.Uint32 Function(ffi.Pointer<pkgffi.Utf8>);
 typedef _get_user_id_by_friend_number_c = ffi.Pointer<pkgffi.Utf8> Function(ffi.Uint32);
 
@@ -479,6 +499,8 @@ class Tim2ToxFfi {
   late final void Function(int, ffi.Pointer<ffi.NativeFunction<_av_call_state_callback_native>>, ffi.Pointer<ffi.Void>) avSetCallStateCallbackNative = _lib.lookupFunction<_av_set_call_state_callback_c, void Function(int, ffi.Pointer<ffi.NativeFunction<_av_call_state_callback_native>>, ffi.Pointer<ffi.Void>)>('tim2tox_ffi_av_set_call_state_callback');
   late final void Function(int, ffi.Pointer<ffi.NativeFunction<_av_audio_receive_callback_native>>, ffi.Pointer<ffi.Void>) avSetAudioReceiveCallbackNative = _lib.lookupFunction<_av_set_audio_receive_callback_c, void Function(int, ffi.Pointer<ffi.NativeFunction<_av_audio_receive_callback_native>>, ffi.Pointer<ffi.Void>)>('tim2tox_ffi_av_set_audio_receive_callback');
   late final void Function(int, ffi.Pointer<ffi.NativeFunction<_av_video_receive_callback_native>>, ffi.Pointer<ffi.Void>) avSetVideoReceiveCallbackNative = _lib.lookupFunction<_av_set_video_receive_callback_c, void Function(int, ffi.Pointer<ffi.NativeFunction<_av_video_receive_callback_native>>, ffi.Pointer<ffi.Void>)>('tim2tox_ffi_av_set_video_receive_callback');
+  late final void Function(int, ffi.Pointer<ffi.NativeFunction<_av_audio_bitrate_callback_native>>, ffi.Pointer<ffi.Void>) avSetAudioBitrateCallbackNative = _lib.lookupFunction<_av_set_audio_bitrate_callback_c, void Function(int, ffi.Pointer<ffi.NativeFunction<_av_audio_bitrate_callback_native>>, ffi.Pointer<ffi.Void>)>('tim2tox_ffi_av_set_audio_bitrate_callback');
+  late final void Function(int, ffi.Pointer<ffi.NativeFunction<_av_video_bitrate_callback_native>>, ffi.Pointer<ffi.Void>) avSetVideoBitrateCallbackNative = _lib.lookupFunction<_av_set_video_bitrate_callback_c, void Function(int, ffi.Pointer<ffi.NativeFunction<_av_video_bitrate_callback_native>>, ffi.Pointer<ffi.Void>)>('tim2tox_ffi_av_set_video_bitrate_callback');
   late final int Function(ffi.Pointer<pkgffi.Utf8>) getFriendNumberByUserIdNative = _lib.lookupFunction<_get_friend_number_by_user_id_c, int Function(ffi.Pointer<pkgffi.Utf8>)>('tim2tox_ffi_get_friend_number_by_user_id');
   late final ffi.Pointer<pkgffi.Utf8> Function(int) getUserIdByFriendNumberNative = _lib.lookupFunction<_get_user_id_by_friend_number_c, ffi.Pointer<pkgffi.Utf8> Function(int)>('tim2tox_ffi_get_user_id_by_friend_number');
   

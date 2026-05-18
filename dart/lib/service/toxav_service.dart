@@ -35,6 +35,16 @@ typedef AudioReceiveCallback = void Function(int friendNumber, List<int> pcm,
 typedef VideoReceiveCallback = void Function(int friendNumber, int width,
     int height, List<int> y, List<int> u, List<int> v);
 
+/// Peer-suggested audio bit rate change (toxav_audio_bit_rate_cb).
+/// `audioBitRate` is in kbit/sec; 0 means the peer disabled audio.
+typedef AudioBitrateChangedCallback = void Function(
+    int friendNumber, int audioBitRate);
+
+/// Peer-suggested video bit rate change (toxav_video_bit_rate_cb).
+/// `videoBitRate` is in kbit/sec; 0 means the peer disabled video.
+typedef VideoBitrateChangedCallback = void Function(
+    int friendNumber, int videoBitRate);
+
 // Define callback types for FFI (matching tim2tox_ffi.dart)
 typedef _AvCallCallbackNative = ffi.Void Function(
   ffi.Uint32, // friend_number
@@ -64,6 +74,16 @@ typedef _AvVideoReceiveCallbackNative = ffi.Void Function(
   ffi.Pointer<ffi.Uint8>, // v
   ffi.Pointer<ffi.Void>, // user_data
 );
+typedef _AvAudioBitrateChangedCallbackNative = ffi.Void Function(
+  ffi.Uint32, // friend_number
+  ffi.Uint32, // audio_bit_rate
+  ffi.Pointer<ffi.Void>, // user_data
+);
+typedef _AvVideoBitrateChangedCallbackNative = ffi.Void Function(
+  ffi.Uint32, // friend_number
+  ffi.Uint32, // video_bit_rate
+  ffi.Pointer<ffi.Void>, // user_data
+);
 
 /// ToxAV Service for managing audio/video calls
 class ToxAVService implements CallAvBackend {
@@ -87,6 +107,8 @@ class ToxAVService implements CallAvBackend {
   CallStateCallback? _onCallState;
   AudioReceiveCallback? _onAudioReceive;
   VideoReceiveCallback? _onVideoReceive;
+  AudioBitrateChangedCallback? _onAudioBitrateChanged;
+  VideoBitrateChangedCallback? _onVideoBitrateChanged;
 
   ToxAVService(this._ffi, {LoggerService? logger}) : _logger = logger {
     if (logger != null) _staticLogger = logger;
@@ -207,6 +229,14 @@ class ToxAVService implements CallAvBackend {
         ffi.Pointer.fromFunction<_AvVideoReceiveCallbackNative>(
       _onVideoReceiveNativeTrampoline,
     );
+    final onAudioBitrateNative =
+        ffi.Pointer.fromFunction<_AvAudioBitrateChangedCallbackNative>(
+      _onAudioBitrateNativeTrampoline,
+    );
+    final onVideoBitrateNative =
+        ffi.Pointer.fromFunction<_AvVideoBitrateChangedCallbackNative>(
+      _onVideoBitrateNativeTrampoline,
+    );
 
     final instanceIdForFfi = _instanceId ?? _ffi.getCurrentInstanceId();
     _ffi.avSetCallCallbackNative(
@@ -217,6 +247,10 @@ class ToxAVService implements CallAvBackend {
         instanceIdForFfi, onAudioReceiveNative.cast(), instanceIdPtr.cast());
     _ffi.avSetVideoReceiveCallbackNative(
         instanceIdForFfi, onVideoReceiveNative.cast(), instanceIdPtr.cast());
+    _ffi.avSetAudioBitrateCallbackNative(
+        instanceIdForFfi, onAudioBitrateNative.cast(), instanceIdPtr.cast());
+    _ffi.avSetVideoBitrateCallbackNative(
+        instanceIdForFfi, onVideoBitrateNative.cast(), instanceIdPtr.cast());
 
     _logger?.logDebug(
         '[ToxAVService] _setupCallbacks() completed with instanceId=$instanceId');
@@ -369,6 +403,52 @@ class ToxAVService implements CallAvBackend {
     }
   }
 
+  @pragma('vm:entry-point')
+  static void _onAudioBitrateNativeTrampoline(
+    int friendNumber,
+    int audioBitRate,
+    ffi.Pointer<ffi.Void> userData,
+  ) {
+    try {
+      final instanceId = _readInstanceId(userData);
+      final target = _lookupService(instanceId);
+      if (target == null || target._onAudioBitrateChanged == null) {
+        _staticLogger?.logWarning(
+            '[ToxAVService] _onAudioBitrateNativeTrampoline: no service/handler for instanceId=$instanceId');
+        return;
+      }
+      target._logger?.logDebug(
+          '[ToxAVService] _onAudioBitrateNativeTrampoline: friendNumber=$friendNumber audioBitRate=$audioBitRate');
+      target._onAudioBitrateChanged!.call(friendNumber, audioBitRate);
+    } catch (e, st) {
+      _staticLogger?.logError(
+          '[ToxAVService] _onAudioBitrateNativeTrampoline exception', e, st);
+    }
+  }
+
+  @pragma('vm:entry-point')
+  static void _onVideoBitrateNativeTrampoline(
+    int friendNumber,
+    int videoBitRate,
+    ffi.Pointer<ffi.Void> userData,
+  ) {
+    try {
+      final instanceId = _readInstanceId(userData);
+      final target = _lookupService(instanceId);
+      if (target == null || target._onVideoBitrateChanged == null) {
+        _staticLogger?.logWarning(
+            '[ToxAVService] _onVideoBitrateNativeTrampoline: no service/handler for instanceId=$instanceId');
+        return;
+      }
+      target._logger?.logDebug(
+          '[ToxAVService] _onVideoBitrateNativeTrampoline: friendNumber=$friendNumber videoBitRate=$videoBitRate');
+      target._onVideoBitrateChanged!.call(friendNumber, videoBitRate);
+    } catch (e, st) {
+      _staticLogger?.logError(
+          '[ToxAVService] _onVideoBitrateNativeTrampoline exception', e, st);
+    }
+  }
+
   /// Copies the native I420 planes into Dart-owned `Uint8List`s.
   ///
   /// Returns `(y, u, v)`. See [copyAudioForCallback] for the safety rationale.
@@ -407,6 +487,18 @@ class ToxAVService implements CallAvBackend {
   /// Set video receive callback
   void setVideoReceiveCallback(VideoReceiveCallback? callback) {
     _onVideoReceive = callback;
+  }
+
+  /// Set audio-bitrate-changed callback (fires when the peer suggests a new
+  /// audio bit rate via toxav_audio_bit_rate_cb).
+  void setAudioBitrateChangedCallback(AudioBitrateChangedCallback? callback) {
+    _onAudioBitrateChanged = callback;
+  }
+
+  /// Set video-bitrate-changed callback (fires when the peer suggests a new
+  /// video bit rate via toxav_video_bit_rate_cb).
+  void setVideoBitrateChangedCallback(VideoBitrateChangedCallback? callback) {
+    _onVideoBitrateChanged = callback;
   }
 
   /// Start a call

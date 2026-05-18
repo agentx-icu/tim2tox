@@ -2661,6 +2661,8 @@ namespace {
         tim2tox_av_call_state_callback_t on_call_state = nullptr;
         tim2tox_av_audio_receive_callback_t on_audio_receive = nullptr;
         tim2tox_av_video_receive_callback_t on_video_receive = nullptr;
+        tim2tox_av_audio_bitrate_callback_t on_audio_bitrate = nullptr;
+        tim2tox_av_video_bitrate_callback_t on_video_bitrate = nullptr;
         void* user_data = nullptr;
     };
     
@@ -2764,7 +2766,29 @@ int tim2tox_ffi_av_initialize(int64_t instance_id) {
                 it->second.on_video_receive(friend_number, width, height, y, u, v, it->second.user_data);
             }
         });
-        
+
+        // Bitrate-change suggestions from c-toxcore. These fire when the peer
+        // requests a different audio/video bit rate (e.g. on congestion or
+        // when audio/video is toggled). Dispatch via the same direct
+        // function-pointer pattern as the receive callbacks — we do NOT want
+        // these queued through SendCallbackToDart because Dart-side handlers
+        // are cheap and we want to reflect quality changes promptly.
+        av_mgr->setAudioBitrateCallback([captured_instance_id](uint32_t friend_number, uint32_t audio_bit_rate) {
+            std::lock_guard<std::mutex> lock(g_av_callbacks_mutex);
+            auto it = g_instance_av_callbacks.find(captured_instance_id);
+            if (it != g_instance_av_callbacks.end() && it->second.on_audio_bitrate) {
+                it->second.on_audio_bitrate(friend_number, audio_bit_rate, it->second.user_data);
+            }
+        });
+
+        av_mgr->setVideoBitrateCallback([captured_instance_id](uint32_t friend_number, uint32_t video_bit_rate) {
+            std::lock_guard<std::mutex> lock(g_av_callbacks_mutex);
+            auto it = g_instance_av_callbacks.find(captured_instance_id);
+            if (it != g_instance_av_callbacks.end() && it->second.on_video_bitrate) {
+                it->second.on_video_bitrate(friend_number, video_bit_rate, it->second.user_data);
+            }
+        });
+
         {
             std::lock_guard<std::mutex> lock(g_av_callbacks_mutex);
             g_av_initialized_instances.insert(instance_id);
@@ -3050,6 +3074,24 @@ void tim2tox_ffi_av_set_video_receive_callback(int64_t instance_id, tim2tox_av_v
     V2TIM_LOG(kInfo, "[ffi] tim2tox_ffi_av_set_video_receive_callback() set for instance {}", (long long)instance_id);
 }
 
+void tim2tox_ffi_av_set_audio_bitrate_callback(int64_t instance_id, tim2tox_av_audio_bitrate_callback_t callback, void* user_data) {
+    if (instance_id == 0) instance_id = GetCurrentInstanceId();
+    std::lock_guard<std::mutex> lock(g_av_callbacks_mutex);
+    AVCallbacks* callbacks = GetCallbacksForInstance(instance_id);
+    callbacks->on_audio_bitrate = callback;
+    callbacks->user_data = user_data;
+    V2TIM_LOG(kInfo, "[ffi] tim2tox_ffi_av_set_audio_bitrate_callback() set for instance {}", (long long)instance_id);
+}
+
+void tim2tox_ffi_av_set_video_bitrate_callback(int64_t instance_id, tim2tox_av_video_bitrate_callback_t callback, void* user_data) {
+    if (instance_id == 0) instance_id = GetCurrentInstanceId();
+    std::lock_guard<std::mutex> lock(g_av_callbacks_mutex);
+    AVCallbacks* callbacks = GetCallbacksForInstance(instance_id);
+    callbacks->on_video_bitrate = callback;
+    callbacks->user_data = user_data;
+    V2TIM_LOG(kInfo, "[ffi] tim2tox_ffi_av_set_video_bitrate_callback() set for instance {}", (long long)instance_id);
+}
+
 #endif // BUILD_TOXAV
 
 // Helper function: Get friend number by user ID
@@ -3237,6 +3279,8 @@ void tim2tox_ffi_av_set_call_callback(int64_t, tim2tox_av_call_callback_t, void*
 void tim2tox_ffi_av_set_call_state_callback(int64_t, tim2tox_av_call_state_callback_t, void*) {}
 void tim2tox_ffi_av_set_audio_receive_callback(int64_t, tim2tox_av_audio_receive_callback_t, void*) {}
 void tim2tox_ffi_av_set_video_receive_callback(int64_t, tim2tox_av_video_receive_callback_t, void*) {}
+void tim2tox_ffi_av_set_audio_bitrate_callback(int64_t, tim2tox_av_audio_bitrate_callback_t, void*) {}
+void tim2tox_ffi_av_set_video_bitrate_callback(int64_t, tim2tox_av_video_bitrate_callback_t, void*) {}
 
 #endif // BUILD_TOXAV
 

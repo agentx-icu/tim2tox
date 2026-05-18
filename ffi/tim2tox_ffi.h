@@ -532,6 +532,11 @@ typedef void (*tim2tox_av_call_callback_t)(uint32_t friend_number, int audio_ena
 typedef void (*tim2tox_av_call_state_callback_t)(uint32_t friend_number, uint32_t state, void* user_data);
 typedef void (*tim2tox_av_audio_receive_callback_t)(uint32_t friend_number, const int16_t* pcm, size_t sample_count, uint8_t channels, uint32_t sampling_rate, void* user_data);
 typedef void (*tim2tox_av_video_receive_callback_t)(uint32_t friend_number, uint16_t width, uint16_t height, const uint8_t* y, const uint8_t* u, const uint8_t* v, void* user_data);
+// Bitrate-change suggestions delivered by c-toxcore (toxav_audio_bit_rate_cb /
+// toxav_video_bit_rate_cb). bit_rate is in kbit/sec; 0 means the corresponding
+// media has been disabled (audio or video off).
+typedef void (*tim2tox_av_audio_bitrate_callback_t)(uint32_t friend_number, uint32_t audio_bit_rate, void* user_data);
+typedef void (*tim2tox_av_video_bitrate_callback_t)(uint32_t friend_number, uint32_t video_bit_rate, void* user_data);
 
 // Set AV callbacks
 // Pass NULL to disable a callback
@@ -539,6 +544,8 @@ void tim2tox_ffi_av_set_call_callback(int64_t instance_id, tim2tox_av_call_callb
 void tim2tox_ffi_av_set_call_state_callback(int64_t instance_id, tim2tox_av_call_state_callback_t callback, void* user_data);
 void tim2tox_ffi_av_set_audio_receive_callback(int64_t instance_id, tim2tox_av_audio_receive_callback_t callback, void* user_data);
 void tim2tox_ffi_av_set_video_receive_callback(int64_t instance_id, tim2tox_av_video_receive_callback_t callback, void* user_data);
+void tim2tox_ffi_av_set_audio_bitrate_callback(int64_t instance_id, tim2tox_av_audio_bitrate_callback_t callback, void* user_data);
+void tim2tox_ffi_av_set_video_bitrate_callback(int64_t instance_id, tim2tox_av_video_bitrate_callback_t callback, void* user_data);
 
 // Helper: Get friend number by user ID
 // user_id: user ID (hex string)
