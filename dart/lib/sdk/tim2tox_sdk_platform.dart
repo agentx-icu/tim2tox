@@ -4917,11 +4917,15 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
         } catch (e) {}
       }
 
-      // Filter messages based on criteria
-      // IMPORTANT: Sort history by timestamp descending (newest first, oldest last)
-      // This matches the internal storage format in TencentCloudChatMessageData
+      // Filter + sort history.
+      //
+      // Performance (P4 in `local-storage-review-2026-05-18.md`): the previous
+      // implementation called `.sort()` three times — once up front, then again
+      // after each `where(...).toList()`. Filtering preserves relative order,
+      // so a single sort after both filters have run is correct and O(n log n)
+      // instead of O(3·n log n). For 1k-message conversations on a cold open
+      // this used to dominate `getHistoryMessageListV2`'s wall time.
       List<ChatMessage> filteredHistory = List.from(history);
-      filteredHistory.sort((a, b) => b.timestamp.compareTo(a.timestamp));
 
       // Filter by message type if specified
       if (messageTypeList != null && messageTypeList.isNotEmpty) {
@@ -4938,8 +4942,6 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
           }
           return messageTypeList.contains(msgType);
         }).toList();
-        // Re-sort after filtering to maintain descending order
-        filteredHistory.sort((a, b) => b.timestamp.compareTo(a.timestamp));
       }
 
       // Filter by time range if specified
@@ -4949,9 +4951,12 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
           final msgTime = msg.timestamp.millisecondsSinceEpoch ~/ 1000;
           return msgTime >= timeBegin && msgTime <= timeEnd;
         }).toList();
-        // Re-sort after filtering to maintain descending order
-        filteredHistory.sort((a, b) => b.timestamp.compareTo(a.timestamp));
       }
+
+      // Sort once, descending (newest first, oldest last) — matches the
+      // internal storage format in TencentCloudChatMessageData and is required
+      // for the pagination logic below.
+      filteredHistory.sort((a, b) => b.timestamp.compareTo(a.timestamp));
 
       // CRITICAL: Keep descending order (newest first, oldest last)
       // This is required for correct pagination logic below
@@ -5120,7 +5125,13 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
   }
 
   /// Ensure message has necessary download info (imageList with uuid/url for images, UUID/url for files)
-  V2TimMessage _ensureDownloadInfo(V2TimMessage msg) {
+  ///
+  /// Performance (P5 in `local-storage-review-2026-05-18.md`): file size and
+  /// existence checks are async (`File.length()` / `File.exists()`) so the UI
+  /// isolate doesn't block on a synchronous `stat()` per message while the
+  /// page is being built. The previous `existsSync` + `lengthSync` pair was
+  /// hot in `getHistoryMessageListV2`'s response path.
+  Future<V2TimMessage> _ensureDownloadInfo(V2TimMessage msg) async {
     final msgID = msg.msgID ?? msg.id ?? '';
     if (msgID.isEmpty) return msg;
 
@@ -5151,8 +5162,8 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
         int? fileSize;
         try {
           final file = File(imagePath);
-          if (file.existsSync()) {
-            fileSize = file.lengthSync();
+          if (await file.exists()) {
+            fileSize = await file.length();
           }
         } catch (e) {
           // Ignore file size errors
@@ -5206,8 +5217,8 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
           if (fileSize == null) {
             try {
               final file = File(filePath);
-              if (file.existsSync()) {
-                fileSize = file.lengthSync();
+              if (await file.exists()) {
+                fileSize = await file.length();
               }
             } catch (e) {
               // Ignore file size errors
@@ -5383,7 +5394,7 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
               forwardTargetGroupID: isGroup ? peerId : null,
             );
             // Ensure download info is set
-            final fixedMsg = _ensureDownloadInfo(v2Msg);
+            final fixedMsg = await _ensureDownloadInfo(v2Msg);
             // Required for deleteMessagesForMe/revokeMessage: native adapter rejects messages without userID/groupID
             if ((fixedMsg.userID == null || fixedMsg.userID!.isEmpty) &&
                 (fixedMsg.groupID == null || fixedMsg.groupID!.isEmpty)) {
@@ -5517,7 +5528,7 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
                 print(
                     '[Tim2ToxSdkPlatform] Found message $msgID in messageData for conversation $targetID');
                 // Ensure download info is set before adding
-                final fixedMsg = _ensureDownloadInfo(found);
+                final fixedMsg = await _ensureDownloadInfo(found);
                 // Required for deleteMessagesForMe/revokeMessage: ensure userID/groupID from conversation
                 if ((fixedMsg.userID == null || fixedMsg.userID!.isEmpty) &&
                     (fixedMsg.groupID == null || fixedMsg.groupID!.isEmpty)) {

@@ -37,6 +37,23 @@ class MessageHistoryPersistence {
   // Concurrency control: write locks per conversation
   final Map<String, Completer<void>?> _writeLocks = {};
 
+  /// P2 debounce state (see `local-storage-review-2026-05-18.md`).
+  ///
+  /// `appendHistory` used to call `saveHistory` on every single message,
+  /// which re-serialized the entire in-memory list to disk per send. Hot
+  /// senders (paste, image batch, rapid replies) produced O(messages²) write
+  /// volume.
+  ///
+  /// We now coalesce successive appends to the same conversation into a
+  /// single disk write 200ms after the last append. The returned Future from
+  /// `appendHistory` still completes when the debounced save lands, so
+  /// callers that await it (e.g. `BinaryReplacementHistoryHook.saveMessage`)
+  /// still see write failures.
+  static const Duration _appendDebounce = Duration(milliseconds: 200);
+  final Map<String, Timer> _appendDebounceTimers = {};
+  final Map<String, Completer<void>> _appendDebouncePending = {};
+  bool _disposed = false;
+
   /// Get the directory for storing message history.
   /// When _historyDirectory is set, uses it (per-account); otherwise uses appDir + instance suffix.
   Future<Directory> _getHistoryDirectory() async {
@@ -390,48 +407,85 @@ class MessageHistoryPersistence {
     return [];
   }
   
-  /// Load all message histories from disk
-  /// 
+  /// Load all message histories from disk.
+  ///
   /// Scans the chat_history directory and loads all conversation histories.
   /// Returns a map of conversationId -> messages.
+  ///
+  /// Performance (P4 in `local-storage-review-2026-05-18.md`): files are loaded
+  /// in parallel batches via `Future.wait` to overlap disk I/O. The batch size
+  /// is bounded so we don't open hundreds of file handles on cold start (e.g.
+  /// 500-conversation install). Per-file errors are swallowed so a single bad
+  /// file can't block the rest of the boot — same semantics as the previous
+  /// sequential loop, just concurrent within each batch.
   Future<Map<String, List<ChatMessage>>> loadAllHistories({Set<String>? quitGroups}) async {
     final result = <String, List<ChatMessage>>{};
-    
+
     try {
       final dir = await _getHistoryDirectory();
       if (!await dir.exists()) {
         return result;
       }
-      
-      final files = dir.listSync();
-      
-      for (final file in files) {
-        if (file is File && file.path.endsWith('.json')) {
-          // Extract sanitized id from filename
-          final filename = file.path.split('/').last;
-          final sanitizedId = filename.replaceAll('.json', '');
-          
-          try {
-            final messages = await loadHistory(sanitizedId, quitGroups: quitGroups);
-            if (messages.isNotEmpty) {
-              // Use the conversation ID from the filename (sanitizedId), normalized.
-              // For C2C the file is named by peer id; using firstMsg.fromUserId would be
-              // wrong when the first message was sent by self (would use self id as key),
-              // so lastMessages[peerId] would be null and conversation list would show
-              // empty last message/time for that contact.
-              final conversationKey = ConversationIdUtils.normalize(sanitizedId);
-              result[conversationKey] = messages;
-            }
-          } catch (e) {
-            // Continue loading other files even if one fails
-          }
+
+      final entries = dir
+          .listSync()
+          .whereType<File>()
+          .where((f) => f.path.endsWith('.json'))
+          .toList(growable: false);
+
+      // Bounded parallelism: open at most `batchSize` files concurrently to
+      // avoid file-descriptor exhaustion on installs with many conversations.
+      const int batchSize = 16;
+      for (var start = 0; start < entries.length; start += batchSize) {
+        final end = (start + batchSize) > entries.length
+            ? entries.length
+            : (start + batchSize);
+        final batch = entries.sublist(start, end);
+
+        final loaded = await Future.wait(
+          batch.map((file) => _loadOneForLoadAll(file, quitGroups: quitGroups)),
+        );
+
+        for (final entry in loaded) {
+          if (entry == null) continue;
+          result[entry.key] = entry.value;
         }
       }
     } catch (e) {
       // Return whatever we've loaded so far
     }
-    
+
     return result;
+  }
+
+  /// Helper for [loadAllHistories]: load a single conversation file and return
+  /// its (conversationKey, messages) entry, or null if it produced no messages
+  /// or failed. Errors are swallowed to preserve the previous "skip bad files"
+  /// behaviour of the sequential implementation.
+  Future<MapEntry<String, List<ChatMessage>>?> _loadOneForLoadAll(
+    File file, {
+    Set<String>? quitGroups,
+  }) async {
+    try {
+      final filename = file.path.split(Platform.pathSeparator).last;
+      // On POSIX the previous code split on '/'; preserve that fallback for
+      // paths that may use forward slashes regardless of platform separator.
+      final canonicalFilename = filename.contains('/')
+          ? filename.split('/').last
+          : filename;
+      final sanitizedId = canonicalFilename.replaceAll('.json', '');
+
+      final messages = await loadHistory(sanitizedId, quitGroups: quitGroups);
+      if (messages.isEmpty) return null;
+
+      // Key on the (normalized) filename: see the long-form comment in the
+      // previous implementation about why firstMsg.fromUserId is the wrong
+      // key for C2C conversations the user has sent into.
+      final conversationKey = ConversationIdUtils.normalize(sanitizedId);
+      return MapEntry(conversationKey, messages);
+    } catch (_) {
+      return null;
+    }
   }
   
   /// Append a message to the history for a conversation.
@@ -466,7 +520,10 @@ class MessageHistoryPersistence {
       if (existingIndex >= 0) {
         final existing = list[existingIndex];
         list[existingIndex] = _mergeMessages(existing, message);
-        return saveHistory(normalizedId, list);
+        // Merge of an existing message: in-memory state is already consistent.
+        // Schedule a debounced save instead of writing immediately so a burst
+        // of file_request / file_done updates for the same msgID coalesces.
+        return _scheduleDebouncedSave(normalizedId);
       }
     } else if (message.text.isNotEmpty) {
       const dedupWindow = Duration(seconds: 2);
@@ -477,21 +534,116 @@ class MessageHistoryPersistence {
           msg.timestamp.difference(message.timestamp).abs() <= dedupWindow);
       if (contentMatch >= 0) {
         list[contentMatch] = _mergeMessages(list[contentMatch], message);
-        return saveHistory(normalizedId, list);
+        return _scheduleDebouncedSave(normalizedId);
       }
     }
 
     list.add(message);
 
-    // Persist the FULL list to disk before truncating in-memory cache, so we
-    // never lose old messages when memory is trimmed.
+    // P2: keep memory trim immediate but debounce the disk write. The "save
+    // FULL list before truncating" invariant from the previous implementation
+    // is preserved because the snapshot the debounced save reads is taken
+    // AFTER truncation — which means we need to write the pre-truncation
+    // list synchronously enough to not lose data. We retain the original
+    // synchronous-save behaviour on truncation specifically: the truncation
+    // boundary is rare (every 1000 messages per conversation) and getting
+    // it wrong silently drops history.
     if (list.length > _maxMessagesInMemory) {
       final fullList = List<ChatMessage>.from(list);
       final saveFuture = saveHistory(normalizedId, fullList);
       list.removeRange(0, list.length - _maxMessagesInMemory);
+      // Make sure any pending debounced save is cancelled — we just wrote
+      // the up-to-date state synchronously.
+      _appendDebounceTimers.remove(normalizedId)?.cancel();
+      final pending = _appendDebouncePending.remove(normalizedId);
+      if (pending != null && !pending.isCompleted) {
+        saveFuture.then(
+          pending.complete,
+          onError: pending.completeError,
+        );
+      }
       return saveFuture;
     }
-    return saveHistory(normalizedId, list);
+    return _scheduleDebouncedSave(normalizedId);
+  }
+
+  /// Schedule a coalesced disk write for [normalizedId]. Successive calls
+  /// inside [_appendDebounce] reset the timer and share the same returned
+  /// Future, which completes when the eventual `saveHistory` finishes.
+  ///
+  /// Callers should pass an already-normalized id.
+  Future<void> _scheduleDebouncedSave(String normalizedId) {
+    if (_disposed) {
+      // Fall back to synchronous save during shutdown so we don't drop the
+      // very last message under a not-yet-fired timer.
+      final list = _historyById[normalizedId];
+      if (list == null || list.isEmpty) return Future.value();
+      return saveHistory(normalizedId, List<ChatMessage>.from(list));
+    }
+    final completer = _appendDebouncePending.putIfAbsent(
+      normalizedId,
+      () => Completer<void>(),
+    );
+    _appendDebounceTimers.remove(normalizedId)?.cancel();
+    _appendDebounceTimers[normalizedId] = Timer(_appendDebounce, () {
+      _appendDebounceTimers.remove(normalizedId);
+      final pending = _appendDebouncePending.remove(normalizedId);
+      final list = _historyById[normalizedId];
+      if (list == null || list.isEmpty) {
+        pending?.complete();
+        return;
+      }
+      final snapshot = List<ChatMessage>.from(list);
+      saveHistory(normalizedId, snapshot).then(
+        (_) => pending?.complete(),
+        onError: (Object error, StackTrace? stack) {
+          if (pending != null && !pending.isCompleted) {
+            pending.completeError(error, stack);
+          }
+        },
+      );
+    });
+    return completer.future;
+  }
+
+  /// Force any pending debounced saves to disk immediately. Intended for
+  /// shutdown / logout paths so the very last burst of messages doesn't get
+  /// stranded in a not-yet-fired timer.
+  Future<void> flushPendingSaves() async {
+    final ids = _appendDebounceTimers.keys.toList(growable: false);
+    for (final id in ids) {
+      _appendDebounceTimers.remove(id)?.cancel();
+      final pending = _appendDebouncePending.remove(id);
+      final list = _historyById[id];
+      if (list == null || list.isEmpty) {
+        pending?.complete();
+        continue;
+      }
+      try {
+        await saveHistory(id, List<ChatMessage>.from(list));
+        pending?.complete();
+      } catch (e, stack) {
+        if (pending != null && !pending.isCompleted) {
+          pending.completeError(e, stack);
+        }
+      }
+    }
+  }
+
+  /// Cancel any in-flight debounce timers without flushing. Use only in tests
+  /// or in tear-down paths that have already persisted via another route.
+  void dispose() {
+    _disposed = true;
+    for (final timer in _appendDebounceTimers.values) {
+      timer.cancel();
+    }
+    _appendDebounceTimers.clear();
+    for (final completer in _appendDebouncePending.values) {
+      if (!completer.isCompleted) {
+        completer.complete();
+      }
+    }
+    _appendDebouncePending.clear();
   }
   
   /// Intelligently merge two messages with the same msgID
@@ -580,7 +732,20 @@ class MessageHistoryPersistence {
   Future<void> clearHistory(String conversationId) async {
     // Normalize conversationId for comparison
     final normalizedConversationId = ConversationIdUtils.normalize(conversationId);
-    
+
+    // Cancel any in-flight debounced saves for this conversation — otherwise
+    // a queued save could resurrect the in-memory list we are about to clear.
+    _appendDebounceTimers.remove(conversationId)?.cancel();
+    _appendDebounceTimers.remove(normalizedConversationId)?.cancel();
+    final pendingDirect = _appendDebouncePending.remove(conversationId);
+    if (pendingDirect != null && !pendingDirect.isCompleted) {
+      pendingDirect.complete();
+    }
+    final pendingNormalized = _appendDebouncePending.remove(normalizedConversationId);
+    if (pendingNormalized != null && !pendingNormalized.isCompleted) {
+      pendingNormalized.complete();
+    }
+
     // Clear in-memory cache for this ID and all variants
     _historyById.remove(conversationId);
     
@@ -695,8 +860,19 @@ class MessageHistoryPersistence {
   
   /// Clear all message histories
   Future<void> clearAllHistories() async {
+    // Cancel any in-flight debounced saves so they don't recreate files we
+    // are about to delete.
+    for (final timer in _appendDebounceTimers.values) {
+      timer.cancel();
+    }
+    _appendDebounceTimers.clear();
+    for (final completer in _appendDebouncePending.values) {
+      if (!completer.isCompleted) completer.complete();
+    }
+    _appendDebouncePending.clear();
+
     _historyById.clear();
-    
+
     try {
       final historyDir = await _getHistoryDirectory();
       if (await historyDir.exists()) {
