@@ -1,12 +1,14 @@
 /// LAN Discovery Test
 /// Reference: c-toxcore/auto_tests/scenarios/scenario_lan_discovery_test.c
-/// 
+///
 /// Tests LAN discovery functionality:
 /// - Two nodes (Alice and Bob) with local discovery enabled
 /// - NO bootstrap configuration (key difference from bootstrap test)
 /// - Both nodes wait for DHT connection via LAN discovery
-/// 
+///
 /// Now uses tim2tox_ffi_create_test_instance_ex to set local discovery and IPv6 options.
+
+// SKIP_IN_PARALLEL: LAN multicast requires sole occupancy of loopback 33445-33545 port range
 
 import 'package:test/test.dart';
 import '../test_helper.dart';

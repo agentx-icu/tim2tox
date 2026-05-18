@@ -177,6 +177,20 @@ PARALLEL_WORKERS=3 ./run_tests_ordered.sh 4 10
 
 `PARALLEL_WORKERS=N` flattens all selected tests into a single queue and dispatches them across N concurrent `flutter test` processes. Default is 1 (sequential). Rule of thumb on a developer Mac: 2–3 workers stay reliable, 4+ tends to trip Tox DHT timeouts and friend P2P handshake failures under CPU pressure. Each test file already has its own `setUpAll` so no cross-phase ordering is assumed; results are still printed grouped by phase after the parallel batch completes.
 
+#### Opting tests out of parallel mode
+
+Some tests are fundamentally incompatible with concurrent execution (cross-process state, sole-occupancy network resources, etc.). Mark such a file by adding a comment line near the top — anywhere in the first ~40 lines, typically right after the docstring and before `void main()`:
+
+```dart
+// SKIP_IN_PARALLEL: <one-line reason>
+```
+
+When `PARALLEL_WORKERS>=2`, the runner greps for that marker and drops matching files from every phase array before dispatch, regardless of which path (bundle, parallel-xargs, or sequential-inside-an-N>=2-invocation) would have run them. The marker is sibling-symmetric: if either the wall-clock `_test.dart` or its `_virtual_test.dart` sibling carries it, both variants are filtered. Skipped files show up in the runner's "Skipped Tests" summary section with the declared reason.
+
+Current users of the marker:
+
+- `scenario_lan_discovery_test.dart` / `scenario_lan_discovery_virtual_test.dart` — Tox LAN multicast on the loopback 33445-33545 port range needs sole occupancy; with other parallel test processes broadcasting on the same range, discovery becomes ambiguous and the assertion fails.
+
 ### Phase coverage
 
 Phase 1–12 have `*_virtual_test.dart` siblings (~69 files plus `scenario_virtual_clock_smoke_test.dart`), covering basics / friendship / message / group / ToxAV / profile / conversation / file / conference / group-ext / network / other. Phase 13 (Binary Replacement) and Phase 14 (unit_tests) do not depend on Tox protocol timers and **do not need** virtual variants.

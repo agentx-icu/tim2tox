@@ -252,19 +252,31 @@ class TestNode {
     final initPathPtr = testInitPath.toNativeUtf8();
     try {
       int instanceHandle;
-      // Use extended version if options are provided
-      if (localDiscoveryEnabled != null || ipv6Enabled != null) {
-        final localDiscovery = localDiscoveryEnabled ?? true;
-        final ipv6 = ipv6Enabled ?? true;
-        instanceHandle = ffiInstance.createTestInstanceExNative(
-            initPathPtr, localDiscovery ? 1 : 0, ipv6 ? 1 : 0);
-        print(
-            '[Test] Created test instance $instanceHandle for node $alias with options: localDiscovery=$localDiscovery, ipv6=$ipv6');
-      } else {
-        instanceHandle = ffiInstance.createTestInstanceNative(initPathPtr);
-        print(
-            '[Test] Created test instance $instanceHandle for node $alias with default options (localDiscovery=true, ipv6=true)');
-      }
+      // localDiscovery default is mode-dependent:
+      //   • Solo (PARALLEL_WORKERS=1 or unset): default ON. LAN multicast
+      //     accelerates loopback DHT peer-find by ~5–10 s, so a 2-node
+      //     friendship test costs ~11 s instead of ~20 s.
+      //   • Parallel (PARALLEL_WORKERS≥2): default OFF. With LAN on, every
+      //     process's Tox instances broadcast on the loopback interface;
+      //     c-toxcore's LAN-discovery sweeps the entire 33445–33545 port
+      //     range and crosses test-process boundaries. The second worker's
+      //     nodes end up routing through the first worker's DHT entries —
+      //     friend P2P never resolves, so message / group / ToxAV tests
+      //     time out with `friend in list=true but role=2 (OFFLINE)`.
+      //     Trading ~50 % per-test wall-clock for zero cross-process flakes
+      //     is the right call here.
+      // Tests that need LAN discovery for their own purpose
+      // (`scenario_lan_discovery_test`) still pass `localDiscoveryEnabled:
+      // true` explicitly and override this default.
+      final parallelWorkers =
+          int.tryParse(Platform.environment['PARALLEL_WORKERS'] ?? '1') ?? 1;
+      final defaultLocalDiscovery = parallelWorkers <= 1;
+      final localDiscovery = localDiscoveryEnabled ?? defaultLocalDiscovery;
+      final ipv6 = ipv6Enabled ?? true;
+      instanceHandle = ffiInstance.createTestInstanceExNative(
+          initPathPtr, localDiscovery ? 1 : 0, ipv6 ? 1 : 0);
+      print(
+          '[Test] Created test instance $instanceHandle for node $alias with options: localDiscovery=$localDiscovery, ipv6=$ipv6 (PARALLEL_WORKERS=$parallelWorkers)');
 
       if (instanceHandle == 0) {
         throw Exception('Failed to create test instance for node $alias');
@@ -2155,7 +2167,21 @@ Future<void> waitForConnectionVirtual(
     throw Exception('Cannot wait for connection: node is not logged in');
   }
 
-  final connectionTimeout = timeout ?? const Duration(seconds: 15);
+  // Scale the caller-supplied virtual timeout when running under
+  // PARALLEL_WORKERS>=2: in that mode `TestNode.initSDK` defaults LAN
+  // discovery OFF to prevent cross-process Tox-DHT cross-pollination,
+  // which makes loopback multi-node bootstrap rely entirely on the
+  // explicit `tox_bootstrap()` chain and the slower onion-announce path.
+  // The wall-clock cost roughly doubles. Without scaling, multi-node
+  // setUpAll budgets that pass `Duration(seconds: 25)` (e.g.
+  // scenario_group_large_virtual_test) saturate before Tox finishes.
+  // Single-worker / solo runs leave the timeout untouched.
+  final parallelWorkers =
+      int.tryParse(Platform.environment['PARALLEL_WORKERS'] ?? '1') ?? 1;
+  final baseTimeout = timeout ?? const Duration(seconds: 15);
+  final connectionTimeout = parallelWorkers >= 2
+      ? Duration(milliseconds: baseTimeout.inMilliseconds * 3)
+      : baseTimeout;
 
   await node.runWithInstanceAsync(() async {
     final ffiInstance = ffi_lib.Tim2ToxFfi.open();

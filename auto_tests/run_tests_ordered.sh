@@ -492,6 +492,84 @@ apply_known_unstable_filters() {
 }
 apply_known_unstable_filters
 
+# SKIP_IN_PARALLEL filter — drop tests that declare themselves incompatible
+# with concurrent execution. Convention: a file marked with a top-level
+# comment of the form
+#   // SKIP_IN_PARALLEL: <reason>
+# (anywhere in the first ~40 lines, typically right after the docstring)
+# is filtered out whenever PARALLEL_WORKERS>=2, regardless of whether the
+# actual dispatch path is sequential (the one inside an N>=2 invocation
+# of this script that ends up routing through run_phase), bundle, or
+# parallel-xargs. The marker is applied symmetrically: if either the
+# wall-clock _test.dart or its _virtual_test.dart sibling carries it,
+# both variants are filtered.
+#
+# Concrete known case: scenario_lan_discovery — Tox LAN multicast on the
+# loopback interface (33445-33545) requires sole occupancy or the
+# discovery becomes ambiguous between parallel test processes.
+_parallel_workers_for_filter="${PARALLEL_WORKERS:-1}"
+if [[ "$_parallel_workers_for_filter" =~ ^[0-9]+$ ]] && [ "$_parallel_workers_for_filter" -ge 2 ]; then
+  # Prints the SKIP_IN_PARALLEL reason on stdout if either the file or its
+  # _virtual / wall-clock sibling carries the marker; otherwise prints
+  # nothing. Always returns 0 (the empty-vs-nonempty stdout is the signal,
+  # so `set -e` and command substitution interact safely).
+  parallel_skip_reason_for_file() {
+    local f="$1"
+    local sibling
+    if [[ "$f" == *_virtual_test.dart ]]; then
+      sibling="${f%_virtual_test.dart}_test.dart"
+    else
+      sibling="${f%_test.dart}_virtual_test.dart"
+    fi
+    local candidate reason
+    for candidate in "$f" "$sibling"; do
+      if [ -f "$candidate" ]; then
+        reason=$(grep -m1 -E '^[[:space:]]*//[[:space:]]*SKIP_IN_PARALLEL:' "$candidate" 2>/dev/null \
+                  | sed -E 's|^[[:space:]]*//[[:space:]]*SKIP_IN_PARALLEL:[[:space:]]*||' \
+                  || true)
+        if [ -n "$reason" ]; then
+          echo "$reason"
+          return 0
+        fi
+      fi
+    done
+    return 0
+  }
+
+  filter_phase_array_for_parallel() {
+    # $1: name of phase array variable (e.g. PHASE11_NETWORK).
+    local arr_name="$1"
+    eval "local _items=(\"\${${arr_name}[@]}\")"
+    local kept=()
+    local item reason base
+    for item in "${_items[@]}"; do
+      reason=$(parallel_skip_reason_for_file "$item")
+      if [ -n "$reason" ]; then
+        base=$(basename "$item" .dart)
+        TOTAL_SKIPPED=$((TOTAL_SKIPPED + 1))
+        SKIPPED_TESTS+=("$base (SKIP_IN_PARALLEL: $reason)")
+        echo -e "${YELLOW}Skipping in parallel mode: $base — $reason${NC}"
+      else
+        kept+=("$item")
+      fi
+    done
+    # Reassign the array variable; use printf to safely round-trip quoted entries.
+    local quoted=""
+    local k
+    for k in "${kept[@]}"; do
+      quoted+=" $(printf '%q' "$k")"
+    done
+    eval "$arr_name=($quoted)"
+  }
+
+  for _arr_name in PHASE1_BASIC PHASE2_FRIENDSHIP PHASE3_MESSAGE PHASE4_GROUP \
+                   PHASE5_TOXAV PHASE6_PROFILE PHASE7_CONVERSATION PHASE8_FILE \
+                   PHASE9_CONFERENCE PHASE10_GROUP_EXT PHASE11_NETWORK \
+                   PHASE12_OTHER PHASE13_BINARY_REPLACEMENT PHASE14_UNIT; do
+    filter_phase_array_for_parallel "$_arr_name"
+  done
+fi
+
 # Account for phases dropped via SKIP_PHASES (env var parsed earlier).
 # Adds each skipped phase's test count to TOTAL_SKIPPED and records a single
 # "Phase N (SKIP_PHASES env)" entry per skipped phase. Done here (after the

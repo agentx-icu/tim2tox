@@ -183,6 +183,20 @@ PARALLEL_WORKERS=3 ./run_tests_ordered.sh 4 10
 
 `PARALLEL_WORKERS=N` 把全部选中的测试合并成一条队列，跨 Phase 一起分发到 N 个并发的 `flutter test` 进程。默认值是 1（顺序执行）。开发机典型经验：2–3 个 worker 通常稳定，4+ 容易因 CPU 抢占触发 Tox DHT 超时和 friend P2P 握手失败。Phase 间不再有顺序依赖（每个测试文件已经各自 `setUpAll`），并行汇总后仍按 Phase 重新分组打印结果。
 
+#### 让测试在并行模式下自动跳过
+
+部分测试本质上不兼容并行执行（跨进程状态、独占型网络资源等）。这类文件可以在顶部（文件头注释之后、`void main()` 之前的前 ~40 行内任意位置）加一行标记：
+
+```dart
+// SKIP_IN_PARALLEL: <一行原因>
+```
+
+当 `PARALLEL_WORKERS>=2` 时，runner 会 grep 该标记并在分发前把命中文件从所有 Phase 数组里剔除，不管真正的分发路径是 bundle、parallel-xargs，还是 `PARALLEL_WORKERS>=2` 调用里顺序执行的那条 fallback —— 一律生效。标记是 sibling 对称的：只要 wall-clock 版 `_test.dart` 或 `_virtual_test.dart` 任一文件带了标记，两边都会被过滤。被跳过的文件会出现在 runner 的 "Skipped Tests" 汇总段落里，并附上声明的原因。
+
+当前使用该标记的测试：
+
+- `scenario_lan_discovery_test.dart` / `scenario_lan_discovery_virtual_test.dart` —— Tox LAN 多播在 loopback 33445-33545 端口需要独占；其他并行测试进程同时在该端口段广播会让发现路径产生歧义，断言失败。
+
 ### Phase 覆盖
 
 Phase 1–12 已经有 `*_virtual_test.dart` 虚拟变体（约 69 个文件，加上 `scenario_virtual_clock_smoke_test.dart` 共 70 个；wall-clock 原版另有 ~70 个，详见 `test/scenarios/`），覆盖基础 / 好友 / 消息 / 群组 / ToxAV / Profile / 会话 / 文件 / 会议 / 群组扩展 / 网络 / 其他全部业务路径。Phase 13（Binary Replacement）和 Phase 14（unit_tests）不依赖 Tox 协议定时器，**无需**虚拟变体。

@@ -574,8 +574,16 @@ Future<void> setupTestEnvironment() async {
     // For now, we'll rely on the library being in the system search path
   }
 
-  // Mock path_provider platform channel to avoid plugin dependency
-  final testDataDir = path.join(Directory.systemTemp.path, 'tim2tox_tests');
+  // Mock path_provider platform channel to avoid plugin dependency.
+  // PID-namespace the directories so PARALLEL_WORKERS>1 (or any other
+  // setup that runs multiple `flutter test` processes concurrently)
+  // doesn't share `tim2tox_tests/app_support` across processes — Tim2Tox
+  // writes message-history dirs keyed by *instance_id* (1, 2, …) which
+  // each process re-assigns from 1 upward, so without PID separation
+  // two parallel processes' `chat_history_instance_1/` directories
+  // would collide and corrupt each other's persisted state.
+  final testDataDir =
+      path.join(Directory.systemTemp.path, 'tim2tox_tests', 'pid-$pid');
   final appDocumentsDir = path.join(testDataDir, 'app_documents');
   final appSupportDir = path.join(testDataDir, 'app_support');
   final appCacheDir = path.join(testDataDir, 'app_cache');

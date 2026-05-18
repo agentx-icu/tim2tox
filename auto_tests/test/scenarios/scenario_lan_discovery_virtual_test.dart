@@ -4,6 +4,8 @@
 /// the virtual-clock helpers (VirtualClock + pumpTestTick + *Virtual
 /// helpers).
 
+// SKIP_IN_PARALLEL: LAN multicast requires sole occupancy of loopback 33445-33545 port range
+
 import 'package:test/test.dart';
 import '../test_helper.dart';
 import '../test_fixtures.dart';
