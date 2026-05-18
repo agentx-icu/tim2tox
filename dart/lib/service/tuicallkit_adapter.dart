@@ -10,6 +10,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'package:tencent_cloud_chat_sdk/tencent_cloud_chat_sdk_platform_interface.dart';
+import '../interfaces/logger_service.dart';
 import 'call_bridge_service.dart';
 
 /// TUICallKit service name (must match tuicore_define.dart / TUICallingService)
@@ -43,6 +44,7 @@ class TUICallKitAdapter {
   final TencentCloudChatSdkPlatform _sdkPlatform;
   final CallAvBackend _avService;
   final CallBridgeService _callBridge;
+  final LoggerService? _logger;
 
   // Track active calls by user ID
   final Map<String, String> _userToInviteId = {}; // userID -> inviteID
@@ -55,17 +57,21 @@ class TUICallKitAdapter {
   /// Avoids blocking the UI when native endCall() is invoked with no call in progress (e.g. second call after hangup).
   bool Function()? isCallIdle;
 
-  TUICallKitAdapter._(this._sdkPlatform, this._avService, this._callBridge);
+  TUICallKitAdapter._(this._sdkPlatform, this._avService, this._callBridge,
+      {LoggerService? logger})
+      : _logger = logger;
 
   /// Initialize the adapter
   static Future<TUICallKitAdapter> initialize(
     TencentCloudChatSdkPlatform sdkPlatform,
     CallAvBackend avService,
-    CallBridgeService callBridge,
-  ) async {
+    CallBridgeService callBridge, {
+    LoggerService? logger,
+  }) async {
     if (_instance != null) return _instance!;
 
-    _instance = TUICallKitAdapter._(sdkPlatform, avService, callBridge);
+    _instance = TUICallKitAdapter._(sdkPlatform, avService, callBridge,
+        logger: logger);
     _globalAdapter = _instance;
     await _instance!._registerService();
     return _instance!;
@@ -73,7 +79,7 @@ class TUICallKitAdapter {
 
   /// Internal setup (TUICore registration happens via registerToxAVWithTUICore).
   Future<void> _registerService() async {
-    print('[TUICallKitAdapter] Service initialized');
+    _logger?.log('[TUICallKitAdapter] Service initialized');
   }
 
   /// Intercept and handle TUICallKit calls
@@ -90,8 +96,8 @@ class TUICallKitAdapter {
         PARAM_NAME_GROUPID: groupid ?? "",
       });
       return true;
-    } catch (e) {
-      print('[TUICallKitAdapter] Error handling call: $e');
+    } catch (e, st) {
+      _logger?.logError('[TUICallKitAdapter] Error handling call', e, st);
       return false;
     }
   }
@@ -155,16 +161,17 @@ class TUICallKitAdapter {
     );
 
     // Notify listeners about the outgoing call so UI can show ringing overlay
-    print(
-        '[TUICallKitAdapter] _handleCall: about to fire onOutgoingCallInitiated, callback=${onOutgoingCallInitiated != null ? "SET" : "NULL"}, inviteID=$inviteID, userID=$userID, type=$type');
+    _logger?.logDebug(
+        '[TUICallKitAdapter] _handleCall firing onOutgoingCallInitiated: '
+        'inviteID=$inviteID userID=$userID type=$type '
+        'cb=${onOutgoingCallInitiated != null ? "SET" : "NULL"}');
     onOutgoingCallInitiated?.call(inviteID, userID, type ?? TYPE_AUDIO);
-    print('[TUICallKitAdapter] _handleCall: onOutgoingCallInitiated fired');
 
     // Get friend number and start ToxAV call
     final friendNumber = _avService.getFriendNumberByUserId(userID);
     if (friendNumber == 0xFFFFFFFF) {
-      print(
-          '[TUICallKitAdapter] Friend not found for userID=$userID, signaling-only call');
+      _logger?.logWarning(
+          '[TUICallKitAdapter] Friend not found for userID=$userID; signaling-only call');
       return;
     }
 
@@ -200,8 +207,8 @@ class TUICallKitAdapter {
     // Start the call
     final callResult = await _avService.startCall(friendNumber,
         audioBitRate: audioBitRate, videoBitRate: videoBitRate);
-    print(
-        '[TUICallKitAdapter] _handleCall: startCall result=$callResult, friendNumber=$friendNumber');
+    _logger?.log(
+        '[TUICallKitAdapter] _handleCall startCall result=$callResult friendNumber=$friendNumber');
   }
 
   /// Dispose
@@ -218,9 +225,11 @@ TUICallKitAdapter? _globalAdapter;
 Future<TUICallKitAdapter> initializeTUICallKitAdapter(
   TencentCloudChatSdkPlatform sdkPlatform,
   CallAvBackend avService,
-  CallBridgeService callBridge,
-) async {
-  return await TUICallKitAdapter.initialize(sdkPlatform, avService, callBridge);
+  CallBridgeService callBridge, {
+  LoggerService? logger,
+}) async {
+  return await TUICallKitAdapter.initialize(sdkPlatform, avService, callBridge,
+      logger: logger);
 }
 
 /// Get global adapter instance

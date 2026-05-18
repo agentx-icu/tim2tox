@@ -5,6 +5,7 @@
 import 'dart:async';
 import 'package:tencent_cloud_chat_sdk/enum/V2TimSignalingListener.dart';
 import 'package:tencent_cloud_chat_sdk/tencent_cloud_chat_sdk_platform_interface.dart';
+import '../interfaces/logger_service.dart';
 import 'call_av_backend.dart';
 
 export 'call_av_backend.dart';
@@ -43,6 +44,7 @@ class CallInfo {
 class CallBridgeService {
   final TencentCloudChatSdkPlatform _sdkPlatform;
   final CallAvBackend _avService;
+  final LoggerService? _logger;
 
   // Active calls: inviteID -> CallInfo
   final Map<String, CallInfo> _activeCalls = {};
@@ -53,7 +55,9 @@ class CallBridgeService {
   // Callbacks
   Function(String inviteID, CallState state)? onCallStateChanged;
 
-  CallBridgeService(this._sdkPlatform, this._avService) {
+  CallBridgeService(this._sdkPlatform, this._avService,
+      {LoggerService? logger})
+      : _logger = logger {
     _setupSignalingListener();
   }
 
@@ -114,8 +118,8 @@ class CallBridgeService {
                 callInfo.state = CallState.inCall;
                 onCallStateChanged?.call(inviteID, CallState.inCall);
               }
-            } catch (e) {
-              print('[CallBridge] Error starting call: $e');
+            } catch (e, st) {
+              _logger?.logError('[CallBridge] Error starting call', e, st);
             }
           } else {
             // Call already started, just update state

@@ -1,14 +1,32 @@
-/// ToxAV Service
+/// ToxAV Service.
 ///
-/// Manages ToxAV lifecycle and audio/video frame processing
+/// Manages ToxAV lifecycle and audio/video frame processing.
+///
+/// Threading & FFI safety:
+/// - The four receive-side trampolines are invoked from native code via
+///   `Dart_PostCObject_DL` and execute on the Dart isolate that owns the
+///   FFI library handle. Frame buffers (`pcm`, `y`, `u`, `v`) are owned by
+///   c-toxcore and MUST NOT be retained past the synchronous trampoline
+///   call — they are recycled by the next ToxAV iterate tick. We therefore
+///   COPY each buffer into a Dart-owned `Int16List` / `Uint8List` before
+///   handing it off to user callbacks. The previous implementation passed
+///   `asTypedList` views directly, which was a latent use-after-free when
+///   the consumer iterated the data asynchronously (e.g. in a `compute()`
+///   isolate or after an `await`).
+library;
 
 import 'dart:async';
 import 'dart:ffi' as ffi;
+import 'dart:typed_data';
 import 'package:ffi/ffi.dart' as pkgffi;
 import '../ffi/tim2tox_ffi.dart';
+import '../interfaces/logger_service.dart';
 import 'call_av_backend.dart';
 
-/// Callback types for audio/video events
+/// Callback types for audio/video events.
+///
+/// `pcm`, `y`, `u`, `v` are Dart-owned copies (`Int16List` / `Uint8List`).
+/// Consumers may retain or pass them across async boundaries safely.
 typedef CallCallback = void Function(
     int friendNumber, bool audioEnabled, bool videoEnabled);
 typedef CallStateCallback = void Function(int friendNumber, int state);
@@ -50,16 +68,19 @@ typedef _AvVideoReceiveCallbackNative = ffi.Void Function(
 /// ToxAV Service for managing audio/video calls
 class ToxAVService implements CallAvBackend {
   final Tim2ToxFfi _ffi;
+  final LoggerService? _logger;
   bool _initialized = false;
   int? _instanceId; // Instance ID for multi-instance routing
 
   // Global map for instance ID -> ToxAVService routing (for multi-instance support)
   static final Map<int, ToxAVService> _instanceServices = {};
-  static final Object _instanceServicesLock =
-      Object(); // Simple lock for thread safety
 
   // Kept for backward compatibility with default instance
   static ToxAVService? _globalService;
+
+  // Last-wins logger usable from static trampolines (for early-startup
+  // diagnostics before a per-instance lookup succeeds).
+  static LoggerService? _staticLogger;
 
   // Callbacks
   CallCallback? _onCall;
@@ -67,153 +88,126 @@ class ToxAVService implements CallAvBackend {
   AudioReceiveCallback? _onAudioReceive;
   VideoReceiveCallback? _onVideoReceive;
 
-  ToxAVService(this._ffi) {
-    // Get current instance ID
+  ToxAVService(this._ffi, {LoggerService? logger}) : _logger = logger {
+    if (logger != null) _staticLogger = logger;
     try {
       _instanceId = _ffi.getCurrentInstanceId();
-      print('[ToxAVService] Constructor: instanceId=$_instanceId');
+      _logger?.logDebug('[ToxAVService] Constructor: instanceId=$_instanceId');
 
-      // Register this service instance in the global map
-      synchronized(_instanceServicesLock, () {
-        if (_instanceId != null && _instanceId! != 0) {
-          _instanceServices[_instanceId!] = this;
-          print('[ToxAVService] Registered service for instance $_instanceId');
-        } else {
-          // Default instance (backward compatibility)
-          _globalService = this;
-          print(
-              '[ToxAVService] Registered as global service (default instance)');
-        }
-      });
-    } catch (e) {
-      print('[ToxAVService] Constructor: Failed to get instance ID: $e');
+      if (_instanceId != null && _instanceId! != 0) {
+        _instanceServices[_instanceId!] = this;
+        _logger
+            ?.logDebug('[ToxAVService] Registered service for instance $_instanceId');
+      } else {
+        // Default instance (backward compatibility)
+        _globalService = this;
+        _logger?.logDebug(
+            '[ToxAVService] Registered as global service (default instance)');
+      }
+    } catch (e, st) {
+      _logger?.logError('[ToxAVService] Constructor: failed to get instance ID',
+          e, st);
       // Fallback to global service
       _globalService = this;
     }
   }
 
-  // Helper function for synchronized access
-  static T synchronized<T>(Object lock, T Function() action) {
-    return action(); // In Dart, we rely on single-threaded execution
-  }
-
   /// Dispatches AV call callback from native (posted via SendCallbackToDart from tox thread).
   static void dispatchAvCall(
       int instanceId, int friendNumber, bool audioEnabled, bool videoEnabled) {
-    ToxAVService? targetService;
-    synchronized(_instanceServicesLock, () {
-      if (instanceId != 0) {
-        targetService = _instanceServices[instanceId];
-      } else {
-        targetService = _globalService;
-      }
-    });
-    if (targetService != null && targetService!._onCall != null) {
-      targetService!._onCall!.call(friendNumber, audioEnabled, videoEnabled);
-    }
+    final targetService =
+        instanceId != 0 ? _instanceServices[instanceId] : _globalService;
+    targetService?._onCall?.call(friendNumber, audioEnabled, videoEnabled);
   }
 
   /// Dispatches AV call state callback from native (posted via SendCallbackToDart from tox thread).
   static void dispatchAvCallState(int instanceId, int friendNumber, int state) {
-    ToxAVService? targetService;
-    synchronized(_instanceServicesLock, () {
-      if (instanceId != 0) {
-        targetService = _instanceServices[instanceId];
-      } else {
-        targetService = _globalService;
-      }
-    });
-    if (targetService != null && targetService!._onCallState != null) {
-      targetService!._onCallState!.call(friendNumber, state);
-    }
+    final targetService =
+        instanceId != 0 ? _instanceServices[instanceId] : _globalService;
+    targetService?._onCallState?.call(friendNumber, state);
   }
 
   /// Initialize ToxAV
+  @override
   Future<bool> initialize() async {
-    print('[ToxAVService] initialize() called');
+    _logger?.logDebug('[ToxAVService] initialize() called');
     if (_initialized) {
-      print('[ToxAVService] initialize() already initialized, returning true');
+      _logger?.logDebug('[ToxAVService] initialize() already initialized');
       return true;
     }
 
     try {
       final result = _ffi.avInitialize(_ffi.getCurrentInstanceId());
-      print('[ToxAVService] initialize() FFI result: $result');
+      _logger?.logDebug('[ToxAVService] initialize() FFI result: $result');
       if (result == 1) {
         _initialized = true;
         _setupCallbacks();
-        print('[ToxAVService] initialize() succeeded');
+        _logger?.log('[ToxAVService] initialize() succeeded');
         return true;
       }
-      print('[ToxAVService] initialize() failed: FFI returned $result');
+      _logger?.logWarning(
+          '[ToxAVService] initialize() failed: FFI returned $result');
       return false;
-    } catch (e, stackTrace) {
-      print('[ToxAVService] initialize() exception: $e');
-      print('[ToxAVService] Stack trace: $stackTrace');
+    } catch (e, st) {
+      _logger?.logError('[ToxAVService] initialize() exception', e, st);
       return false;
     }
   }
 
   /// Shutdown ToxAV
   void shutdown() {
-    print('[ToxAVService] shutdown() called');
+    _logger?.logDebug('[ToxAVService] shutdown() called');
     if (!_initialized) {
-      print('[ToxAVService] shutdown() not initialized, skipping');
+      _logger?.logDebug('[ToxAVService] shutdown() not initialized, skipping');
       return;
     }
     _ffi.avShutdown(_ffi.getCurrentInstanceId());
     _initialized = false;
 
-    // Unregister from instance map
-    synchronized(_instanceServicesLock, () {
-      if (_instanceId != null && _instanceId! != 0) {
-        _instanceServices.remove(_instanceId!);
-        print('[ToxAVService] Unregistered service for instance $_instanceId');
-      } else {
-        if (_globalService == this) {
-          _globalService = null;
-          print('[ToxAVService] Unregistered global service');
-        }
+    if (_instanceId != null && _instanceId! != 0) {
+      _instanceServices.remove(_instanceId!);
+      _logger?.logDebug(
+          '[ToxAVService] Unregistered service for instance $_instanceId');
+    } else {
+      if (_globalService == this) {
+        _globalService = null;
+        _logger?.logDebug('[ToxAVService] Unregistered global service');
       }
-    });
+    }
 
-    print('[ToxAVService] shutdown() completed');
+    _logger?.log('[ToxAVService] shutdown() completed');
   }
 
   /// Setup callbacks
   void _setupCallbacks() {
-    // Get instance ID for user_data
     final instanceId = _instanceId ?? 0;
-    print('[ToxAVService] _setupCallbacks() instanceId=$instanceId');
+    _logger?.logDebug('[ToxAVService] _setupCallbacks() instanceId=$instanceId');
 
-    // Allocate memory for instance ID (will be passed as user_data)
+    // Allocate memory for instance ID (will be passed as user_data).
+    //
+    // This block is intentionally retained for the lifetime of the registered
+    // native callbacks. Freeing it during `shutdown()` is unsafe because
+    // c-toxcore may still hold the pointer and dispatch a final tail-event
+    // after `avShutdown()` returns. The memory cost is 8 bytes per instance.
     final instanceIdPtr = pkgffi.malloc<ffi.Int64>();
     instanceIdPtr.value = instanceId;
 
-    // Setup call callback
     final onCallNative = ffi.Pointer.fromFunction<_AvCallCallbackNative>(
       _onCallNativeTrampoline,
     );
-
-    // Setup call state callback
     final onCallStateNative =
         ffi.Pointer.fromFunction<_AvCallStateCallbackNative>(
       _onCallStateNativeTrampoline,
     );
-
-    // Setup audio receive callback
     final onAudioReceiveNative =
         ffi.Pointer.fromFunction<_AvAudioReceiveCallbackNative>(
       _onAudioReceiveNativeTrampoline,
     );
-
-    // Setup video receive callback
     final onVideoReceiveNative =
         ffi.Pointer.fromFunction<_AvVideoReceiveCallbackNative>(
       _onVideoReceiveNativeTrampoline,
     );
 
-    // Pass instance ID as first param and as user_data for routing
     final instanceIdForFfi = _instanceId ?? _ffi.getCurrentInstanceId();
     _ffi.avSetCallCallbackNative(
         instanceIdForFfi, onCallNative.cast(), instanceIdPtr.cast());
@@ -224,12 +218,29 @@ class ToxAVService implements CallAvBackend {
     _ffi.avSetVideoReceiveCallbackNative(
         instanceIdForFfi, onVideoReceiveNative.cast(), instanceIdPtr.cast());
 
-    print(
+    _logger?.logDebug(
         '[ToxAVService] _setupCallbacks() completed with instanceId=$instanceId');
   }
 
-  // Static trampoline functions for FFI (must be static for fromFunction)
-  // These route callbacks to the correct service instance based on instance ID in userData
+  // ---------- Static trampoline functions for FFI ----------
+  //
+  // These execute on the Dart isolate that owns the SendPort and route the
+  // callback to the correct service instance using the `userData` pointer
+  // (which holds a pointer to the instance ID).
+  //
+  // CRITICAL FFI SAFETY: The audio/video pointer arguments reference memory
+  // owned by c-toxcore that is recycled after the trampoline returns. We
+  // copy each buffer into Dart-owned typed-data lists before forwarding.
+
+  static ToxAVService? _lookupService(int instanceId) {
+    return instanceId != 0 ? _instanceServices[instanceId] : _globalService;
+  }
+
+  static int _readInstanceId(ffi.Pointer<ffi.Void> userData) {
+    if (userData.address == 0) return 0;
+    return userData.cast<ffi.Int64>().value;
+  }
+
   @pragma('vm:entry-point')
   static void _onCallNativeTrampoline(
     int friendNumber,
@@ -238,37 +249,23 @@ class ToxAVService implements CallAvBackend {
     ffi.Pointer<ffi.Void> userData,
   ) {
     try {
-      // Extract instance ID from userData
-      int instanceId = 0;
-      if (userData.address != 0) {
-        instanceId = userData.cast<ffi.Int64>().value;
+      final instanceId = _readInstanceId(userData);
+      final target = _lookupService(instanceId);
+      if (target == null || target._onCall == null) {
+        _staticLogger?.logWarning(
+            '[ToxAVService] _onCallNativeTrampoline: no service for instanceId=$instanceId');
+        return;
       }
-
-      print(
-          '[ToxAVService] _onCallNativeTrampoline() callback: instanceId=$instanceId, friendNumber=$friendNumber, audioEnabled=$audioEnabled, videoEnabled=$videoEnabled');
-
-      // Route to the correct service instance
-      ToxAVService? targetService;
-      synchronized(_instanceServicesLock, () {
-        if (instanceId != 0) {
-          targetService = _instanceServices[instanceId];
-        } else {
-          targetService = _globalService;
-        }
-      });
-
-      if (targetService != null && targetService!._onCall != null) {
-        targetService!._onCall!.call(
-          friendNumber,
-          audioEnabled != 0,
-          videoEnabled != 0,
-        );
-      } else {
-        print(
-            '[ToxAVService] _onCallNativeTrampoline() warning: No service found for instanceId=$instanceId or callback is null');
-      }
-    } catch (e) {
-      print('[ToxAVService] _onCallNativeTrampoline() exception: $e');
+      target._logger?.logDebug(
+          '[ToxAVService] _onCallNativeTrampoline: friendNumber=$friendNumber audio=$audioEnabled video=$videoEnabled');
+      target._onCall!.call(
+        friendNumber,
+        audioEnabled != 0,
+        videoEnabled != 0,
+      );
+    } catch (e, st) {
+      _staticLogger?.logError(
+          '[ToxAVService] _onCallNativeTrampoline exception', e, st);
     }
   }
 
@@ -279,36 +276,19 @@ class ToxAVService implements CallAvBackend {
     ffi.Pointer<ffi.Void> userData,
   ) {
     try {
-      // Extract instance ID from userData
-      int instanceId = 0;
-      if (userData.address != 0) {
-        instanceId = userData.cast<ffi.Int64>().value;
+      final instanceId = _readInstanceId(userData);
+      final target = _lookupService(instanceId);
+      if (target == null || target._onCallState == null) {
+        _staticLogger?.logWarning(
+            '[ToxAVService] _onCallStateNativeTrampoline: no service for instanceId=$instanceId');
+        return;
       }
-
-      print(
-          '[ToxAVService] _onCallStateNativeTrampoline() callback: instanceId=$instanceId, friendNumber=$friendNumber, state=$state');
-
-      // Route to the correct service instance
-      ToxAVService? targetService;
-      synchronized(_instanceServicesLock, () {
-        if (instanceId != 0) {
-          targetService = _instanceServices[instanceId];
-        } else {
-          targetService = _globalService;
-        }
-      });
-
-      if (targetService != null && targetService!._onCallState != null) {
-        targetService!._onCallState!.call(
-          friendNumber,
-          state,
-        );
-      } else {
-        print(
-            '[ToxAVService] _onCallStateNativeTrampoline() warning: No service found for instanceId=$instanceId or callback is null');
-      }
-    } catch (e) {
-      print('[ToxAVService] _onCallStateNativeTrampoline() exception: $e');
+      target._logger?.logDebug(
+          '[ToxAVService] _onCallStateNativeTrampoline: friendNumber=$friendNumber state=$state');
+      target._onCallState!.call(friendNumber, state);
+    } catch (e, st) {
+      _staticLogger?.logError(
+          '[ToxAVService] _onCallStateNativeTrampoline exception', e, st);
     }
   }
 
@@ -322,35 +302,39 @@ class ToxAVService implements CallAvBackend {
     ffi.Pointer<ffi.Void> userData,
   ) {
     try {
-      // Extract instance ID from userData
-      int instanceId = 0;
-      if (userData.address != 0) {
-        instanceId = userData.cast<ffi.Int64>().value;
-      }
+      final instanceId = _readInstanceId(userData);
+      final target = _lookupService(instanceId);
+      if (target == null || target._onAudioReceive == null) return;
 
-      // Route to the correct service instance
-      ToxAVService? targetService;
-      synchronized(_instanceServicesLock, () {
-        if (instanceId != 0) {
-          targetService = _instanceServices[instanceId];
-        } else {
-          targetService = _globalService;
-        }
-      });
+      final pcmCopy = copyAudioForCallback(pcm, sampleCount, channels);
 
-      if (targetService != null && targetService!._onAudioReceive != null) {
-        final pcmList = pcm.asTypedList(sampleCount);
-        targetService!._onAudioReceive!(
-          friendNumber,
-          pcmList,
-          sampleCount,
-          channels,
-          samplingRate,
-        );
-      }
-    } catch (e) {
-      print('[ToxAVService] _onAudioReceiveNativeTrampoline() exception: $e');
+      target._onAudioReceive!(
+        friendNumber,
+        pcmCopy,
+        sampleCount,
+        channels,
+        samplingRate,
+      );
+    } catch (e, st) {
+      _staticLogger?.logError(
+          '[ToxAVService] _onAudioReceiveNativeTrampoline exception', e, st);
     }
+  }
+
+  /// Copies the native PCM buffer into a Dart-owned `Int16List`.
+  ///
+  /// Exposed for testing the FFI-safety invariant: the returned list must be
+  /// fully decoupled from `pcm` (mutating or freeing `pcm` afterwards must
+  /// not affect the consumer).
+  ///
+  /// `sampleCount` is per-channel; total interleaved samples = `sampleCount *
+  /// channels` (matching the libtoxav `toxav_audio_receive_frame_cb` contract).
+  static Int16List copyAudioForCallback(
+      ffi.Pointer<ffi.Int16> pcm, int sampleCount, int channels) {
+    final totalSamples = sampleCount * (channels <= 0 ? 1 : channels);
+    final pcmCopy = Int16List(totalSamples);
+    pcmCopy.setAll(0, pcm.asTypedList(totalSamples));
+    return pcmCopy;
   }
 
   @pragma('vm:entry-point')
@@ -364,43 +348,45 @@ class ToxAVService implements CallAvBackend {
     ffi.Pointer<ffi.Void> userData,
   ) {
     try {
-      // Extract instance ID from userData
-      int instanceId = 0;
-      if (userData.address != 0) {
-        instanceId = userData.cast<ffi.Int64>().value;
-      }
+      final instanceId = _readInstanceId(userData);
+      final target = _lookupService(instanceId);
+      if (target == null || target._onVideoReceive == null) return;
 
-      // Route to the correct service instance
-      ToxAVService? targetService;
-      synchronized(_instanceServicesLock, () {
-        if (instanceId != 0) {
-          targetService = _instanceServices[instanceId];
-        } else {
-          targetService = _globalService;
-        }
-      });
+      if (width <= 0 || height <= 0) return;
+      final planes = copyVideoForCallback(width, height, y, u, v);
 
-      if (targetService != null && targetService!._onVideoReceive != null) {
-        // Calculate buffer sizes
-        final ySize = width * height;
-        final uvSize = (width ~/ 2) * (height ~/ 2);
-
-        final yList = y.asTypedList(ySize);
-        final uList = u.asTypedList(uvSize);
-        final vList = v.asTypedList(uvSize);
-
-        targetService!._onVideoReceive!(
-          friendNumber,
-          width,
-          height,
-          yList,
-          uList,
-          vList,
-        );
-      }
-    } catch (e) {
-      print('[ToxAVService] _onVideoReceiveNativeTrampoline() exception: $e');
+      target._onVideoReceive!(
+        friendNumber,
+        width,
+        height,
+        planes.$1,
+        planes.$2,
+        planes.$3,
+      );
+    } catch (e, st) {
+      _staticLogger?.logError(
+          '[ToxAVService] _onVideoReceiveNativeTrampoline exception', e, st);
     }
+  }
+
+  /// Copies the native I420 planes into Dart-owned `Uint8List`s.
+  ///
+  /// Returns `(y, u, v)`. See [copyAudioForCallback] for the safety rationale.
+  static (Uint8List, Uint8List, Uint8List) copyVideoForCallback(
+      int width,
+      int height,
+      ffi.Pointer<ffi.Uint8> y,
+      ffi.Pointer<ffi.Uint8> u,
+      ffi.Pointer<ffi.Uint8> v) {
+    final ySize = width * height;
+    final uvSize = (width ~/ 2) * (height ~/ 2);
+    final yCopy = Uint8List(ySize);
+    yCopy.setAll(0, y.asTypedList(ySize));
+    final uCopy = Uint8List(uvSize);
+    uCopy.setAll(0, u.asTypedList(uvSize));
+    final vCopy = Uint8List(uvSize);
+    vCopy.setAll(0, v.asTypedList(uvSize));
+    return (yCopy, uCopy, vCopy);
   }
 
   /// Set call callback
@@ -424,77 +410,74 @@ class ToxAVService implements CallAvBackend {
   }
 
   /// Start a call
+  @override
   Future<bool> startCall(int friendNumber,
       {int audioBitRate = 48, int videoBitRate = 5000}) async {
-    print(
-        '[ToxAVService] startCall() called: friendNumber=$friendNumber, audioBitRate=$audioBitRate, videoBitRate=$videoBitRate');
+    _logger?.log(
+        '[ToxAVService] startCall: friendNumber=$friendNumber audio=$audioBitRate video=$videoBitRate');
     if (!_initialized) {
-      print('[ToxAVService] startCall() not initialized, initializing...');
+      _logger?.logDebug('[ToxAVService] startCall: not initialized, initializing…');
       final initResult = await initialize();
       if (!initResult) {
-        print('[ToxAVService] startCall() failed: initialization failed');
+        _logger?.logWarning('[ToxAVService] startCall: initialization failed');
         return false;
       }
     }
 
     final result = _ffi.avStartCallNative(
         _ffi.getCurrentInstanceId(), friendNumber, audioBitRate, videoBitRate);
-    print('[ToxAVService] startCall() FFI result: $result');
     final success = result == 1;
     if (success) {
-      print('[ToxAVService] startCall() succeeded: friendNumber=$friendNumber');
+      _logger?.log('[ToxAVService] startCall succeeded: friendNumber=$friendNumber');
     } else {
-      print(
-          '[ToxAVService] startCall() failed: friendNumber=$friendNumber, result=$result');
+      _logger?.logWarning(
+          '[ToxAVService] startCall failed: friendNumber=$friendNumber result=$result');
     }
     return success;
   }
 
   /// Answer an incoming call
+  @override
   Future<bool> answerCall(int friendNumber,
       {int audioBitRate = 48, int videoBitRate = 5000}) async {
-    print(
-        '[ToxAVService] answerCall() called: friendNumber=$friendNumber, audioBitRate=$audioBitRate, videoBitRate=$videoBitRate');
+    _logger?.log(
+        '[ToxAVService] answerCall: friendNumber=$friendNumber audio=$audioBitRate video=$videoBitRate');
     if (!_initialized) {
-      print('[ToxAVService] answerCall() not initialized, initializing...');
+      _logger?.logDebug('[ToxAVService] answerCall: not initialized, initializing…');
       final initResult = await initialize();
       if (!initResult) {
-        print('[ToxAVService] answerCall() failed: initialization failed');
+        _logger?.logWarning('[ToxAVService] answerCall: initialization failed');
         return false;
       }
     }
 
     final result = _ffi.avAnswerCallNative(
         _ffi.getCurrentInstanceId(), friendNumber, audioBitRate, videoBitRate);
-    print('[ToxAVService] answerCall() FFI result: $result');
     final success = result == 1;
     if (success) {
-      print(
-          '[ToxAVService] answerCall() succeeded: friendNumber=$friendNumber');
+      _logger?.log('[ToxAVService] answerCall succeeded: friendNumber=$friendNumber');
     } else {
-      print(
-          '[ToxAVService] answerCall() failed: friendNumber=$friendNumber, result=$result');
+      _logger?.logWarning(
+          '[ToxAVService] answerCall failed: friendNumber=$friendNumber result=$result');
     }
     return success;
   }
 
   /// End a call
+  @override
   Future<bool> endCall(int friendNumber) async {
-    print('[ToxAVService] endCall() called: friendNumber=$friendNumber');
+    _logger?.log('[ToxAVService] endCall: friendNumber=$friendNumber');
     if (!_initialized) {
-      print('[ToxAVService] endCall() failed: not initialized');
+      _logger?.logWarning('[ToxAVService] endCall: not initialized');
       return false;
     }
 
     final result =
         _ffi.avEndCallNative(_ffi.getCurrentInstanceId(), friendNumber);
-    print('[ToxAVService] endCall() FFI result: $result');
     final success = result == 1;
-    if (success) {
-      print('[ToxAVService] endCall() succeeded: friendNumber=$friendNumber');
-    } else {
-      print(
-          '[ToxAVService] endCall() failed: friendNumber=$friendNumber, result=$result');
+    if (!success) {
+      _logger?.logWarning(
+          '[ToxAVService] endCall failed: friendNumber=$friendNumber result=$result');
     }
     return success;
   }
@@ -506,13 +489,15 @@ class ToxAVService implements CallAvBackend {
     if (ptr == ffi.nullptr) return null;
     try {
       return ptr.toDartString();
-    } catch (e) {
-      print('[ToxAVService] getUserIdByFriendNumber() error: $e');
+    } catch (e, st) {
+      _logger?.logError(
+          '[ToxAVService] getUserIdByFriendNumber error', e, st);
       return null;
     }
   }
 
   /// Mute/unmute audio
+  @override
   Future<bool> muteAudio(int friendNumber, bool mute) async {
     if (!_initialized) return false;
 
@@ -522,6 +507,7 @@ class ToxAVService implements CallAvBackend {
   }
 
   /// Hide/show video
+  @override
   Future<bool> muteVideo(int friendNumber, bool hide) async {
     if (!_initialized) return false;
 
@@ -609,18 +595,16 @@ class ToxAVService implements CallAvBackend {
   }
 
   /// Get friend number by user ID
+  @override
   int getFriendNumberByUserId(String userId) {
-    print(
-        '[ToxAVService] getFriendNumberByUserId() called: userId=$userId (length=${userId.length})');
+    _logger?.logDebug(
+        '[ToxAVService] getFriendNumberByUserId: userId.length=${userId.length}');
     final userIdPtr = userId.toNativeUtf8();
     try {
       final result = _ffi.getFriendNumberByUserIdNative(userIdPtr);
       if (result == 0xFFFFFFFF) {
-        print(
-            '[ToxAVService] getFriendNumberByUserId() failed: friend not found for userId=$userId');
-      } else {
-        print(
-            '[ToxAVService] getFriendNumberByUserId() succeeded: userId=$userId, friendNumber=$result');
+        _logger?.logWarning(
+            '[ToxAVService] getFriendNumberByUserId: friend not found');
       }
       return result;
     } finally {
@@ -628,5 +612,6 @@ class ToxAVService implements CallAvBackend {
     }
   }
 
+  @override
   bool get isInitialized => _initialized;
 }
