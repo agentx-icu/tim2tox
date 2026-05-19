@@ -967,7 +967,7 @@ packages:
       path: "../../tencent_cloud_chat_sdk"
       relative: true
     source: path
-    version: "8.7.7201"
+    version: "8.9.7540+3"
   tencent_cloud_uikit_core:
     dependency: transitive
     description:

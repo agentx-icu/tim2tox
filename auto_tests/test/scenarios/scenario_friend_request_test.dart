@@ -420,13 +420,17 @@ void main() {
 
       // Poll Bob's application list instead of a fixed sleep — returns as
       // soon as the request has propagated through the Tox network.
+      // Shortened from 10s → 4s: under tim2tox auto-accept the application
+      // list is typically drained almost immediately, so a long wait here is
+      // pure dead time. The downstream `else` branch already polls the
+      // friend list with its own budget, so a timeout here is harmless.
       await waitUntilAsync(
         () async {
           final list = await bob.runWithInstanceAsync(() async =>
               TIMFriendshipManager.instance.getFriendApplicationList());
           return list.data?.friendApplicationList?.isNotEmpty ?? false;
         },
-        timeout: const Duration(seconds: 10),
+        timeout: const Duration(seconds: 4),
         description: "Bob's friend application list is populated",
       ).catchError((_) {
         // Timeout is recoverable here: a previous run may have already
@@ -529,23 +533,43 @@ void main() {
       // Handle "already sent" error - if request was already sent, check if it's in the application list
       if (addResult.code != 0 && addResult.desc.contains('already sent')) {
         print('Note: Friend request already sent (code=${addResult.code}), checking application list...');
-        // Wait a bit for the request to propagate
-        await Future.delayed(const Duration(seconds: 2));
+        // Poll for application list propagation (was fixed 2s sleep).
+        await waitUntilAsync(
+          () async {
+            final list = await bob.runWithInstanceAsync(() async =>
+                TIMFriendshipManager.instance.getFriendApplicationList());
+            return list.data?.friendApplicationList?.isNotEmpty ?? false;
+          },
+          timeout: const Duration(seconds: 4),
+          description: "Bob's application list populated (already-sent path)",
+        ).catchError((_) {});
       } else {
         expect(addResult.code, equals(0), reason: 'Friend request should succeed');
       }
-      
-      await Future.delayed(const Duration(seconds: 2));
-      
+
+      // Poll briefly for application list to populate (was fixed 2s sleep).
+      // Under tim2tox auto-accept the list usually drains immediately; the
+      // empty-list branch below handles the no-app case gracefully.
+      await waitUntilAsync(
+        () async {
+          final list = await bob.runWithInstanceAsync(() async =>
+              TIMFriendshipManager.instance.getFriendApplicationList());
+          return list.data?.friendApplicationList?.isNotEmpty ?? false;
+        },
+        timeout: const Duration(seconds: 3),
+        description: "Bob's friend application list populated",
+      ).catchError((_) {});
+
       // Bob gets friend application list
       final appListResult = await bob.runWithInstanceAsync(() async => TIMFriendshipManager.instance.getFriendApplicationList());
       expect(appListResult.code, equals(0));
-      
-      if (appListResult.data?.friendApplicationList != null && 
+
+      if (appListResult.data?.friendApplicationList != null &&
           appListResult.data!.friendApplicationList!.isNotEmpty) {
-        // In Tox, rejection is simply not accepting the application
-        // We verify that friendship is NOT established without accepting
-        await Future.delayed(const Duration(seconds: 2));
+        // In Tox, rejection is simply not accepting the application.
+        // Brief settle (was 2s) — just need a moment for any auto-accept
+        // callback to land before reading friend list.
+        await Future.delayed(const Duration(milliseconds: 500));
         final friendListResult = await bob.runWithInstanceAsync(() async => TIMFriendshipManager.instance.getFriendList());
         expect(friendListResult.code, equals(0));
         if (friendListResult.data != null) {
@@ -555,9 +579,9 @@ void main() {
           expect(aliceInList, isFalse, reason: 'Alice should not be in friend list without accepting application');
         }
       } else {
-        // If application list is empty, it might have been auto-accepted
-        // Check if friendship is already established
-        await Future.delayed(const Duration(seconds: 2));
+        // If application list is empty, it might have been auto-accepted.
+        // Brief settle (was 2s).
+        await Future.delayed(const Duration(milliseconds: 500));
         final friendListResult = await bob.runWithInstanceAsync(() async => TIMFriendshipManager.instance.getFriendList());
         if (friendListResult.data != null) {
           final aliceInList = friendListResult.data!.any((friend) => friend.userID == alicePublicKey);
