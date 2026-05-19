@@ -1,0 +1,633 @@
+From 7a86f07865430b7ebc3c68050a87dc9735707611 Mon Sep 17 00:00:00 2001
+From: tim2tox-bootstrap <bootstrap@local>
+Date: Tue, 19 May 2026 02:01:24 -0700
+Subject: [PATCH 4/6] 0004-native-library-manager-callback-dispatch
+
+---
+ .../bindings/native_library_manager.dart      | 369 +++++++++++++++---
+ 1 file changed, 313 insertions(+), 56 deletions(-)
+
+diff --git a/lib/native_im/bindings/native_library_manager.dart b/lib/native_im/bindings/native_library_manager.dart
+index fc91744..5cfe833 100644
+--- a/lib/native_im/bindings/native_library_manager.dart
++++ b/lib/native_im/bindings/native_library_manager.dart
+@@ -40,6 +40,7 @@ import 'package:tencent_cloud_chat_sdk/enum/V2TimCommunityListener.dart';
+ import 'package:tencent_cloud_chat_sdk/enum/V2TimFriendshipListener.dart';
+ import 'package:tencent_cloud_chat_sdk/enum/V2TimGroupListener.dart';
+ import 'package:tencent_cloud_chat_sdk/enum/V2TimSignalingListener.dart';
++import 'package:tencent_cloud_chat_sdk/tencent_cloud_chat_sdk_platform_interface.dart';
+ import 'native_imsdk_bindings_generated.dart';
+ 
+ /// Override the native library name before any SDK call.
+@@ -89,8 +90,13 @@ typedef ApiCallback = void Function(Map);
+ class NativeLibraryManager {
+   static NativeLibraryManager instance = NativeLibraryManager();
+ 
++  /// Generic hook for custom callback types not handled by the SDK.
++  /// Set this to handle application-specific callbacks from the native layer.
++  static Future<void> Function(String callbackName, Map<String, dynamic> data, Map<String, ApiCallback> apiCallbackMap)? customCallbackHandler;
++
+   static final NativeImsdkBindings bindings = NativeImsdkBindings(_dylib);
+   static final ReceivePort _receivePort = ReceivePort();
++  static StreamSubscription<dynamic>? _receivePortSubscription;
+   static final Map<String, ApiCallback> _apiCallbackMap = Map.from({});
+ 
+   static V2TimSDKListener? _sdkListener;
+@@ -238,6 +244,9 @@ class NativeLibraryManager {
+         _handleGlobalCallback(dataFromNativeMap);
+         break;
+       default:
++        if (customCallbackHandler != null) {
++          await customCallbackHandler!(callbackName, dataFromNativeMap, _apiCallbackMap);
++        }
+         break;
+     }
+   }
+@@ -249,27 +258,64 @@ class NativeLibraryManager {
+ 
+     bindings.DartInitDartApiDL(NativeApi.initializeApiDLData);
+     bindings.DartRegisterSendPort(_receivePort.sendPort.nativePort);
+-    _receivePort.listen((dynamic message) {
++    
++    // Start listening on the ReceivePort immediately
++    // ReceivePort.listen() is synchronous and should start listening right away
++    // IMPORTANT: Store the subscription to prevent it from being garbage collected
++    _receivePortSubscription = _receivePort.listen((dynamic message) {
+       _handleNativeMessage(message);
+     });
++    
+     _isRegisterPort = true;
+   }
+ 
+   static void timCallback2Future(String userData, Completer<V2TimCallback> completer) {
+-    _apiCallbackMap.addAll({userData: (Map jsonResult) { completer.complete(V2TimCallback.fromJson(jsonResult)); }});
++    _apiCallbackMap.addAll({userData: (Map jsonResult) {
++      if (!completer.isCompleted) {
++        completer.complete(V2TimCallback.fromJson(jsonResult));
++      }
++    }});
+   }
+ 
+   static void timValueCallback2Future<T>(String userData, Completer<V2TimValueCallback<T>> completer) {
+-    _apiCallbackMap.addAll({userData: (Map jsonResult) { completer.complete(V2TimValueCallback<T>.fromJson(jsonResult)); }});
++    _apiCallbackMap.addAll({userData: (Map jsonResult) {
++      if (!completer.isCompleted) {
++        completer.complete(V2TimValueCallback<T>.fromJson(jsonResult));
++      }
++    }});
+   }
+ 
+   static void timApiValueCallback2Future(String userData, ApiCallback callback) {
+     _apiCallbackMap.addAll({userData: callback});
+   }
+ 
++  static void removeTimCallbackFromMap(String userData) {
++    _apiCallbackMap.remove(userData);
++  }
++
+   static void _handleGlobalCallback(Map<String, dynamic> dataFromNativeMap) {
+     int callbackType = dataFromNativeMap["callbackType"];
+-    GlobalCallbackType globalCallbackType = GlobalCallbackType.fromValue(callbackType);
++    final rawId = dataFromNativeMap["instance_id"];
++    final int? instanceId = rawId == null
++        ? null
++        : (rawId is int ? rawId : (rawId is num ? rawId.toInt() : int.tryParse(rawId.toString())));
++    // Route to custom platform listeners (including instance_id 0 so GroupTipsEvent/invite is shown).
++    // dispatchInstanceGlobalCallback is a typed extension point on the platform interface
++    // (default no-op); custom platforms override to fan out to per-instance listeners.
++    final platform = TencentCloudChatSdkPlatform.instance;
++    if (instanceId != null && platform.isCustomPlatform) {
++      platform.dispatchInstanceGlobalCallback(instanceId, callbackType, dataFromNativeMap);
++      // For non-zero instance, only fall through for FriendAddRequest so _friendshipListener is also called
++      if (instanceId != 0 && callbackType != GlobalCallbackType.FriendAddRequest.value) {
++        return;
++      }
++    }
++    final GlobalCallbackType globalCallbackType;
++    try {
++      globalCallbackType = GlobalCallbackType.fromValue(callbackType);
++    } on ArgumentError {
++      return;
++    }
+     switch (globalCallbackType) {
+       case GlobalCallbackType.NetworkStatus: {
+         int code = dataFromNativeMap["code"];
+@@ -294,8 +340,19 @@ class NativeLibraryManager {
+ 
+         break;
+       case GlobalCallbackType.SelfInfoUpdated: {
+-          String jsonUserInfo = dataFromNativeMap["json_user_profile"];
+-          Map<String, dynamic> userInfo = json.decode(jsonUserInfo);
++          final jsonUserInfoValue = dataFromNativeMap["json_user_profile"];
++          if (jsonUserInfoValue == null) {
++            break;
++          }
++          // Handle both String (JSON) and Map cases
++          Map<String, dynamic> userInfo;
++          if (jsonUserInfoValue is String) {
++            userInfo = json.decode(jsonUserInfoValue);
++          } else if (jsonUserInfoValue is Map) {
++            userInfo = Map<String, dynamic>.from(jsonUserInfoValue);
++          } else {
++            break;
++          }
+           V2TimUserFullInfo v2timUserFullInfo = V2TimUserFullInfo.fromJson(userInfo);
+ 
+           _sdkListener?.onSelfInfoUpdated(v2timUserFullInfo);
+@@ -303,8 +360,19 @@ class NativeLibraryManager {
+ 
+         break;
+       case GlobalCallbackType.UserStatusChanged: {
+-        String jsonUserStatusArray = dataFromNativeMap["json_user_status_array"];
+-        List<dynamic> userStatusArray = json.decode(jsonUserStatusArray);
++        final jsonUserStatusArrayValue = dataFromNativeMap["json_user_status_array"];
++        if (jsonUserStatusArrayValue == null) {
++          break;
++        }
++        // Handle both String (JSON) and List cases
++        List<dynamic> userStatusArray;
++        if (jsonUserStatusArrayValue is String) {
++          userStatusArray = json.decode(jsonUserStatusArrayValue);
++        } else if (jsonUserStatusArrayValue is List) {
++          userStatusArray = jsonUserStatusArrayValue;
++        } else {
++          break;
++        }
+         List<V2TimUserStatus> userStatusList = [];
+         for (dynamic userStatus in userStatusArray) {
+           V2TimUserStatus v2timUserStatus = V2TimUserStatus.fromJson(userStatus);
+@@ -316,8 +384,19 @@ class NativeLibraryManager {
+ 
+         break;
+       case GlobalCallbackType.UserInfoChanged: {
+-        String jsonUserInfoArray = dataFromNativeMap["json_user_info_array"];
+-        List<dynamic> userInfoArray = json.decode(jsonUserInfoArray);
++        final jsonUserInfoArrayValue = dataFromNativeMap["json_user_info_array"];
++        if (jsonUserInfoArrayValue == null) {
++          break;
++        }
++        // Handle both String (JSON) and List cases
++        List<dynamic> userInfoArray;
++        if (jsonUserInfoArrayValue is String) {
++          userInfoArray = json.decode(jsonUserInfoArrayValue);
++        } else if (jsonUserInfoArrayValue is List) {
++          userInfoArray = jsonUserInfoArrayValue;
++        } else {
++          break;
++        }
+         List<V2TimUserFullInfo> userInfoList = [];
+         for (dynamic userInfo in userInfoArray) {
+           V2TimUserFullInfo v2timUserFullInfo = V2TimUserFullInfo.fromJson(userInfo);
+@@ -335,9 +414,21 @@ class NativeLibraryManager {
+ 
+         break;
+       case GlobalCallbackType.ReceiveNewMessage: {
+-        String jsonMessageArray = dataFromNativeMap["json_msg_array"];
+-        List<dynamic> messageArray = json.decode(jsonMessageArray);
+-        for (Map<String, dynamic> message in messageArray) {
++        final jsonMessageArrayValue = dataFromNativeMap["json_msg_array"];
++        if (jsonMessageArrayValue == null) {
++          break;
++        }
++        // Handle both String (JSON) and List cases
++        List<dynamic> messageArray;
++        if (jsonMessageArrayValue is String) {
++          messageArray = json.decode(jsonMessageArrayValue);
++        } else if (jsonMessageArrayValue is List) {
++          messageArray = jsonMessageArrayValue;
++        } else {
++          break;
++        }
++        for (int i = 0; i < messageArray.length; i++) {
++          Map<String, dynamic> message = messageArray[i] as Map<String, dynamic>;
+           V2TimMessage v2timMessage = V2TimMessage.fromJson(message);
+           if (v2timMessage.elemType == MessageElemType.V2TIM_ELEM_TYPE_GROUP_REPORT) {
+             _notifyGroupReport(v2timMessage.groupReportElem);
+@@ -350,8 +441,19 @@ class NativeLibraryManager {
+ 
+         break;
+       case GlobalCallbackType.MessageElemUploadProgress: {
+-        String jsonMessage = dataFromNativeMap["json_msg"];
+-        Map<String, dynamic> messageInfo = json.decode(jsonMessage);
++        final jsonMessageValue = dataFromNativeMap["json_msg"];
++        if (jsonMessageValue == null) {
++          break;
++        }
++        // Handle both String (JSON) and Map cases
++        Map<String, dynamic> messageInfo;
++        if (jsonMessageValue is String) {
++          messageInfo = json.decode(jsonMessageValue);
++        } else if (jsonMessageValue is Map) {
++          messageInfo = Map<String, dynamic>.from(jsonMessageValue);
++        } else {
++          break;
++        }
+         V2TimMessage v2timMessage = V2TimMessage.fromJson(messageInfo);
+         int index = dataFromNativeMap["index"];
+         int currentSize = dataFromNativeMap["cur_size"];
+@@ -366,8 +468,19 @@ class NativeLibraryManager {
+ 
+         break;
+       case GlobalCallbackType.MessageReadReceipt: {
+-        String jsonMsgReadReceiptArray = dataFromNativeMap["json_msg_read_receipt_array"];
+-        List<dynamic> msgReadReceiptArray = json.decode(jsonMsgReadReceiptArray);
++        final jsonMsgReadReceiptArrayValue = dataFromNativeMap["json_msg_read_receipt_array"];
++        if (jsonMsgReadReceiptArrayValue == null) {
++          break;
++        }
++        // Handle both String (JSON) and List cases
++        List<dynamic> msgReadReceiptArray;
++        if (jsonMsgReadReceiptArrayValue is String) {
++          msgReadReceiptArray = json.decode(jsonMsgReadReceiptArrayValue);
++        } else if (jsonMsgReadReceiptArrayValue is List) {
++          msgReadReceiptArray = jsonMsgReadReceiptArrayValue;
++        } else {
++          break;
++        }
+         List<V2TimMessageReceipt> c2cMessageReceiptList = [];
+         List<V2TimMessageReceipt> messageReceiptList = [];
+         for (dynamic msgReadReceipt in msgReadReceiptArray) {
+@@ -388,8 +501,20 @@ class NativeLibraryManager {
+ 
+         break;
+       case GlobalCallbackType.MessageRevoke: {
+-        String jsonMessageRevokeArray = dataFromNativeMap["json_msg_locator_array"];
+-        List<Map<String, dynamic>> messageRevokeArray = List<Map<String, dynamic>>.from(json.decode(jsonMessageRevokeArray));
++        final jsonMessageRevokeArrayValue = dataFromNativeMap["json_msg_locator_array"];
++        if (jsonMessageRevokeArrayValue == null) {
++          break;
++        }
++        // Handle both String (JSON) and List cases
++        List<dynamic> messageRevokeArrayRaw;
++        if (jsonMessageRevokeArrayValue is String) {
++          messageRevokeArrayRaw = json.decode(jsonMessageRevokeArrayValue);
++        } else if (jsonMessageRevokeArrayValue is List) {
++          messageRevokeArrayRaw = jsonMessageRevokeArrayValue;
++        } else {
++          break;
++        }
++        List<Map<String, dynamic>> messageRevokeArray = List<Map<String, dynamic>>.from(messageRevokeArrayRaw);
+         for (Map<String, dynamic> messageRevoke in messageRevokeArray) {
+           String msgID = messageRevoke["message_msg_id"];
+           String reason = messageRevoke["message_revoke_reason"];
+@@ -409,8 +534,19 @@ class NativeLibraryManager {
+ 
+         break;
+       case GlobalCallbackType.MessageUpdate: {
+-        String jsonMessageArray = dataFromNativeMap["json_msg_array"];
+-        List<dynamic> messageArray = json.decode(jsonMessageArray);
++        final jsonMessageArrayValue = dataFromNativeMap["json_msg_array"];
++        if (jsonMessageArrayValue == null) {
++          break;
++        }
++        // Handle both String (JSON) and List cases
++        List<dynamic> messageArray;
++        if (jsonMessageArrayValue is String) {
++          messageArray = json.decode(jsonMessageArrayValue);
++        } else if (jsonMessageArrayValue is List) {
++          messageArray = jsonMessageArrayValue;
++        } else {
++          break;
++        }
+         for (dynamic message in messageArray) {
+           V2TimMessage v2timMessage = V2TimMessage.fromJson(message);
+           _advancedMessageListener?.onRecvMessageModified(v2timMessage);
+@@ -442,8 +578,21 @@ class NativeLibraryManager {
+ 
+         break;
+       case GlobalCallbackType.MessageReactionChange: {
+-        String jsonMessageReactionChangeInfoArray = dataFromNativeMap["message_reaction_change_info_array"];
+-        List<dynamic> messageReactionChangeInfoArray = jsonMessageReactionChangeInfoArray.isNotEmpty ? json.decode(jsonMessageReactionChangeInfoArray) : [];
++        final jsonMessageReactionChangeInfoArrayValue = dataFromNativeMap["message_reaction_change_info_array"];
++        if (jsonMessageReactionChangeInfoArrayValue == null) {
++          break;
++        }
++        // Handle both String (JSON) and List cases
++        List<dynamic> messageReactionChangeInfoArray;
++        if (jsonMessageReactionChangeInfoArrayValue is String) {
++          messageReactionChangeInfoArray = jsonMessageReactionChangeInfoArrayValue.isNotEmpty 
++              ? json.decode(jsonMessageReactionChangeInfoArrayValue) 
++              : [];
++        } else if (jsonMessageReactionChangeInfoArrayValue is List) {
++          messageReactionChangeInfoArray = jsonMessageReactionChangeInfoArrayValue;
++        } else {
++          messageReactionChangeInfoArray = [];
++        }
+         List<V2TIMMessageReactionChangeInfo> messageReactionChangeInfoList = [];
+         for (dynamic messageReactionChangeInfo in messageReactionChangeInfoArray) {
+           V2TIMMessageReactionChangeInfo v2timMessageReactionChangeInfo = V2TIMMessageReactionChangeInfo.fromJson(messageReactionChangeInfo);
+@@ -455,8 +604,19 @@ class NativeLibraryManager {
+ 
+         break;
+       case GlobalCallbackType.AllMessageReceiveOption: {
+-          String jsonAllMessageReceiveOption = dataFromNativeMap["json_receive_message_option_info"];
+-          Map<String, dynamic> allMessageReceiveOption = json.decode(jsonAllMessageReceiveOption);
++          final jsonAllMessageReceiveOptionValue = dataFromNativeMap["json_receive_message_option_info"];
++          if (jsonAllMessageReceiveOptionValue == null) {
++            break;
++          }
++          // Handle both String (JSON) and Map cases
++          Map<String, dynamic> allMessageReceiveOption;
++          if (jsonAllMessageReceiveOptionValue is String) {
++            allMessageReceiveOption = json.decode(jsonAllMessageReceiveOptionValue);
++          } else if (jsonAllMessageReceiveOptionValue is Map) {
++            allMessageReceiveOption = Map<String, dynamic>.from(jsonAllMessageReceiveOptionValue);
++          } else {
++            break;
++          }
+           V2TimReceiveMessageOptInfo v2timReceiveMessageOpt = V2TimReceiveMessageOptInfo.fromJson(allMessageReceiveOption);
+ 
+           _sdkListener?.onAllReceiveMessageOptChanged(v2timReceiveMessageOpt);
+@@ -464,9 +624,18 @@ class NativeLibraryManager {
+ 
+         break;
+       case GlobalCallbackType.GroupTipsEvent: {
+-          Map<String, dynamic> jsonGroupTips = json.decode(dataFromNativeMap["json_group_tip"] ?? []);
++          final tipInstanceId = dataFromNativeMap["instance_id"];
++          // json_group_tip may be a String (JSON) or already a Map
++          dynamic jsonGroupTipData = dataFromNativeMap["json_group_tip"];
++          Map<String, dynamic> jsonGroupTips;
++          if (jsonGroupTipData is String) {
++            jsonGroupTips = json.decode(jsonGroupTipData);
++          } else if (jsonGroupTipData is Map) {
++            jsonGroupTips = Map<String, dynamic>.from(jsonGroupTipData);
++          } else {
++            jsonGroupTips = {};
++          }
+           V2TimGroupTipsElem groupTips = V2TimGroupTipsElem.fromJson(jsonGroupTips);
+-
+           _notifyGroupTips(groupTips);
+         }
+ 
+@@ -625,11 +794,20 @@ class NativeLibraryManager {
+ 
+         break;
+       case GlobalCallbackType.ConversationEvent: {
+-        final convEvent = dataFromNativeMap["conv_event"];
+-        // List<dynamic>
+-        var resultList = [];
+-        if (dataFromNativeMap["json_conv_array"]?.isNotEmpty ?? false) {
+-          resultList = json.decode(dataFromNativeMap["json_conv_array"]);
++        final convEventRaw = dataFromNativeMap["conv_event"];
++        // C++ may send "2" (String) or 2 (int); normalize to int for switch
++        final convEvent = convEventRaw is int
++            ? convEventRaw
++            : int.tryParse(convEventRaw?.toString() ?? '') ?? -1;
++        // Handle both String (JSON) and List cases
++        List<dynamic> resultList = [];
++        final jsonConvArrayValue = dataFromNativeMap["json_conv_array"];
++        if (jsonConvArrayValue != null) {
++          if (jsonConvArrayValue is String && jsonConvArrayValue.isNotEmpty) {
++            resultList = json.decode(jsonConvArrayValue);
++          } else if (jsonConvArrayValue is List) {
++            resultList = jsonConvArrayValue;
++          }
+         }
+         List<V2TimConversation> conversationList = [];
+         List<String> conversationIDList = [];
+@@ -681,7 +859,11 @@ class NativeLibraryManager {
+         break;
+       case GlobalCallbackType.ConversationGroupCreated: {
+         final groupName = dataFromNativeMap["group_name"];
+-        final conversationArray = json.decode(dataFromNativeMap["conversation_array"]);
++        final conversationArrayStr = dataFromNativeMap["conversation_array"];
++        if (conversationArrayStr == null || conversationArrayStr is! String) {
++          break;
++        }
++        final conversationArray = json.decode(conversationArrayStr);
+         List<V2TimConversation> conversationList = [];
+         if (conversationArray is List && conversationArray.isNotEmpty) {
+           conversationList = conversationArray.whereType<Map>().map((v) => V2TimConversation.fromJson(v)).toList();
+@@ -708,7 +890,11 @@ class NativeLibraryManager {
+         break;
+       case GlobalCallbackType.ConversationsAddedToGroup: {
+         final groupName = dataFromNativeMap["group_name"];
+-        final conversationArray = json.decode(dataFromNativeMap["conversation_array"]);
++        final conversationArrayStr = dataFromNativeMap["conversation_array"];
++        if (conversationArrayStr == null || conversationArrayStr is! String) {
++          break;
++        }
++        final conversationArray = json.decode(conversationArrayStr);
+         List<V2TimConversation> conversationList = [];
+         if (conversationArray is List && conversationArray.isNotEmpty) {
+           conversationList = conversationArray.whereType<Map>().map((v) => V2TimConversation.fromJson(v)).toList();
+@@ -720,7 +906,11 @@ class NativeLibraryManager {
+         break;
+       case GlobalCallbackType.ConversationsDeletedFromGroup: {
+         final groupName = dataFromNativeMap["group_name"];
+-        final conversationArray = json.decode(dataFromNativeMap["conversation_array"]);
++        final conversationArrayStr = dataFromNativeMap["conversation_array"];
++        if (conversationArrayStr == null || conversationArrayStr is! String) {
++          break;
++        }
++        final conversationArray = json.decode(conversationArrayStr);
+         List<V2TimConversation> conversationList = [];
+         if (conversationArray is List && conversationArray.isNotEmpty) {
+           conversationList = conversationArray.whereType<Map>().map((v) => V2TimConversation.fromJson(v)).toList();
+@@ -731,7 +921,11 @@ class NativeLibraryManager {
+ 
+         break;
+       case GlobalCallbackType.AddFriend: {
+-        final friendInfoArray = json.decode(dataFromNativeMap["friend_info_array"]);
++        final friendInfoArrayStr = dataFromNativeMap["friend_info_array"];
++        if (friendInfoArrayStr == null || friendInfoArrayStr is! String) {
++          break;
++        }
++        final friendInfoArray = json.decode(friendInfoArrayStr);
+         List<V2TimFriendInfo> friendInfoList = [];
+         if (friendInfoArray is List && friendInfoArray.isNotEmpty) {
+           friendInfoList = friendInfoArray.whereType<Map>().map((v) => V2TimFriendInfo.fromJson(v)).toList();
+@@ -755,14 +949,22 @@ class NativeLibraryManager {
+ 
+         break;
+       case GlobalCallbackType.DeleteFriend: {
+-        final friendIDList = json.decode(dataFromNativeMap["friend_id_array"]);
++        final friendIDArrayStr = dataFromNativeMap["friend_id_array"];
++        if (friendIDArrayStr == null || friendIDArrayStr is! String) {
++          break;
++        }
++        final friendIDList = json.decode(friendIDArrayStr);
+ 
+         _friendshipListener?.onFriendListDeleted(friendIDList.whereType<String>().toList());
+       }
+ 
+         break;
+       case GlobalCallbackType.UpdateFriendProfile: {
+-        final friendInfoArray = json.decode(dataFromNativeMap["friend_info_update_array"]);
++        final friendInfoUpdateArrayStr = dataFromNativeMap["friend_info_update_array"];
++        if (friendInfoUpdateArrayStr == null || friendInfoUpdateArrayStr is! String) {
++          break;
++        }
++        final friendInfoArray = json.decode(friendInfoUpdateArrayStr);
+         List<V2TimFriendInfo> friendInfoList = [];
+         if (friendInfoArray is List && friendInfoArray.isNotEmpty) {
+           Map<String, dynamic> updateFriendProfile = friendInfoArray[0];
+@@ -835,18 +1037,44 @@ class NativeLibraryManager {
+ 
+         break;
+       case GlobalCallbackType.FriendAddRequest: {
+-        final applicationArray = json.decode(dataFromNativeMap["json_application_array"]);
++        final jsonApplicationArray = dataFromNativeMap["json_application_array"];
++        if (jsonApplicationArray == null) {
++          break;
++        }
++        // Handle both String (JSON) and List cases
++        List<dynamic> applicationArray;
++        if (jsonApplicationArray is String) {
++          applicationArray = json.decode(jsonApplicationArray);
++        } else if (jsonApplicationArray is List) {
++          applicationArray = jsonApplicationArray;
++        } else {
++          break;
++        }
+         List<V2TimFriendApplication> applicationList = [];
+-        if (applicationArray is List && applicationArray.isNotEmpty) {
+-          applicationList = applicationArray.whereType<Map>().map((v) => V2TimFriendApplication.fromJsonForCallback(v)).toList();
++        if (applicationArray.isNotEmpty) {
++          try {
++            applicationList = applicationArray.whereType<Map>().map((v) => V2TimFriendApplication.fromJsonForCallback(v)).toList();
++          } catch (e, stackTrace) {
++            break;
++          }
++        } else {
++        }
++        if (_friendshipListener != null) {
++          try {
++            _friendshipListener!.onFriendApplicationListAdded(applicationList);
++          } catch (e, stackTrace) {
++          }
++        } else {
+         }
+-
+-        _friendshipListener?.onFriendApplicationListAdded(applicationList);
+       }
+ 
+         break;
+       case GlobalCallbackType.FriendApplicationListDeleted: {
+-        final userIDList = json.decode(dataFromNativeMap["json_user_id_array"]);
++        final userIDArrayStr = dataFromNativeMap["json_user_id_array"];
++        if (userIDArrayStr == null || userIDArrayStr is! String) {
++          break;
++        }
++        final userIDList = json.decode(userIDArrayStr);
+ 
+         _friendshipListener?.onFriendApplicationListDeleted(userIDList.whereType<String>().toList());
+       }
+@@ -857,7 +1085,11 @@ class NativeLibraryManager {
+ 
+         break;
+       case GlobalCallbackType.FriendBlackListAdded: {
+-        final friendInfoArray = json.decode(dataFromNativeMap["json_friend_info_array"]);
++        final friendInfoArrayStr = dataFromNativeMap["json_friend_info_array"];
++        if (friendInfoArrayStr == null || friendInfoArrayStr is! String) {
++          break;
++        }
++        final friendInfoArray = json.decode(friendInfoArrayStr);
+         List<V2TimFriendInfo> friendInfoList = [];
+         if (friendInfoArray is List && friendInfoArray.isNotEmpty) {
+           friendInfoList = friendInfoArray.whereType<Map>().map((v) => V2TimFriendInfo.fromJson(v)).toList();
+@@ -868,14 +1100,22 @@ class NativeLibraryManager {
+ 
+         break;
+       case GlobalCallbackType.FriendBlackListDeleted: {
+-        final userIDList = json.decode(dataFromNativeMap["json_user_id_array"]);
++        final userIDArrayStr = dataFromNativeMap["json_user_id_array"];
++        if (userIDArrayStr == null || userIDArrayStr is! String) {
++          break;
++        }
++        final userIDList = json.decode(userIDArrayStr);
+         _friendshipListener?.onBlackListDeleted(userIDList.whereType<String>().toList());
+       }
+ 
+         break;
+       case GlobalCallbackType.FriendGroupCreated: {
+         final groupName = dataFromNativeMap["group_name"];
+-        final friendInfoArray = json.decode(dataFromNativeMap["json_friend_info_array"]);
++        final friendInfoArrayStr = dataFromNativeMap["json_friend_info_array"];
++        if (friendInfoArrayStr == null || friendInfoArrayStr is! String) {
++          break;
++        }
++        final friendInfoArray = json.decode(friendInfoArrayStr);
+         List<V2TimFriendInfo> friendInfoList = [];
+         if (friendInfoArray is List && friendInfoArray.isNotEmpty) {
+           friendInfoList = friendInfoArray.whereType<Map>().map((v) => V2TimFriendInfo.fromJson(v)).toList();
+@@ -886,7 +1126,11 @@ class NativeLibraryManager {
+ 
+         break;
+       case GlobalCallbackType.FriendGroupDeleted: {
+-        final groupNameList = json.decode(dataFromNativeMap["json_group_name_array"]);
++        final groupNameArrayStr = dataFromNativeMap["json_group_name_array"];
++        if (groupNameArrayStr == null || groupNameArrayStr is! String) {
++          break;
++        }
++        final groupNameList = json.decode(groupNameArrayStr);
+ 
+         _friendshipListener?.onFriendGroupDeleted(groupNameList.whereType<String>().toList());
+       }
+@@ -902,7 +1146,11 @@ class NativeLibraryManager {
+         break;
+       case GlobalCallbackType.FriendsAddedToGroup: {
+         final groupName = dataFromNativeMap["group_name"];
+-        final friendInfoArray = json.decode(dataFromNativeMap["json_friend_info_array"]);
++        final friendInfoArrayStr = dataFromNativeMap["json_friend_info_array"];
++        if (friendInfoArrayStr == null || friendInfoArrayStr is! String) {
++          break;
++        }
++        final friendInfoArray = json.decode(friendInfoArrayStr);
+         List<V2TimFriendInfo> friendInfoList = [];
+         if (friendInfoArray is List && friendInfoArray.isNotEmpty) {
+           friendInfoList = friendInfoArray.whereType<Map>().map((v) => V2TimFriendInfo.fromJson(v)).toList();
+@@ -1028,9 +1276,10 @@ class NativeLibraryManager {
+         break;
+       case GlobalCallbackType.SignalingInvitationTimeout: {
+         String inviteID = dataFromNativeMap["invite_id"];
+-        final inviteeList = json.decode(dataFromNativeMap["json_invitee_list"]);
++        final rawInviteeList = dataFromNativeMap["json_invitee_list"];
++        final inviteeList = rawInviteeList is String ? json.decode(rawInviteeList) : rawInviteeList;
+ 
+-        _signalingListener?.onInvitationTimeout(inviteID, inviteeList.whereType<String>().toList());
++        _signalingListener?.onInvitationTimeout(inviteID, (inviteeList is List ? inviteeList : []).whereType<String>().toList());
+       }
+ 
+         break;
+@@ -1065,16 +1314,24 @@ class NativeLibraryManager {
+       case GroupTipsElemType.V2TIM_GROUP_TIPS_TYPE_INVITE:
+         // 剔除自己
+         groupMemberList.removeWhere((member) => member.userID == loginUser);
+-        if (groupMemberList.isNotEmpty) {
+-          _groupListener?.onMemberInvited(groupID, opUser, groupMemberList);
+-        }
++        // tim2tox sends memberList = [self] when "you are invited"; after removing self we get empty.
++        // Always notify onMemberInvited for INVITE so the app receives the invite (opUser is the inviter).
++        _groupListener?.onMemberInvited(groupID, opUser, groupMemberList);
+ 
+         break;
+       case GroupTipsElemType.V2TIM_GROUP_TIPS_TYPE_JOIN:
+         // 剔除自己
++        final originalMemberCount = groupMemberList.length;
+         groupMemberList.removeWhere((member) => member.userID == loginUser);
+-        if (groupMemberList.isNotEmpty) {
++        final afterRemoveCount = groupMemberList.length;
++        final opUserID = opUser.userID ?? '';
++        // Special case: If memberList is empty and opUser.userID is empty,
++        // this is likely an onGroupCreated event (sent from C++ layer)
++        if (groupMemberList.isEmpty && opUserID.isEmpty) {
++          _groupListener?.onGroupCreated(groupID);
++        } else if (groupMemberList.isNotEmpty) {
+           _groupListener?.onMemberEnter(groupID, groupMemberList);
++        } else {
+         }
+ 
+         break;
+@@ -1108,7 +1365,7 @@ class NativeLibraryManager {
+         break;
+       case GroupTipsElemType.V2TIM_GROUP_TIPS_TYPE_MEMBER_INFO_CHANGE:
+         memberChangeInfoList.removeWhere((member) => member.userID == loginUser);
+-        if (groupMemberList.isNotEmpty) {
++        if (memberChangeInfoList.isNotEmpty) {
+           _groupListener?.onMemberInfoChanged(groupID, memberChangeInfoList);
+         }
+ 
+-- 
+2.50.1 (Apple Git-155)
+

@@ -1,3 +1,9 @@
-# Patches for tencent_cloud_chat_sdk 8.7.7201 (one patch filename per line).
-# Add lines like: 0001-description.patch
-0001-tim2tox-custom-platform.patch
+# Patches for tencent_cloud_chat_sdk 8.7.7201 (one patch filename per line, applied in order).
+# Generated via `git format-patch baseline..HEAD` from a tim2tox/toxee work tree.
+# Each patch corresponds to one logical concern — keep them split when adding new changes.
+0001-native-library-name-override.patch
+0002-platform-interface-extension-points.patch
+0003-route-managers-through-platform.patch
+0004-native-library-manager-callback-dispatch.patch
+0005-native-adapter-additions.patch
+0006-models-and-bindings.patch

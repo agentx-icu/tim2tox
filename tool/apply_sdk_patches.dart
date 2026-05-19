@@ -66,6 +66,28 @@ void main(List<String> args) async {
       stderr.writeln('apply_sdk_patches: git add failed');
       exit(1);
     }
+    // Plant a baseline commit + tag so refresh_sdk_patch.sh can diff against
+    // the pre-patch SDK state without needing HEAD ancestry math.
+    c = await _run(sdk.path, 'git', ['config', 'user.name', 'tim2tox-bootstrap']);
+    if (c != 0) {
+      stderr.writeln('apply_sdk_patches: git config user.name failed');
+      exit(1);
+    }
+    c = await _run(sdk.path, 'git', ['config', 'user.email', 'bootstrap@local']);
+    if (c != 0) {
+      stderr.writeln('apply_sdk_patches: git config user.email failed');
+      exit(1);
+    }
+    c = await _run(sdk.path, 'git', ['commit', '-m', 'baseline $version']);
+    if (c != 0) {
+      stderr.writeln('apply_sdk_patches: git commit (baseline) failed');
+      exit(1);
+    }
+    c = await _run(sdk.path, 'git', ['tag', 'baseline']);
+    if (c != 0) {
+      stderr.writeln('apply_sdk_patches: git tag baseline failed');
+      exit(1);
+    }
   }
 
   for (final name in lines) {
@@ -83,6 +105,19 @@ void main(List<String> args) async {
     c = await _run(sdk.path, 'git', ['apply', '-p1', patchFile.path]);
     if (c != 0) {
       stderr.writeln('apply_sdk_patches: failed to apply patch: $name');
+      exit(1);
+    }
+    // Commit the applied patch so `git format-patch baseline..HEAD` can
+    // regenerate the split series later.
+    c = await _run(sdk.path, 'git', ['add', '-A']);
+    if (c != 0) {
+      stderr.writeln('apply_sdk_patches: git add after $name failed');
+      exit(1);
+    }
+    final commitMsg = name.endsWith('.patch') ? name.substring(0, name.length - '.patch'.length) : name;
+    c = await _run(sdk.path, 'git', ['commit', '-m', commitMsg]);
+    if (c != 0) {
+      stderr.writeln('apply_sdk_patches: git commit for $name failed');
       exit(1);
     }
   }

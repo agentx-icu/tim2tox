@@ -1,0 +1,53 @@
+From 1d157b2e9ad99af931c910622544a3a0bb55bfc8 Mon Sep 17 00:00:00 2001
+From: tim2tox-bootstrap <bootstrap@local>
+Date: Tue, 19 May 2026 01:58:30 -0700
+Subject: [PATCH 2/6] 0002-platform-interface-extension-points
+
+---
+ ...ent_cloud_chat_sdk_platform_interface.dart | 30 +++++++++++++++++++
+ 1 file changed, 30 insertions(+)
+
+diff --git a/lib/tencent_cloud_chat_sdk_platform_interface.dart b/lib/tencent_cloud_chat_sdk_platform_interface.dart
+index 2262472..759d246 100644
+--- a/lib/tencent_cloud_chat_sdk_platform_interface.dart
++++ b/lib/tencent_cloud_chat_sdk_platform_interface.dart
+@@ -157,6 +157,36 @@ abstract class TencentCloudChatSdkPlatform extends PlatformInterface {
+     _instance = instance;
+   }
+ 
++  /// Returns true if this is a custom platform (not the default MethodChannel implementation).
++  /// Custom platforms (e.g. tim2tox) override to return true so that V2Tim* managers
++  /// route calls through the Platform path and native adapters fan out callbacks
++  /// to per-instance listeners.
++  bool get isCustomPlatform => false;
++
++  /// Single helper used by every V2Tim*Manager method to decide between
++  /// the native adapter path and the Platform path. Equivalent to
++  /// `kIsWeb || isCustomPlatform`. Centralized so the per-method
++  /// branching stays a one-token check.
++  bool get isPlatformRouted => kIsWeb || isCustomPlatform;
++
++  /// Called by the binary-replacement adapter path after a C2C send completes
++  /// so a custom platform can refresh the corresponding conversation listener.
++  /// Default: no-op. Tim2ToxSdkPlatform overrides to emit onConversationChanged.
++  void notifyConversationChangedForC2C(String receiver) {
++    // No-op by default; custom platforms override.
++  }
++
++  /// Called by NativeLibraryManager._handleGlobalCallback when a global
++  /// callback carries an `instance_id` field, so a custom platform can
++  /// fan out to per-instance listeners. Default: no-op.
++  void dispatchInstanceGlobalCallback(
++    int instanceId,
++    int callbackType,
++    Map<String, dynamic> data,
++  ) {
++    // No-op by default; custom platforms override.
++  }
++
+   Future<String?> getPlatformVersion() {
+     throw UnimplementedError('platformVersion() has not been implemented.');
+   }
+-- 
+2.50.1 (Apple Git-155)
+

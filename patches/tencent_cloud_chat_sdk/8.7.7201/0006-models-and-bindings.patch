@@ -1,0 +1,243 @@
+From 55650bdcec5ce9efe8fcb136c796669e1309659c Mon Sep 17 00:00:00 2001
+From: tim2tox-bootstrap <bootstrap@local>
+Date: Tue, 19 May 2026 02:01:59 -0700
+Subject: [PATCH 6/6] 0006-models-and-bindings
+
+---
+ lib/models/v2_tim_conversation.dart           | 10 +++---
+ lib/models/v2_tim_group_info.dart             | 32 +++++++++++--------
+ ..._tim_group_invite_user_to_group_param.dart | 11 +++++--
+ lib/models/v2_tim_message.dart                | 22 +++++++++----
+ .../native_imsdk_bindings_generated.dart      | 17 ++++++++++
+ lib/native_im/tools.dart                      | 12 +++++++
+ 6 files changed, 77 insertions(+), 27 deletions(-)
+
+diff --git a/lib/models/v2_tim_conversation.dart b/lib/models/v2_tim_conversation.dart
+index d3ce7c3..053a8e0 100644
+--- a/lib/models/v2_tim_conversation.dart
++++ b/lib/models/v2_tim_conversation.dart
+@@ -59,7 +59,7 @@ class V2TimConversation {
+   V2TimConversation.fromJson(Map json) {
+     json = Utils.formatJson(json);
+     String cConvID = json['conv_id'] ?? '';
+-    type = json['conv_type'] ?? ConversationType.CONVERSATION_TYPE_INVALID;
++    type = (json['conv_type'] as num?)?.toInt() ?? ConversationType.CONVERSATION_TYPE_INVALID;
+     switch (type) {
+       case ConversationType.V2TIM_C2C:
+         userID = cConvID;
+@@ -80,10 +80,10 @@ class V2TimConversation {
+     if (json['conv_group_type'] != null) {
+       groupType = EnumUtils.cGroupType2DartType(json['conv_group_type']);
+     }
+-    unreadCount = json['conv_unread_num'];
++    unreadCount = (json['conv_unread_num'] as num?)?.toInt();
+     isPinned = json['conv_is_pinned'];
+     recvOpt = EnumUtils.cReceiveMessageOpt2DartOpt(json['conv_recv_opt']).index;
+-    orderkey = json['conv_active_time'];
++    orderkey = (json['conv_active_time'] as num?)?.toInt();
+     lastMessage = json['conv_last_msg'] != null
+         ? V2TimMessage.fromJson(json['conv_last_msg'])
+         : null;
+@@ -113,8 +113,8 @@ class V2TimConversation {
+       });
+     }
+ 
+-    c2cReadTimestamp = json["conv_c2c_read_timestamp"] ?? 0;
+-    groupReadSequence = json["conv_group_read_sequence"] ?? 0;
++    c2cReadTimestamp = (json["conv_c2c_read_timestamp"] as num?)?.toInt() ?? 0;
++    groupReadSequence = (json["conv_group_read_sequence"] as num?)?.toInt() ?? 0;
+   }
+ 
+   Map<String, dynamic> toJson() {
+diff --git a/lib/models/v2_tim_group_info.dart b/lib/models/v2_tim_group_info.dart
+index 27e0d90..ec1e33c 100644
+--- a/lib/models/v2_tim_group_info.dart
++++ b/lib/models/v2_tim_group_info.dart
+@@ -66,7 +66,9 @@ class V2TimGroupInfo {
+ 
+   V2TimGroupInfo.fromJson(Map json) {
+     json = Utils.formatJson(json);
+-    approveOpt = EnumUtils.cGroupAddOption2DartEnum(json["group_detail_info_approve_option"]).index;
++    approveOpt = json["group_detail_info_approve_option"] != null 
++        ? EnumUtils.cGroupAddOption2DartEnum(json["group_detail_info_approve_option"]).index 
++        : null;
+     groupID = json['group_detail_info_group_id'] ?? '';
+     groupType = GroupType.convertGroupTypeEnum(json['group_detail_info_group_type'] ?? 0);
+     groupName = json['group_detail_info_group_name'];
+@@ -76,20 +78,24 @@ class V2TimGroupInfo {
+     isAllMuted = json['group_detail_info_is_shutup_all'];
+     owner = json['group_detail_info_owner_identifier'];
+ 
+-    createTime = json['group_detail_info_create_time'];
+-    groupAddOpt = EnumUtils.cGroupAddOption2DartEnum(json['group_detail_info_add_option']).index;
+-    lastInfoTime = json['group_detail_info_last_info_time'];
+-    lastMessageTime = json['group_detail_info_last_msg_time'];
+-    memberCount = json['group_detail_info_member_num'];
+-    onlineCount = json['group_detail_info_online_member_num'];
+-    isSupportTopic = json["group_detail_info_is_support_topic"];
++    createTime = json['group_detail_info_create_time'] as int?;
++    groupAddOpt = json['group_detail_info_add_option'] != null 
++        ? EnumUtils.cGroupAddOption2DartEnum(json['group_detail_info_add_option']).index 
++        : null;
++    lastInfoTime = json['group_detail_info_last_info_time'] as int?;
++    lastMessageTime = json['group_detail_info_last_msg_time'] as int?;
++    memberCount = json['group_detail_info_member_num'] as int?;
++    onlineCount = json['group_detail_info_online_member_num'] as int?;
++    isSupportTopic = json["group_detail_info_is_support_topic"] as bool?;
+     isEnablePermissionGroup = json["group_detail_info_enable_permission_group"] ?? false;
+ 
+-    Map<String, dynamic> jsonGroupSelfInfo = json["group_base_info_self_info"];
+-    role = jsonGroupSelfInfo['group_self_info_role'];
+-    joinTime = jsonGroupSelfInfo['group_self_info_join_time'];
+-    unreadMsgCount = jsonGroupSelfInfo['group_self_info_unread_num'];
+-    recvOpt = jsonGroupSelfInfo['group_self_info_msg_flag'];
++    Map<String, dynamic>? jsonGroupSelfInfo = json["group_base_info_self_info"] as Map<String, dynamic>?;
++    if (jsonGroupSelfInfo != null) {
++      role = jsonGroupSelfInfo['group_self_info_role'] as int?;
++      joinTime = jsonGroupSelfInfo['group_self_info_join_time'] as int?;
++      unreadMsgCount = jsonGroupSelfInfo['group_self_info_unread_num'] as int?;
++      recvOpt = jsonGroupSelfInfo['group_self_info_msg_flag'] as int?;
++    }
+ 
+     var jsonCustomInfo = List<Map<String, dynamic>>.from(json["group_detail_info_custom_info"] ?? []);
+     if (jsonCustomInfo.isNotEmpty) {
+diff --git a/lib/models/v2_tim_group_invite_user_to_group_param.dart b/lib/models/v2_tim_group_invite_user_to_group_param.dart
+index bf806ea..9aa3025 100644
+--- a/lib/models/v2_tim_group_invite_user_to_group_param.dart
++++ b/lib/models/v2_tim_group_invite_user_to_group_param.dart
+@@ -6,19 +6,24 @@ class V2TimGroupInviteUserToGroupParam {
+   late String groupID;
+   late List<String> userList;
+   String? customData;
++  int? instanceId;
+ 
+-  V2TimGroupInviteUserToGroupParam({required this.groupID, required this.userList, this.customData});
++  V2TimGroupInviteUserToGroupParam({required this.groupID, required this.userList, this.customData, this.instanceId});
+ 
+   Map<dynamic, dynamic> toJson() {
+-    return {
++    final map = <dynamic, dynamic>{
+       "group_invite_member_param_group_id": groupID,
+       "group_invite_member_param_identifier_array": userList,
+       "group_invite_member_param_user_data": customData,
+     };
++    if (instanceId != null) {
++      map["group_invite_member_param_instance_id"] = instanceId;
++    }
++    return map;
+   }
+ 
+   String toLogString() {
+-    String res = "groupID: $groupID|userList: $userList|customData: $customData";
++    String res = "groupID: $groupID|userList: $userList|customData: $customData|instanceId: $instanceId";
+     return res;
+   }
+ }
+diff --git a/lib/models/v2_tim_message.dart b/lib/models/v2_tim_message.dart
+index 35543ee..b7b9fa9 100644
+--- a/lib/models/v2_tim_message.dart
++++ b/lib/models/v2_tim_message.dart
+@@ -222,9 +222,15 @@ class V2TimMessage {
+     this.id,
+     this.needReadReceipt,
+   }) {
+-    _clientTime = TIMManager.instance.getServerTime();
++    // Initialize _clientTime synchronously if possible, otherwise set to current time
++    _clientTime = DateTime.now().millisecondsSinceEpoch ~/ 1000;
+     if (timestamp == null || timestamp == 0) {
+-      timestamp = _clientTime;
++      timestamp = _clientTime;  
++    }
++    // Update with server time synchronously if available
++    int serverTime = TIMManager.instance.getServerTime();
++    if (serverTime > 0) {
++      _clientTime = serverTime;
+     }
+   }
+ 
+@@ -270,8 +276,10 @@ class V2TimMessage {
+     _senderTinyID = json['message_sender_tiny_id'];
+     _receiverTinyID = json['message_receiver_tiny_id'];
+     priority = json['message_priority'];
+-    _clientTime = json['message_client_time'];
+-    _serverTime = json['message_server_time'];
++    final rawClient = json['message_client_time'];
++    final rawServer = json['message_server_time'];
++    _clientTime = rawClient == null ? null : (rawClient is num ? rawClient.toInt() : rawClient as int);
++    _serverTime = rawServer == null ? null : (rawServer is num ? rawServer.toInt() : rawServer as int);
+     if (_serverTime != null && _serverTime! > 0) {
+       timestamp = _serverTime;
+     } else {
+@@ -295,7 +303,9 @@ class V2TimMessage {
+     _uiStatus = json['ui_status'];
+     msgID = json['message_msg_id'];
+     seq = json['message_seq']?.toString();
+-    random = json['message_rand'];
++    // message_rand may be int or double from JSON; V2TimMessage.random is int?
++    final msgRand = json['message_rand'];
++    random = msgRand == null ? null : (msgRand is num ? msgRand.toInt() : msgRand as int);
+     localCustomInt = json['message_custom_int'];
+     localCustomData = json['message_custom_str'] ?? "";
+     cloudCustomData = json['message_cloud_custom_str'] ?? "";
+@@ -309,8 +319,8 @@ class V2TimMessage {
+     isExcludedFromLastMessage = json['message_excluded_from_last_message'];
+     isExcludedFromContentModeration = json['message_excluded_from_content_moderation'];
+     _customModerationConfigurationID = json['message_custom_moderation_configuration_id'];
++    _riskTypeIdentified = json['message_risk_type_identified'] ?? 0;
+     hasRiskContent = _riskTypeIdentified > 1 ? true : false;
+-    _riskTypeIdentified = json['message_risk_type_identified'];
+     isDisableCloudMessagePreHook = json['message_disable_cloud_message_pre_hook'];
+     isDisableCloudMessagePostHook = json['message_disable_cloud_message_post_hook'];
+     revokeReason = json['message_revoke_reason'];
+diff --git a/lib/native_im/bindings/native_imsdk_bindings_generated.dart b/lib/native_im/bindings/native_imsdk_bindings_generated.dart
+index 839e95d..7715a44 100644
+--- a/lib/native_im/bindings/native_imsdk_bindings_generated.dart
++++ b/lib/native_im/bindings/native_imsdk_bindings_generated.dart
+@@ -1762,6 +1762,23 @@ class NativeImsdkBindings {
+   late final _DartGetGroupMemberList = _DartGetGroupMemberListPtr.asFunction<
+       int Function(ffi.Pointer<ffi.Char>, ffi.Pointer<ffi.Void>)>();
+ 
++  int DartGetGroupMembersInfo(
++    ffi.Pointer<ffi.Char> json_group_get_members_info_param,
++    ffi.Pointer<ffi.Void> user_data,
++  ) {
++    return _DartGetGroupMembersInfo(
++      json_group_get_members_info_param,
++      user_data,
++    );
++  }
++
++  late final _DartGetGroupMembersInfoPtr = _lookup<
++      ffi.NativeFunction<
++          ffi.Int Function(ffi.Pointer<ffi.Char>,
++              ffi.Pointer<ffi.Void>)>>('DartGetGroupMembersInfo');
++  late final _DartGetGroupMembersInfo = _DartGetGroupMembersInfoPtr.asFunction<
++      int Function(ffi.Pointer<ffi.Char>, ffi.Pointer<ffi.Void>)>();
++
+   int DartSearchGroupMembers(
+     ffi.Pointer<ffi.Char> json_group_search_group_members_param,
+     ffi.Pointer<ffi.Void> user_data,
+diff --git a/lib/native_im/tools.dart b/lib/native_im/tools.dart
+index c2c435a..28d8138 100644
+--- a/lib/native_im/tools.dart
++++ b/lib/native_im/tools.dart
+@@ -40,4 +40,16 @@ class Tools {
+     }
+     return resultMap;
+   }
++
++  static void freePointer(ffi.Pointer? pointer) {
++    if (pointer != null && pointer.address != 0) {
++      malloc.free(pointer);
++    }
++  }
++
++  static void freePointers(List<ffi.Pointer?> pointers) {
++    for (var pointer in pointers) {
++      freePointer(pointer);
++    }
++  }
+ }
+-- 
+2.50.1 (Apple Git-155)
+
