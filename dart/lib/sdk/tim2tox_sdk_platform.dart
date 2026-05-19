@@ -2458,7 +2458,16 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
       );
       return;
     }
-    final type = GlobalCallbackType.fromValue(callbackType);
+    final GlobalCallbackType type;
+    try {
+      type = GlobalCallbackType.fromValue(callbackType);
+    } on ArgumentError {
+      // Unknown callbackType (likely added by a future upstream SDK).
+      // Match the safety net in NativeLibraryManager._handleGlobalCallback so
+      // multi-instance dispatch degrades to no-op instead of crashing the
+      // callback isolate.
+      return;
+    }
     final sdkList = selectDispatchListeners<V2TimSDKListener>(
       instanceId: instanceId,
       instanceListeners: _instanceSdkListeners[instanceId] ?? [],
