@@ -80,5 +80,15 @@ abstract class ExtendedPreferencesService extends PreferencesService {
   Future<void> setBlackList(Set<String> userIDs, [String? userToxId]);
   Future<void> addToBlackList(List<String> userIDs, [String? userToxId]);
   Future<void> removeFromBlackList(List<String> userIDs, [String? userToxId]);
+
+  // C2C receive message option (per-peer "Do Not Disturb" state, user-specific).
+  // The opt value is the int form of V2TIM's ReceiveMsgOptEnum index — for
+  // example 0 = V2TIM_RECEIVE_MESSAGE, 2 = V2TIM_RECEIVE_NOT_NOTIFY_MESSAGE.
+  // Bound to current user Tox ID so account A and account B can have different
+  // DND settings for the same peer. If userToxId is not provided, the
+  // implementation should resolve it from the current context.
+  Future<int> getC2CReceiveMessageOpt(String userID, [String? userToxId]);
+  Future<void> setC2CReceiveMessageOpt(String userID, int opt,
+      [String? userToxId]);
 }
 

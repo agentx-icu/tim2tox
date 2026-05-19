@@ -5206,7 +5206,17 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
         failedMsg.msgID = id;
         failedMsg.id = id;
       }
+      failedMsg.userID = receiver.isNotEmpty ? receiver : null;
+      failedMsg.groupID = groupID.isNotEmpty ? groupID : null;
+      if (failedMsg.groupID != null) {
+        failedMsg.userID = null;
+      }
+      failedMsg.isSelf = true;
+      if (failedMsg.sender == null || failedMsg.sender!.isEmpty) {
+        failedMsg.sender = ffiService.selfId;
+      }
       failedMsg.status = MessageStatus.V2TIM_MSG_STATUS_SEND_FAIL;
+      await _setFaceUrlForMsg(failedMsg);
       try {
         _notifyAdvancedMsgListeners((listener) {
           listener.onRecvMessageModified?.call(failedMsg);
@@ -7283,6 +7293,57 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
   }
 
   @override
+  Future<V2TimCallback> setC2CReceiveMessageOpt({
+    required List<String> userIDList,
+    required int opt,
+  }) async {
+    try {
+      final prefs = _prefs;
+
+      // No prefs attached — surface the silent drop instead of pretending
+      // success. Mirrors the loud failure mode in [setFriendInfo] so an
+      // integrator that forgot to inject ExtendedPreferencesService sees a
+      // real error rather than UI that toggles back on next refresh.
+      if (prefs == null) {
+        _log(
+          '[Tim2ToxSdkPlatform] setC2CReceiveMessageOpt: no preferences '
+          'service attached — dropping opt=$opt for ${userIDList.length} '
+          'user(s). Caller should inject ExtendedPreferencesService via the '
+          'Tim2ToxSdkPlatform constructor or FfiChatService.preferencesService.',
+        );
+        return V2TimCallback(
+          code: -1,
+          desc:
+              'setC2CReceiveMessageOpt: no preferences service available, opt not persisted',
+        );
+      }
+
+      final currentUserToxId = ffiService.selfId;
+      if (currentUserToxId.isEmpty) {
+        return V2TimCallback(
+          code: -1,
+          desc:
+              'setC2CReceiveMessageOpt failed: user not logged in (no Tox ID)',
+        );
+      }
+
+      for (final userID in userIDList) {
+        await prefs.setC2CReceiveMessageOpt(userID, opt, currentUserToxId);
+      }
+
+      return V2TimCallback(
+        code: 0,
+        desc: 'success',
+      );
+    } catch (e) {
+      return V2TimCallback(
+        code: -1,
+        desc: 'setC2CReceiveMessageOpt failed: $e',
+      );
+    }
+  }
+
+  @override
   Future<V2TimCallback> deleteFriendApplication({
     required int type,
     required String userID,
@@ -7326,6 +7387,22 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
     required List<String> userIDList,
   }) async {
     try {
+      final prefs = _prefs;
+      if (prefs == null) {
+        _log(
+          '[Tim2ToxSdkPlatform] addToBlackList: no preferences service '
+          'attached — dropping ${userIDList.length} user(s). Caller should '
+          'inject ExtendedPreferencesService via the Tim2ToxSdkPlatform '
+          'constructor or FfiChatService.preferencesService.',
+        );
+        return V2TimValueCallback<List<V2TimFriendOperationResult>>(
+          code: -1,
+          desc:
+              'addToBlackList: no preferences service available, blacklist not persisted',
+          data: [],
+        );
+      }
+
       // Add to blacklist via preferences service, using current user's Tox ID
       final currentUserToxId = ffiService.selfId;
       if (currentUserToxId.isEmpty) {
@@ -7335,7 +7412,17 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
           data: [],
         );
       }
-      await _prefs?.addToBlackList(userIDList, currentUserToxId);
+      // Tox protocol itself does not block incoming messages from a peer — the
+      // blacklist is a purely local hide/filter applied by the client when
+      // rendering conversations and notifications. Persistence here is
+      // sufficient for UIKit's blacklist UI; incoming-message filtering is
+      // the host's responsibility on top of this state.
+      _log(
+        '[Tim2ToxSdkPlatform] addToBlackList: persisting locally for '
+        '${userIDList.length} user(s); Tox protocol does not block messages '
+        'at the network layer.',
+      );
+      await prefs.addToBlackList(userIDList, currentUserToxId);
 
       final results = userIDList
           .map((userID) => V2TimFriendOperationResult(
@@ -7371,6 +7458,22 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
     required List<String> userIDList,
   }) async {
     try {
+      final prefs = _prefs;
+      if (prefs == null) {
+        _log(
+          '[Tim2ToxSdkPlatform] deleteFromBlackList: no preferences service '
+          'attached — dropping ${userIDList.length} user(s). Caller should '
+          'inject ExtendedPreferencesService via the Tim2ToxSdkPlatform '
+          'constructor or FfiChatService.preferencesService.',
+        );
+        return V2TimValueCallback<List<V2TimFriendOperationResult>>(
+          code: -1,
+          desc:
+              'deleteFromBlackList: no preferences service available, blacklist not updated',
+          data: [],
+        );
+      }
+
       // Remove from blacklist via preferences service, using current user's Tox ID
       final currentUserToxId = ffiService.selfId;
       if (currentUserToxId.isEmpty) {
@@ -7380,7 +7483,7 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
           data: [],
         );
       }
-      await _prefs?.removeFromBlackList(userIDList, currentUserToxId);
+      await prefs.removeFromBlackList(userIDList, currentUserToxId);
 
       final results = userIDList
           .map((userID) => V2TimFriendOperationResult(

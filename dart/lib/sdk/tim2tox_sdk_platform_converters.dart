@@ -431,11 +431,25 @@ extension Tim2ToxSdkPlatformConverters on Tim2ToxSdkPlatform {
     conv.faceUrl = fakeConv.faceUrl;
     conv.unreadCount = fakeConv.unreadCount;
     conv.isPinned = fakeConv.isPinned;
-    conv.recvOpt = 0;
 
     final peerId = fakeConv.isGroup
         ? fakeConv.conversationID.replaceFirst('group_', '')
         : fakeConv.conversationID.replaceFirst('c2c_', '');
+
+    // recvOpt is the per-peer DND state (0 = receive, 2 = mute). UIKit reads
+    // it back from V2TimConversation, so a stale 0 here makes the DND toggle
+    // appear to reset on every conversation refresh. Pull from prefs when
+    // available (only C2C currently — group DND has its own pathway and
+    // isn't routed through this prefs key shape).
+    if (!fakeConv.isGroup) {
+      final prefs = preferencesService ?? ffiService.preferencesService;
+      conv.recvOpt = await prefs?.getC2CReceiveMessageOpt(
+              peerId, ffiService.selfId) ??
+          0;
+    } else {
+      conv.recvOpt = 0;
+    }
+
     // Fallback faceUrl from prefs when not set so conversation list/header show correct avatar
     if (conv.faceUrl == null || conv.faceUrl!.isEmpty) {
       final prefs = preferencesService ?? ffiService.preferencesService;
