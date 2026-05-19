@@ -1,0 +1,108 @@
+From 1ca47b0a2a9cf822539f136df2ca3a27a60e28ab Mon Sep 17 00:00:00 2001
+From: tim2tox-bootstrap <bootstrap@local>
+Date: Tue, 19 May 2026 02:49:27 -0700
+Subject: [PATCH 4/5] 0004-native-library-manager-callback-dispatch
+
+---
+ .../bindings/native_library_manager.dart      | 57 ++++++++++++++++++-
+ 1 file changed, 56 insertions(+), 1 deletion(-)
+
+diff --git a/lib/native_im/bindings/native_library_manager.dart b/lib/native_im/bindings/native_library_manager.dart
+index 6a99ca0..9be98fa 100644
+--- a/lib/native_im/bindings/native_library_manager.dart
++++ b/lib/native_im/bindings/native_library_manager.dart
+@@ -40,6 +40,7 @@ import 'package:tencent_cloud_chat_sdk/enum/V2TimCommunityListener.dart';
+ import 'package:tencent_cloud_chat_sdk/enum/V2TimFriendshipListener.dart';
+ import 'package:tencent_cloud_chat_sdk/enum/V2TimGroupListener.dart';
+ import 'package:tencent_cloud_chat_sdk/enum/V2TimSignalingListener.dart';
++import 'package:tencent_cloud_chat_sdk/tencent_cloud_chat_sdk_platform_interface.dart';
+ import 'native_imsdk_bindings_generated.dart';
+ 
+ /// Override the native library name before any SDK call.
+@@ -97,6 +98,14 @@ class NativeLibraryManager {
+   static final ReceivePort _receivePort = ReceivePort();
+   static final Map<String, ApiCallback> _apiCallbackMap = Map.from({});
+ 
++  /// Generic hook for custom callback types not handled by the SDK.
++  /// Set this to handle application-specific callbacks from the native layer.
++  /// Tim2tox registers this from Tim2ToxSdkPlatform to route ToxAV / signaling
++  /// callbacks that have no built-in V2Tim* listener.
++  static Future<void> Function(String callbackName,
++      Map<String, dynamic> data, Map<String, ApiCallback> apiCallbackMap)?
++      customCallbackHandler;
++
+   static V2TimSDKListener? _sdkListener;
+   static V2TimAdvancedMsgListener? _advancedMessageListener;
+   static V2TimConversationListener? _conversationListener;
+@@ -253,6 +262,10 @@ class NativeLibraryManager {
+         _handleGlobalCallback(dataFromNativeMap);
+         break;
+       default:
++        if (customCallbackHandler != null) {
++          await customCallbackHandler!(
++              callbackName, dataFromNativeMap, _apiCallbackMap);
++        }
+         break;
+     }
+   }
+@@ -307,6 +320,20 @@ class NativeLibraryManager {
+     _apiCallbackMap.remove(userData);
+   }
+ 
++  /// Backwards-compatibility aliases for tim2tox callers written against the
++  /// 8.7.x API surface (renamed to `addTimXxx2Map` in 8.9.x). These delegate
++  /// to the new names with the same signatures, so dart/lib code in
++  /// third_party/tim2tox does not need a coordinated rename.
++  static void timCallback2Future(
++          String userData, Completer<V2TimCallback> completer) =>
++      addTimCallback2Map(userData, completer);
++  static void timValueCallback2Future<T>(
++          String userData, Completer<V2TimValueCallback<T>> completer) =>
++      addTimValueCallback2Map<T>(userData, completer);
++  static void timApiValueCallback2Future(
++          String userData, ApiCallback callback) =>
++      addTimApiValueCallback2Map(userData, callback);
++
+   /// 从全局回调数据中获取指定 key 的字符串值
+   static String _getGlobalCallbackJsonString(Map<String, dynamic> dataFromNativeMap, String key) {
+     String rawValue = dataFromNativeMap[key] ?? '';
+@@ -315,7 +342,35 @@ class NativeLibraryManager {
+ 
+   static void _handleGlobalCallback(Map<String, dynamic> dataFromNativeMap) {
+     int callbackType = dataFromNativeMap["callbackType"];
+-    GlobalCallbackType globalCallbackType = GlobalCallbackType.fromValue(callbackType);
++    // Tim2tox multi-instance routing: when the native side stamps an
++    // `instance_id` onto the callback, fan out to per-instance listeners via
++    // the typed dispatchInstanceGlobalCallback extension point on the
++    // platform interface (default no-op; Tim2ToxSdkPlatform overrides).
++    final rawId = dataFromNativeMap["instance_id"];
++    final int? instanceId = rawId == null
++        ? null
++        : (rawId is int
++            ? rawId
++            : (rawId is num
++                ? rawId.toInt()
++                : int.tryParse(rawId.toString())));
++    final platform = TencentCloudChatSdkPlatform.instance;
++    if (instanceId != null && platform.isCustomPlatform) {
++      platform.dispatchInstanceGlobalCallback(
++          instanceId, callbackType, dataFromNativeMap);
++      // For non-zero instance, only fall through for FriendAddRequest so
++      // _friendshipListener is also called (matches 8.7 tim2tox behavior).
++      if (instanceId != 0 &&
++          callbackType != GlobalCallbackType.FriendAddRequest.value) {
++        return;
++      }
++    }
++    final GlobalCallbackType globalCallbackType;
++    try {
++      globalCallbackType = GlobalCallbackType.fromValue(callbackType);
++    } on ArgumentError {
++      return;
++    }
+     switch (globalCallbackType) {
+       case GlobalCallbackType.NetworkStatus: {
+         int code = dataFromNativeMap["code"];
+-- 
+2.50.1 (Apple Git-155)
+

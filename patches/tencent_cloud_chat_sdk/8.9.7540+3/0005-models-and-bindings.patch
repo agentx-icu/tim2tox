@@ -1,0 +1,40 @@
+From ae05454ee49d2c8d8fa0f72870b914767a334c86 Mon Sep 17 00:00:00 2001
+From: tim2tox-bootstrap <bootstrap@local>
+Date: Tue, 19 May 2026 02:50:20 -0700
+Subject: [PATCH 5/5] 0006-models-and-bindings
+
+---
+ .../native_imsdk_bindings_generated.dart        | 17 +++++++++++++++++
+ 1 file changed, 17 insertions(+)
+
+diff --git a/lib/native_im/bindings/native_imsdk_bindings_generated.dart b/lib/native_im/bindings/native_imsdk_bindings_generated.dart
+index 8733753..e61aa09 100644
+--- a/lib/native_im/bindings/native_imsdk_bindings_generated.dart
++++ b/lib/native_im/bindings/native_imsdk_bindings_generated.dart
+@@ -1776,6 +1776,23 @@ class NativeImsdkBindings {
+   late final _DartGetGroupMemberList = _DartGetGroupMemberListPtr.asFunction<
+       int Function(ffi.Pointer<ffi.Char>, ffi.Pointer<ffi.Void>)>();
+ 
++  int DartGetGroupMembersInfo(
++    ffi.Pointer<ffi.Char> json_group_get_members_info_param,
++    ffi.Pointer<ffi.Void> user_data,
++  ) {
++    return _DartGetGroupMembersInfo(
++      json_group_get_members_info_param,
++      user_data,
++    );
++  }
++
++  late final _DartGetGroupMembersInfoPtr = _lookup<
++      ffi.NativeFunction<
++          ffi.Int Function(ffi.Pointer<ffi.Char>,
++              ffi.Pointer<ffi.Void>)>>('DartGetGroupMembersInfo');
++  late final _DartGetGroupMembersInfo = _DartGetGroupMembersInfoPtr.asFunction<
++      int Function(ffi.Pointer<ffi.Char>, ffi.Pointer<ffi.Void>)>();
++
+   int DartSearchGroupMembers(
+     ffi.Pointer<ffi.Char> json_group_search_group_members_param,
+     ffi.Pointer<ffi.Void> user_data,
+-- 
+2.50.1 (Apple Git-155)
+

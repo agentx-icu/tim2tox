@@ -1,0 +1,1680 @@
+From 6a89f0d6a8c4cb159c144a3d0cb4408edd5a5cbf Mon Sep 17 00:00:00 2001
+From: tim2tox-bootstrap <bootstrap@local>
+Date: Tue, 19 May 2026 02:45:54 -0700
+Subject: [PATCH 3/5] 0003-route-managers-through-platform
+
+---
+ lib/manager/v2_tim_conversation_manager.dart | 106 ++++----
+ lib/manager/v2_tim_friendship_manager.dart   |  36 +--
+ lib/manager/v2_tim_group_manager.dart        |  32 +--
+ lib/manager/v2_tim_manager.dart              | 124 +++++++---
+ lib/manager/v2_tim_message_manager.dart      | 247 +++++++------------
+ 5 files changed, 272 insertions(+), 273 deletions(-)
+
+diff --git a/lib/manager/v2_tim_conversation_manager.dart b/lib/manager/v2_tim_conversation_manager.dart
+index ae881f5..82ae01b 100644
+--- a/lib/manager/v2_tim_conversation_manager.dart
++++ b/lib/manager/v2_tim_conversation_manager.dart
+@@ -18,47 +18,51 @@ import 'package:tencent_cloud_chat_sdk/native_im/adapter/tim_conversation_manage
+     if (dart.library.html) 'package:tencent_cloud_chat_sdk/native_im/adapter/tim_conversation_manager_dummy.dart';
+ import 'package:tencent_cloud_chat_sdk/tencent_cloud_chat_sdk_platform_interface.dart';
+ 
++// Tim2Tox fix: When isCustomPlatform is true (Tim2ToxSdkPlatform registered),
++// conversation operations route through TencentCloudChatSdkPlatform.instance
++// instead of the native C API (TIMConversationManager). The native C API has
++// no knowledge of Tox conversations, so it returned empty/default
++// V2TimConversation objects, causing the chat header to flash between correct
++// and empty avatar/nickname.
++
+ class V2TIMConversationManager {
+   Future<void> setConversationListener({
+     required V2TimConversationListener listener,
+   }) {
+-    if (kIsWeb) {
++    if (TencentCloudChatSdkPlatform.instance.isPlatformRouted) {
+       return TencentCloudChatSdkPlatform.instance
+-        .setConversationListener(listener: listener);
++          .setConversationListener(listener: listener);
+     }
+ 
+     TIMConversationManager.instance
+         .setConversationListener(listener: listener);
+-  
+     return Future.value();
+   }
+ 
+   Future<void> addConversationListener({
+     required V2TimConversationListener listener,
+   }) {
+-    if (kIsWeb) {
++    if (TencentCloudChatSdkPlatform.instance.isPlatformRouted) {
+       return TencentCloudChatSdkPlatform.instance
+-        .addConversationListener(listener: listener);
++          .addConversationListener(listener: listener);
+     }
+ 
+     TIMConversationManager.instance
+         .addConversationListener(listener: listener);
+-
+     return Future.value();
+   }
+ 
+   Future<void> removeConversationListener(
+       {V2TimConversationListener? listener}) {
+-    if (kIsWeb) {
++    if (TencentCloudChatSdkPlatform.instance.isPlatformRouted) {
+       return TencentCloudChatSdkPlatform.instance.removeConversationListener(
+         listener: listener,
+       );
+     }
+-      
++
+     TIMConversationManager.instance.removeConversationListener(
+       listener: listener,
+     );
+-
+     return Future.value();
+   }
+ 
+@@ -82,7 +86,7 @@ class V2TIMConversationManager {
+     required String nextSeq,
+     required int count,
+   }) async {
+-    if (kIsWeb) {
++    if (TencentCloudChatSdkPlatform.instance.isPlatformRouted) {
+       return TencentCloudChatSdkPlatform.instance.getConversationList(
+         nextSeq: nextSeq,
+         count: count,
+@@ -100,7 +104,7 @@ class V2TIMConversationManager {
+     required String nextSeq,
+     required int count,
+   }) async {
+-    if (kIsWeb) {
++    if (TencentCloudChatSdkPlatform.instance.isPlatformRouted) {
+       return TencentCloudChatSdkPlatform.instance
+           .getConversationListWithoutFormat(
+         nextSeq: nextSeq,
+@@ -126,9 +130,9 @@ class V2TIMConversationManager {
+   Future<V2TimValueCallback<V2TimConversation>> getConversation({
+     required String conversationID,
+   }) async {
+-    if (kIsWeb) {
++    if (TencentCloudChatSdkPlatform.instance.isPlatformRouted) {
+       return TencentCloudChatSdkPlatform.instance
+-        .getConversation(conversationID: conversationID);
++          .getConversation(conversationID: conversationID);
+     }
+ 
+     return TIMConversationManager.instance
+@@ -141,13 +145,15 @@ class V2TIMConversationManager {
+       getConversationListByConversationIds({
+     required List<String> conversationIDList,
+   }) async {
+-    if (kIsWeb) {
+-      return TencentCloudChatSdkPlatform.instance.getConversationListByConversationIds(
+-          conversationIDList: conversationIDList);
++    if (TencentCloudChatSdkPlatform.instance.isPlatformRouted) {
++      return TencentCloudChatSdkPlatform.instance
++          .getConversationListByConversationIds(
++              conversationIDList: conversationIDList);
+     }
+ 
+-    return TIMConversationManager.instance.getConversationListByConversationIds(
+-        conversationIDList: conversationIDList);
++    return TIMConversationManager.instance
++        .getConversationListByConversationIds(
++            conversationIDList: conversationIDList);
+   }
+ 
+   /// 高级获取会话接口
+@@ -158,7 +164,7 @@ class V2TIMConversationManager {
+     required int nextSeq,
+     required int count,
+   }) async {
+-    if (kIsWeb) {
++    if (TencentCloudChatSdkPlatform.instance.isPlatformRouted) {
+       return TencentCloudChatSdkPlatform.instance.getConversationListByFilter(
+         filter: filter,
+         nextSeq: nextSeq,
+@@ -179,9 +185,9 @@ class V2TIMConversationManager {
+     required String conversationID,
+     required bool isPinned,
+   }) async {
+-    if (kIsWeb) {
++    if (TencentCloudChatSdkPlatform.instance.isPlatformRouted) {
+       return TencentCloudChatSdkPlatform.instance
+-        .pinConversation(conversationID: conversationID, isPinned: isPinned);
++          .pinConversation(conversationID: conversationID, isPinned: isPinned);
+     }
+ 
+     return TIMConversationManager.instance
+@@ -191,7 +197,7 @@ class V2TIMConversationManager {
+   /// 获取会话未读总数
+   ///
+   Future<V2TimValueCallback<int>> getTotalUnreadMessageCount() async {
+-    if (kIsWeb) {
++    if (TencentCloudChatSdkPlatform.instance.isPlatformRouted) {
+       return TencentCloudChatSdkPlatform.instance.getTotalUnreadMessageCount();
+     }
+ 
+@@ -210,9 +216,9 @@ class V2TIMConversationManager {
+   Future<V2TimCallback> deleteConversation({
+     required String conversationID,
+   }) async {
+-    if (kIsWeb) {
++    if (TencentCloudChatSdkPlatform.instance.isPlatformRouted) {
+       return TencentCloudChatSdkPlatform.instance
+-        .deleteConversation(conversationID: conversationID);
++          .deleteConversation(conversationID: conversationID);
+     }
+ 
+     return TIMConversationManager.instance
+@@ -224,9 +230,9 @@ class V2TIMConversationManager {
+     required List<String> conversationIDList,
+     required bool clearMessage,
+   }) async {
+-    if (kIsWeb) {
++    if (TencentCloudChatSdkPlatform.instance.isPlatformRouted) {
+       return TencentCloudChatSdkPlatform.instance.deleteConversationList(
+-        conversationIDList: conversationIDList, clearMessage: clearMessage);
++          conversationIDList: conversationIDList, clearMessage: clearMessage);
+     }
+ 
+     return TIMConversationManager.instance.deleteConversationList(
+@@ -248,9 +254,9 @@ class V2TIMConversationManager {
+     required String conversationID,
+     String? draftText = "",
+   }) async {
+-    if (kIsWeb) {
++    if (TencentCloudChatSdkPlatform.instance.isPlatformRouted) {
+       return TencentCloudChatSdkPlatform.instance.setConversationDraft(
+-        conversationID: conversationID, draftText: draftText);
++          conversationID: conversationID, draftText: draftText);
+     }
+ 
+     return TIMConversationManager.instance.setConversationDraft(
+@@ -258,7 +264,7 @@ class V2TIMConversationManager {
+   }
+ 
+   /// 设置会话自定义数据
+-  /// 
++  ///
+   /// 自定义数据，最大支持 256 bytes
+   ///
+   Future<V2TimValueCallback<List<V2TimConversationOperationResult>>>
+@@ -266,9 +272,9 @@ class V2TIMConversationManager {
+     required String customData,
+     required List<String> conversationIDList,
+   }) async {
+-    if (kIsWeb) {
++    if (TencentCloudChatSdkPlatform.instance.isPlatformRouted) {
+       return TencentCloudChatSdkPlatform.instance.setConversationCustomData(
+-        customData: customData, conversationIDList: conversationIDList);
++          customData: customData, conversationIDList: conversationIDList);
+     }
+ 
+     return TIMConversationManager.instance.setConversationCustomData(
+@@ -290,11 +296,11 @@ class V2TIMConversationManager {
+     required bool enableMark,
+     required List<String> conversationIDList,
+   }) async {
+-    if (kIsWeb) {
++    if (TencentCloudChatSdkPlatform.instance.isPlatformRouted) {
+       return TencentCloudChatSdkPlatform.instance.markConversation(
+-        markType: markType,
+-        enableMark: enableMark,
+-        conversationIDList: conversationIDList);
++          markType: markType,
++          enableMark: enableMark,
++          conversationIDList: conversationIDList);
+     }
+ 
+     return TIMConversationManager.instance.markConversation(
+@@ -312,9 +318,9 @@ class V2TIMConversationManager {
+     required String groupName,
+     required List<String> conversationIDList,
+   }) async {
+-    if (kIsWeb) {
++    if (TencentCloudChatSdkPlatform.instance.isPlatformRouted) {
+       return TencentCloudChatSdkPlatform.instance.createConversationGroup(
+-        groupName: groupName, conversationIDList: conversationIDList);
++          groupName: groupName, conversationIDList: conversationIDList);
+     }
+ 
+     return TIMConversationManager.instance.createConversationGroup(
+@@ -325,7 +331,7 @@ class V2TIMConversationManager {
+   /// 4.0.8及以后版本支持，web不支持
+   ///
+   Future<V2TimValueCallback<List<String>>> getConversationGroupList() async {
+-    if (kIsWeb) {
++    if (TencentCloudChatSdkPlatform.instance.isPlatformRouted) {
+       return TencentCloudChatSdkPlatform.instance.getConversationGroupList();
+     }
+ 
+@@ -338,9 +344,9 @@ class V2TIMConversationManager {
+   Future<V2TimCallback> deleteConversationGroup({
+     required String groupName,
+   }) async {
+-    if (kIsWeb) {
++    if (TencentCloudChatSdkPlatform.instance.isPlatformRouted) {
+       return TencentCloudChatSdkPlatform.instance
+-        .deleteConversationGroup(groupName: groupName);
++          .deleteConversationGroup(groupName: groupName);
+     }
+ 
+     return TIMConversationManager.instance
+@@ -354,7 +360,7 @@ class V2TIMConversationManager {
+     required String oldName,
+     required String newName,
+   }) async {
+-    if (kIsWeb) {
++    if (TencentCloudChatSdkPlatform.instance.isPlatformRouted) {
+       return TencentCloudChatSdkPlatform.instance.renameConversationGroup(
+         oldName: oldName,
+         newName: newName,
+@@ -375,7 +381,7 @@ class V2TIMConversationManager {
+     required String groupName,
+     required List<String> conversationIDList,
+   }) async {
+-    if (kIsWeb) {
++    if (TencentCloudChatSdkPlatform.instance.isPlatformRouted) {
+       return TencentCloudChatSdkPlatform.instance.addConversationsToGroup(
+         groupName: groupName,
+         conversationIDList: conversationIDList,
+@@ -396,7 +402,7 @@ class V2TIMConversationManager {
+     required String groupName,
+     required List<String> conversationIDList,
+   }) async {
+-    if (kIsWeb) {
++    if (TencentCloudChatSdkPlatform.instance.isPlatformRouted) {
+       return TencentCloudChatSdkPlatform.instance.deleteConversationsFromGroup(
+         groupName: groupName,
+         conversationIDList: conversationIDList,
+@@ -412,9 +418,9 @@ class V2TIMConversationManager {
+   Future<V2TimValueCallback<int>> getUnreadMessageCountByFilter({
+     required V2TimConversationFilter filter,
+   }) async {
+-    if (kIsWeb) {
++    if (TencentCloudChatSdkPlatform.instance.isPlatformRouted) {
+       return TencentCloudChatSdkPlatform.instance
+-        .getUnreadMessageCountByFilter(filter: filter);
++          .getUnreadMessageCountByFilter(filter: filter);
+     }
+ 
+     return TIMConversationManager.instance
+@@ -424,9 +430,9 @@ class V2TIMConversationManager {
+   Future<V2TimCallback> subscribeUnreadMessageCountByFilter({
+     required V2TimConversationFilter filter,
+   }) async {
+-    if (kIsWeb) {
++    if (TencentCloudChatSdkPlatform.instance.isPlatformRouted) {
+       return TencentCloudChatSdkPlatform.instance
+-        .subscribeUnreadMessageCountByFilter(filter: filter);
++          .subscribeUnreadMessageCountByFilter(filter: filter);
+     }
+ 
+     return TIMConversationManager.instance
+@@ -436,9 +442,9 @@ class V2TIMConversationManager {
+   Future<V2TimCallback> unsubscribeUnreadMessageCountByFilter({
+     required V2TimConversationFilter filter,
+   }) async {
+-    if (kIsWeb) {
++    if (TencentCloudChatSdkPlatform.instance.isPlatformRouted) {
+       return TencentCloudChatSdkPlatform.instance
+-        .unsubscribeUnreadMessageCountByFilter(filter: filter);
++          .unsubscribeUnreadMessageCountByFilter(filter: filter);
+     }
+ 
+     return TIMConversationManager.instance
+@@ -450,7 +456,7 @@ class V2TIMConversationManager {
+     required int cleanTimestamp,
+     required int cleanSequence,
+   }) async {
+-    if (kIsWeb) {
++    if (TencentCloudChatSdkPlatform.instance.isPlatformRouted) {
+       return TencentCloudChatSdkPlatform.instance
+           .cleanConversationUnreadMessageCount(
+               conversationID: conversationID,
+diff --git a/lib/manager/v2_tim_friendship_manager.dart b/lib/manager/v2_tim_friendship_manager.dart
+index 6291ae8..39ec1f6 100644
+--- a/lib/manager/v2_tim_friendship_manager.dart
++++ b/lib/manager/v2_tim_friendship_manager.dart
+@@ -45,7 +45,7 @@ class V2TIMFriendshipManager {
+   Future<void> setFriendListener({
+     required V2TimFriendshipListener listener,
+   }) {
+-    if (kIsWeb) {
++    if (TencentCloudChatSdkPlatform.instance.isPlatformRouted) {
+       return TencentCloudChatSdkPlatform.instance
+         .setFriendListener(listener: listener);
+     }
+@@ -57,7 +57,7 @@ class V2TIMFriendshipManager {
+   Future<void> addFriendListener({
+     required V2TimFriendshipListener listener,
+   }) {
+-    if (kIsWeb) {
++    if (TencentCloudChatSdkPlatform.instance.isPlatformRouted) {
+       return TencentCloudChatSdkPlatform.instance
+         .addFriendListener(listener: listener);
+ 
+@@ -70,7 +70,7 @@ class V2TIMFriendshipManager {
+   Future<void> removeFriendListener({
+     V2TimFriendshipListener? listener,
+   }) {
+-    if (kIsWeb) {
++    if (TencentCloudChatSdkPlatform.instance.isPlatformRouted) {
+       return TencentCloudChatSdkPlatform.instance.removeFriendListener(
+         listener: listener,
+       );
+@@ -84,7 +84,7 @@ class V2TIMFriendshipManager {
+   ///获取好友列表
+   ///
+   Future<V2TimValueCallback<List<V2TimFriendInfo>>> getFriendList() async {
+-    if (kIsWeb) {
++    if (TencentCloudChatSdkPlatform.instance.isPlatformRouted) {
+       return TencentCloudChatSdkPlatform.instance.getFriendList();
+     }
+ 
+@@ -103,7 +103,7 @@ class V2TIMFriendshipManager {
+   Future<V2TimValueCallback<List<V2TimFriendInfoResult>>> getFriendsInfo({
+     required List<String> userIDList,
+   }) async {
+-    if (kIsWeb) {
++    if (TencentCloudChatSdkPlatform.instance.isPlatformRouted) {
+       return TencentCloudChatSdkPlatform.instance
+         .getFriendsInfo(userIDList: userIDList);
+     }
+@@ -119,7 +119,7 @@ class V2TIMFriendshipManager {
+     String? friendRemark,
+     Map<String, String>? friendCustomInfo,
+   }) async {
+-    if (kIsWeb) {
++    if (TencentCloudChatSdkPlatform.instance.isPlatformRouted) {
+       return TencentCloudChatSdkPlatform.instance.setFriendInfo(
+         userID: userID,
+         friendRemark: friendRemark,
+@@ -142,7 +142,7 @@ class V2TIMFriendshipManager {
+     String? addSource,
+     required FriendTypeEnum addType,
+   }) async {
+-    if (kIsWeb) {
++    if (TencentCloudChatSdkPlatform.instance.isPlatformRouted) {
+       return TencentCloudChatSdkPlatform.instance.addFriend(
+         userID: userID,
+         remark: remark,
+@@ -183,7 +183,7 @@ class V2TIMFriendshipManager {
+     required List<String> userIDList,
+     required FriendTypeEnum deleteType,
+   }) async {
+-    if (kIsWeb) {
++    if (TencentCloudChatSdkPlatform.instance.isPlatformRouted) {
+       return TencentCloudChatSdkPlatform.instance.deleteFromFriendList(
+         userIDList: userIDList,
+         deleteType: deleteType.index,
+@@ -213,7 +213,7 @@ class V2TIMFriendshipManager {
+     required List<String> userIDList,
+     required FriendTypeEnum checkType,
+   }) async {
+-    if (kIsWeb) {
++    if (TencentCloudChatSdkPlatform.instance.isPlatformRouted) {
+       return TencentCloudChatSdkPlatform.instance.checkFriend(
+         userIDList: userIDList,
+         checkType: checkType.index,
+@@ -230,7 +230,7 @@ class V2TIMFriendshipManager {
+   ///
+   Future<V2TimValueCallback<V2TimFriendApplicationResult>>
+       getFriendApplicationList() async {
+-    if (kIsWeb) {
++    if (TencentCloudChatSdkPlatform.instance.isPlatformRouted) {
+       return TencentCloudChatSdkPlatform.instance.getFriendApplicationList();
+     }
+ 
+@@ -257,9 +257,9 @@ class V2TIMFriendshipManager {
+     required FriendApplicationTypeEnum type,
+     required String userID,
+   }) async {
+-    if (kIsWeb) {
++    if (TencentCloudChatSdkPlatform.instance.isPlatformRouted) {
+       return TencentCloudChatSdkPlatform.instance.acceptFriendApplication(
+-          responseType: responseType.index, type: type.index, userID: userID);
++          responseType: responseType.index, type: type?.index ?? 0, userID: userID);
+     }
+ 
+     return TIMFriendshipManager.instance.acceptFriendApplication(
+@@ -279,7 +279,7 @@ class V2TIMFriendshipManager {
+     required FriendApplicationTypeEnum type,
+     required String userID,
+   }) async {
+-    if (kIsWeb) {
++    if (TencentCloudChatSdkPlatform.instance.isPlatformRouted) {
+       return TencentCloudChatSdkPlatform.instance
+           .refuseFriendApplication(type: type.index, userID: userID);
+     }
+@@ -300,7 +300,7 @@ class V2TIMFriendshipManager {
+     required FriendApplicationTypeEnum type,
+     required String userID,
+   }) async {
+-    if (kIsWeb) {
++    if (TencentCloudChatSdkPlatform.instance.isPlatformRouted) {
+       return TencentCloudChatSdkPlatform.instance
+           .deleteFriendApplication(type: type.index, userID: userID);
+     }
+@@ -312,7 +312,7 @@ class V2TIMFriendshipManager {
+   ///设置好友申请已读
+   ///
+   Future<V2TimCallback> setFriendApplicationRead() async {
+-    if (kIsWeb) {
++    if (TencentCloudChatSdkPlatform.instance.isPlatformRouted) {
+       return TencentCloudChatSdkPlatform.instance.setFriendApplicationRead();
+     }
+ 
+@@ -324,7 +324,7 @@ class V2TIMFriendshipManager {
+   Future<V2TimValueCallback<List<V2TimFriendOperationResult>>> addToBlackList({
+     required List<String> userIDList,
+   }) async {
+-    if (kIsWeb) {
++    if (TencentCloudChatSdkPlatform.instance.isPlatformRouted) {
+       return TencentCloudChatSdkPlatform.instance
+           .addToBlackList(userIDList: userIDList);
+     }
+@@ -339,7 +339,7 @@ class V2TIMFriendshipManager {
+       deleteFromBlackList({
+     required List<String> userIDList,
+   }) async {
+-    if (kIsWeb) {
++    if (TencentCloudChatSdkPlatform.instance.isPlatformRouted) {
+       return TencentCloudChatSdkPlatform.instance
+           .deleteFromBlackList(userIDList: userIDList);
+     }
+@@ -351,7 +351,7 @@ class V2TIMFriendshipManager {
+   ///获取黑名单列表
+   ///
+   Future<V2TimValueCallback<List<V2TimFriendInfo>>> getBlackList() async {
+-    if (kIsWeb) {
++    if (TencentCloudChatSdkPlatform.instance.isPlatformRouted) {
+       return TencentCloudChatSdkPlatform.instance.getBlackList();
+     }
+ 
+diff --git a/lib/manager/v2_tim_group_manager.dart b/lib/manager/v2_tim_group_manager.dart
+index b491e14..bd9d934 100644
+--- a/lib/manager/v2_tim_group_manager.dart
++++ b/lib/manager/v2_tim_group_manager.dart
+@@ -86,7 +86,7 @@ class V2TIMGroupManager {
+           ? GroupAddOptTypeEnum.V2TIM_GROUP_ADD_ANY
+           : GroupAddOptTypeEnum.V2TIM_GROUP_ADD_FORBID)
+         : (groupType == GroupType.AVChatRoom ? GroupAddOptTypeEnum.V2TIM_GROUP_ADD_FORBID : approveOpt);
+-    if (kIsWeb) {
++    if (TencentCloudChatSdkPlatform.instance.isPlatformRouted) {
+       return TencentCloudChatSdkPlatform.instance.createGroup(
+         groupType: groupType,
+         groupName: groupName,
+@@ -130,7 +130,7 @@ class V2TIMGroupManager {
+   /// 该接口有频限检测，SDK 限制调用频率为1 秒 10 次，超过限制后会报 ERR_SDK_COMM_API_CALL_FREQUENCY_LIMIT （7008）错误
+   /// ```
+   Future<V2TimValueCallback<List<V2TimGroupInfo>>> getJoinedGroupList() async {
+-    if (kIsWeb) {
++    if (TencentCloudChatSdkPlatform.instance.isPlatformRouted) {
+       return TencentCloudChatSdkPlatform.instance.getJoinedGroupList();
+     }
+     return TIMGroupManager.instance.getJoinedGroupList();
+@@ -146,7 +146,7 @@ class V2TIMGroupManager {
+   Future<V2TimValueCallback<List<V2TimGroupInfoResult>>> getGroupsInfo({
+     required List<String> groupIDList,
+   }) async {
+-    if (kIsWeb) {
++    if (TencentCloudChatSdkPlatform.instance.isPlatformRouted) {
+       return TencentCloudChatSdkPlatform.instance.getGroupsInfo(groupIDList: groupIDList);
+     }
+     return TIMGroupManager.instance.getGroupsInfo(groupIDList: groupIDList);
+@@ -159,7 +159,7 @@ class V2TIMGroupManager {
+   Future<V2TimCallback> setGroupInfo({
+     required V2TimGroupInfo info,
+   }) async {
+-    if (kIsWeb) {
++    if (TencentCloudChatSdkPlatform.instance.isPlatformRouted) {
+       return TencentCloudChatSdkPlatform.instance.setGroupInfo(info: info);
+     }
+     return TIMGroupManager.instance.setGroupInfo(info: info);
+@@ -271,7 +271,7 @@ class V2TIMGroupManager {
+     int count = 15,
+     int offset = 0,
+   }) async {
+-    if (kIsWeb) {
++    if (TencentCloudChatSdkPlatform.instance.isPlatformRouted) {
+       return TencentCloudChatSdkPlatform.instance
+           .getGroupMemberList(groupID: groupID, filter: filter.index, nextSeq: nextSeq, count: count, offset: offset);
+     }
+@@ -285,7 +285,7 @@ class V2TIMGroupManager {
+     required String groupID,
+     required List<String> memberList,
+   }) async {
+-    if (kIsWeb) {
++    if (TencentCloudChatSdkPlatform.instance.isPlatformRouted) {
+       return TencentCloudChatSdkPlatform.instance.getGroupMembersInfo(groupID: groupID, memberList: memberList);
+     }
+     return TIMGroupManager.instance.getGroupMembersInfo(groupID: groupID, memberList: memberList);
+@@ -299,7 +299,7 @@ class V2TIMGroupManager {
+     String? nameCard,
+     Map<String, String>? customInfo,
+   }) async {
+-    if (kIsWeb) {
++    if (TencentCloudChatSdkPlatform.instance.isPlatformRouted) {
+       return TencentCloudChatSdkPlatform.instance.setGroupMemberInfo(
+         groupID: groupID,
+         userID: userID,
+@@ -322,7 +322,7 @@ class V2TIMGroupManager {
+     required String userID,
+     required int seconds,
+   }) async {
+-    if (kIsWeb) {
++    if (TencentCloudChatSdkPlatform.instance.isPlatformRouted) {
+       return TencentCloudChatSdkPlatform.instance.muteGroupMember(
+         groupID: groupID,
+         userID: userID,
+@@ -381,7 +381,7 @@ class V2TIMGroupManager {
+     required String groupID,
+     required List<String> userList,
+   }) async {
+-    if (kIsWeb) {
++    if (TencentCloudChatSdkPlatform.instance.isPlatformRouted) {
+       return TencentCloudChatSdkPlatform.instance.inviteUserToGroup(groupID: groupID, userList: userList);
+     }
+     return TIMGroupManager.instance.inviteUserToGroup(groupID: groupID, userList: userList);
+@@ -402,7 +402,7 @@ class V2TIMGroupManager {
+     int? duration,
+     String? reason,
+   }) async {
+-    if (kIsWeb) {
++    if (TencentCloudChatSdkPlatform.instance.isPlatformRouted) {
+       return TencentCloudChatSdkPlatform.instance.kickGroupMember(
+         groupID: groupID,
+         memberList: memberList,
+@@ -437,7 +437,7 @@ class V2TIMGroupManager {
+     required String userID,
+     required GroupMemberRoleTypeEnum role,
+   }) async {
+-    if (kIsWeb) {
++    if (TencentCloudChatSdkPlatform.instance.isPlatformRouted) {
+       return TencentCloudChatSdkPlatform.instance
+           .setGroupMemberRole(groupID: groupID, userID: userID, role: EnumUtils.convertGroupMemberRoleTypeEnum(role));
+     }
+@@ -460,7 +460,7 @@ class V2TIMGroupManager {
+     required String groupID,
+     required String userID,
+   }) async {
+-    if (kIsWeb) {
++    if (TencentCloudChatSdkPlatform.instance.isPlatformRouted) {
+       return TencentCloudChatSdkPlatform.instance.transferGroupOwner(groupID: groupID, userID: userID);
+     }
+     return TIMGroupManager.instance.transferGroupOwner(groupID: groupID, userID: userID);
+@@ -471,7 +471,7 @@ class V2TIMGroupManager {
+   ///web 不支持
+   ///
+   Future<V2TimValueCallback<V2TimGroupApplicationResult>> getGroupApplicationList() async {
+-    if (kIsWeb) {
++    if (TencentCloudChatSdkPlatform.instance.isPlatformRouted) {
+       return TencentCloudChatSdkPlatform.instance.getGroupApplicationList();
+     }
+     return TIMGroupManager.instance.getGroupApplicationList();
+@@ -493,7 +493,7 @@ class V2TIMGroupManager {
+     V2TimGroupApplication? application,
+     String? webMessageInstance,
+   }) async {
+-    if (kIsWeb) {
++    if (TencentCloudChatSdkPlatform.instance.isPlatformRouted) {
+       return TencentCloudChatSdkPlatform.instance.acceptGroupApplication(
+         groupID: groupID,
+         reason: reason,
+@@ -544,7 +544,7 @@ class V2TIMGroupManager {
+     V2TimGroupApplication? application,
+     String? webMessageInstance,
+   }) async {
+-    if (kIsWeb) {
++    if (TencentCloudChatSdkPlatform.instance.isPlatformRouted) {
+       return TencentCloudChatSdkPlatform.instance.refuseGroupApplication(
+           groupID: groupID,
+           fromUser: fromUser,
+@@ -568,7 +568,7 @@ class V2TIMGroupManager {
+   /// web 不支持
+   ///
+   Future<V2TimCallback> setGroupApplicationRead() async {
+-    if (kIsWeb) {
++    if (TencentCloudChatSdkPlatform.instance.isPlatformRouted) {
+       return TencentCloudChatSdkPlatform.instance.setGroupApplicationRead();
+     }
+     return TIMGroupManager.instance.setGroupApplicationRead();
+diff --git a/lib/manager/v2_tim_manager.dart b/lib/manager/v2_tim_manager.dart
+index 99f9d8a..67ec4f5 100644
+--- a/lib/manager/v2_tim_manager.dart
++++ b/lib/manager/v2_tim_manager.dart
+@@ -34,6 +34,16 @@ import 'package:tencent_cloud_chat_sdk/models/v2_tim_user_full_info.dart'
+     if (dart.library.html) 'package:tencent_cloud_chat_sdk/web/compatible_models/v2_tim_user_full_info.dart';
+ import 'package:tencent_cloud_chat_sdk/native_im/adapter/tim_manager.dart'
+     if (dart.library.html) 'package:tencent_cloud_chat_sdk/native_im/adapter/tim_manager_dummy.dart';
++import 'package:tencent_cloud_chat_sdk/native_im/adapter/tim_message_manager.dart'
++    if (dart.library.html) 'package:tencent_cloud_chat_sdk/native_im/adapter/tim_message_manager_dummy.dart';
++import 'package:tencent_cloud_chat_sdk/native_im/adapter/tim_group_manager.dart'
++    if (dart.library.html) 'package:tencent_cloud_chat_sdk/native_im/adapter/tim_group_manager_dummy.dart';
++import 'package:tencent_cloud_chat_sdk/native_im/adapter/tim_conversation_manager.dart'
++    if (dart.library.html) 'package:tencent_cloud_chat_sdk/native_im/adapter/tim_conversation_manager_dummy.dart';
++import 'package:tencent_cloud_chat_sdk/native_im/adapter/tim_friendship_manager.dart'
++    if (dart.library.html) 'package:tencent_cloud_chat_sdk/native_im/adapter/tim_friendship_manager_dummy.dart';
++import 'package:tencent_cloud_chat_sdk/native_im/adapter/tim_signaling_manager.dart'
++    if (dart.library.html) 'package:tencent_cloud_chat_sdk/native_im/adapter/tim_signaling_manager_dummy.dart';
+ import 'package:tencent_cloud_chat_sdk/tencent_cloud_chat_sdk_platform_interface.dart';
+ import 'package:tencent_cloud_chat_sdk/utils/const.dart';
+ 
+@@ -132,25 +142,39 @@ class V2TIMManager {
+   String addUIKitListener({
+     required V2TimUIKitListener listener,
+   }) {
+-    return TencentCloudChatSdkPlatform.instance.addUIKitListener(
+-      listener: listener,
+-    );
++    if (TencentCloudChatSdkPlatform.instance.isPlatformRouted) {
++      return TencentCloudChatSdkPlatform.instance.addUIKitListener(listener: listener);
++    }
++    
++    // For binary replacement mode without Platform interface, UIKit listener functionality
++    // is handled by SDK listeners (legacy behavior)
++    return 'add success';
+   }
+ 
+   void emitUIKitListener({
+     required Map<String, dynamic> data,
+   }) {
+-    TencentCloudChatSdkPlatform.instance.emitUIKitListener(
+-      data: data,
+-    );
++    if (TencentCloudChatSdkPlatform.instance.isPlatformRouted) {
++      TencentCloudChatSdkPlatform.instance.emitUIKitListener(data: data);
++      return;
++    }
++    
++    // For binary replacement mode without Platform interface, UIKit listener functionality
++    // is handled by SDK listeners (legacy behavior)
++    // Note: This may not work correctly for sticker click events in binary replacement mode
++    // if Platform interface is not set
+   }
+ 
+   void removeUIKitListener({
+     String? uuid,
+   }) {
+-    TencentCloudChatSdkPlatform.instance.removeUIKitListener(
+-      uuid: uuid,
+-    );
++    if (TencentCloudChatSdkPlatform.instance.isPlatformRouted) {
++      TencentCloudChatSdkPlatform.instance.removeUIKitListener(uuid: uuid);
++      return;
++    }
++    
++    // For binary replacement mode without Platform interface, UIKit listener functionality
++    // is handled by SDK listeners (legacy behavior)
+   }
+ 
+   ///@nodoc
+@@ -188,14 +212,21 @@ class V2TIMManager {
+     }
+ 
+     v2TIMSDKListenerList.clear();
+-    bool result = TIMManager.instance.unInitSDK();
+-    if (result) {
++    TIMMessageManager.instance.removeAdvancedMsgListener();
++    TIMConversationManager.instance.removeConversationListener();
++    TIMFriendshipManager.instance.removeFriendListener();
++    TIMGroupManager.instance.removeGroupListener();
++    TIMManager.instance.removeSimpleMsgListener();
++    TIMSignalingManager.instance.removeSignalingListener();
++
++    bool unInitResult = TIMManager.instance.unInitSDK();
++    V2TimCallback res = V2TimCallback(code: unInitResult ? 0 : 1, desc: unInitResult ? "success" : "failed");
++    if (res.code == 0) {
+       currentLoginInfo.remove(currentLoginSDKAPPIDKey);
+       currentLoginInfo.remove(currentLoginUserIDKey);
+       currentLoginInfo.remove(currentLoginSigKey);
+     }
+-
+-    return V2TimCallback.fromBool(result, '');
++    return res;
+   }
+ 
+   /// 添加 IM 监听
+@@ -223,6 +254,7 @@ class V2TIMManager {
+       return TencentCloudChatSdkPlatform.instance.getVersion();
+     }
+ 
++    // 非 Web 平台：TIMManager 有 getSDKVersion 方法，返回 String
+     String sdkVersion = TIMManager.instance.getSDKVersion();
+     return V2TimValueCallback<String>.fromObject(sdkVersion);
+   }
+@@ -264,7 +296,7 @@ class V2TIMManager {
+     required String userID,
+     required String userSig,
+   }) async {
+-    if (kIsWeb) {
++    if (TencentCloudChatSdkPlatform.instance.isPlatformRouted) {
+       V2TimCallback res = await TencentCloudChatSdkPlatform.instance.login(userID: userID, userSig: userSig);
+       if (res.code == 0) {
+         currentLoginInfo["u"] = userID;
+@@ -288,7 +320,7 @@ class V2TIMManager {
+   /// 退出登录，如果切换账号，需要 logout 回调成功或者失败后才能再次 login，否则 login 可能会失败。
+   ///```
+   Future<V2TimCallback> logout() async {
+-    if (kIsWeb) {
++    if (TencentCloudChatSdkPlatform.instance.isPlatformRouted) {
+       V2TimCallback res = await TencentCloudChatSdkPlatform.instance.logout();
+       if (res.code == 0) {
+         currentLoginInfo.remove(currentLoginUserIDKey);
+@@ -409,6 +441,7 @@ class V2TIMManager {
+       );
+     }
+ 
++    // TIMManager 没有 sendC2CCustomMessage 方法，使用 MessageManager
+     return v2TIMMessageManager.sendCustomMessage(
+       data: customData,
+       receiver: userID,
+@@ -449,11 +482,19 @@ class V2TIMManager {
+         .sendGroupTextMessage(text: text, groupID: groupID, priority: priority);
+     }
+ 
+-    MessagePriorityEnum priorityEnum = MessagePriorityEnum.V2TIM_PRIORITY_DEFAULT;
+-    if (priority >= 0 && priority < MessagePriorityEnum.values.length) {
+-      priorityEnum = MessagePriorityEnum.values[priority];
++    // TIMManager 没有 sendGroupTextMessage 方法，使用 MessageManager
++    MessagePriorityEnum? priorityEnum;
++    if (priority == 1) {
++      priorityEnum = MessagePriorityEnum.V2TIM_PRIORITY_HIGH;
++    } else if (priority == 2) {
++      priorityEnum = MessagePriorityEnum.V2TIM_PRIORITY_NORMAL;
+     }
+-    return v2TIMMessageManager.sendTextMessage(text: text, receiver: '', groupID: groupID, priority: priorityEnum);
++    return v2TIMMessageManager.sendTextMessage(
++      text: text,
++      receiver: '',
++      groupID: groupID,
++      priority: priorityEnum,
++    );
+   }
+ 
+   /// 发送群聊自定义（信令）消息（最大支持 8KB）（自3.6.0开始弃用，请使用MessageManager下的高级收发消息）
+@@ -491,6 +532,7 @@ class V2TIMManager {
+       );
+     }
+ 
++    // TIMManager 没有 sendGroupCustomMessage 方法，使用 MessageManager
+     return v2TIMMessageManager.sendCustomMessage(
+       data: customData,
+       receiver: '',
+@@ -533,7 +575,9 @@ class V2TIMManager {
+         groupType: groupType, groupName: groupName, groupID: groupID);
+     }
+ 
+-    return v2TIMGroupManager.createGroup(groupType: groupType, groupName: groupName, groupID: groupID);
++    // TIMManager 没有 createGroup 方法，使用 GroupManager
++    return v2TIMGroupManager.createGroup(
++        groupType: groupType, groupName: groupName, groupID: groupID);
+   }
+ 
+   /// 加入群组
+@@ -551,7 +595,7 @@ class V2TIMManager {
+     required String message,
+     String? groupType,
+   }) async {
+-    if (kIsWeb) {
++    if (TencentCloudChatSdkPlatform.instance.isPlatformRouted) {
+       return TencentCloudChatSdkPlatform.instance.joinGroup(groupID: groupID, message: message, groupType: groupType);
+     }
+ 
+@@ -568,7 +612,7 @@ class V2TIMManager {
+   Future<V2TimCallback> quitGroup({
+     required String groupID,
+   }) async {
+-    if (kIsWeb) {
++    if (TencentCloudChatSdkPlatform.instance.isPlatformRouted) {
+       return TencentCloudChatSdkPlatform.instance.quitGroup(groupID: groupID);
+     }
+ 
+@@ -586,7 +630,7 @@ class V2TIMManager {
+   Future<V2TimCallback> dismissGroup({
+     required String groupID,
+   }) async {
+-    if (kIsWeb) {
++    if (TencentCloudChatSdkPlatform.instance.isPlatformRouted) {
+       return TencentCloudChatSdkPlatform.instance.dismissGroup(groupID: groupID);
+     }
+ 
+@@ -607,8 +651,12 @@ class V2TIMManager {
+     if (kIsWeb) {
+       return TencentCloudChatSdkPlatform.instance.getUsersInfo(userIDList: userIDList);
+     }
+-
+-    return TIMManager.instance.getUsersInfo(userIDList: userIDList);
++    // Prefer platform implementation when available (e.g. Tim2ToxSdkPlatform) so profile gets faceUrl from prefs.
++    try {
++      return await TencentCloudChatSdkPlatform.instance.getUsersInfo(userIDList: userIDList);
++    } on UnimplementedError {
++      return TIMManager.instance.getUsersInfo(userIDList: userIDList);
++    }
+   }
+ 
+   /// 修改个人资料
+@@ -742,12 +790,11 @@ class V2TIMManager {
+     String? uuid,
+   }) {
+     if (kIsWeb) {
+-      return TencentCloudChatSdkPlatform.instance.removeSimpleMsgListener(
++      return TIMManager.instance.removeSimpleMsgListener(
+         listener: listener,
+         uuid: uuid,
+       );
+     }
+-
+     return TIMManager.instance.removeSimpleMsgListener(
+       listener: listener,
+       uuid: uuid,
+@@ -761,11 +808,12 @@ class V2TIMManager {
+   Future<void> setGroupListener({
+     required V2TimGroupListener listener,
+   }) {
+-    if (kIsWeb) {
++    if (TencentCloudChatSdkPlatform.instance.isPlatformRouted) {
+       return TencentCloudChatSdkPlatform.instance.setGroupListener(listener: listener);
+     }
+ 
+-    TIMManager.instance.addGroupListener(listener: listener);
++    // TIMManager 没有 setGroupListener 方法，使用 TIMGroupManager
++    TIMGroupManager.instance.addGroupListener(listener);
+     return Future.value();
+   }
+ 
+@@ -776,11 +824,11 @@ class V2TIMManager {
+   Future<void> addGroupListener({
+     required V2TimGroupListener listener,
+   }) {
+-    if (kIsWeb) {
++    if (TencentCloudChatSdkPlatform.instance.isPlatformRouted) {
+       return TencentCloudChatSdkPlatform.instance.addGroupListener(listener: listener);
+     }
+ 
+-    TIMManager.instance.addGroupListener(listener: listener);
++    TIMGroupManager.instance.addGroupListener(listener);
+     return Future.value();
+   }
+ 
+@@ -790,11 +838,11 @@ class V2TIMManager {
+   Future<void> removeGroupListener({
+     V2TimGroupListener? listener,
+   }) {
+-    if (kIsWeb) {
++    if (TencentCloudChatSdkPlatform.instance.isPlatformRouted) {
+       return TencentCloudChatSdkPlatform.instance.removeGroupListener(listener: listener);
+     }
+ 
+-    TIMManager.instance.removeGroupListener(listener: listener);
++    TIMGroupManager.instance.removeGroupListener(listener: listener);
+     return Future.value();
+   }
+ 
+@@ -818,7 +866,7 @@ class V2TIMManager {
+   Future<V2TimValueCallback<List<V2TimUserStatus>>> getUserStatus({
+     required List<String> userIDList,
+   }) {
+-    if (kIsWeb) {
++    if (TencentCloudChatSdkPlatform.instance.isPlatformRouted) {
+       return TencentCloudChatSdkPlatform.instance.getUserStatus(userIDList: userIDList);
+     }
+ 
+@@ -832,7 +880,7 @@ class V2TIMManager {
+   Future<V2TimCallback> setSelfStatus({
+     required String status,
+   }) {
+-    if (kIsWeb) {
++    if (TencentCloudChatSdkPlatform.instance.isPlatformRouted) {
+       return TencentCloudChatSdkPlatform.instance.setSelfStatus(status: status);
+     }
+ 
+@@ -851,7 +899,7 @@ class V2TIMManager {
+   Future<V2TimCallback> subscribeUserStatus({
+     required List<String> userIDList,
+   }) {
+-    if (kIsWeb) {
++    if (TencentCloudChatSdkPlatform.instance.isPlatformRouted) {
+       return TencentCloudChatSdkPlatform.instance.subscribeUserStatus(userIDList: userIDList);
+     }
+ 
+@@ -865,7 +913,7 @@ class V2TIMManager {
+   Future<V2TimCallback> unsubscribeUserStatus({
+     required List<String> userIDList,
+   }) {
+-    if (kIsWeb) {
++    if (TencentCloudChatSdkPlatform.instance.isPlatformRouted) {
+       return TencentCloudChatSdkPlatform.instance.unsubscribeUserStatus(userIDList: userIDList);
+     }
+ 
+@@ -894,6 +942,7 @@ class V2TIMManager {
+       return Future.value();
+     }
+ 
++    // 注意：uikitTrace 主要用于 Web 平台，非 Web 平台可以忽略或使用其他日志方式
+     TIMManager.instance.writeSDKLog(
+       trace: trace,
+       logLevel: logLevel,
+@@ -920,6 +969,7 @@ class V2TIMManager {
+         .subscribeUserInfo(userIDList: userIDList);
+     }
+ 
++    // TIMFriendshipManager 没有 subscribeUserInfo 方法，使用 TIMManager
+     return TIMManager.instance.subscribeUserInfo(userIDList: userIDList);
+   }
+ 
+diff --git a/lib/manager/v2_tim_message_manager.dart b/lib/manager/v2_tim_message_manager.dart
+index f04778d..d257a16 100644
+--- a/lib/manager/v2_tim_message_manager.dart
++++ b/lib/manager/v2_tim_message_manager.dart
+@@ -54,12 +54,11 @@ class V2TIMMessageManager {
+   Future<void> addAdvancedMsgListener({
+     required V2TimAdvancedMsgListener listener,
+   }) {
+-    if (kIsWeb) {
++    if (TencentCloudChatSdkPlatform.instance.isPlatformRouted) {
+       return TencentCloudChatSdkPlatform.instance.addAdvancedMsgListener(
+         listener: listener,
+       );
+     }
+-
+     TIMMessageManager.instance.addAdvancedMsgListener(listener);
+     return Future.value();
+   }
+@@ -67,12 +66,11 @@ class V2TIMMessageManager {
+   /// 移除高级消息监听器
+   ///
+   Future<void> removeAdvancedMsgListener({V2TimAdvancedMsgListener? listener}) {
+-    if (kIsWeb) {
++    if (TencentCloudChatSdkPlatform.instance.isPlatformRouted) {
+       return TencentCloudChatSdkPlatform.instance.removeAdvancedMsgListener(
+         listener: listener,
+       );
+     }
+-
+     TIMMessageManager.instance.removeAdvancedMsgListener(listener: listener);
+     return Future.value();
+   }
+@@ -85,7 +83,6 @@ class V2TIMMessageManager {
+     if (kIsWeb) {
+       return TencentCloudChatSdkPlatform.instance.createTextMessage(text: text);
+     }
+-
+     V2TimMsgCreateInfoResult result = TIMMessageManager.instance.createTextMessage(text: text);
+     return V2TimValueCallback<V2TimMsgCreateInfoResult>.fromObject(result);
+   }
+@@ -110,12 +107,7 @@ class V2TIMMessageManager {
+         atUserList: atUserList,
+       );
+     }
+-
+-    V2TimMsgCreateInfoResult result = TIMMessageManager.instance.createTextAtMessage(
+-      text: text,
+-      atUserList: atUserList,
+-    );
+-
++    V2TimMsgCreateInfoResult result = TIMMessageManager.instance.createTextAtMessage(text: text, atUserList: atUserList);
+     return V2TimValueCallback<V2TimMsgCreateInfoResult>.fromObject(result);
+   }
+ 
+@@ -135,13 +127,7 @@ class V2TIMMessageManager {
+       return TencentCloudChatSdkPlatform.instance
+           .createCustomMessage(data: data, extension: extension, desc: desc);
+     }
+-
+-    V2TimMsgCreateInfoResult result = TIMMessageManager.instance.createCustomMessage(
+-        data: data,
+-        extension: extension,
+-        desc: desc
+-    );
+-
++    V2TimMsgCreateInfoResult result = TIMMessageManager.instance.createCustomMessage(data: data, desc: desc, extension: extension);
+     return V2TimValueCallback<V2TimMsgCreateInfoResult>.fromObject(result);
+   }
+ 
+@@ -164,12 +150,7 @@ class V2TIMMessageManager {
+           imageName: imageName,
+         );
+       }
+-
+-      V2TimMsgCreateInfoResult result = TIMMessageManager.instance.createImageMessage(
+-        imagePath: imagePath,
+-        imageName: imageName,
+-      );
+-
++      V2TimMsgCreateInfoResult result = TIMMessageManager.instance.createImageMessage(imagePath: imagePath, imageName: imageName);
+       return V2TimValueCallback<V2TimMsgCreateInfoResult>.fromObject(result);
+     }
+ 
+@@ -198,12 +179,7 @@ class V2TIMMessageManager {
+           duration: duration,
+         );
+       }
+-
+-      V2TimMsgCreateInfoResult result = TIMMessageManager.instance.createSoundMessage(
+-        soundPath: soundPath,
+-        duration: duration,
+-      );
+-
++      V2TimMsgCreateInfoResult result = TIMMessageManager.instance.createSoundMessage(soundPath: soundPath, duration: duration);
+       return V2TimValueCallback<V2TimMsgCreateInfoResult>.fromObject(result);
+     }
+     return V2TimValueCallback<V2TimMsgCreateInfoResult>.fromJson({
+@@ -243,14 +219,7 @@ class V2TIMMessageManager {
+           inputElement: inputElement,
+         );
+       }
+-
+-      V2TimMsgCreateInfoResult result = TIMMessageManager.instance.createVideoMessage(
+-        videoFilePath: videoFilePath,
+-        type: type,
+-        duration: duration,
+-        snapshotPath: snapshotPath,
+-      );
+-
++      V2TimMsgCreateInfoResult result = TIMMessageManager.instance.createVideoMessage(videoFilePath: videoFilePath, type: type, duration: duration, snapshotPath: snapshotPath);
+       return V2TimValueCallback<V2TimMsgCreateInfoResult>.fromObject(result);
+     }
+ 
+@@ -284,12 +253,7 @@ class V2TIMMessageManager {
+           inputElement: inputElement,
+         );
+       }
+-
+-      V2TimMsgCreateInfoResult result = TIMMessageManager.instance.createFileMessage(
+-        filePath: filePath,
+-        fileName: fileName,
+-      );
+-
++      V2TimMsgCreateInfoResult result = TIMMessageManager.instance.createFileMessage(filePath: filePath, fileName: fileName);
+       return V2TimValueCallback<V2TimMsgCreateInfoResult>.fromObject(result);
+     }
+ 
+@@ -321,13 +285,7 @@ class V2TIMMessageManager {
+         latitude: latitude,
+       );
+     }
+-
+-    V2TimMsgCreateInfoResult result = TIMMessageManager.instance.createLocationMessage(
+-      desc: desc,
+-      longitude: longitude,
+-      latitude: latitude,
+-    );
+-
++    V2TimMsgCreateInfoResult result = TIMMessageManager.instance.createLocationMessage(desc: desc, longitude: longitude, latitude: latitude);
+     return V2TimValueCallback<V2TimMsgCreateInfoResult>.fromObject(result);
+   }
+ 
+@@ -351,12 +309,7 @@ class V2TIMMessageManager {
+         data: data,
+       );
+     }
+-
+-    V2TimMsgCreateInfoResult result = TIMMessageManager.instance.createFaceMessage(
+-      index: index,
+-      data: data,
+-    );
+-
++    V2TimMsgCreateInfoResult result = TIMMessageManager.instance.createFaceMessage(index: index, data: data);
+     return V2TimValueCallback<V2TimMsgCreateInfoResult>.fromObject(result);
+   }
+ 
+@@ -425,7 +378,7 @@ class V2TIMMessageManager {
+   /// [msgID] **待废弃**，请使用 [message] 参数。
+   Future<V2TimValueCallback<V2TimMsgCreateInfoResult>> createForwardMessage(
+       {V2TimMessage? message, String? msgID, String? webMessageInstance}) async {
+-    if (kIsWeb) {
++    if (TencentCloudChatSdkPlatform.instance.isPlatformRouted) {
+       return TencentCloudChatSdkPlatform.instance.createForwardMessage(
+           msgID: msgID, webMessageInstance: webMessageInstance);
+     }
+@@ -450,16 +403,10 @@ class V2TIMMessageManager {
+         .createTargetedGroupMessage(id: id, receiverList: receiverList);
+     }
+ 
++    // 注意：接口支持 message 和 id 参数
+     V2TimMsgCreateInfoResult result = TIMMessageManager.instance.createTargetedGroupMessage(
+-        message: message,
+-        id: id ?? "",
+-        receiverList: receiverList);
+-
+-    if (result.messageInfo != null) {
+-      return V2TimValueCallback<V2TimMsgCreateInfoResult>.fromObject(result);
+-    } else {
+-      return V2TimValueCallback<V2TimMsgCreateInfoResult>.fromBool(false, "param is invalid");
+-    }
++        message: message, id: id, receiverList: receiverList);
++    return V2TimValueCallback<V2TimMsgCreateInfoResult>.fromObject(result);
+   }
+ 
+   /// 创建带 @ 标记的群消息
+@@ -486,17 +433,15 @@ class V2TIMMessageManager {
+       );
+     }
+ 
+-    V2TimMsgCreateInfoResult? result = TIMMessageManager.instance.createAtSignedGroupMessage(
+-      message: message,
+-      createdMsgID: createdMsgID ?? "",
++    // 注意：接口只支持 createdMsgID，不支持 message 参数
++    final result = TIMMessageManager.instance.createAtSignedGroupMessage(
++      createdMsgID: createdMsgID,
+       atUserList: atUserList,
+     );
+-
+     if (result.messageInfo != null) {
+-      return V2TimValueCallback<V2TimMessage>.fromObject(result.messageInfo!);
+-    } else {
+-      return V2TimValueCallback<V2TimMessage>.fromBool(false, "param is invalid");
++      return V2TimValueCallback<V2TimMessage>(code: 0, desc: '', data: result.messageInfo);
+     }
++    return V2TimValueCallback<V2TimMessage>(code: -1, desc: 'Failed to create at signed group message', data: null);
+   }
+ 
+   /// 添加多Element消息。**待废弃**
+@@ -517,12 +462,11 @@ class V2TIMMessageManager {
+       );
+     }
+ 
+-    V2TimMessage message = TIMMessageManager.instance.appendMessage(
+-      createMessageAppendId: createMessageAppendId,
++    final result = TIMMessageManager.instance.appendMessage(
+       createMessageBaseId: createMessageBaseId,
++      createMessageAppendId: createMessageAppendId,
+     );
+-
+-    return V2TimValueCallback<V2TimMessage>.fromObject(message);
++    return V2TimValueCallback<V2TimMessage>(code: 0, desc: '', data: result);
+   }
+ 
+   /// 发送消息
+@@ -562,7 +506,7 @@ class V2TIMMessageManager {
+     bool? isDisableCloudMessagePreHook,
+     bool? isDisableCloudMessagePostHook,
+   }) async {
+-    if (kIsWeb) {
++    if (TencentCloudChatSdkPlatform.instance.isPlatformRouted) {
+       return TencentCloudChatSdkPlatform.instance.sendMessage(
+         id: id,
+         receiver: receiver,
+@@ -582,13 +526,14 @@ class V2TIMMessageManager {
+       );
+     }
+ 
+-    return TIMMessageManager.instance.sendMessage(
++    // 注意：接口不支持 message 参数，只支持 id
++    return await TIMMessageManager.instance.sendMessage(
+       id: id,
+       message: message,
+       onSyncMsgID: onSyncMsgID,
+       receiver: receiver,
+       groupID: groupID,
+-      priority: priority!.index,
++      priority: priority?.index ?? 0,
+       onlineUserOnly: onlineUserOnly,
+       isExcludedFromUnreadCount: isExcludedFromUnreadCount,
+       isExcludedFromLastMessage: isExcludedFromLastMessage,
+@@ -614,7 +559,8 @@ class V2TIMMessageManager {
+           return await TencentCloudChatSdkPlatform.instance.downloadMergerMessage(msgID: msgID);
+         }
+ 
+-        return TIMMessageManager.instance.downloadMergerMessage(message: message, msgID: msgID);
++        // 注意：接口只支持 msgID，不支持 message 参数
++        return await TIMMessageManager.instance.downloadMergerMessage(msgID: msgID);
+   }
+ 
+   /// 设置用户消息接收选项
+@@ -638,7 +584,7 @@ class V2TIMMessageManager {
+       return TencentCloudChatSdkPlatform.instance.setC2CReceiveMessageOpt(userIDList: userIDList, opt: opt.index);
+     }
+ 
+-    return TIMMessageManager.instance.setC2CReceiveMessageOpt(userIDList: userIDList, opt: opt);
++    return await TIMMessageManager.instance.setC2CReceiveMessageOpt(userIDList: userIDList, opt: opt);
+   }
+ 
+   ///查询针对某个用户的 C2C 消息接收选项
+@@ -652,7 +598,7 @@ class V2TIMMessageManager {
+       return TencentCloudChatSdkPlatform.instance.getC2CReceiveMessageOpt(userIDList: userIDList);
+     }
+ 
+-    return TIMMessageManager.instance.getC2CReceiveMessageOpt(userIDList: userIDList);
++    return await TIMMessageManager.instance.getC2CReceiveMessageOpt(userIDList: userIDList);
+   }
+ 
+   /// 修改群消息接收选项
+@@ -668,11 +614,11 @@ class V2TIMMessageManager {
+     required String groupID,
+     required ReceiveMsgOptEnum opt,
+   }) async {
+-    if (kIsWeb) {
++    if (TencentCloudChatSdkPlatform.instance.isPlatformRouted) {
+       return TencentCloudChatSdkPlatform.instance.setGroupReceiveMessageOpt(groupID: groupID, opt: opt.index);
+     }
+ 
+-    return TIMMessageManager.instance.setGroupReceiveMessageOpt(groupID: groupID, opt: opt);
++    return await TIMMessageManager.instance.setGroupReceiveMessageOpt(groupID: groupID, opt: opt);
+   }
+ 
+   /// 设置全局消息接收选项
+@@ -704,7 +650,7 @@ class V2TIMMessageManager {
+           duration: duration);
+     }
+ 
+-    return TIMMessageManager.instance.setAllReceiveMessageOpt(
++    return await TIMMessageManager.instance.setAllReceiveMessageOpt(
+         opt: opt,
+         startHour: startHour,
+         startMinute: startMinute,
+@@ -732,8 +678,7 @@ class V2TIMMessageManager {
+           opt: opt, startTimeStamp: startTimeStamp, duration: duration);
+     }
+ 
+-    return TIMMessageManager.instance
+-        .setAllReceiveMessageOptWithTimestamp(
++    return await TIMMessageManager.instance.setAllReceiveMessageOptWithTimestamp(
+         opt: opt, startTimeStamp: startTimeStamp, duration: duration);
+   }
+ 
+@@ -743,7 +688,7 @@ class V2TIMMessageManager {
+       return TencentCloudChatSdkPlatform.instance.getAllReceiveMessageOpt();
+     }
+ 
+-    return TIMMessageManager.instance.getAllReceiveMessageOpt();
++    return await TIMMessageManager.instance.getAllReceiveMessageOpt();
+   }
+ 
+   /// 获取单聊历史消息
+@@ -773,11 +718,9 @@ class V2TIMMessageManager {
+           userID: userID, count: count, lastMsgID: lastMsgID);
+     }
+ 
+-    if (lastMsg != null) {
+-      return TIMMessageManager.instance.getC2CHistoryMessageList(userID: userID, count: count, lastMsg: lastMsg);
+-    } else {
+-      return TIMMessageManager.instance.getC2CHistoryMessageList(userID: userID, count: count, lastMsgID: lastMsgID);
+-    }
++    // 注意：接口支持 lastMsg 和 lastMsgID 参数
++    return await TIMMessageManager.instance.getC2CHistoryMessageList(
++        userID: userID, count: count, lastMsg: lastMsg, lastMsgID: lastMsgID);
+   }
+ 
+   /// 获取群组历史消息
+@@ -808,13 +751,9 @@ class V2TIMMessageManager {
+           groupID: groupID, count: count, lastMsgID: lastMsgID);
+     }
+ 
+-    if (lastMsg != null) {
+-      return TIMMessageManager.instance.getGroupHistoryMessageList(
+-          groupID: groupID, count: count, lastMsg: lastMsg);
+-    } else {
+-      return TIMMessageManager.instance.getGroupHistoryMessageList(
+-          groupID: groupID, count: count, lastMsgID: lastMsgID);
+-    }
++    // 注意：接口支持 lastMsg 和 lastMsgID 参数
++    return await TIMMessageManager.instance.getGroupHistoryMessageList(
++        groupID: groupID, count: count, lastMsg: lastMsg, lastMsgID: lastMsgID);
+   }
+ 
+   /// 获取历史消息高级接口
+@@ -900,8 +839,9 @@ class V2TIMMessageManager {
+       );
+     }
+ 
+-    return TIMMessageManager.instance.getHistoryMessageList(
+-        getType: getType,
++    // 注意：接口支持 lastMsg、lastMsgID、getType 和 lastMsgSeq 参数
++    return await TIMMessageManager.instance.getHistoryMessageList(
++        getType: getType ?? HistoryMsgGetTypeEnum.V2TIM_GET_LOCAL_OLDER_MSG,
+         userID: userID,
+         count: count,
+         lastMsg: lastMsg,
+@@ -983,9 +923,9 @@ class V2TIMMessageManager {
+     int? timeBegin,
+     int? timePeriod,
+   }) async {
+-    if (kIsWeb) {
++    if (TencentCloudChatSdkPlatform.instance.isPlatformRouted) {
+       return TencentCloudChatSdkPlatform.instance.getHistoryMessageListV2(
+-        getType: getType!.index,
++        getType: getType?.index ?? HistoryMsgGetTypeEnum.V2TIM_GET_LOCAL_OLDER_MSG.index,
+         userID: userID,
+         count: count,
+         lastMsgID: lastMsgID,
+@@ -998,8 +938,9 @@ class V2TIMMessageManager {
+       );
+     }
+ 
+-    return TIMMessageManager.instance.getHistoryMessageListV2(
+-      getType: getType,
++    // 注意：接口支持 lastMsg、lastMsgID、getType 和 lastMsgSeq 参数
++    return await TIMMessageManager.instance.getHistoryMessageListV2(
++      getType: getType ?? HistoryMsgGetTypeEnum.V2TIM_GET_LOCAL_OLDER_MSG,
+       userID: userID,
+       count: count,
+       lastMsg: lastMsg,
+@@ -1031,12 +972,13 @@ class V2TIMMessageManager {
+   /// ```
+   ///
+   Future<V2TimCallback> revokeMessage({V2TimMessage? message, String? msgID, Object? webMessageInstatnce}) async {
+-    if (kIsWeb) {
++    if (TencentCloudChatSdkPlatform.instance.isPlatformRouted) {
+       return TencentCloudChatSdkPlatform.instance
+-          .revokeMessage(msgID: msgID, webMessageInstatnce: webMessageInstatnce);
++          .revokeMessage(msgID: msgID ?? message?.msgID, webMessageInstatnce: webMessageInstatnce);
+     }
+ 
+-    return TIMMessageManager.instance.revokeMessage(message: message, msgID: msgID);
++    // 注意：接口支持 message 和 msgID 参数
++    return await TIMMessageManager.instance.revokeMessage(message: message, msgID: msgID);
+   }
+ 
+   /// 消息变更
+@@ -1049,7 +991,7 @@ class V2TIMMessageManager {
+   Future<V2TimValueCallback<V2TimMessageChangeInfo>> modifyMessage({
+     required V2TimMessage message,
+   }) async {
+-    if (kIsWeb) {
++    if (TencentCloudChatSdkPlatform.instance.isPlatformRouted) {
+       return await TencentCloudChatSdkPlatform.instance.modifyMessage(message: message);
+     }
+ 
+@@ -1074,8 +1016,7 @@ class V2TIMMessageManager {
+       return TencentCloudChatSdkPlatform.instance.setLocalCustomData(msgID: msgID, localCustomData: localCustomData);
+     }
+ 
+-    return TIMMessageManager.instance.setLocalCustomData(
+-        message: message, msgID: msgID, localCustomData: localCustomData);
++    return await TIMMessageManager.instance.setLocalCustomData(message: message, msgID: msgID, localCustomData: localCustomData);
+   }
+ 
+   /// 设置消息自定义数据，可以用来标记语音、视频消息是否已经播放（本地保存，不会发送到对端，程序卸载重装后失效）
+@@ -1094,8 +1035,7 @@ class V2TIMMessageManager {
+       return TencentCloudChatSdkPlatform.instance.setLocalCustomInt(msgID: msgID, localCustomInt: localCustomInt);
+     }
+ 
+-    return TIMMessageManager.instance.setLocalCustomInt(
+-        message: message, msgID: msgID, localCustomInt: localCustomInt);
++    return await TIMMessageManager.instance.setLocalCustomInt(message: message, msgID: msgID, localCustomInt: localCustomInt);
+   }
+ 
+   /// 设置云端自定义数据（云端保存，会发送到对端，程序卸载重装后还能拉取到）
+@@ -1114,7 +1054,7 @@ class V2TIMMessageManager {
+       return TencentCloudChatSdkPlatform.instance.setCloudCustomData(data: data, msgID: msgID);
+     }
+ 
+-    return TIMMessageManager.instance.setCloudCustomData(message: message, msgID: msgID, data: data);
++    return await TIMMessageManager.instance.setCloudCustomData(message: message, msgID: msgID, data: data);
+   }
+ 
+   /// 删除本地消息
+@@ -1136,7 +1076,7 @@ class V2TIMMessageManager {
+       return TencentCloudChatSdkPlatform.instance.deleteMessageFromLocalStorage(msgID: msgID);
+     }
+ 
+-    return TIMMessageManager.instance.deleteMessageFromLocalStorage(message: message, msgID: msgID);
++    return await TIMMessageManager.instance.deleteMessageFromLocalStorage(message: message, msgID: msgID);
+   }
+ 
+   /// 删除本地及漫游消息
+@@ -1158,12 +1098,13 @@ class V2TIMMessageManager {
+     List<V2TimMessage>? messageList,
+     List<String>? msgIDs,
+     List<dynamic>? webMessageInstanceList}) async {
+-    if (kIsWeb) {
++    if (TencentCloudChatSdkPlatform.instance.isPlatformRouted) {
+       return TencentCloudChatSdkPlatform.instance.deleteMessages(
+           msgIDs: msgIDs, webMessageInstanceList: webMessageInstanceList);
+     }
+ 
+-    return TIMMessageManager.instance.deleteMessages(msgList:messageList, msgIDs: msgIDs);
++    // 注意：接口支持 msgList 和 msgIDs 参数
++    return await TIMMessageManager.instance.deleteMessages(msgList: messageList, msgIDs: msgIDs);
+   }
+ 
+   /// 清空单聊本地及云端的消息（不删除会话）
+@@ -1178,13 +1119,12 @@ class V2TIMMessageManager {
+   Future<V2TimCallback> clearC2CHistoryMessage({
+     required String userID,
+   }) async {
+-    if (kIsWeb) {
++    if (TencentCloudChatSdkPlatform.instance.isPlatformRouted) {
+       return await TencentCloudChatSdkPlatform.instance
+           .clearC2CHistoryMessage(userID: userID);
+     }
+ 
+-    return await TIMMessageManager.instance
+-        .clearC2CHistoryMessage(userID: userID);
++    return await TIMMessageManager.instance.clearC2CHistoryMessage(userID: userID);
+   }
+ 
+   /// 清空群聊本地及云端的消息（不删除会话）
+@@ -1198,7 +1138,7 @@ class V2TIMMessageManager {
+   Future<V2TimCallback> clearGroupHistoryMessage({
+     required String groupID,
+   }) async {
+-    if (kIsWeb) {
++    if (TencentCloudChatSdkPlatform.instance.isPlatformRouted) {
+       return await TencentCloudChatSdkPlatform.instance.clearGroupHistoryMessage(groupID: groupID);
+     }
+ 
+@@ -1235,7 +1175,8 @@ class V2TIMMessageManager {
+       );
+     }
+ 
+-    return TIMMessageManager.instance.insertGroupMessageToLocalStorageV2(
++    // 注意：接口支持 message 和 createdMsgID 参数
++    return await TIMMessageManager.instance.insertGroupMessageToLocalStorageV2(
+       groupID: groupID,
+       senderID: senderID,
+       message: message,
+@@ -1272,7 +1213,8 @@ class V2TIMMessageManager {
+       );
+     }
+ 
+-    return TIMMessageManager.instance.insertC2CMessageToLocalStorageV2(
++    // 注意：接口支持 message 和 createdMsgID 参数
++    return await TIMMessageManager.instance.insertC2CMessageToLocalStorageV2(
+       userID: userID,
+       senderID: senderID,
+       message: message,
+@@ -1288,7 +1230,7 @@ class V2TIMMessageManager {
+   Future<V2TimValueCallback<List<V2TimMessage>>> findMessages({
+     required List<String> messageIDList,
+   }) async {
+-    if (kIsWeb) {
++    if (TencentCloudChatSdkPlatform.instance.isPlatformRouted) {
+       return await TencentCloudChatSdkPlatform.instance.findMessages(messageIDList: messageIDList);
+     }
+ 
+@@ -1322,7 +1264,7 @@ class V2TIMMessageManager {
+       return TencentCloudChatSdkPlatform.instance.searchCloudMessages(searchParam: searchParam);
+     }
+ 
+-    return TIMMessageManager.instance.searchCloudMessages(searchParam: searchParam);
++    return await TIMMessageManager.instance.searchCloudMessages(searchParam: searchParam);
+   }
+ 
+   /// 发送消息已读回执
+@@ -1341,13 +1283,14 @@ class V2TIMMessageManager {
+     List<V2TimMessage>? messageList,
+     List<String>? messageIDList,
+   }) async {
+-    if (kIsWeb) {
++    if (TencentCloudChatSdkPlatform.instance.isPlatformRouted) {
+       return await TencentCloudChatSdkPlatform.instance.sendMessageReadReceipts(
+         messageIDList: messageIDList,
+       );
+     }
+ 
+-    return TIMMessageManager.instance.sendMessageReadReceipts(messageList: messageList, messageIDList: messageIDList);
++    // 注意：接口支持 messageList 和 messageIDList 参数
++    return await TIMMessageManager.instance.sendMessageReadReceipts(messageList: messageList, messageIDList: messageIDList);
+   }
+ 
+   /// 获取消息已读回执
+@@ -1369,7 +1312,8 @@ class V2TIMMessageManager {
+       );
+     }
+ 
+-    return TIMMessageManager.instance.getMessageReadReceipts(messageList: messageList, messageIDList: messageIDList);
++    // 注意：接口支持 messageList 和 messageIDList 参数
++    return await TIMMessageManager.instance.getMessageReadReceipts(messageList: messageList, messageIDList: messageIDList);
+   }
+ 
+   /// 获取群消息已读群成员列表
+@@ -1486,11 +1430,11 @@ class V2TIMMessageManager {
+   /// - 如果单个 Reaction 用户数量超过最大限制，调用接口会报 23006 错误。
+   /// - 如果 Reaction 已经包含当前用户，调用接口会报 23007 错误。
+   Future<V2TimCallback> addMessageReaction({V2TimMessage? message, String? msgID, required String reactionID}) async {
+-    if (kIsWeb) {
++    if (TencentCloudChatSdkPlatform.instance.isPlatformRouted) {
+       return TencentCloudChatSdkPlatform.instance.addMessageReaction(msgID: msgID, reactionID: reactionID);
+     }
+ 
+-    return TIMMessageManager.instance.addMessageReaction(message: message, msgID: msgID, reactionID: reactionID);
++    return await TIMMessageManager.instance.addMessageReaction(message: message, msgID: msgID, reactionID: reactionID);
+   }
+ 
+   Future<V2TimCallback> removeMessageReaction({
+@@ -1498,11 +1442,11 @@ class V2TIMMessageManager {
+     String? msgID,
+     required String reactionID,
+   }) async {
+-    if (kIsWeb) {
++    if (TencentCloudChatSdkPlatform.instance.isPlatformRouted) {
+       return TencentCloudChatSdkPlatform.instance.removeMessageReaction(msgID: msgID, reactionID: reactionID);
+     }
+ 
+-    return TIMMessageManager.instance.removeMessageReaction(message: message, msgID: msgID, reactionID: reactionID);
++    return await TIMMessageManager.instance.removeMessageReaction(message: message, msgID: msgID, reactionID: reactionID);
+   }
+ 
+   /// 批量拉取多条消息回应信息
+@@ -1518,15 +1462,16 @@ class V2TIMMessageManager {
+     required int maxUserCountPerReaction,
+     List<String>? webMessageInstanceList,
+   }) async {
+-    if (kIsWeb) {
++    if (TencentCloudChatSdkPlatform.instance.isPlatformRouted) {
+       return TencentCloudChatSdkPlatform.instance.getMessageReactions(
+-        msgIDList: msgIDList,
++        msgIDList: msgIDList ?? [],
+         maxUserCountPerReaction: maxUserCountPerReaction,
+         webMessageInstanceList: webMessageInstanceList,
+       );
+     }
+ 
+-    return TIMMessageManager.instance.getMessageReactions(
++    // 注意：接口支持 messageList 和 msgIDList 参数
++    return await TIMMessageManager.instance.getMessageReactions(
+       messageList: messageList,
+       msgIDList: msgIDList,
+       maxUserCountPerReaction: maxUserCountPerReaction,
+@@ -1562,7 +1507,7 @@ class V2TIMMessageManager {
+       );
+     }
+ 
+-    return TIMMessageManager.instance.getAllUserListOfMessageReaction(
++    return await TIMMessageManager.instance.getAllUserListOfMessageReaction(
+       message: message,
+       msgID: msgID,
+       reactionID: reactionID,
+@@ -1613,7 +1558,7 @@ class V2TIMMessageManager {
+       );
+     }
+ 
+-    return TIMMessageManager.instance.convertVoiceToText(message: message, msgID: msgID, language: language);
++    return await TIMMessageManager.instance.convertVoiceToText(message: message, msgID: msgID, language: language);
+   }
+ 
+   /// 设置群消息置顶
+@@ -1636,8 +1581,7 @@ class V2TIMMessageManager {
+       return TencentCloudChatSdkPlatform.instance.pinGroupMessage(msgID: msgID, groupID: groupID, isPinned: isPinned);
+     }
+ 
+-    return TIMMessageManager.instance
+-        .pinGroupMessage(message: message, msgID: msgID, groupID: groupID, isPinned: isPinned);
++    return await TIMMessageManager.instance.pinGroupMessage(message: message, msgID: msgID, groupID: groupID, isPinned: isPinned);
+   }
+ 
+   /// 获取已置顶的群消息列表
+@@ -1646,7 +1590,7 @@ class V2TIMMessageManager {
+       return TencentCloudChatSdkPlatform.instance.getPinnedGroupMessageList(groupID: groupID);
+     }
+ 
+-    return TIMMessageManager.instance.getPinnedGroupMessageList(groupID: groupID);
++    return await TIMMessageManager.instance.getPinnedGroupMessageList(groupID: groupID);
+   }
+ 
+   /// 获取多媒体消息URL
+@@ -1659,7 +1603,7 @@ class V2TIMMessageManager {
+     V2TimMessage? message,
+     String? msgID,
+   }) async {
+-    if (kIsWeb) {
++    if (TencentCloudChatSdkPlatform.instance.isPlatformRouted) {
+       return await TencentCloudChatSdkPlatform.instance.getMessageOnlineUrl(msgID: msgID);
+     }
+ 
+@@ -1682,7 +1626,7 @@ class V2TIMMessageManager {
+     String? downloadPath, // 指定的下载路径
+     void Function(V2TimMessage message)? onDownloadFinished, // 下载完成的回调
+   }) async {
+-    if (kIsWeb) {
++    if (TencentCloudChatSdkPlatform.instance.isPlatformRouted) {
+       return await TencentCloudChatSdkPlatform.instance.downloadMessage(
+         msgID: msgID,
+         messageType: messageType,
+@@ -1989,7 +1933,7 @@ class V2TIMMessageManager {
+           data: data, groupID: groupID, sender: sender);
+     }
+ 
+-    return TIMMessageManager.instance.insertGroupMessageToLocalStorage(
++    return await TIMMessageManager.instance.insertGroupMessageToLocalStorage(
+         data: data, groupID: groupID, sender: sender);
+ 
+   }
+@@ -2007,8 +1951,7 @@ class V2TIMMessageManager {
+           data: data, userID: userID, sender: sender);
+     }
+ 
+-    return await TIMMessageManager.instance
+-        .insertC2CMessageToLocalStorage(
++    return await TIMMessageManager.instance.insertC2CMessageToLocalStorage(
+         data: data, userID: userID, sender: sender);
+   }
+ 
+@@ -2017,11 +1960,11 @@ class V2TIMMessageManager {
+   Future<V2TimCallback> markC2CMessageAsRead({
+     required String userID,
+   }) async {
+-    if (kIsWeb) {
++    if (TencentCloudChatSdkPlatform.instance.isPlatformRouted) {
+       return TencentCloudChatSdkPlatform.instance.markC2CMessageAsRead(userID: userID);
+     }
+ 
+-    return TIMMessageManager.instance.markC2CMessageAsRead(userID: userID);
++    return await TIMMessageManager.instance.markC2CMessageAsRead(userID: userID);
+   }
+ 
+   /// **待废弃** 请使用 [V2TIMConversationManager.cleanConversationUnreadMessageCount] 接口。设置群组消息已读。
+@@ -2029,11 +1972,11 @@ class V2TIMMessageManager {
+   Future<V2TimCallback> markGroupMessageAsRead({
+     required String groupID,
+   }) async {
+-    if (kIsWeb) {
++    if (TencentCloudChatSdkPlatform.instance.isPlatformRouted) {
+       return TencentCloudChatSdkPlatform.instance.markGroupMessageAsRead(groupID: groupID);
+     }
+ 
+-    return TIMMessageManager.instance.markGroupMessageAsRead(groupID: groupID);
++    return await TIMMessageManager.instance.markGroupMessageAsRead(groupID: groupID);
+   }
+ 
+   /// **待废弃** 请使用 [V2TIMConversationManager.cleanConversationUnreadMessageCount] 接口。标记所有消息为已读。
+-- 
+2.50.1 (Apple Git-155)
+

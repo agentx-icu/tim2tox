@@ -1,0 +1,14 @@
+# Patches for tencent_cloud_chat_sdk 8.9.7540+3 (one patch filename per line, applied in order).
+# Generated via `git format-patch baseline..HEAD` from a tim2tox/toxee work tree.
+# Note: 8.9.7540+3 dropped the 8.7.x "0005-native-adapter-additions" patch
+# (adapter freePointers memory-leak fixes and per-method defensive guards).
+# Upstream rewrote the adapters substantially in 8.9 and the old hunks no
+# longer apply; revisit when memory regressions surface or when an upstream
+# refactor stabilizes the surface enough to re-port. tim2tox depends on a
+# small set of backward-compat aliases in 0004 (timCallback2Future et al.)
+# until those callers move to the new addTimXxx2Map names.
+0001-native-library-name-override.patch
+0002-platform-interface-extension-points.patch
+0003-route-managers-through-platform.patch
+0004-native-library-manager-callback-dispatch.patch
+0005-models-and-bindings.patch
