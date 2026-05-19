@@ -9,6 +9,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'package:path_provider/path_provider.dart';
+import '../interfaces/logger_service.dart';
 import '../models/chat_message.dart';
 import 'conversation_id_utils.dart';
 
@@ -20,10 +21,43 @@ import 'conversation_id_utils.dart';
 class MessageHistoryPersistence {
   final int? _instanceId;
   final String? _historyDirectory;
+  final LoggerService? _logger;
 
-  MessageHistoryPersistence({int? instanceId, String? historyDirectory})
-      : _instanceId = instanceId,
-        _historyDirectory = historyDirectory;
+  MessageHistoryPersistence({
+    int? instanceId,
+    String? historyDirectory,
+    LoggerService? logger,
+  })  : _instanceId = instanceId,
+        _historyDirectory = historyDirectory,
+        _logger = logger {
+    // X11 from `local-storage-review-2026-05-18.md`:
+    // when no explicit per-account [historyDirectory] is injected we fall
+    // back to a single shared `<AppSupport>/chat_history` (or
+    // instance-scoped) directory. With more than one account on the device
+    // that silently merges histories — conversation files key on peer
+    // pubkey only, so messages from two different accounts to the same
+    // peer collide. Surface the issue at construction time so integrators
+    // notice early; do NOT change the default behaviour (that would
+    // require coordinated changes in every caller and would regress
+    // existing tests that rely on the shared default).
+    if (historyDirectory == null || historyDirectory.isEmpty) {
+      const warning =
+          '[MessageHistoryPersistence] no historyDirectory injected — '
+          'falling back to shared <AppSupport>/chat_history. '
+          'For multi-account isolation, callers should inject a '
+          'per-account historyDirectory (e.g. AppPaths.getAccountChatHistoryPath(toxId)).';
+      final logger = _logger;
+      if (logger != null) {
+        logger.logWarning(warning);
+      } else {
+        // No logger available — last resort so the warning still surfaces
+        // in dev consoles and test output without requiring the caller to
+        // wire one up.
+        // ignore: avoid_print
+        stderr.writeln(warning);
+      }
+    }
+  }
 
   // In-memory cache: conversationId -> List<ChatMessage>
   final Map<String, List<ChatMessage>> _historyById = {};
@@ -150,15 +184,27 @@ class MessageHistoryPersistence {
       
       // Write to temporary file first
       await tempFile.writeAsString(jsonString);
-      
+
       // Atomic rename: temp file -> final file
       // This ensures the file is either completely written or not present
       await tempFile.rename(file.path);
-      
-      // Clean up backup after successful write (optional, can keep for recovery)
-      // For now, we keep backups and clean them up on next successful write
-      
+
       completer.complete();
+
+      // X10: delete the backup we just used as a safety net. We only reach
+      // this point after `tempFile.rename` succeeded and the completer has
+      // been settled, so the user-visible save is durable; the backup is no
+      // longer needed and otherwise accumulates forever (`cleanupTempFiles`
+      // only sweeps `.bak` files older than 7 days). Wrapped in its own
+      // try/catch so a delete failure (file in use, permission) can never
+      // turn a successful save into a failed one.
+      try {
+        if (await backupFile.exists()) {
+          await backupFile.delete();
+        }
+      } catch (_) {
+        // Best-effort cleanup; leave the stale .bak for the 7-day sweep.
+      }
     } catch (e) {
       completer.completeError(e);
       // Don't silently fail - at least log or rethrow for critical errors
@@ -1033,6 +1079,79 @@ class MessageHistoryPersistence {
     } else {
       _historyById[normalizedId] = List<ChatMessage>.from(messages);
     }
+  }
+
+  // ---- Single-source-of-truth cache accessors (X4 consolidation) ----
+  //
+  // The previous design kept a parallel `_historyByIdInternal` map inside
+  // `FfiChatService` and lazily merged from `_historyById` here, which let the
+  // two drift (e.g. `_handleFileDone` mutated the FfiChatService list by index
+  // and only `_saveHistory`'d that one — the persistence cache never saw the
+  // update). These accessors expose the persistence map as the only writable
+  // in-memory store so FfiChatService can act as a thin client over it.
+
+  /// Lookup the cached list for [conversationId] WITHOUT defensive copy.
+  ///
+  /// Returns the mutable internal list (or null if absent). Callers may mutate
+  /// elements in place (e.g. `list[i] = updated`) and the mutations are
+  /// observable through subsequent [getHistory] / [cache] reads. After a
+  /// mutation, the caller is responsible for arranging persistence via
+  /// [saveHistory] (or [appendHistory] for new tail entries).
+  ///
+  /// Pure reads that want a defensive copy should keep using [getHistory].
+  ///
+  /// [conversationId] - Will be normalized before lookup.
+  List<ChatMessage>? getCachedList(String conversationId) {
+    final normalizedId = ConversationIdUtils.normalize(conversationId);
+    return _historyById[normalizedId];
+  }
+
+  /// Lookup the cached list for [conversationId], creating an empty list if
+  /// it does not yet exist. Returns the mutable internal list.
+  ///
+  /// Like [getCachedList], element mutations are observable downstream and the
+  /// caller is responsible for persistence.
+  ///
+  /// [conversationId] - Will be normalized before use.
+  List<ChatMessage> ensureCachedList(String conversationId) {
+    final normalizedId = ConversationIdUtils.normalize(conversationId);
+    return _historyById.putIfAbsent(normalizedId, () => <ChatMessage>[]);
+  }
+
+  /// Replace a single message in the cached list at [index]. No-op if the
+  /// conversation is not cached or the index is out of range.
+  ///
+  /// Does not touch disk — callers needing persistence should follow up with
+  /// [saveHistory] (or use [updateMessage] for the merge-aware path).
+  ///
+  /// [conversationId] - Will be normalized before lookup.
+  void replaceInCache(
+      String conversationId, int index, ChatMessage message) {
+    final normalizedId = ConversationIdUtils.normalize(conversationId);
+    final list = _historyById[normalizedId];
+    if (list == null || index < 0 || index >= list.length) return;
+    list[index] = message;
+  }
+
+  /// Remove the cached list for [conversationId]. Does not delete the on-disk
+  /// file — use [clearHistory] for the full clear semantics.
+  ///
+  /// [conversationId] - Will be normalized before removal.
+  void removeCachedHistory(String conversationId) {
+    final normalizedId = ConversationIdUtils.normalize(conversationId);
+    _historyById.remove(normalizedId);
+    // Also strip exact-match (un-normalized) variant to mirror legacy
+    // FfiChatService behaviour for ids that fail the equals check.
+    _historyById.remove(conversationId);
+  }
+
+  /// Clear ALL in-memory cached histories. Does not touch disk.
+  ///
+  /// Used by FfiChatService.dispose() to release per-account state without
+  /// disturbing the persisted JSON files (which are wiped via
+  /// [clearAllHistories] only on explicit account deletion).
+  void clearAllCached() {
+    _historyById.clear();
   }
   
   /// Update the last view timestamp for a conversation
