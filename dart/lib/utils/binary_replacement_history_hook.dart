@@ -1,11 +1,13 @@
 /// Binary replacement scheme history persistence hook
-/// 
+///
 /// This hook provides message persistence for binary replacement scheme by:
 /// 1. Wrapping V2TimAdvancedMsgListener to automatically save received messages
 /// 2. Intercepting history message queries to load from persistence service
+import 'dart:io';
 import 'package:tencent_cloud_chat_sdk/models/v2_tim_message.dart';
 import 'package:tencent_cloud_chat_sdk/enum/V2TimAdvancedMsgListener.dart';
 import 'package:tencent_cloud_chat_sdk/native_im/adapter/tim_message_manager.dart';
+import '../interfaces/logger_service.dart';
 import 'message_history_persistence.dart';
 import 'message_converter.dart';
 
@@ -15,6 +17,11 @@ import 'message_converter.dart';
 class BinaryReplacementHistoryHook {
   static MessageHistoryPersistence? _persistence;
   static String? _selfId;
+  static LoggerService? _logger;
+
+  /// Rate-limit the "empty selfId" warning to once per generation so we don't
+  /// flood logs on every message during the M6 deferred-selfId window.
+  static bool _warnedEmptySelfIdThisGeneration = false;
 
   /// Monotonic counter bumped on every [initialize] call.
   ///
@@ -37,9 +44,12 @@ class BinaryReplacementHistoryHook {
   static V2TimAdvancedMsgListener? _standaloneListener;
 
   /// Initialize the hook with persistence service and self ID
-  static void initialize(MessageHistoryPersistence persistence, String selfId) {
+  static void initialize(MessageHistoryPersistence persistence, String selfId,
+      {LoggerService? logger}) {
     _persistence = persistence;
     _selfId = selfId;
+    if (logger != null) _logger = logger;
+    _warnedEmptySelfIdThisGeneration = false;
     _generation++;
   }
 
@@ -63,8 +73,9 @@ class BinaryReplacementHistoryHook {
   /// happens exactly once via this dedicated listener. Idempotent — calling
   /// twice in the same session is a no-op after the first.
   static void installStandalone(
-      MessageHistoryPersistence persistence, String selfId) {
-    initialize(persistence, selfId);
+      MessageHistoryPersistence persistence, String selfId,
+      {LoggerService? logger}) {
+    initialize(persistence, selfId, logger: logger);
     if (_standaloneListener != null) return;
     final listener = V2TimAdvancedMsgListener(
       onRecvNewMessage: (V2TimMessage message) {
@@ -111,6 +122,18 @@ class BinaryReplacementHistoryHook {
     final capturedPersistence = _persistence;
     final capturedSelfId = _selfId;
     if (capturedPersistence == null || capturedSelfId == null) return;
+
+    // M6 deferred-selfId window: the standalone listener may have been
+    // installed before the connection event delivered a real selfId. In that
+    // case `isSelf` from MessageConverter cannot be trusted (will be false for
+    // self-sent echoes). We still persist the message — better than dropping
+    // it — but surface the window once per generation so it is observable.
+    if (capturedSelfId.isEmpty && !_warnedEmptySelfIdThisGeneration) {
+      _warnedEmptySelfIdThisGeneration = true;
+      _logFallback(
+          'BinaryReplacementHistoryHook: selfId empty during saveMessage — '
+          'isSelf may be inaccurate until updateSelfId() runs');
+    }
 
     try {
       // CRITICAL: Skip messages with m-prefix IDs from native FFI callbacks.
@@ -181,8 +204,22 @@ class BinaryReplacementHistoryHook {
       // save inside the try block so disk-quota / permission failures land in
       // the catch path instead of becoming silent uncaught Future errors.
       await capturedPersistence.appendHistory(conversationId, chatMsg);
-    } catch (e) {
-      // Silently handle errors to avoid breaking the app
+    } catch (e, st) {
+      _logFallback(
+          'BinaryReplacementHistoryHook.saveMessage failed: $e\n$st');
+    }
+  }
+
+  /// Route a log line through the injected [LoggerService] when available,
+  /// falling back to stderr so failures still surface in test consoles and
+  /// release builds that don't wire a logger.
+  static void _logFallback(String message) {
+    final logger = _logger;
+    if (logger != null) {
+      logger.logWarning(message);
+    } else {
+      // ignore: avoid_print
+      stderr.writeln(message);
     }
   }
 }
