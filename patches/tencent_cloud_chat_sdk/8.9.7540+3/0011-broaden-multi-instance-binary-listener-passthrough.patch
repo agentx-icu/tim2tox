@@ -1,0 +1,100 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: tim2tox-bootstrap <bootstrap@local>
+Date: Wed, 20 May 2026 09:10:00 -0700
+Subject: [PATCH 11/11] _handleGlobalCallback: broaden multi-instance
+ binary-listener passthrough
+
+Extension of 0008's `passthroughCallbacks` carve-out to cover four more
+callback types that suffer from the same architectural mismatch: the
+binary-replacement path's SDK-listener and advanced-msg-listener
+channels.
+
+`NativeLibraryManager._handleGlobalCallback` dispatches every callback
+with an `instance_id` to `Tim2ToxSdkPlatform.dispatchInstanceGlobalCallback`
+and then early-returns for non-zero instances (so the SDK singleton
+doesn't double-fire on instance 0). 0008 carved out
+`FriendAddRequest` + `GroupTipsEvent` so listeners registered via the
+SDK singleton (`TIMFriendshipManager.instance.addFriendListener` /
+`TIMGroupManager.instance.addGroupListener`) still fire on non-zero
+instances. tim2tox auto_tests and toxee use the singleton pattern for
+those listener categories.
+
+The same mismatch affects:
+
+  * `OnUserStatusChanged` — auto_tests register via
+    `TIMManager.instance.addSDKListener` which populates the singleton
+    `v2TimSDKListenerList`, not the platform's per-instance map.
+    Without passthrough, `scenario_user_status_virtual_test` times out.
+  * `SelfInfoUpdated` — same singleton path. Without passthrough,
+    `scenario_events_virtual_test` times out.
+  * `UserInfoChanged` — same singleton path. Added defensively because
+    the production usage pattern (SDKListener) is identical to the
+    above two. No test currently asserts on it, but the symmetry is
+    the right shape.
+  * `ReceiveNewMessage` — auto_tests register via
+    `TIMMessageManager.instance.addAdvancedMsgListener` which
+    populates the singleton `_advancedMessageListener`, not the
+    platform's per-instance map. Without passthrough,
+    `scenario_avatar_virtual_test` times out (waiting for the avatar-
+    update message to land in `onRecvNewMessage`).
+
+Double-dispatch risk in clients that use BOTH paths simultaneously
+(toxee — uses platform for history + binary for UIKit listeners):
+
+  * `ReceiveNewMessage`: `BinaryReplacementHistoryHook.saveMessage`
+    (dart/lib/utils/binary_replacement_history_hook.dart) already
+    dedups via msgID match + content/sender/timestamp fallback within
+    a 2-second window. Duplicate dispatches are suppressed before
+    they reach persistence. The binary-path listener (UIKit fan-out)
+    expects to receive the event on instance 0, which is the only
+    instance toxee ever runs at — non-zero instances only exist in
+    auto_tests. So in practice, toxee never sees a non-zero instance
+    here at all, and the new passthrough has zero effect on toxee.
+  * `UserStatusChanged` / `SelfInfoUpdated` / `UserInfoChanged`:
+    same observation — toxee runs at instance 0 exclusively. The
+    passthrough only changes behavior for the multi-instance test
+    runner.
+
+Net result: auto_tests in Phase 6 / Phase 7 / Phase 12 that wait for
+these singleton-side callbacks now receive them. toxee is unaffected.
+---
+ .../bindings/native_library_manager.dart      | 22 ++++++++++++++++++-
+ 1 file changed, 21 insertions(+), 1 deletion(-)
+
+diff --git a/lib/native_im/bindings/native_library_manager.dart b/lib/native_im/bindings/native_library_manager.dart
+--- a/lib/native_im/bindings/native_library_manager.dart
++++ b/lib/native_im/bindings/native_library_manager.dart
+@@ -377,10 +377,30 @@
+       // Without GroupTipsEvent in this list, the multi-instance test path
+       // (Tim2ToxSdkPlatform.dispatchInstanceGlobalCallback) early-returns on
+       // `grpList.isEmpty` and the event is lost — tests waiting for
+       // onGroupInvited / onMemberInvited / onGroupCreated time out.
++      //
++      // The same architectural mismatch affects SDK-listener / advanced-msg
++      // listener channels. Phase 6/7/12 virtual tests register listeners via
++      // `TIMManager.instance.addSDKListener` (singleton `v2TimSDKListenerList`)
++      // and `TIMMessageManager.instance.addAdvancedMsgListener` (singleton
++      // `_advancedMessageListener`), not via the platform's per-instance
++      // listener maps. Without passthrough the events are dropped and tests
++      // timeout waiting for OnUserStatusChanged / SelfInfoUpdated /
++      // UserInfoChanged / ReceiveNewMessage.
++      //
++      // Double-dispatch risk in clients using BOTH paths (toxee): the
++      // platform-side listeners fire first and the SDK singleton then fires.
++      // For ReceiveNewMessage, `BinaryReplacementHistoryHook` dedups via
++      // msgID + (fromUserId, text, isSelf, timestamp within 2s), so duplicate
++      // saves are suppressed before they touch persistence. For SDK status
++      // events (UserStatusChanged / SelfInfoUpdated / UserInfoChanged) the
++      // singleton listener list is the toxee/UIKit fan-out — running it on a
++      // non-zero instance is the desired behavior, identical to instance 0.
+       const passthroughCallbacks = <int>{};
+       final shouldPassthrough = callbackType ==
+               GlobalCallbackType.FriendAddRequest.value ||
+           callbackType == GlobalCallbackType.GroupTipsEvent.value ||
++          callbackType == GlobalCallbackType.UserStatusChanged.value ||
++          callbackType == GlobalCallbackType.SelfInfoUpdated.value ||
++          callbackType == GlobalCallbackType.UserInfoChanged.value ||
++          callbackType == GlobalCallbackType.ReceiveNewMessage.value ||
+           passthroughCallbacks.contains(callbackType);
+       if (instanceId != 0 && !shouldPassthrough) {
+         return;

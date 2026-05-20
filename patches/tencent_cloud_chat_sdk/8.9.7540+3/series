@@ -17,3 +17,8 @@
 0004-native-library-manager-callback-dispatch.patch
 0005-models-and-bindings.patch
 0006-group-members-info-adapter-fix.patch
+0007-v2-tim-message-risk-type-null-safety.patch
+0008-callback-passthrough-group-tips-event.patch
+0009-v2-tim-group-info-null-safety.patch
+0010-conference-group-created-and-member-invited.patch
+0011-broaden-multi-instance-binary-listener-passthrough.patch

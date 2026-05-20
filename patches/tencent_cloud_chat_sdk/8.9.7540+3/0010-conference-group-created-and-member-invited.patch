@@ -1,0 +1,74 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: tim2tox-bootstrap <bootstrap@local>
+Date: Wed, 20 May 2026 09:00:00 -0700
+Subject: [PATCH 10/10] Fix onGroupCreated on JOIN tip and tolerate missing
+ opUser in V2TimMemberInvited.fromJson
+
+Two singleton-path regressions surfaced once 0008 let GroupTipsEvent
+fall through to the SDK's `NativeLibraryManager._notifyGroupTips`
+dispatcher (binary-replacement path).
+
+Symptoms in tim2tox auto_tests Phase 5/9 conference scenarios
+(`scenario_toxav_conference_virtual_test`,
+`scenario_conference_virtual_test`,
+`scenario_conference_simple_virtual_test`):
+
+  1. The local creator never received `onGroupCreated`. C++
+     `OnGroupCreated` (`ffi/dart_compat_listeners.cpp`) emits a JOIN
+     tip with an empty `memberList` and an empty `opMember.userID`
+     to signal "group was just created by me". The Platform-path
+     `Tim2ToxSdkPlatform` already translates that shape to
+     `onGroupCreated`, but `_notifyGroupTips`'s JOIN case only fires
+     `onMemberEnter` when `groupMemberList.isNotEmpty`, so this
+     event was silently dropped on the singleton path.
+
+  2. `type 'Null' is not a subtype of type 'Map<dynamic, dynamic>'`
+     in `V2TimMemberInvited.fromJson` when an invite-result callback
+     arrived without an `opUser` field. The crash aborted the entire
+     callback dispatch via the outer try/catch in
+     `_handleNativeMessage`.
+
+Fix (mirrors prior null-tolerance patches 0007 and 0009):
+
+  - `_notifyGroupTips` JOIN case: when both `groupMemberList` is
+    empty and `opUser.userID` is empty, fire `_groupListener?.onGroupCreated(groupID)`.
+    Otherwise keep existing `onMemberEnter` behavior.
+  - `V2TimMemberInvited.fromJson`: default `json['opUser']` to `{}`
+    before passing into `V2TimGroupMemberInfo.fromJson`. The inner
+    constructor already tolerates an empty map.
+
+After this fix, Phase 5 `scenario_toxav_conference_virtual_test`
+and Phase 9 conference scenarios pass on both Platform and
+binary-replacement paths.
+---
+ lib/models/v2_tim_member_invited.dart                  | 2 +-
+ lib/native_im/bindings/native_library_manager.dart     | 5 ++++-
+ 2 files changed, 5 insertions(+), 2 deletions(-)
+
+diff --git a/lib/models/v2_tim_member_invited.dart b/lib/models/v2_tim_member_invited.dart
+--- a/lib/models/v2_tim_member_invited.dart
++++ b/lib/models/v2_tim_member_invited.dart
+@@ -21,7 +21,7 @@
+   V2TimMemberInvited.fromJson(Map json) {
+     json = Utils.formatJson(json);
+     groupID = json['groupID'] ?? '';
+-    opUser = V2TimGroupMemberInfo.fromJson(json['opUser']);
++    opUser = V2TimGroupMemberInfo.fromJson(json['opUser'] ?? {});
+     if (json['memberList'] != null) {
+       memberList = List.empty(growable: true);
+       json['memberList'].forEach((v) {
+diff --git a/lib/native_im/bindings/native_library_manager.dart b/lib/native_im/bindings/native_library_manager.dart
+--- a/lib/native_im/bindings/native_library_manager.dart
++++ b/lib/native_im/bindings/native_library_manager.dart
+@@ -1212,7 +1212,10 @@
+       case GroupTipsElemType.V2TIM_GROUP_TIPS_TYPE_JOIN:
+         // 剔除自己
+         groupMemberList.removeWhere((member) => member.userID == loginUser);
+-        if (groupMemberList.isNotEmpty) {
++        final opUserID = opUser.userID ?? '';
++        if (groupMemberList.isEmpty && opUserID.isEmpty) {
++          _groupListener?.onGroupCreated(groupID);
++        } else if (groupMemberList.isNotEmpty) {
+           _groupListener?.onMemberEnter(groupID, groupMemberList);
+         }
+

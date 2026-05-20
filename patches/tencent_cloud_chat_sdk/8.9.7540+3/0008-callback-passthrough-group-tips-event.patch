@@ -1,0 +1,88 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: tim2tox-bootstrap <bootstrap@local>
+Date: Wed, 20 May 2026 07:25:00 -0700
+Subject: [PATCH 8/8] _handleGlobalCallback: also pass through GroupTipsEvent
+ to singleton listener
+
+Mirror of 0004's FriendAddRequest dual-fire for the group-tips channel.
+
+`NativeLibraryManager._handleGlobalCallback` already dispatches every
+incoming callback to the platform via
+`platform.dispatchInstanceGlobalCallback(...)` when an `instance_id` is
+present, and for non-zero instance it early-returns so the SDK's own
+singleton handler doesn't double-fire. The only exception was
+`FriendAddRequest`, which was deliberately allowed to fall through so
+that callers who register friendship listeners through the SDK
+singleton (`TIMFriendshipManager.instance.addFriendListener`) still
+receive friend requests on multi-instance test runs.
+
+Group listeners had the same architectural mismatch but no
+fall-through. tim2tox auto_tests and toxee both register group
+listeners via `TIMGroupManager.instance.addGroupListener` (which goes
+into the SDK singleton's `v2TimGroupListenerList`, not into
+`Tim2ToxSdkPlatform._instanceGroupListeners`). When a Tox group invite
+arrived on a non-zero instance:
+
+  1. The platform's `dispatchInstanceGlobalCallback` was called.
+  2. Inside `GroupTipsEvent`, `grpList = _instanceGroupListeners[id]
+     ?? []` was empty (no platform-side registration), so it hit
+     `if (grpList.isEmpty) break;` and dropped the event.
+  3. `_handleGlobalCallback` then early-returned without calling
+     `_groupListener?.onMemberInvited(...)`.
+
+Result: every multi-node Phase 4 (Group) virtual scenario that
+expected `onGroupInvited` / `onMemberInvited` / `onGroupCreated` /
+`onMemberEnter` timed out in `setUpAll`, even though the C++ side was
+firing the callback correctly. Eight of ten group virtual tests were
+affected (group_message, group_invite, group_double_invite,
+group_state, group_sync, group_topic_revert, group_moderation, group).
+The two that passed (group_save, group_topic) don't rely on group
+callbacks.
+
+Fix: extend the existing fall-through allowlist to also cover
+`GlobalCallbackType.GroupTipsEvent`. The platform handler still runs
+first; if it has its own platform-registered listeners it fires them
+and the singleton fire is a no-op (the singleton `_groupListener` is
+typically the SDK's internal fan-out which respects its own list). If
+it has none (the toxee/auto_tests case), the singleton path fires
+correctly.
+
+A small `passthroughCallbacks` set is introduced so future additions
+to the dual-fire list don't keep growing the conditional. Behavior is
+unchanged for FriendAddRequest.
+---
+ .../bindings/native_library_manager.dart      | 20 +++++++++++++++----
+ 1 file changed, 17 insertions(+), 3 deletions(-)
+
+diff --git a/lib/native_im/bindings/native_library_manager.dart b/lib/native_im/bindings/native_library_manager.dart
+--- a/lib/native_im/bindings/native_library_manager.dart
++++ b/lib/native_im/bindings/native_library_manager.dart
+@@ -366,10 +366,24 @@
+     if (instanceId != null && platform.isCustomPlatform) {
+       platform.dispatchInstanceGlobalCallback(
+           instanceId, callbackType, dataFromNativeMap);
+-      // For non-zero instance, only fall through for FriendAddRequest so
+-      // _friendshipListener is also called (matches 8.7 tim2tox behavior).
+-      if (instanceId != 0 &&
+-          callbackType != GlobalCallbackType.FriendAddRequest.value) {
++      // For non-zero instance, fall through for a small set of callbacks so the
++      // SDK's singleton `_friendshipListener` / `_groupListener` are also called.
++      // This matches the 8.7 tim2tox behavior and is required for clients (and
++      // auto_tests) that register listeners via `TIMFriendshipManager.instance.
++      // addFriendListener` / `TIMGroupManager.instance.addGroupListener` instead
++      // of the platform's per-instance addGroupListener (which is the typical
++      // toxee + auto_tests pattern).
++      //
++      // Without GroupTipsEvent in this list, the multi-instance test path
++      // (Tim2ToxSdkPlatform.dispatchInstanceGlobalCallback) early-returns on
++      // `grpList.isEmpty` and the event is lost — tests waiting for
++      // onGroupInvited / onMemberInvited / onGroupCreated time out.
++      const passthroughCallbacks = <int>{};
++      final shouldPassthrough = callbackType ==
++              GlobalCallbackType.FriendAddRequest.value ||
++          callbackType == GlobalCallbackType.GroupTipsEvent.value ||
++          passthroughCallbacks.contains(callbackType);
++      if (instanceId != 0 && !shouldPassthrough) {
+         return;
+       }
+     }

@@ -1,0 +1,52 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: tim2tox-bootstrap <bootstrap@local>
+Date: Wed, 20 May 2026 07:00:00 -0700
+Subject: [PATCH 7/7] V2TimMessage.fromJson: tolerate missing
+ message_risk_type_identified
+
+`_riskTypeIdentified` is declared as a non-nullable `int` (default 0), but
+`V2TimMessage.fromJson` reads `json['message_risk_type_identified']`
+directly into it without a null fallback. Any callback JSON that omits
+this field (e.g. the apiCallback sendMessage success path constructed by
+`MessageVectorToJsonLocal` in `ffi/dart_compat_message.cpp`) drops a
+`null` into a non-nullable int slot and the immediate `> 1` comparison
+on the next line throws `TypeError: type 'Null' is not a subtype of
+type 'int'`.
+
+The throw is swallowed by the outer try/catch in `_handleNativeMessage`
+(lib/native_im/bindings/native_library_manager.dart) and only logged,
+which silently aborts every downstream callback dispatch on that JSON
+payload. Observed effects:
+
+- Binary-replacement path: callbackType 7 (ReceiveNewMessage) never
+  reaches `_advancedMessageListener.onRecvNewMessage`, so
+  scenario_native_callback_dispatch_test ReceiveNewMessage subtest
+  hangs to its 5s timeout.
+- Platform / send path: `sendMessage` apiCallback completion never
+  fires its `Completer<V2TimValueCallback<V2TimMessage>>`, hanging
+  every scenario that awaits a sendMessage after friendship is up
+  (scenario_multi_instance_virtual_test "Nodes can connect via
+  127.0.0.1 bootstrap", scenario_friend_read_receipt_virtual_test
+  "Send read receipt", etc.).
+
+Fix: read with a null-coalescing fallback to 0 so the comparison on
+the next line is always safe. This matches the declared default of
+the field and the value the C++ side emits when populated.
+---
+ lib/models/v2_tim_message.dart | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/lib/models/v2_tim_message.dart b/lib/models/v2_tim_message.dart
+--- a/lib/models/v2_tim_message.dart
++++ b/lib/models/v2_tim_message.dart
+@@ -313,7 +313,7 @@
+     isExcludedFromLastMessage = json['message_excluded_from_last_message'];
+     isExcludedFromContentModeration = json['message_excluded_from_content_moderation'];
+     customModerationConfigurationID = json['message_custom_moderation_configuration_id'];
+-    _riskTypeIdentified = json['message_risk_type_identified'];
++    _riskTypeIdentified = (json['message_risk_type_identified'] as int?) ?? 0;
+     hasRiskContent = _riskTypeIdentified > 1 ? true : false;
+     isDisableCloudMessagePreHook = json['message_disable_cloud_message_pre_hook'];
+     isDisableCloudMessagePostHook = json['message_disable_cloud_message_post_hook'];
+--
+2.50.1 (Apple Git-155)
