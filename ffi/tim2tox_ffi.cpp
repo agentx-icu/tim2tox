@@ -651,6 +651,19 @@ int64_t tim2tox_ffi_create_test_instance_ex(const char* init_path, int local_dis
     V2TIM_LOG(kInfo, "[ffi] create_test_instance_ex: InitSDK completed successfully for instance={} (instance_id={})", (void*)instance, (long long)instance_id);
 
     MarkInstanceInited(instance_id);
+
+    // Replay any previously-registered listener callbacks on this new instance.
+    // The Tencent SDK's TIMManager.initSDK early-returns when _isInitSDK is true, so
+    // the second-and-later test instances never reach setGroupListener / setFriendshipListener
+    // again. Without this, the second instance's V2TIMManagerImpl.group_listeners_ is
+    // empty, and multi-node tests that wait for onGroupInvited / onMemberInvited time
+    // out (the Tox group invite arrives on the second instance, the C++ side fires the
+    // callback, but there is no Dart-side listener to receive it).
+    // Defined in dart_compat_listeners.cpp; declared here to avoid pulling in
+    // dart_compat_internal.h (which depends on full Dart listener class definitions).
+    extern void ReplayListenersForNewInstance(int64_t instance_id, V2TIMManagerImpl* manager);
+    ReplayListenersForNewInstance(instance_id, instance);
+
     return instance_id;
 }
 

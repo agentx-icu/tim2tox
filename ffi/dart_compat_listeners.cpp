@@ -2786,6 +2786,90 @@ DartCommunityListenerImpl* GetOrCreateCommunityListener() {
     return listener;
 }
 
+// Helper function to replay previously-registered listener callbacks on a newly-created
+// test instance. The Tencent SDK's TIMManager.initSDK is a Dart-side singleton with an
+// early-return guard (`if (_isInitSDK) return true`), so when a multi-instance test creates
+// a second test instance and calls initSDK on it, the SDK's internal listener wiring
+// (TIMGroupManager.init -> setGroupListener -> DartSetGroupTipsEventCallback, etc.) is
+// silently skipped. The result was that only the FIRST node's V2TIMManagerImpl had
+// listeners registered; the SECOND node received Tox callbacks (e.g. group invite,
+// member-info-change) but had an empty group_listeners_ set, so the events never
+// reached Dart. Symptom: tests waiting for `onGroupInvited` time out.
+//
+// Fix: after a new test instance finishes InitSDK, replay any callback user_data that
+// was already registered for instance_id 0 (default singleton) or any earlier instance,
+// and register the matching DartListenerImpl on this new instance's manager.
+//
+// This is the per-instance mirror of the loop inside DartSetGroupTipsEventCallback that
+// iterates all instances when Dart calls it explicitly. Together they guarantee:
+//   - Listener registered before this instance existed -> picked up here (this function)
+//   - Listener registered after this instance exists  -> picked up by the existing loop
+void ReplayListenersForNewInstance(int64_t instance_id, V2TIMManagerImpl* manager) {
+    if (!manager) return;
+
+    // Forward declaration for callback user_data map (defined in dart_compat_utils.cpp).
+    // We scan the map directly here instead of going through GetCallbackUserData() because
+    // GetCallbackUserData only falls back instance_id != 0 -> 0; in the multi-instance
+    // test case the user_data is actually stored under instance_id == 1 (the first test
+    // instance whose Dart-side initSDK ran the singleton DartSet*Callback registration),
+    // and there is no entry under instance_id == 0 to fall back to.
+    extern std::map<std::pair<int64_t, std::string>, void*> g_callback_user_data;
+    extern std::mutex g_callback_user_data_mutex;
+    extern void StoreCallbackUserData(int64_t instance_id, const std::string& callback_name, void* user_data);
+
+    // Look up the most-recently-registered user_data for a callback name across all
+    // instances. We prefer the first non-self entry to avoid replaying our own
+    // freshly-stored value (which would be a no-op anyway, but cleaner).
+    auto find_existing_user_data = [&](const std::string& name) -> void* {
+        std::lock_guard<std::mutex> lock(g_callback_user_data_mutex);
+        for (const auto& kv : g_callback_user_data) {
+            if (kv.first.second == name && kv.first.first != instance_id && kv.second) {
+                return kv.second;
+            }
+        }
+        return nullptr;
+    };
+
+    // Group listener: needed for onMemberInvited, onGroupCreated, onMemberEnter, etc.
+    bool group_registered = false;
+    auto register_group_listener = [&]() {
+        if (group_registered) return;
+        DartGroupListenerImpl* listener = GetOrCreateGroupListenerForInstance(instance_id);
+        if (listener) {
+            manager->AddGroupListener(listener);
+            group_registered = true;
+        }
+    };
+    if (void* group_ud = find_existing_user_data("GroupTipsEvent")) {
+        StoreCallbackUserData(instance_id, "GroupTipsEvent", group_ud);
+        register_group_listener();
+    }
+    if (void* group_attr_ud = find_existing_user_data("GroupAttributeChanged")) {
+        StoreCallbackUserData(instance_id, "GroupAttributeChanged", group_attr_ud);
+        register_group_listener();
+    }
+    if (void* group_ctr_ud = find_existing_user_data("GroupCounterChanged")) {
+        StoreCallbackUserData(instance_id, "GroupCounterChanged", group_ctr_ud);
+        register_group_listener();
+    }
+
+    // Friendship listener: friend tests already have an on-demand fallback in
+    // V2TIMManagerImpl::HandleFriendRequest (GetOrCreateFriendshipListenerForInstance),
+    // but other friendship events (HandleFriendConnectionStatus, HandleFriendStatus,
+    // HandleFriendName) only iterate already-registered listeners and do not auto-create.
+    // Mirror the same replay here so they fire on the new instance.
+    if (void* friend_add_ud = find_existing_user_data("AddFriend")) {
+        StoreCallbackUserData(instance_id, "AddFriend", friend_add_ud);
+        DartFriendshipListenerImpl* listener = GetOrCreateFriendshipListenerForInstance(instance_id);
+        if (listener) {
+            auto* fm = manager->GetFriendshipManager();
+            if (fm) {
+                fm->AddFriendListener(listener);
+            }
+        }
+    }
+}
+
 // Helper function to cleanup listeners for a specific instance
 // Note: This should be called before destroying the instance to remove listeners from managers
 // This function is defined here (not in dart_compat_utils.cpp) because it needs access to the complete listener class definitions

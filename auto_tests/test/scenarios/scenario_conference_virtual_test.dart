@@ -139,7 +139,6 @@ void main() {
             TIMGroupManager.instance.inviteUserToGroup(
               groupID: groupId,
               userList: [bobPublicKey, charliePublicKey],
-              instanceId: alice.testInstanceHandle,
             ));
         expect(inviteResult.code, equals(0));
         expect(inviteResult.data, isNotNull);
@@ -265,7 +264,6 @@ void main() {
           TIMGroupManager.instance.inviteUserToGroup(
             groupID: groupId,
             userList: [bob.getPublicKey(), charlie.getPublicKey()],
-            instanceId: alice.testInstanceHandle,
           ));
       expect(inviteResult.code, equals(0));
       await pumpTestTick(scenario, advanceMs: 2000, iterationsPerInstance: 1);
@@ -449,7 +447,6 @@ void main() {
             TIMGroupManager.instance.inviteUserToGroup(
               groupID: groupId,
               userList: [bobPk],
-              instanceId: alice.testInstanceHandle,
             ));
         expect(inviteResult.code, equals(0));
         expect(inviteResult.data, isNotNull);

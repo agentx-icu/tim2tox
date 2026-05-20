@@ -1122,9 +1122,33 @@ void V2TIMMessageManagerImpl::SearchCloudMessages(const V2TIMMessageSearchParam&
 void V2TIMMessageManagerImpl::SendMessageReadReceipts(const V2TIMMessageVector& messageList, V2TIMCallback* callback) { ReportNotImplemented(callback); }
 void V2TIMMessageManagerImpl::GetMessageReadReceipts(const V2TIMMessageVector& messageList, V2TIMValueCallback<V2TIMMessageReceiptVector>* callback) { ReportNotImplemented(callback); }
 void V2TIMMessageManagerImpl::GetGroupMessageReadMemberList(const V2TIMMessage& message, V2TIMGroupMessageReadMembersFilter filter, uint64_t nextSeq, uint32_t count, V2TIMValueCallback<V2TIMGroupMessageReadMemberList>* callback) { ReportNotImplemented(callback); }
-void V2TIMMessageManagerImpl::MarkC2CMessageAsRead(const V2TIMString& userID, V2TIMCallback* callback) { ReportNotImplemented(callback); }
-void V2TIMMessageManagerImpl::MarkGroupMessageAsRead(const V2TIMString& groupID, V2TIMCallback* callback) { ReportNotImplemented(callback); }
-void V2TIMMessageManagerImpl::MarkAllMessageAsRead(V2TIMCallback *callback) { ReportNotImplemented(callback); }
+// Mark-as-read: Tox has no per-message read-receipt protocol like Tencent IM.
+// The authoritative local-state implementation lives on the Dart side
+// (Tim2ToxSdkPlatform.markC2CMessageAsRead / markGroupMessageAsRead) and updates
+// the Flutter-owned MessageHistoryPersistence. On the binary-replacement path
+// these C++ entrypoints would otherwise return ERR_SDK_NOT_SUPPORTED (6015),
+// which V2TIM-style callers treat as a hard failure. Mirror the Platform-path
+// semantic by reporting success without doing any over-the-wire work. The
+// Flutter-side BinaryReplacementHistoryHook / persistence layer remains the
+// source of truth for local read state.
+void V2TIMMessageManagerImpl::MarkC2CMessageAsRead(const V2TIMString& userID, V2TIMCallback* callback) {
+    V2TIM_LOG(kInfo, "MarkC2CMessageAsRead: userID={} (local no-op; Tox has no read-receipt protocol)", userID.CString());
+    if (callback) {
+        callback->OnSuccess();
+    }
+}
+void V2TIMMessageManagerImpl::MarkGroupMessageAsRead(const V2TIMString& groupID, V2TIMCallback* callback) {
+    V2TIM_LOG(kInfo, "MarkGroupMessageAsRead: groupID={} (local no-op; Tox has no read-receipt protocol)", groupID.CString());
+    if (callback) {
+        callback->OnSuccess();
+    }
+}
+void V2TIMMessageManagerImpl::MarkAllMessageAsRead(V2TIMCallback *callback) {
+    V2TIM_LOG(kInfo, "MarkAllMessageAsRead (local no-op; Tox has no read-receipt protocol)");
+    if (callback) {
+        callback->OnSuccess();
+    }
+}
 void V2TIMMessageManagerImpl::SetMessageExtensions(const V2TIMMessage& message, const V2TIMMessageExtensionVector& extensions, V2TIMValueCallback<V2TIMMessageExtensionResultVector>* callback) { ReportNotImplemented(callback); }
 void V2TIMMessageManagerImpl::GetMessageExtensions(const V2TIMMessage& message, V2TIMValueCallback<V2TIMMessageExtensionVector>* callback) { ReportNotImplemented(callback); }
 void V2TIMMessageManagerImpl::DeleteMessageExtensions(const V2TIMMessage& message, const V2TIMStringVector& keys, V2TIMValueCallback<V2TIMMessageExtensionResultVector>* callback) { ReportNotImplemented(callback); }

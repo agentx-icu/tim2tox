@@ -128,6 +128,15 @@ void RegisterFriendshipListenerWithManager(DartFriendshipListenerImpl* listener,
 // Get or create Group listener for a specific instance_id (used when registering with all instances)
 DartGroupListenerImpl* GetOrCreateGroupListenerForInstance(int64_t instance_id);
 
+// Replay previously-registered listener callbacks on a newly-created test instance.
+// Called from create_test_instance_ex after a new test instance finishes InitSDK so that
+// listeners which were registered before this instance existed (via the Tencent SDK's
+// singleton-guarded initSDK path) are also wired up here. Without this, only the first
+// node's V2TIMManagerImpl receives group/friendship callbacks and multi-node tests
+// time out waiting for events on subsequent nodes. See the doc comment in
+// dart_compat_listeners.cpp for the full rationale.
+void ReplayListenersForNewInstance(int64_t instance_id, V2TIMManagerImpl* manager);
+
 // Iterate all (instance_id, V2TIMManagerImpl*) pairs. Implemented in tim2tox_ffi.cpp.
 // Used to register group/friendship listeners with every instance when addGroupListener is called.
 extern "C" void Tim2ToxFfiForEachInstanceManager(void (*cb)(int64_t id, void* manager, void* user), void* user);
