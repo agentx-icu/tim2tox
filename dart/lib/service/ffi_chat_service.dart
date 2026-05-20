@@ -6943,8 +6943,9 @@ class FfiChatService {
     // into _scheduleDebouncedSave (defensive — should not happen given step 1)
     // falls through to a synchronous saveHistory using the still-present
     // in-memory list, instead of scheduling a timer that gets cancelled in
-    // step 4.
-    _messageHistoryPersistence.dispose();
+    // step 4. `dispose()` itself awaits an internal `flushPendingSaves` —
+    // idempotent against the explicit flush in step 2.
+    await _messageHistoryPersistence.dispose();
 
     // 4. Clear caches and tear down.
     _messageHistoryPersistence.clearAllCached();

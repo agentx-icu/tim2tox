@@ -911,9 +911,16 @@ class MessageHistoryPersistence {
     }
   }
 
-  /// Cancel any in-flight debounce timers without flushing. Use only in tests
-  /// or in tear-down paths that have already persisted via another route.
-  void dispose() {
+  /// Tear down the persistence service.
+  ///
+  /// Awaits [flushPendingSaves] first so any in-flight debounced batch lands
+  /// on disk before the timers are cancelled — otherwise teardown paths that
+  /// forget to call `flushPendingSaves()` themselves would silently drop the
+  /// last burst of messages. Idempotent: a caller that has already awaited
+  /// `flushPendingSaves()` will see an empty debounce map and skip straight
+  /// to the cancel/clear pass.
+  Future<void> dispose() async {
+    await flushPendingSaves();
     _disposed = true;
     for (final timer in _appendDebounceTimers.values) {
       timer.cancel();
@@ -1361,12 +1368,22 @@ class MessageHistoryPersistence {
   }
   
   /// Get the unread message count for a conversation
-  /// 
+  ///
   /// Calculates the number of unread messages based on:
   /// - Messages with timestamp > lastViewTimestamp
   /// - Messages that are not self-sent (!isSelf)
   /// - Messages that are not marked as read (!isRead)
-  /// 
+  ///
+  /// TODO(time-drift): `lastViewTimestamp` is written using `DateTime.now()`
+  /// on the local device but compared against `msg.timestamp`, which often
+  /// originates from the remote peer's clock. System-clock rollback or large
+  /// cross-device skew can either inflate the unread count (already-seen
+  /// messages re-counted) or zero it out (new messages stamped earlier than
+  /// the local clock). The right fix is to anchor `lastViewTimestamp` to the
+  /// highest message timestamp in the conversation at view-time, or to also
+  /// persist a read-msgID set. Both options touch every caller of
+  /// `updateLastViewTimestamp` / `markUnreadMessagesAsRead`, so deferring.
+  ///
   /// [conversationId] - Will be normalized before lookup
   int getUnreadCount(String conversationId) {
     final normalizedId = ConversationIdUtils.normalize(conversationId);
