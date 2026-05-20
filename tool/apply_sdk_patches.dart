@@ -97,12 +97,18 @@ void main(List<String> args) async {
       exit(1);
     }
     stdout.writeln('Applying SDK patch: $name');
-    int c = await _run(sdk.path, 'git', ['apply', '--check', '-p1', patchFile.path]);
+    // Defensive against Windows-style CRLF in the patch file itself
+    // (e.g. if .gitattributes is missing or core.autocrlf=true converted the
+    // checked-out patch). git apply context match is byte-exact — a single
+    // stray \r in a context line will fail. Normalize to LF in a sibling
+    // temp file and feed git apply that instead.
+    final patchPath = _ensureLfPatch(patchFile);
+    int c = await _run(sdk.path, 'git', ['apply', '--check', '-p1', patchPath]);
     if (c != 0) {
       stderr.writeln('apply_sdk_patches: patch would not apply: $name');
       exit(1);
     }
-    c = await _run(sdk.path, 'git', ['apply', '-p1', patchFile.path]);
+    c = await _run(sdk.path, 'git', ['apply', '-p1', patchPath]);
     if (c != 0) {
       stderr.writeln('apply_sdk_patches: failed to apply patch: $name');
       exit(1);
@@ -144,6 +150,19 @@ Future<int> _run(String cwd, String executable, List<String> args) async {
   if (r.stdout.toString().trim().isNotEmpty) stdout.write(r.stdout);
   if (r.stderr.toString().trim().isNotEmpty) stderr.write(r.stderr);
   return r.exitCode;
+}
+
+String _ensureLfPatch(File patchFile) {
+  final bytes = patchFile.readAsBytesSync();
+  if (!bytes.contains(13)) return patchFile.path;
+  final lfBytes = <int>[];
+  for (var i = 0; i < bytes.length; i++) {
+    if (bytes[i] == 13 && i + 1 < bytes.length && bytes[i + 1] == 10) continue;
+    lfBytes.add(bytes[i]);
+  }
+  final tmp = File('${patchFile.path}.lf.tmp');
+  tmp.writeAsBytesSync(lfBytes);
+  return tmp.path;
 }
 
 void _normalizeSdkLineEndings(Directory sdkDir) {

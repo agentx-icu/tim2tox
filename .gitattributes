@@ -1,0 +1,28 @@
+* text=auto eol=lf
+*.patch text eol=lf
+series text eol=lf
+*.sh text eol=lf
+*.dart text eol=lf
+*.yaml text eol=lf
+*.yml text eol=lf
+*.json text eol=lf
+*.lock text eol=lf
+*.md text eol=lf
+*.cpp text eol=lf
+*.h text eol=lf
+*.c text eol=lf
+*.cc text eol=lf
+*.hpp text eol=lf
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.zip binary
+*.tar binary
+*.gz binary
+*.dll binary
+*.so binary
+*.dylib binary
+*.a binary
+*.lib binary

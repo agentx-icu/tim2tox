@@ -334,6 +334,24 @@ class MockPreferencesService implements ExtendedPreferencesService {
     blacklist.removeAll(userIDs);
     await setBlackList(blacklist, userToxId);
   }
+
+  @override
+  Future<int> getC2CReceiveMessageOpt(String userID,
+      [String? userToxId]) async {
+    final key = userToxId != null
+        ? 'c2c_recv_opt_${userToxId}_$userID'
+        : 'c2c_recv_opt_$userID';
+    return await getInt(key) ?? 0;
+  }
+
+  @override
+  Future<void> setC2CReceiveMessageOpt(String userID, int opt,
+      [String? userToxId]) async {
+    final key = userToxId != null
+        ? 'c2c_recv_opt_${userToxId}_$userID'
+        : 'c2c_recv_opt_$userID';
+    await setInt(key, opt);
+  }
 }
 
 /// Mock logger service for testing
