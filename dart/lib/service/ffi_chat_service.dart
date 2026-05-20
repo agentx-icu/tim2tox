@@ -4102,17 +4102,34 @@ class FfiChatService {
   /// Returns true if we already have a recent group message with the same (gid, from, text).
   /// Used to deduplicate when both conference and group callbacks fire for the same message (tox_conf_*).
   bool _isDuplicateGroupTextMessage(String gid, String from, String text) {
-    final list = _messageHistoryPersistence.getCachedList(gid);
-    if (list == null || list.isEmpty) return false;
     final nowMs = DateTime.now().millisecondsSinceEpoch;
-    final windowMs = 5000; // 5 seconds
-    for (var i = list.length - 1; i >= 0 && i >= list.length - 20; i--) {
-      final m = list[i];
-      if (m.fromUserId == from &&
-          m.text == text &&
-          (m.timestamp.millisecondsSinceEpoch - nowMs).abs() < windowMs) {
-        return true;
+    const windowMs = 5000; // 5 seconds
+
+    // Primary: scan the in-memory history tail. After a process restart this
+    // is empty until `loadHistory(gid)` runs, so the conference vs group
+    // duplicate could slip through the very first delivery — see the
+    // _lastByPeer fallback below.
+    final list = _messageHistoryPersistence.getCachedList(gid);
+    if (list != null && list.isNotEmpty) {
+      for (var i = list.length - 1; i >= 0 && i >= list.length - 20; i--) {
+        final m = list[i];
+        if (m.fromUserId == from &&
+            m.text == text &&
+            (m.timestamp.millisecondsSinceEpoch - nowMs).abs() < windowMs) {
+          return true;
+        }
       }
+    }
+
+    // Fallback for the cold-cache window: _lastByPeer is updated on every
+    // append even before loadHistory has run, so it catches the second copy
+    // of a duplicate-delivered first message of the session.
+    final last = _lastByPeer[gid];
+    if (last != null &&
+        last.fromUserId == from &&
+        last.text == text &&
+        (last.timestamp.millisecondsSinceEpoch - nowMs).abs() < windowMs) {
+      return true;
     }
     return false;
   }
@@ -4688,6 +4705,17 @@ class FfiChatService {
     print(
         '[FfiChatService] quitGroup: Prepared FFI pointers, calling DartQuitGroup');
 
+    // Guard against double-free: the original implementation freed on the
+    // success path and again in the catch. If any of the local-cleanup steps
+    // (history clear, prefs write, offline queue) threw after the success
+    // free, the catch would re-free already-released native memory.
+    bool freed = false;
+    void freeOnce() {
+      if (freed) return;
+      freed = true;
+      Tools.freePointers([pGroupID, pUserData]);
+    }
+
     try {
       // Call C++ layer DartQuitGroup (async) - this will call tox_group_leave
       int callResult =
@@ -4700,8 +4728,10 @@ class FfiChatService {
       print(
           '[FfiChatService] quitGroup: Received callback result: code=${result.code}, desc=${result.desc}');
 
-      // Free pointers
-      Tools.freePointers([pGroupID, pUserData]);
+      // FFI pointers are no longer referenced by the native side after the
+      // callback completes — release them before doing local cleanup so any
+      // exception below does not leak the allocations.
+      freeOnce();
 
       // Check if the operation was successful
       if (result.code != 0) {
@@ -4742,12 +4772,14 @@ class FfiChatService {
       print(
           '[FfiChatService] quitGroup: COMPLETE - All cleanup operations finished for groupId=$groupId');
     } catch (e, stackTrace) {
-      // Free pointers on error
-      Tools.freePointers([pGroupID, pUserData]);
       print('[FfiChatService] quitGroup: ERROR - Exception occurred: $e');
       print('[FfiChatService] quitGroup: Stack trace: $stackTrace');
       _logger?.logError('quitGroup failed for group $groupId', e, stackTrace);
       rethrow;
+    } finally {
+      // Idempotent release; safe even if freeOnce() already ran on the
+      // success path.
+      freeOnce();
     }
   }
 
@@ -6095,24 +6127,36 @@ class FfiChatService {
   }
 
   // Drain queued sends when a friend transitions offline -> online.
+  //
   // One drain attempt per transition (no retry loops); successes flip the
   // matching pending bubble to delivered, failures flip it to non-pending so
   // the UI can show a failed state.
+  //
+  // Crash safety: we do NOT bulk-clear the queue before draining. Instead,
+  // each item is removed from the in-memory cache and persisted to disk
+  // individually — on success after dispatch, on failure after marking the
+  // bubble failed. A `kill -9` / OOM mid-drain therefore leaves any
+  // not-yet-attempted items on disk, satisfying the `clearOnLoad: false`
+  // durability contract.
   Future<void> _sendPendingMessages(String peerId) async {
     final normalizedPeerId = _normalizeFriendId(peerId);
 
-    var queue = _getOfflineQueue(normalizedPeerId);
-    if (queue.isEmpty) {
-      queue = _getOfflineQueue(peerId);
-    }
-    if (queue.isEmpty) {
+    // Snapshot the items to drain. The persistence cache still holds them;
+    // they will be removed one-by-one as each is processed.
+    final keyForNormalized = _getOfflineQueue(normalizedPeerId);
+    final hasNormalizedQueue = keyForNormalized.isNotEmpty;
+    final keyForRaw = (peerId != normalizedPeerId && !hasNormalizedQueue)
+        ? _getOfflineQueue(peerId)
+        : const <OfflineMessageItem>[];
+    if (keyForNormalized.isEmpty && keyForRaw.isEmpty) {
       return;
     }
-    final messagesToSend = List<OfflineMessageItem>.from(queue);
-    await _clearOfflineQueue(normalizedPeerId);
-    if (peerId != normalizedPeerId) {
-      await _clearOfflineQueue(peerId);
-    }
+    // The peerId variant under which each item is currently stored matters
+    // for the per-item removal: we must remove from the exact key the queue
+    // was loaded under, otherwise the cache won't find it.
+    final storageKey = hasNormalizedQueue ? normalizedPeerId : peerId;
+    final messagesToSend = List<OfflineMessageItem>.from(
+        hasNormalizedQueue ? keyForNormalized : keyForRaw);
 
     final history = _historyById[normalizedPeerId] ?? _historyById[peerId];
 
@@ -6125,6 +6169,8 @@ class FfiChatService {
         } else if (item.text.isNotEmpty) {
           await _drainTextItem(normalizedPeerId, history, item);
         }
+        // Success: remove this item from disk + cache before the next send.
+        await _offlineQueuePersistence.removeItem(storageKey, item);
         await Future.delayed(const Duration(milliseconds: 100));
       } catch (e, stackTrace) {
         _logger?.logError(
@@ -6132,10 +6178,11 @@ class FfiChatService {
             e,
             stackTrace);
         _markPendingItemFailed(normalizedPeerId, history, item, isFile: isFile);
+        // One drain attempt per online transition: failure also removes the
+        // item from the queue, matching the prior bulk-clear semantics.
+        await _offlineQueuePersistence.removeItem(storageKey, item);
       }
     }
-
-    await _saveOfflineQueue();
   }
 
   // Replay a queued text item: locate the matching pending history record

@@ -150,6 +150,61 @@ class OfflineMessageQueuePersistence {
     await saveQueue(_offlineQueue);
   }
 
+  /// Remove a single [item] from [peerId]'s queue and persist immediately.
+  ///
+  /// Used by the drain loop so disk state always reflects pending work: even
+  /// if the process is killed mid-drain, only items that were successfully
+  /// dispatched (or explicitly given up on) are gone from disk; everything
+  /// still pending stays queued for the next online transition.
+  ///
+  /// `OfflineMessageItem` is a Dart record, so equality is structural over
+  /// `(kind, text, filePath, fileName, timestamp)` — that's sufficient to
+  /// identify the entry. If the same logical message appears more than once
+  /// in the list (duplicate enqueue), only the first occurrence is removed.
+  ///
+  /// If the peer's list becomes empty after removal, the key is dropped so
+  /// the persisted JSON doesn't accumulate empty arrays.
+  Future<void> removeItem(String peerId, OfflineMessageItem item) async {
+    final list = _offlineQueue[peerId];
+    if (list == null || list.isEmpty) {
+      return;
+    }
+    final index = list.indexOf(item);
+    if (index < 0) {
+      return;
+    }
+    list.removeAt(index);
+    if (list.isEmpty) {
+      _offlineQueue.remove(peerId);
+    }
+    await _persistCache();
+  }
+
+  /// Write the current in-memory cache to disk without mutating the cache.
+  ///
+  /// [saveQueue] takes an external map and replaces the cache with it, which
+  /// is unsafe when the caller passes the cache itself (clear() then addAll()
+  /// on the same map wipes the cache). This helper is the safe path used by
+  /// per-item mutations.
+  Future<void> _persistCache() async {
+    try {
+      final file = await _getQueueFile();
+      final jsonMap = <String, dynamic>{};
+      for (final entry in _offlineQueue.entries) {
+        jsonMap[entry.key] = entry.value.map((item) => {
+              'kind': item.kind,
+              'text': item.text,
+              'filePath': item.filePath,
+              'fileName': item.fileName,
+              'timestamp': item.timestamp.toIso8601String(),
+            }).toList();
+      }
+      await file.writeAsString(jsonEncode(jsonMap));
+    } catch (e) {
+      // Silently handle errors; cache stays the source of truth in-memory.
+    }
+  }
+
   /// Clear all messages from the queue
   Future<void> clearQueue() async {
     _offlineQueue.clear();
