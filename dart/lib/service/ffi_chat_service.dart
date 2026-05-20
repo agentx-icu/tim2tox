@@ -299,6 +299,15 @@ final _ircUserJoinPartCbPtr =
 /// location are **not** migrated automatically when a resolver is introduced.
 /// If the resolver returns a different directory, surface the migration in
 /// the integrator's account/bootstrap layer.
+/// Sentinel raised by the offline-drain path when the friend goes offline
+/// again between the trigger and our send call. The drain loop catches
+/// this specifically so it can leave the queue item and pending bubble
+/// untouched for the next online transition — distinct from a real send
+/// failure which removes the item and marks the bubble failed.
+class _OfflineDuringDrain implements Exception {
+  const _OfflineDuringDrain();
+}
+
 abstract class FfiChatPathResolver {
   /// Directory where tox file_recv puts incoming file transfers.
   /// Default fallback: `<appSupport>/file_recv`.
@@ -5267,6 +5276,7 @@ class FfiChatService {
     String peerId,
     String filePath, {
     bool addToChatHistory = true,
+    bool throwIfOffline = false,
   }) async {
     // Normalize friend ID to 64 characters (public key length)
     final normalizedPeerId = _normalizeFriendId(peerId);
@@ -5291,6 +5301,12 @@ class FfiChatService {
     final isOnline = friend.online;
 
     if (!isOnline) {
+      if (throwIfOffline) {
+        // Drain path: friend went offline again before our send landed.
+        // Leak the signal so _sendPendingMessages can leave the queue item
+        // in place for the next online transition.
+        throw const _OfflineDuringDrain();
+      }
       // Friend is offline - queue the file send and surface a pending bubble.
       // Drain happens on the next online transition (see _sendPendingMessages).
       if (addToChatHistory) {
@@ -5315,9 +5331,14 @@ class FfiChatService {
       // -4 == FRIEND_NOT_CONNECTED: friend was reported online by the
       // pre-check but went offline before the FFI call landed. Fall through
       // to queueing instead of throwing so the UI keeps the message pending.
-      if (result == -4 && addToChatHistory) {
-        await _queueOfflineFile(normalizedPeerId, filePath);
-        return;
+      if (result == -4) {
+        if (throwIfOffline) {
+          throw const _OfflineDuringDrain();
+        }
+        if (addToChatHistory) {
+          await _queueOfflineFile(normalizedPeerId, filePath);
+          return;
+        }
       }
       final message = switch (result) {
         -1 => 'Tox is not ready. Please wait for connection.',
@@ -6172,14 +6193,23 @@ class FfiChatService {
         // Success: remove this item from disk + cache before the next send.
         await _offlineQueuePersistence.removeItem(storageKey, item);
         await Future.delayed(const Duration(milliseconds: 100));
+      } on _OfflineDuringDrain {
+        // Friend disconnected again before/during this item's send. Leave
+        // the queue item AND the pending bubble untouched so the next
+        // online transition retries. Abort the rest of the loop since the
+        // remaining items would all hit the same offline state.
+        _logger?.log(
+            '[FfiChatService] _sendPendingMessages: friend $normalizedPeerId went offline mid-drain; ${messagesToSend.length - messagesToSend.indexOf(item)} item(s) kept in queue');
+        break;
       } catch (e, stackTrace) {
         _logger?.logError(
             '[FfiChatService] _sendPendingMessages: drain failed for ${isFile ? "file" : "text"} item',
             e,
             stackTrace);
         _markPendingItemFailed(normalizedPeerId, history, item, isFile: isFile);
-        // One drain attempt per online transition: failure also removes the
-        // item from the queue, matching the prior bulk-clear semantics.
+        // One drain attempt per online transition: real failures (not
+        // offline-during-drain) remove the item, matching the prior
+        // bulk-clear semantics.
         await _offlineQueuePersistence.removeItem(storageKey, item);
       }
     }
@@ -6190,6 +6220,15 @@ class FfiChatService {
   // after the FFI accepts the send.
   Future<void> _drainTextItem(String normalizedPeerId,
       List<ChatMessage>? history, OfflineMessageItem item) async {
+    // The drain trigger was an offline→online transition, but the friend
+    // can flip back to offline before we reach this item. Pre-check the
+    // cached online status (refreshed by the same getFriendList poll that
+    // drives drain) and bail with the offline sentinel so the queue
+    // item and pending bubble stay intact for the next transition.
+    if (_friendOnlineStatus[normalizedPeerId] == 'offline') {
+      throw const _OfflineDuringDrain();
+    }
+
     ChatMessage? pendingMsg;
     int? pendingMsgIndex;
     if (history != null) {
@@ -6270,7 +6309,8 @@ class FfiChatService {
         }
       }
     }
-    await sendFile(normalizedPeerId, filePath, addToChatHistory: false);
+    await sendFile(normalizedPeerId, filePath,
+        addToChatHistory: false, throwIfOffline: true);
     if (pendingMsg != null && pendingMsgIndex != null && history != null) {
       final updatedMsg = pendingMsg.copyWith(isPending: false);
       history[pendingMsgIndex] = updatedMsg;
