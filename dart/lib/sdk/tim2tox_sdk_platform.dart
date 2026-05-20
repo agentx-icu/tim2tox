@@ -1891,29 +1891,33 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
         }
 
         // Clean up forward message cache after message is successfully added to target conversation
-        // This prevents cached messages from being incorrectly used later
-        // Use the same isPending variable for consistency
+        // This prevents cached messages from being incorrectly used later.
+        //
+        // The previous implementation matched by *text content* which made
+        // two forwards with the same text (or with an empty merger) collide:
+        // sending forward A would silently evict forward B's cache entry.
+        // The cache is keyed by `forwardMsgID` (which is what we store
+        // in `cachedMsg.id` / `cachedMsg.msgID`), so we now match by id —
+        // unique per forwarded message.
         if (chatMsg.isSelf && forwardTargetID != null && v2Msg.msgID != null) {
-          // Find and remove the cached forward message by matching text content
-          // We use text as key because the msgID changes when message is sent
-          final messageText =
-              v2Msg.textElem?.text ?? v2Msg.mergerElem?.compatibleText ?? '';
-          if (messageText.isNotEmpty) {
-            // Find the cached message by matching text and target
-            final keysToRemove = <String>[];
-            for (final entry in _forwardMessageCache.entries) {
-              final cachedMsg = entry.value;
-              final cachedText = cachedMsg.textElem?.text ??
-                  cachedMsg.mergerElem?.compatibleText ??
-                  '';
-              if (cachedText == messageText) {
-                // Check if this is the same forward message by comparing target
-                // Since we can't directly compare, we'll remove it after a short delay
-                // to ensure the message has been properly added to the target conversation
-                keysToRemove.add(entry.key);
-              }
+          final v2MsgID = v2Msg.msgID;
+          final v2Id = v2Msg.id;
+          final keysToRemove = <String>[];
+          for (final entry in _forwardMessageCache.entries) {
+            final cachedMsg = entry.value;
+            final cachedId = cachedMsg.id;
+            final cachedMsgID = cachedMsg.msgID;
+            final keyMatches =
+                entry.key == v2MsgID || entry.key == v2Id;
+            final idMatches = (cachedId != null &&
+                    (cachedId == v2MsgID || cachedId == v2Id)) ||
+                (cachedMsgID != null &&
+                    (cachedMsgID == v2MsgID || cachedMsgID == v2Id));
+            if (keyMatches || idMatches) {
+              keysToRemove.add(entry.key);
             }
-            // Remove cached messages after a short delay to ensure message is properly added
+          }
+          if (keysToRemove.isNotEmpty) {
             Future.delayed(const Duration(milliseconds: 500), () {
               for (final key in keysToRemove) {
                 _forwardMessageCache.remove(key);
@@ -2081,8 +2085,11 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
                 listener.onMessageDownloadProgressCallback
                     ?.call(downloadProgress);
               } catch (e, st) {
-                print(
-                    '[Tim2ToxSdkPlatform] Error in instance ${progress.instanceId} progress listener: $e');
+                _logListenerError(
+                    'V2TimAdvancedMsgListener.onMessageDownloadProgressCallback'
+                    ' (instance ${progress.instanceId})',
+                    e,
+                    st);
               }
             }
           }
@@ -2113,8 +2120,11 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
           try {
             listener.onMessageDownloadProgressCallback?.call(downloadProgress);
           } catch (e, st) {
-            print(
-                '[Tim2ToxSdkPlatform] Error in instance ${progress.instanceId} progress listener (no targetMessage): $e');
+            _logListenerError(
+                'V2TimAdvancedMsgListener.onMessageDownloadProgressCallback'
+                ' (instance ${progress.instanceId}, no targetMessage)',
+                e,
+                st);
           }
         }
       }
@@ -2640,46 +2650,74 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
             }
           }
           if (convEvent == '2' && resultList.isNotEmpty) {
+            List<V2TimConversation> conversationList = const [];
             try {
-              final conversationList = resultList
+              conversationList = resultList
                   .map((v) => v is Map<String, dynamic>
                       ? V2TimConversation.fromJson(v)
                       : null)
                   .whereType<V2TimConversation>()
                   .toList();
+            } catch (e, st) {
+              // Parse failure: surface but don't fan out.
+              _logListenerError(
+                  'ConversationEvent.parse', e, st);
+            }
+            if (conversationList.isNotEmpty) {
+              // Per-listener isolation around the fan-out.
               for (final l in convList) {
-                l.onConversationChanged?.call(conversationList);
+                try {
+                  l.onConversationChanged?.call(conversationList);
+                } catch (e, st) {
+                  _logListenerError(
+                      'V2TimConversationListener.onConversationChanged',
+                      e,
+                      st);
+                }
               }
-            } catch (e) {
-              // Ignore parse/listener errors
             }
           }
         }
         break;
       case GlobalCallbackType.NetworkStatus:
         {
+          // Per-listener isolation: one buggy onConnect* handler must not
+          // prevent the rest from receiving the status change.
           final code = dataFromNativeMap["code"] as int? ?? 0;
           final desc = dataFromNativeMap["desc"] as String? ?? '';
           final status = dataFromNativeMap["status"] as int? ?? 0;
           for (final l in sdkList) {
-            if (status == 0) {
-              l.onConnectSuccess();
-            } else if (status == 1 || status == 3) {
-              l.onConnectFailed(code, desc);
-            } else if (status == 2) {
-              l.onConnecting();
+            try {
+              if (status == 0) {
+                l.onConnectSuccess();
+              } else if (status == 1 || status == 3) {
+                l.onConnectFailed(code, desc);
+              } else if (status == 2) {
+                l.onConnecting();
+              }
+            } catch (e, st) {
+              _logListenerError(
+                  'V2TimSDKListener.onConnect*(status=$status)', e, st);
             }
           }
         }
         break;
       case GlobalCallbackType.KickedOffline:
         for (final l in sdkList) {
-          l.onKickedOffline();
+          try {
+            l.onKickedOffline();
+          } catch (e, st) {
+            _logListenerError('V2TimSDKListener.onKickedOffline', e, st);
+          }
         }
         break;
       case GlobalCallbackType.UserSigExpired:
         for (final l in sdkList) {
-          l.onUserSigExpired();
+          try {
+            l.onUserSigExpired();
+          } catch (e, st) {
+            _logListenerError('V2TimSDKListener.onUserSigExpired', e, st);
+          }
         }
         break;
       case GlobalCallbackType.SelfInfoUpdated:
@@ -2696,7 +2734,12 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
             }
             final v2 = V2TimUserFullInfo.fromJson(userInfo);
             for (final l in sdkList) {
-              l.onSelfInfoUpdated(v2);
+              try {
+                l.onSelfInfoUpdated(v2);
+              } catch (e, st) {
+                _logListenerError(
+                    'V2TimSDKListener.onSelfInfoUpdated', e, st);
+              }
             }
           }
         }
@@ -2710,7 +2753,12 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
               for (dynamic e in arr) V2TimUserStatus.fromJson(e)
             ];
             for (final l in sdkList) {
-              l.onUserStatusChanged(userStatusList);
+              try {
+                l.onUserStatusChanged(userStatusList);
+              } catch (e, st) {
+                _logListenerError(
+                    'V2TimSDKListener.onUserStatusChanged', e, st);
+              }
             }
           }
         }
@@ -2724,7 +2772,12 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
               for (dynamic e in arr) V2TimUserFullInfo.fromJson(e)
             ];
             for (final l in sdkList) {
-              l.onUserInfoChanged(userInfoList);
+              try {
+                l.onUserInfoChanged(userInfoList);
+              } catch (e, st) {
+                _logListenerError(
+                    'V2TimSDKListener.onUserInfoChanged', e, st);
+              }
             }
           }
         }
@@ -2734,7 +2787,11 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
           final logLevel = dataFromNativeMap["level"] as int? ?? 0;
           final log = dataFromNativeMap["log"] as String? ?? '';
           for (final l in sdkList) {
-            l.onLog(logLevel, log);
+            try {
+              l.onLog(logLevel, log);
+            } catch (e, st) {
+              _logListenerError('V2TimSDKListener.onLog', e, st);
+            }
           }
         }
         break;
@@ -2763,10 +2820,16 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
                 ffiService.triggerPollOnce();
               }
               // Populate faceUrl from local avatar cache so message list shows correct avatar (same as event path).
+              // Per-listener isolation around the fan-out.
               Future.microtask(() async {
                 await _setFaceUrlForMsg(v2Msg);
                 for (final l in advList) {
-                  l.onRecvNewMessage?.call(v2Msg);
+                  try {
+                    l.onRecvNewMessage?.call(v2Msg);
+                  } catch (e, st) {
+                    _logListenerError(
+                        'V2TimAdvancedMsgListener.onRecvNewMessage', e, st);
+                  }
                 }
               });
             }
@@ -2783,10 +2846,18 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
               final v2Msg = V2TimMessage.fromJson(
                   messageArray[0] as Map<String, dynamic>);
               // Populate faceUrl from local avatar cache so updated message shows correct avatar.
+              // Per-listener isolation around the fan-out.
               Future.microtask(() async {
                 await _setFaceUrlForMsg(v2Msg);
                 for (final l in advList) {
-                  l.onRecvMessageModified?.call(v2Msg);
+                  try {
+                    l.onRecvMessageModified?.call(v2Msg);
+                  } catch (e, st) {
+                    _logListenerError(
+                        'V2TimAdvancedMsgListener.onRecvMessageModified',
+                        e,
+                        st);
+                  }
                 }
                 // H2: persist the modified message so updates (e.g. pending →
                 // sent, content edits) survive restarts. Mirrors the
@@ -2826,8 +2897,14 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
               final loc = (o is Map<String, dynamic>)
                   ? (o["message_msg_id"] as String? ?? '')
                   : '';
+              // Per-listener isolation around the fan-out.
               for (final l in advList) {
-                l.onRecvMessageRevoked?.call(loc);
+                try {
+                  l.onRecvMessageRevoked?.call(loc);
+                } catch (e, st) {
+                  _logListenerError(
+                      'V2TimAdvancedMsgListener.onRecvMessageRevoked', e, st);
+                }
               }
               // H2: persist the revoke by deleting the message from history.
               // Single call outside the listener loop so a persistence error
@@ -2884,10 +2961,9 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
           for (final l in friendshipList) {
             try {
               l.onFriendInfoChanged?.call(friendInfoList);
-            } catch (e) {
-              if (_debugLog)
-                print(
-                    '[Tim2ToxSdkPlatform] UpdateFriendProfile: listener threw: $e');
+            } catch (e, st) {
+              _logListenerError(
+                  'V2TimFriendshipListener.onFriendInfoChanged', e, st);
             }
           }
         }
@@ -2946,10 +3022,11 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
             for (final l in friendshipList) {
               try {
                 l.onFriendApplicationListAdded?.call(applicationList);
-              } catch (e) {
-                if (_debugLog)
-                  print(
-                      '[Tim2ToxSdkPlatform] FriendAddRequest: listener threw: $e');
+              } catch (e, st) {
+                _logListenerError(
+                    'V2TimFriendshipListener.onFriendApplicationListAdded',
+                    e,
+                    st);
               }
             }
           }
@@ -3010,9 +3087,9 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
               for (final l in allListeners) {
                 try {
                   l.onFriendListAdded?.call(friendInfoList);
-                } catch (e) {
-                  if (_debugLog)
-                    print('[Tim2ToxSdkPlatform] AddFriend: listener threw: $e');
+                } catch (e, st) {
+                  _logListenerError(
+                      'V2TimFriendshipListener.onFriendListAdded', e, st);
                 }
               }
               // Send our avatar to all friends (including new ones) so they see our avatar soon
@@ -3055,9 +3132,9 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
           for (final l in allListeners) {
             try {
               l.onFriendListDeleted?.call(deletedUserIDs);
-            } catch (e) {
-              if (_debugLog)
-                print('[Tim2ToxSdkPlatform] DeleteFriend: listener threw: $e');
+            } catch (e, st) {
+              _logListenerError(
+                  'V2TimFriendshipListener.onFriendListDeleted', e, st);
             }
           }
         }
@@ -3098,12 +3175,20 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
                   .toList();
           const loginUser = '';
 
+          // Per-listener isolation across all GroupTips fan-outs below: a
+          // single buggy onMember* handler must not stop the rest from
+          // seeing the tip.
           switch (groupTips.type) {
             case GroupTipsElemType.V2TIM_GROUP_TIPS_TYPE_INVITE:
               groupMemberList
                   .removeWhere((member) => member.userID == loginUser);
               for (final l in grpList) {
-                l.onMemberInvited(groupID, opUser, groupMemberList);
+                try {
+                  l.onMemberInvited(groupID, opUser, groupMemberList);
+                } catch (e, st) {
+                  _logListenerError(
+                      'V2TimGroupListener.onMemberInvited', e, st);
+                }
               }
               break;
             case GroupTipsElemType.V2TIM_GROUP_TIPS_TYPE_JOIN:
@@ -3112,11 +3197,21 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
               final opUserID = opUser.userID ?? '';
               if (groupMemberList.isEmpty && opUserID.isEmpty) {
                 for (final l in grpList) {
-                  l.onGroupCreated(groupID);
+                  try {
+                    l.onGroupCreated(groupID);
+                  } catch (e, st) {
+                    _logListenerError(
+                        'V2TimGroupListener.onGroupCreated', e, st);
+                  }
                 }
               } else if (groupMemberList.isNotEmpty) {
                 for (final l in grpList) {
-                  l.onMemberEnter(groupID, groupMemberList);
+                  try {
+                    l.onMemberEnter(groupID, groupMemberList);
+                  } catch (e, st) {
+                    _logListenerError(
+                        'V2TimGroupListener.onMemberEnter', e, st);
+                  }
                 }
               }
               break;
@@ -3125,7 +3220,12 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
                 print(
                     '[Tim2ToxSdkPlatform] dispatchInstanceGlobalCallback CALL_PATH QUIT -> onMemberLeave(instanceId=$instanceId, groupID=$groupID), grpList.length=${grpList.length}');
               for (final l in grpList) {
-                l.onMemberLeave(groupID, opUser);
+                try {
+                  l.onMemberLeave(groupID, opUser);
+                } catch (e, st) {
+                  _logListenerError(
+                      'V2TimGroupListener.onMemberLeave', e, st);
+                }
               }
               break;
             case GroupTipsElemType.V2TIM_GROUP_TIPS_TYPE_KICKED:
@@ -3136,18 +3236,33 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
                     '[Tim2ToxSdkPlatform] dispatchInstanceGlobalCallback CALL_PATH KICKED -> onMemberKicked(instanceId=$instanceId, groupID=$groupID, memberCount=${groupMemberList.length}), grpList.length=${grpList.length}');
               if (groupMemberList.isNotEmpty) {
                 for (final l in grpList) {
-                  l.onMemberKicked(groupID, opUser, groupMemberList);
+                  try {
+                    l.onMemberKicked(groupID, opUser, groupMemberList);
+                  } catch (e, st) {
+                    _logListenerError(
+                        'V2TimGroupListener.onMemberKicked', e, st);
+                  }
                 }
               }
               break;
             case GroupTipsElemType.V2TIM_GROUP_TIPS_TYPE_SET_ADMIN:
               for (final l in grpList) {
-                l.onGrantAdministrator(groupID, opUser, groupMemberList);
+                try {
+                  l.onGrantAdministrator(groupID, opUser, groupMemberList);
+                } catch (e, st) {
+                  _logListenerError(
+                      'V2TimGroupListener.onGrantAdministrator', e, st);
+                }
               }
               break;
             case GroupTipsElemType.V2TIM_GROUP_TIPS_TYPE_CANCEL_ADMIN:
               for (final l in grpList) {
-                l.onRevokeAdministrator(groupID, opUser, groupMemberList);
+                try {
+                  l.onRevokeAdministrator(groupID, opUser, groupMemberList);
+                } catch (e, st) {
+                  _logListenerError(
+                      'V2TimGroupListener.onRevokeAdministrator', e, st);
+                }
               }
               break;
             case GroupTipsElemType.V2TIM_GROUP_TIPS_TYPE_GROUP_INFO_CHANGE:
@@ -3155,7 +3270,12 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
                   .removeWhere((changeInfo) => changeInfo.type == 7);
               if (groupChangeInfoList.isNotEmpty) {
                 for (final l in grpList) {
-                  l.onGroupInfoChanged(groupID, groupChangeInfoList);
+                  try {
+                    l.onGroupInfoChanged(groupID, groupChangeInfoList);
+                  } catch (e, st) {
+                    _logListenerError(
+                        'V2TimGroupListener.onGroupInfoChanged', e, st);
+                  }
                 }
               }
               break;
@@ -3167,7 +3287,12 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
                     '[Tim2ToxSdkPlatform] dispatchInstanceGlobalCallback CALL_PATH MEMBER_INFO_CHANGE -> onMemberInfoChanged(instanceId=$instanceId, groupID=$groupID, changeCount=${memberChangeInfoList.length}), grpList.length=${grpList.length}');
               if (memberChangeInfoList.isNotEmpty) {
                 for (final l in grpList) {
-                  l.onMemberInfoChanged(groupID, memberChangeInfoList);
+                  try {
+                    l.onMemberInfoChanged(groupID, memberChangeInfoList);
+                  } catch (e, st) {
+                    _logListenerError(
+                        'V2TimGroupListener.onMemberInfoChanged', e, st);
+                  }
                 }
               }
               break;
@@ -3204,10 +3329,9 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
             try {
               l.onReceiveNewInvitation(
                   inviteID, inviter, groupID, inviteeList, data);
-            } catch (e) {
-              if (_debugLog)
-                print(
-                    '[Tim2ToxSdkPlatform] SignalingReceiveNewInvitation: listener threw: $e');
+            } catch (e, st) {
+              _logListenerError(
+                  'V2TimSignalingListener.onReceiveNewInvitation', e, st);
             }
           }
         }
@@ -3223,10 +3347,9 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
           for (final l in sigList) {
             try {
               l.onInvitationCancelled(inviteID, inviter, data);
-            } catch (e) {
-              if (_debugLog)
-                print(
-                    '[Tim2ToxSdkPlatform] SignalingInvitationCancelled: listener threw: $e');
+            } catch (e, st) {
+              _logListenerError(
+                  'V2TimSignalingListener.onInvitationCancelled', e, st);
             }
           }
         }
@@ -3242,10 +3365,9 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
           for (final l in sigList) {
             try {
               l.onInviteeAccepted(inviteID, invitee, data);
-            } catch (e) {
-              if (_debugLog)
-                print(
-                    '[Tim2ToxSdkPlatform] SignalingInviteeAccepted: listener threw: $e');
+            } catch (e, st) {
+              _logListenerError(
+                  'V2TimSignalingListener.onInviteeAccepted', e, st);
             }
           }
         }
@@ -3261,10 +3383,9 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
           for (final l in sigList) {
             try {
               l.onInviteeRejected(inviteID, invitee, data);
-            } catch (e) {
-              if (_debugLog)
-                print(
-                    '[Tim2ToxSdkPlatform] SignalingInviteeRejected: listener threw: $e');
+            } catch (e, st) {
+              _logListenerError(
+                  'V2TimSignalingListener.onInviteeRejected', e, st);
             }
           }
         }
@@ -3288,10 +3409,9 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
           for (final l in sigList) {
             try {
               l.onInvitationTimeout(inviteID, inviteeList);
-            } catch (e) {
-              if (_debugLog)
-                print(
-                    '[Tim2ToxSdkPlatform] SignalingInvitationTimeout: listener threw: $e');
+            } catch (e, st) {
+              _logListenerError(
+                  'V2TimSignalingListener.onInvitationTimeout', e, st);
             }
           }
         }
@@ -3306,10 +3426,9 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
           for (final l in sigList) {
             try {
               l.onInvitationModified(inviteID, data);
-            } catch (e) {
-              if (_debugLog)
-                print(
-                    '[Tim2ToxSdkPlatform] SignalingInvitationModified: listener threw: $e');
+            } catch (e, st) {
+              _logListenerError(
+                  'V2TimSignalingListener.onInvitationModified', e, st);
             }
           }
         }
@@ -3338,16 +3457,15 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
     if (_debugLog)
       print(
           '[Tim2ToxSdkPlatform] emitUIKitListener: ${_uikitListeners.length} UIKit listeners registered');
-    // Notify all UIKit listeners
+    // Per-listener isolation: one UIKit handler bug must not stop the rest.
     for (final listener in _uikitListeners.values) {
       try {
         listener.onUiKitEventEmit?.call(data);
         if (_debugLog)
           print(
               '[Tim2ToxSdkPlatform] emitUIKitListener: Successfully notified listener');
-      } catch (e, stackTrace) {
-        print('[Tim2ToxSdkPlatform] Error notifying UIKit listener: $e');
-        if (_debugLog) print('[Tim2ToxSdkPlatform] Stack trace: $stackTrace');
+      } catch (e, st) {
+        _logListenerError('V2TimUIKitListener.onUiKitEventEmit', e, st);
       }
     }
     if (_uikitListeners.isEmpty) {
@@ -3374,87 +3492,109 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
   // Helper Methods
   // ============================================================================
 
-  /// Notify all SDK listeners
+  /// Surface a listener-thrown error without breaking fan-out or the dispatch
+  /// site. `catch (Object)` covers both `Exception` and `Error` — we want both,
+  /// because hot-reload routinely produces `TypeError`/`NoSuchMethodError`
+  /// from stale closures and silently swallowing those would mask real bugs.
+  void _logListenerError(String context, Object e, StackTrace st) {
+    _log('[Tim2ToxSdkPlatform] Listener error in $context: $e');
+    if (_debugLog) {
+      _log('[Tim2ToxSdkPlatform] Stack trace: $st');
+    }
+  }
+
+  /// Notify all SDK listeners.
+  ///
+  /// Each listener runs inside its own try/catch so one buggy listener cannot
+  /// stop the fan-out or stall the caller (e.g. sendMessage reporting failure
+  /// even though the message went out).
   void _notifySDKListeners(void Function(V2TimSDKListener) callback) {
     // Snapshot before iterating: a listener callback may add or remove
     // listeners (e.g. one-shot subscriptions), which would otherwise throw
     // ConcurrentModificationError.
     final listeners = List.of(_sdkListeners);
     if (_debugLog) {
-      print(
+      _log(
           '[Tim2ToxSdkPlatform] _notifySDKListeners: ${listeners.length} listeners registered');
     }
     for (final listener in listeners) {
       try {
         callback(listener);
-      } catch (e) {
-        print('Error notifying SDK listener: $e');
+      } catch (e, st) {
+        _logListenerError('V2TimSDKListener', e, st);
       }
     }
   }
 
-  /// Notify all Advanced Message listeners
+  /// Notify all Advanced Message listeners.
+  ///
+  /// See [_notifySDKListeners] — same per-listener isolation pattern.
   void _notifyAdvancedMsgListeners(
       void Function(V2TimAdvancedMsgListener) callback) {
     final listeners = List.of(_advancedMsgListeners);
     if (_debugLog) {
-      print(
+      _log(
           '[Tim2ToxSdkPlatform] _notifyAdvancedMsgListeners: ${listeners.length} listeners registered');
     }
     if (listeners.isEmpty) {
       // Always warn — no UIKit listener means messages disappear, which is
       // almost always a startup-ordering bug worth surfacing in release logs.
-      print(
+      _log(
           '[Tim2ToxSdkPlatform] WARNING: No AdvancedMsg listeners registered! Messages will not be delivered to UIKit.');
     }
     for (final listener in listeners) {
       try {
         if (_debugLog) {
-          print(
+          _log(
               '[Tim2ToxSdkPlatform] Notifying listener: ${listener.runtimeType}');
         }
         callback(listener);
-      } catch (e, stackTrace) {
-        print('[Tim2ToxSdkPlatform] Error notifying AdvancedMsg listener: $e');
-        if (_debugLog) print('[Tim2ToxSdkPlatform] Stack trace: $stackTrace');
+      } catch (e, st) {
+        _logListenerError('V2TimAdvancedMsgListener', e, st);
       }
     }
   }
 
-  /// Notify all Conversation listeners
+  /// Notify all Conversation listeners.
+  ///
+  /// See [_notifySDKListeners] — same per-listener isolation pattern.
   void _notifyConversationListeners(
       void Function(V2TimConversationListener) callback) {
     final listeners = List.of(_conversationListeners);
     for (final listener in listeners) {
       try {
         callback(listener);
-      } catch (e) {
-        print('Error notifying Conversation listener: $e');
+      } catch (e, st) {
+        _logListenerError('V2TimConversationListener', e, st);
       }
     }
   }
 
-  /// Notify all Friendship listeners
+  /// Notify all Friendship listeners.
+  ///
+  /// See [_notifySDKListeners] — same per-listener isolation pattern.
   void _notifyFriendshipListeners(
       void Function(V2TimFriendshipListener) callback) {
     final listeners = List.of(_friendshipListeners);
     for (final listener in listeners) {
       try {
         callback(listener);
-      } catch (e) {
-        print('Error notifying Friendship listener: $e');
+      } catch (e, st) {
+        _logListenerError('V2TimFriendshipListener', e, st);
       }
     }
   }
 
-  /// Notify all Group listeners
+  /// Notify all Group listeners.
+  ///
+  /// See [_notifySDKListeners] — same per-listener isolation pattern.
   void _notifyGroupListeners(void Function(V2TimGroupListener) callback) {
     final listeners = List.of(_groupListeners);
     for (final listener in listeners) {
       try {
         callback(listener);
-      } catch (e) {
-        print('Error notifying Group listener: $e');
+      } catch (e, st) {
+        _logListenerError('V2TimGroupListener', e, st);
       }
     }
   }
@@ -4896,7 +5036,14 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
           _rememberSoundDuration(soundPath, soundDuration);
           String pathToSend = soundPath;
           String? encodedName;
-          if (soundDuration > 0) {
+          // Track whether the duration-encoding side-channel succeeded. If
+          // soundDuration > 0 and the temp copy fails, the receiver would
+          // silently get duration=0 — worse than failing the send, because
+          // the user has no way to retry. We surface the failure.
+          bool durationEncodeRequested = soundDuration > 0;
+          bool durationEncodeFailed = false;
+          Object? durationEncodeError;
+          if (durationEncodeRequested) {
             try {
               final originalName = soundPath.split('/').last;
               final dotIdx = originalName.lastIndexOf('.');
@@ -4930,14 +5077,36 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
                   }
                 });
               }
+              // If the source file doesn't exist we leave pathToSend
+              // unchanged and let provider.sendFile produce the canonical
+              // file-not-found error. Don't pre-empt that path here.
             } catch (e) {
-              if (_debugLog) {
-                print(
-                    '[Tim2ToxSdkPlatform] U-3 duration encode failed (falling back to raw path): $e');
-              }
-              pathToSend = soundPath;
-              encodedName = null;
+              durationEncodeFailed = true;
+              durationEncodeError = e;
             }
+          }
+          if (durationEncodeFailed) {
+            // The duration is the only metadata the receiver gets for an
+            // audio bubble. Silently sending the raw path would put the
+            // receiver in a wrong-but-plausible state (duration=0); fail
+            // the send instead so the UI's standard "send failed" path
+            // kicks in and the user can retry.
+            final l = ffiService.logger;
+            final msg =
+                '[Tim2ToxSdkPlatform] U-3 sound duration encode failed for $soundPath: $durationEncodeError';
+            if (l != null) {
+              l.logWarning(msg);
+            } else {
+              // ignore: avoid_print
+              print(msg);
+            }
+            return V2TimValueCallback<V2TimMessage>(
+              code: -1,
+              desc:
+                  'Failed to encode sound duration; please retry. ($durationEncodeError)',
+              data: messageToSend
+                ..status = MessageStatus.V2TIM_MSG_STATUS_SEND_FAIL,
+            );
           }
           await provider.sendFile(
             userID: userID,
@@ -6587,6 +6756,9 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
     // __face__: { index, data } — keep message, show "[Sticker]" placeholder.
     if (text.startsWith('__face__:')) {
       final payload = text.substring('__face__:'.length);
+      if (!_isValidControlPayload('__face__', payload)) {
+        return _interceptResult();
+      }
       return _interceptResult(
         rewriteText: '[Sticker]',
         rewriteCustomData: payload,
@@ -6597,6 +6769,9 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
     // __location__: { desc, longitude, latitude } — show "[Location]".
     if (text.startsWith('__location__:')) {
       final payload = text.substring('__location__:'.length);
+      if (!_isValidControlPayload('__location__', payload)) {
+        return _interceptResult();
+      }
       return _interceptResult(
         rewriteText: '[Location]',
         rewriteCustomData: payload,
@@ -6607,6 +6782,9 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
     // __custom__: arbitrary JSON — show "[Custom Message]".
     if (text.startsWith('__custom__:')) {
       final payload = text.substring('__custom__:'.length);
+      if (!_isValidControlPayload('__custom__', payload)) {
+        return _interceptResult();
+      }
       return _interceptResult(
         rewriteText: '[Custom Message]',
         rewriteCustomData: payload,
@@ -6615,6 +6793,29 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
     }
 
     return _interceptResult();
+  }
+
+  /// Hardening guard for `__face__`/`__location__`/`__custom__` payloads.
+  ///
+  /// A malformed JSON payload from a peer (intentional or buggy client) can
+  /// poison the downstream `customElem.data` consumers that `json.decode` it
+  /// later. Validate eagerly so the message falls back to plain text instead
+  /// of throwing later in the listener dispatch.
+  ///
+  /// Returns `true` when [payload] parses as JSON, `false` otherwise. On
+  /// failure logs a warning with the prefix name and the offending text
+  /// truncated to 200 chars.
+  bool _isValidControlPayload(String prefix, String payload) {
+    try {
+      json.decode(payload);
+      return true;
+    } catch (e) {
+      final truncated =
+          payload.length > 200 ? '${payload.substring(0, 200)}…' : payload;
+      _log(
+          '[Tim2ToxSdkPlatform] $prefix: malformed JSON payload, falling back to plain text: $e (text="$truncated")');
+      return false;
+    }
   }
 
   @override
@@ -9206,14 +9407,20 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
     final data =
         dataPtr.address != 0 ? dataPtr.cast<pkgffi.Utf8>().toDartString() : '';
 
+    // Per-listener isolation around the fan-out.
     for (final listener in instance._signalingListeners) {
-      listener.onReceiveNewInvitation(
-        inviteId,
-        inviter,
-        groupId,
-        const [],
-        data,
-      );
+      try {
+        listener.onReceiveNewInvitation(
+          inviteId,
+          inviter,
+          groupId,
+          const [],
+          data,
+        );
+      } catch (e, st) {
+        instance._logListenerError(
+            'V2TimSignalingListener.onReceiveNewInvitation', e, st);
+      }
     }
   }
 
@@ -9235,8 +9442,14 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
     final data =
         dataPtr.address != 0 ? dataPtr.cast<pkgffi.Utf8>().toDartString() : '';
 
+    // Per-listener isolation around the fan-out.
     for (final listener in instance._signalingListeners) {
-      listener.onInvitationCancelled(inviteId, inviter, data);
+      try {
+        listener.onInvitationCancelled(inviteId, inviter, data);
+      } catch (e, st) {
+        instance._logListenerError(
+            'V2TimSignalingListener.onInvitationCancelled', e, st);
+      }
     }
   }
 
@@ -9258,8 +9471,14 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
     final data =
         dataPtr.address != 0 ? dataPtr.cast<pkgffi.Utf8>().toDartString() : '';
 
+    // Per-listener isolation around the fan-out.
     for (final listener in instance._signalingListeners) {
-      listener.onInviteeAccepted(inviteId, invitee, data);
+      try {
+        listener.onInviteeAccepted(inviteId, invitee, data);
+      } catch (e, st) {
+        instance._logListenerError(
+            'V2TimSignalingListener.onInviteeAccepted', e, st);
+      }
     }
   }
 
@@ -9281,8 +9500,14 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
     final data =
         dataPtr.address != 0 ? dataPtr.cast<pkgffi.Utf8>().toDartString() : '';
 
+    // Per-listener isolation around the fan-out.
     for (final listener in instance._signalingListeners) {
-      listener.onInviteeRejected(inviteId, invitee, data);
+      try {
+        listener.onInviteeRejected(inviteId, invitee, data);
+      } catch (e, st) {
+        instance._logListenerError(
+            'V2TimSignalingListener.onInviteeRejected', e, st);
+      }
     }
   }
 
@@ -9301,8 +9526,14 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
         ? inviterPtr.cast<pkgffi.Utf8>().toDartString()
         : '';
 
+    // Per-listener isolation around the fan-out.
     for (final listener in instance._signalingListeners) {
-      listener.onInvitationTimeout(inviteId, const []);
+      try {
+        listener.onInvitationTimeout(inviteId, const []);
+      } catch (e, st) {
+        instance._logListenerError(
+            'V2TimSignalingListener.onInvitationTimeout', e, st);
+      }
     }
   }
 }

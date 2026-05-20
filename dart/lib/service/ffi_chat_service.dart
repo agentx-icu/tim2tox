@@ -469,10 +469,18 @@ class FfiChatService {
   OfflineMessageQueuePersistence get offlineMessageQueuePersistence =>
       _offlineQueuePersistence;
 
-  /// Normalizes a Tox friend/user ID to 64 characters (public key length)
+  /// Normalizes a Tox friend/user ID to 64 characters (public key length).
+  ///
+  /// Preserves caller-provided casing (Tox IDs are hex; case-sensitive map
+  /// lookups elsewhere depend on this), trims whitespace, and strips the
+  /// nospam+checksum suffix when the input is a full 76-char Tox ID.
+  /// New call sites that also want lowercase canonicalisation should use
+  /// [toToxPublicKey].
   String normalizeToxId(String id) {
     final trimmed = id.trim();
-    return trimmed.length > 64 ? trimmed.substring(0, 64) : trimmed;
+    if (trimmed.length == 76) return trimmed.substring(0, 64);
+    if (trimmed.length > 64) return trimmed.substring(0, 64);
+    return trimmed;
   }
 
   final _messages = StreamController<ChatMessage>.broadcast();
@@ -671,13 +679,11 @@ class FfiChatService {
   void Function()? _scheduleNextPollRef;
   // Offline message queue - use persistence service cache
   // Helper methods to access offline message queue through persistence service
-  List<({String text, String? filePath, DateTime timestamp})> _getOfflineQueue(
-      String peerId) {
+  List<OfflineMessageItem> _getOfflineQueue(String peerId) {
     return _offlineQueuePersistence.getMessages(peerId);
   }
 
-  void _addToOfflineQueue(String peerId,
-      ({String text, String? filePath, DateTime timestamp}) item) {
+  void _addToOfflineQueue(String peerId, OfflineMessageItem item) {
     _offlineQueuePersistence.addMessage(peerId, item);
   }
 
@@ -3457,27 +3463,7 @@ class FfiChatService {
     final isOnline = friend.online;
 
     if (!isOnline) {
-      // Friend is offline - cache the message
-      _addToOfflineQueue(normalizedPeerId,
-          (text: text, filePath: null, timestamp: DateTime.now()));
-      // Create pending message for UI
-      final timestamp = DateTime.now().millisecondsSinceEpoch;
-      final sequence = _msgIDSequence++;
-      final msgID = '${timestamp}_${sequence}_$_selfId';
-      final msg = ChatMessage(
-        text: text,
-        fromUserId: _selfId,
-        isSelf: true,
-        timestamp: DateTime.now(),
-        groupId: null,
-        isPending: true,
-        msgID: msgID,
-      );
-      _lastByPeer[normalizedPeerId] = msg;
-      _appendHistory(normalizedPeerId, msg);
-      _messages.add(msg);
-      // Save offline queue
-      await _saveOfflineQueue();
+      await _queueOfflineText(normalizedPeerId, text);
       return;
     }
 
@@ -3500,6 +3486,71 @@ class FfiChatService {
     _lastByPeer[normalizedPeerId] = msg;
     _appendHistory(normalizedPeerId, msg);
     _messages.add(msg);
+  }
+
+  // Enqueue a text send for a friend that is offline (or that flipped offline
+  // between the pre-check and the FFI call). The UI sees a pending bubble
+  // immediately; drain on the next online transition resends and clears it.
+  Future<void> _queueOfflineText(String normalizedPeerId, String text) async {
+    final now = DateTime.now();
+    _addToOfflineQueue(normalizedPeerId, (
+      kind: 'text',
+      text: text,
+      filePath: null,
+      fileName: null,
+      timestamp: now,
+    ));
+    final timestamp = now.millisecondsSinceEpoch;
+    final sequence = _msgIDSequence++;
+    final msgID = '${timestamp}_${sequence}_$_selfId';
+    final msg = ChatMessage(
+      text: text,
+      fromUserId: _selfId,
+      isSelf: true,
+      timestamp: now,
+      groupId: null,
+      isPending: true,
+      msgID: msgID,
+    );
+    _lastByPeer[normalizedPeerId] = msg;
+    _appendHistory(normalizedPeerId, msg);
+    _messages.add(msg);
+    await _saveOfflineQueue();
+  }
+
+  // Enqueue a file send for a friend that is offline (or that flipped offline
+  // mid-send). Surfaces a pending file bubble; drain replays via sendFile().
+  Future<void> _queueOfflineFile(
+      String normalizedPeerId, String filePath) async {
+    final now = DateTime.now();
+    final fileName = p.basename(filePath);
+    _addToOfflineQueue(normalizedPeerId, (
+      kind: 'file',
+      text: '',
+      filePath: filePath,
+      fileName: fileName,
+      timestamp: now,
+    ));
+    final timestamp = now.millisecondsSinceEpoch;
+    final sequence = _msgIDSequence++;
+    final msgID = '${timestamp}_${sequence}_$_selfId';
+    final kind = _detectKind(filePath);
+    final msg = ChatMessage(
+      text: '',
+      fromUserId: _selfId,
+      isSelf: true,
+      timestamp: now,
+      groupId: null,
+      filePath: filePath,
+      fileName: fileName,
+      mediaKind: kind,
+      isPending: true,
+      msgID: msgID,
+    );
+    _lastByPeer[normalizedPeerId] = msg;
+    _appendHistory(normalizedPeerId, msg);
+    _messages.add(msg);
+    await _saveOfflineQueue();
   }
 
   Future<void> updateSelfProfile(
@@ -4498,10 +4549,7 @@ class FfiChatService {
   /// If the ID is 76 characters (full address), extracts the first 64 characters (public key).
   /// If longer, extracts only the first 64 characters.
   /// If shorter, returns as is (might be a partial ID or different format).
-  String _normalizeFriendId(String id) {
-    final trimmed = id.trim();
-    return trimmed.length > 64 ? trimmed.substring(0, 64) : trimmed;
-  }
+  String _normalizeFriendId(String id) => normalizeToxId(id);
 
   /// Avatar sync files should never appear in chat history.
   /// This is used as a compatibility fallback when old peers still send avatar as kind=0.
@@ -5211,8 +5259,12 @@ class FfiChatService {
     final isOnline = friend.online;
 
     if (!isOnline) {
-      // Friend is offline - throw exception so UI layer can handle it and send appropriate text message
-      throw Exception('Friend is offline. Cannot send file.');
+      // Friend is offline - queue the file send and surface a pending bubble.
+      // Drain happens on the next online transition (see _sendPendingMessages).
+      if (addToChatHistory) {
+        await _queueOfflineFile(normalizedPeerId, filePath);
+      }
+      return;
     }
 
     // H-B: if the basename exceeds tox's 255-UTF-8-byte filename limit,
@@ -5228,6 +5280,13 @@ class FfiChatService {
     pkgffi.malloc.free(pto);
     pkgffi.malloc.free(pfp);
     if (result <= 0) {
+      // -4 == FRIEND_NOT_CONNECTED: friend was reported online by the
+      // pre-check but went offline before the FFI call landed. Fall through
+      // to queueing instead of throwing so the UI keeps the message pending.
+      if (result == -4 && addToChatHistory) {
+        await _queueOfflineFile(normalizedPeerId, filePath);
+        return;
+      }
       final message = switch (result) {
         -1 => 'Tox is not ready. Please wait for connection.',
         -2 => 'Invalid peer ID format.',
@@ -6035,11 +6094,13 @@ class FfiChatService {
     await sendAvatarToAllFriends(avatarPathOverride: avatarPath);
   }
 
-  // Send pending offline messages when friend comes online
+  // Drain queued sends when a friend transitions offline -> online.
+  // One drain attempt per transition (no retry loops); successes flip the
+  // matching pending bubble to delivered, failures flip it to non-pending so
+  // the UI can show a failed state.
   Future<void> _sendPendingMessages(String peerId) async {
     final normalizedPeerId = _normalizeFriendId(peerId);
 
-    // Check both normalized and original peerId
     var queue = _getOfflineQueue(normalizedPeerId);
     if (queue.isEmpty) {
       queue = _getOfflineQueue(peerId);
@@ -6047,120 +6108,162 @@ class FfiChatService {
     if (queue.isEmpty) {
       return;
     }
-    final messagesToSend = List.from(queue);
+    final messagesToSend = List<OfflineMessageItem>.from(queue);
     await _clearOfflineQueue(normalizedPeerId);
     if (peerId != normalizedPeerId) {
       await _clearOfflineQueue(peerId);
     }
 
-    // Use normalized peerId for history lookup
     final history = _historyById[normalizedPeerId] ?? _historyById[peerId];
 
     for (final item in messagesToSend) {
+      final isFile = item.kind == 'file' ||
+          (item.filePath != null && item.filePath!.isNotEmpty);
       try {
-        // Only send text messages (files/images/videos/cards should not be resent)
-        if (item.filePath != null && item.filePath!.isNotEmpty) {
-          // Skip file messages - they should not be resent when friend comes online
-          continue;
+        if (isFile) {
+          await _drainFileItem(normalizedPeerId, history, item);
+        } else if (item.text.isNotEmpty) {
+          await _drainTextItem(normalizedPeerId, history, item);
         }
-        // Send text message (including emoji)
-        if (item.text.isNotEmpty) {
-          // Find the corresponding pending message in history
-          // Match by text content, isSelf, and isPending status
-          // We search from the end (most recent) to find the most recent matching pending message
-          ChatMessage? pendingMsg;
-          int? pendingMsgIndex;
-          if (history != null) {
-            for (int i = history.length - 1; i >= 0; i--) {
-              final msg = history[i];
-              // Match by text content, isSelf, isPending status, and timestamp (within 10 seconds)
-              if (msg.isSelf &&
-                  msg.isPending &&
-                  msg.filePath == null &&
-                  msg.text == item.text &&
-                  (msg.timestamp.difference(item.timestamp).abs().inSeconds <=
-                      10)) {
-                pendingMsg = msg;
-                pendingMsgIndex = i;
-                break;
-              }
-            }
-          }
-
-          // Send the message via Tox
-          // Use the same approach as sendText method
-          // Explicitly convert to String to ensure type is correct
-          final textStr = item.text as String;
-          final pto = normalizedPeerId.toNativeUtf8();
-          final pmsg = textStr.toNativeUtf8();
-          _ffi.sendText(pto, pmsg);
-          pkgffi.malloc.free(pto);
-          pkgffi.malloc.free(pmsg);
-
-          // Update the existing pending message instead of creating a new one
-          if (pendingMsg != null &&
-              pendingMsgIndex != null &&
-              history != null) {
-            final updatedMsg = ChatMessage(
-              text: pendingMsg.text,
-              fromUserId: pendingMsg.fromUserId,
-              isSelf: pendingMsg.isSelf,
-              timestamp: pendingMsg.timestamp,
-              groupId: pendingMsg.groupId,
-              filePath: pendingMsg.filePath,
-              mediaKind: pendingMsg.mediaKind,
-              isPending: false, // Mark as sent
-              isReceived: pendingMsg.isReceived,
-              isRead: pendingMsg.isRead,
-              msgID: pendingMsg.msgID, // Keep the same msgID
-            );
-            history[pendingMsgIndex] = updatedMsg;
-            _lastByPeer[normalizedPeerId] = updatedMsg;
-            // `history` IS the persistence-owned list; the index mutation
-            // above is already visible through `_historyById` / `getHistory`.
-            // Save updated history first
-            try {
-              await _saveHistory(normalizedPeerId);
-            } catch (e, stackTrace) {}
-            // Then emit the updated message to notify listeners
-            // This will trigger onRecvMessageModified in Tim2ToxSdkPlatform, which will notify UIKit
-            try {
-              _messages.add(updatedMsg);
-            } catch (e, stackTrace) {}
-          } else {
-            // If we couldn't find the pending message, create a new one (fallback)
-            final timestamp = DateTime.now().millisecondsSinceEpoch;
-            final sequence = _msgIDSequence++;
-            final msgID = '${timestamp}_${sequence}_$_selfId';
-            final msg = ChatMessage(
-              text: item.text,
-              fromUserId: _selfId,
-              isSelf: true,
-              timestamp: DateTime.now(),
-              groupId: null,
-              isPending: false,
-              msgID: msgID,
-            );
-            _lastByPeer[normalizedPeerId] = msg;
-            _appendHistory(normalizedPeerId, msg);
-            _messages.add(msg);
-            await _saveHistory(normalizedPeerId);
-          }
-        } else {
-          continue;
-        }
-        // Small delay between messages to avoid overwhelming
         await Future.delayed(const Duration(milliseconds: 100));
       } catch (e, stackTrace) {
-        // Re-add failed message to queue (only text messages)
-        if (item.filePath == null && item.text.isNotEmpty) {
-          queue.add(item);
+        _logger?.logError(
+            '[FfiChatService] _sendPendingMessages: drain failed for ${isFile ? "file" : "text"} item',
+            e,
+            stackTrace);
+        _markPendingItemFailed(normalizedPeerId, history, item, isFile: isFile);
+      }
+    }
+
+    await _saveOfflineQueue();
+  }
+
+  // Replay a queued text item: locate the matching pending history record
+  // (preserving its original timestamp + msgID) and flip it to delivered
+  // after the FFI accepts the send.
+  Future<void> _drainTextItem(String normalizedPeerId,
+      List<ChatMessage>? history, OfflineMessageItem item) async {
+    ChatMessage? pendingMsg;
+    int? pendingMsgIndex;
+    if (history != null) {
+      for (int i = history.length - 1; i >= 0; i--) {
+        final msg = history[i];
+        if (msg.isSelf &&
+            msg.isPending &&
+            msg.filePath == null &&
+            msg.text == item.text &&
+            (msg.timestamp.difference(item.timestamp).abs().inSeconds <= 10)) {
+          pendingMsg = msg;
+          pendingMsgIndex = i;
+          break;
         }
       }
     }
 
-    // Save offline queue
-    await _saveOfflineQueue();
+    final pto = normalizedPeerId.toNativeUtf8();
+    final pmsg = item.text.toNativeUtf8();
+    _ffi.sendText(pto, pmsg);
+    pkgffi.malloc.free(pto);
+    pkgffi.malloc.free(pmsg);
+
+    if (pendingMsg != null && pendingMsgIndex != null && history != null) {
+      final updatedMsg = pendingMsg.copyWith(isPending: false);
+      history[pendingMsgIndex] = updatedMsg;
+      _lastByPeer[normalizedPeerId] = updatedMsg;
+      try {
+        await _saveHistory(normalizedPeerId);
+      } catch (_) {}
+      try {
+        _messages.add(updatedMsg);
+      } catch (_) {}
+    } else {
+      // Fallback: history record was lost across restart; create a fresh
+      // delivered message but keep the original composition timestamp.
+      final sequence = _msgIDSequence++;
+      final msgID =
+          '${item.timestamp.millisecondsSinceEpoch}_${sequence}_$_selfId';
+      final msg = ChatMessage(
+        text: item.text,
+        fromUserId: _selfId,
+        isSelf: true,
+        timestamp: item.timestamp,
+        groupId: null,
+        isPending: false,
+        msgID: msgID,
+      );
+      _lastByPeer[normalizedPeerId] = msg;
+      _appendHistory(normalizedPeerId, msg);
+      _messages.add(msg);
+      await _saveHistory(normalizedPeerId);
+    }
+  }
+
+  // Replay a queued file item via sendFile(addToChatHistory: false): the
+  // pending bubble already exists from when it was queued, so we just
+  // flip it to delivered after the FFI accepts the transfer.
+  Future<void> _drainFileItem(String normalizedPeerId,
+      List<ChatMessage>? history, OfflineMessageItem item) async {
+    final filePath = item.filePath;
+    if (filePath == null || filePath.isEmpty) return;
+    if (!await File(filePath).exists()) {
+      throw Exception('Queued file no longer exists: $filePath');
+    }
+    ChatMessage? pendingMsg;
+    int? pendingMsgIndex;
+    if (history != null) {
+      for (int i = history.length - 1; i >= 0; i--) {
+        final msg = history[i];
+        if (msg.isSelf &&
+            msg.isPending &&
+            msg.filePath == filePath &&
+            (msg.timestamp.difference(item.timestamp).abs().inSeconds <= 10)) {
+          pendingMsg = msg;
+          pendingMsgIndex = i;
+          break;
+        }
+      }
+    }
+    await sendFile(normalizedPeerId, filePath, addToChatHistory: false);
+    if (pendingMsg != null && pendingMsgIndex != null && history != null) {
+      final updatedMsg = pendingMsg.copyWith(isPending: false);
+      history[pendingMsgIndex] = updatedMsg;
+      _lastByPeer[normalizedPeerId] = updatedMsg;
+      try {
+        await _saveHistory(normalizedPeerId);
+      } catch (_) {}
+      try {
+        _messages.add(updatedMsg);
+      } catch (_) {}
+    }
+  }
+
+  // On drain failure, flip the matching pending history record to
+  // non-pending so the UI can render it as failed. The queue entry is NOT
+  // re-enqueued — one drain attempt per online transition by design.
+  void _markPendingItemFailed(String normalizedPeerId,
+      List<ChatMessage>? history, OfflineMessageItem item,
+      {required bool isFile}) {
+    if (history == null) return;
+    for (int i = history.length - 1; i >= 0; i--) {
+      final msg = history[i];
+      if (!msg.isSelf || !msg.isPending) continue;
+      final matches = isFile
+          ? (msg.filePath == item.filePath &&
+              (msg.timestamp.difference(item.timestamp).abs().inSeconds <= 10))
+          : (msg.filePath == null &&
+              msg.text == item.text &&
+              (msg.timestamp.difference(item.timestamp).abs().inSeconds <= 10));
+      if (matches) {
+        final updated = msg.copyWith(isPending: false);
+        history[i] = updated;
+        _lastByPeer[normalizedPeerId] = updated;
+        try {
+          _messages.add(updated);
+        } catch (_) {}
+        unawaited(_saveHistory(normalizedPeerId).catchError((_) {}));
+        break;
+      }
+    }
   }
 
   // Save offline message queue to disk (delegate to persistence service)
@@ -6170,11 +6273,10 @@ class FfiChatService {
     await _offlineQueuePersistence.saveQueue(queue);
   }
 
-  // Load offline message queue from disk (delegate to persistence service)
+  // Load offline message queue from disk (delegate to persistence service).
+  // Queue persists across restart; drain runs on the next online transition.
   Future<void> _loadOfflineQueue() async {
-    // Load with clearOnLoad=true to prevent resending old messages
-    // This will clear the queue file and return empty map
-    await _offlineQueuePersistence.loadQueue(clearOnLoad: true);
+    await _offlineQueuePersistence.loadQueue(clearOnLoad: false);
   }
 
   /// Clear all account data (history, offline queue, files)
