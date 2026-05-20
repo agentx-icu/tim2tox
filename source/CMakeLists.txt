@@ -109,6 +109,33 @@ target_link_libraries(tim2tox
     ${SODIUM_LIBRARY}
 )
 
+# V2TIMCommunityManagerImpl uses sqlite3 directly on non-Windows builds
+# (the `_WIN32` guard skips it on MSVC). When sqlite3 is in the translation
+# unit we must link the library too, otherwise libtim2tox_ffi.so ships with
+# an undefined `sqlite3_open` symbol that aborts dlopen at runtime.
+# Allow the integrator to opt out with `-DTIM2TOX_DISABLE_SQLITE=ON`, in
+# which case the source-side `TIM2TOX_DISABLE_SQLITE` macro keeps the code
+# out of the build (mobile FFI builds already rely on this).
+option(TIM2TOX_DISABLE_SQLITE "Build without sqlite3 (skips V2TIMCommunityManager persistence)" OFF)
+if(TIM2TOX_DISABLE_SQLITE)
+    target_compile_definitions(tim2tox PRIVATE TIM2TOX_DISABLE_SQLITE=1)
+elseif(NOT WIN32)
+    find_package(SQLite3 QUIET)
+    if(SQLite3_FOUND)
+        target_link_libraries(tim2tox PUBLIC SQLite::SQLite3)
+    else()
+        find_library(SQLITE3_LIB NAMES sqlite3)
+        if(SQLITE3_LIB)
+            target_link_libraries(tim2tox PUBLIC ${SQLITE3_LIB})
+        else()
+            message(FATAL_ERROR
+                "sqlite3 not found. Install libsqlite3-dev (Linux) or pass "
+                "-DTIM2TOX_DISABLE_SQLITE=ON to skip V2TIMCommunityManager "
+                "persistence.")
+        endif()
+    endif()
+endif()
+
 if(BUILD_TOXAV)
     # Note: toxav code is compiled into toxcore_static, so we don't need to link toxav_static
     # But we need to link OPUS and VPX libraries that toxav depends on
