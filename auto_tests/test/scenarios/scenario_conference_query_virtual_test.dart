@@ -209,10 +209,17 @@ void main() {
       expect(bobUserIDFromList, isNotNull,
           reason: 'could not identify Bob in member list');
 
+      // Note: alice.getPublicKey() returns alice's main Tox public key, but
+      // bob's NGCv2 view of alice uses a different chat-specific peer pubkey
+      // (the signature key tox_group_peer_get_public_key returns). To probe
+      // via getGroupMembersInfo we must use the userID *as seen in bob's
+      // member list* — same pattern peer_nick uses with bobUserIdForApi.
+      final aliceUserIdForApi = aliceUserIDFromList!;
+      final bobUserIdForApi = bobUserIDFromList!;
       final aliceMemberInfoResult = await bob.runWithInstanceAsync(() async =>
           TIMGroupManager.instance.getGroupMembersInfo(
             groupID: groupId,
-            memberList: [alicePublicKey],
+            memberList: [aliceUserIdForApi],
           ));
       expect(aliceMemberInfoResult.code, equals(0),
           reason:
@@ -223,7 +230,7 @@ void main() {
       final bobMemberInfoResult = await bob.runWithInstanceAsync(() async =>
           TIMGroupManager.instance.getGroupMembersInfo(
             groupID: groupId,
-            memberList: [bobPublicKey],
+            memberList: [bobUserIdForApi],
           ));
       expect(bobMemberInfoResult.code, equals(0),
           reason: 'getGroupMembersInfo failed: ${bobMemberInfoResult.code}');

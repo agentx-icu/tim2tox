@@ -2237,6 +2237,59 @@ void V2TIMGroupManagerImpl::GetGroupMembersInfo(
                 }
             }
         } else {
+            // Self-lookup short-circuit. tox_group_peer_get_name() for the
+            // self peer_id does NOT reflect the value just set via
+            // tox_group_self_set_name() until a full iterate cycle has run
+            // (and even then, conferences gate self-name on a network round
+            // trip that virtual-clock tests don't drive). The fix is to call
+            // tox_group_self_get_name directly when the requested userID
+            // matches our own public key — that path is purely local and
+            // reflects writes immediately. Also honour any nameCard override
+            // that SetGroupMemberInfo stored locally for non-self peers.
+            uint8_t self_pubkey[TOX_PUBLIC_KEY_SIZE];
+            tox_self_get_public_key(tox, self_pubkey);
+            std::string self_pk_hex = ToxUtil::tox_bytes_to_hex(self_pubkey, TOX_PUBLIC_KEY_SIZE);
+            std::string self_pk_upper = self_pk_hex;
+            std::transform(self_pk_upper.begin(), self_pk_upper.end(), self_pk_upper.begin(), ::toupper);
+            std::string requested_upper_for_self = requested_user_id_str;
+            std::transform(requested_upper_for_self.begin(), requested_upper_for_self.end(), requested_upper_for_self.begin(), ::toupper);
+            // requested ID may be 76-char address (first 64 chars are pubkey)
+            std::string requested_pk_prefix = (requested_upper_for_self.length() >= 64)
+                ? requested_upper_for_self.substr(0, 64)
+                : requested_upper_for_self;
+            if (requested_pk_prefix == self_pk_upper) {
+                // Self path
+                Tox_Err_Group_Self_Query err_self;
+                size_t name_sz = tox_group_self_get_name_size(tox, group_number, &err_self);
+                std::string self_name;
+                if (err_self == TOX_ERR_GROUP_SELF_QUERY_OK && name_sz > 0 && name_sz <= TOX_MAX_NAME_LENGTH) {
+                    uint8_t name_buf[TOX_MAX_NAME_LENGTH + 1] = {};
+                    if (tox_group_self_get_name(tox, group_number, name_buf, &err_self) &&
+                        err_self == TOX_ERR_GROUP_SELF_QUERY_OK) {
+                        self_name = std::string(reinterpret_cast<const char*>(name_buf), name_sz);
+                    }
+                }
+                Tox_Err_Group_Self_Query err_role;
+                Tox_Group_Role self_role = tox_group_self_get_role(tox, group_number, &err_role);
+                uint32_t v2tim_role = (err_role == TOX_ERR_GROUP_SELF_QUERY_OK)
+                    ? toxRoleToV2timRole(self_role)
+                    : V2TIM_GROUP_MEMBER_ROLE_MEMBER;
+
+                V2TIMGroupMemberFullInfo memberInfo;
+                memberInfo.userID = V2TIMString(requested_user_id_str.c_str());
+                memberInfo.nameCard = self_name;
+                memberInfo.nickName = self_name.empty() ? requested_user_id_str : self_name;
+                memberInfo.role = v2tim_role;
+                memberInfo.joinTime = static_cast<int64_t>(std::time(nullptr));
+
+                V2TIM_LOG(kInfo, "[GetGroupMembersInfo] Returning SELF member - userID={}, nameCard={}, role={}",
+                         memberInfo.userID.CString(), memberInfo.nameCard.CString(), memberInfo.role);
+
+                resultList.PushBack(memberInfo);
+                found = true;
+                // fall through to next requested member
+                continue;
+            }
             // For NGCv2 groups, try peer iteration
             for (Tox_Group_Peer_Number peer_id = 0; peer_id < 1000; ++peer_id) {
                 uint8_t peer_pubkey[TOX_PUBLIC_KEY_SIZE];
@@ -2266,6 +2319,21 @@ void V2TIMGroupManagerImpl::GetGroupMembersInfo(
                         err_name == TOX_ERR_GROUP_PEER_QUERY_OK) {
                         size_t name_len = strnlen(reinterpret_cast<const char*>(name_buffer), TOX_MAX_NAME_LENGTH);
                         peer_name = std::string(reinterpret_cast<const char*>(name_buffer), name_len);
+                    }
+
+                    // Honour any stored nameCard override for this peer (set
+                    // via SetGroupMemberInfo before the peer was visible). The
+                    // override is the source of truth for non-self peers since
+                    // Tox doesn't propagate nameCard changes for them.
+                    {
+                        std::lock_guard<std::mutex> ov_lock(member_mutex_);
+                        auto group_it = member_name_card_overrides_.find(group_id_str);
+                        if (group_it != member_name_card_overrides_.end()) {
+                            auto user_it = group_it->second.find(requested_user_id_str);
+                            if (user_it != group_it->second.end() && !user_it->second.empty()) {
+                                peer_name = user_it->second;
+                            }
+                        }
                     }
 
                     // Get peer role

@@ -1612,6 +1612,8 @@ extern "C" {
     // Signature: int DartGetGroupMembersInfo(Pointer<Char> json_group_get_members_info_param, Pointer<Void> user_data)
     // Note: Dart layer passes a single JSON parameter containing group_id and memberList
     int DartGetGroupMembersInfo(const char* json_group_get_members_info_param, void* user_data) {
+        V2TIM_LOG(kInfo, "[dart_compat] DartGetGroupMembersInfo: ENTRY json_str_first200={}",
+                  json_group_get_members_info_param ? std::string(json_group_get_members_info_param).substr(0, 200) : std::string("<null>"));
         if (!json_group_get_members_info_param || !user_data) {
             V2TIM_LOG(kError, "[dart_compat] DartGetGroupMembersInfo: Invalid parameters - json_param={}, user_data={}",
                       (void*)json_group_get_members_info_param, (void*)user_data);
@@ -1620,40 +1622,54 @@ extern "C" {
         }
 
         std::string json_str = json_group_get_members_info_param;
+        // The Tencent SDK 8.9.x adapter (tim_group_manager.dart) and the
+        // Tim2ToxSdkPlatform binding use slightly different JSON field names
+        // for the same DartGetGroupMembersInfo entry point:
+        //   • 8.9 native_im adapter (GroupGetMemberInfoListParam.toJson):
+        //       group_get_members_info_list_param_group_id
+        //       group_get_members_info_list_param_identifier_array
+        //   • Tim2ToxSdkPlatform.getGroupMembersInfo:
+        //       group_get_members_info_param_group_id
+        //       group_get_members_info_param_identifier_array
+        // Accept both so binary-replacement-path callers don't get a phantom
+        // 6017 ("invalid parameter") that never reaches the C++ search loop.
         std::string group_id = ExtractJsonValue(json_str, "group_get_members_info_param_group_id");
+        if (group_id.empty()) {
+            group_id = ExtractJsonValue(json_str, "group_get_members_info_list_param_group_id");
+        }
 
         if (group_id.empty()) {
             V2TIM_LOG(kError, "[dart_compat] DartGetGroupMembersInfo: group_id is required in JSON parameter");
             SendApiCallbackResult(user_data, ERR_INVALID_PARAMETERS, "group_id is required");
             return 1;
         }
-        // Parse member ID list from JSON
+        // Parse member ID list from JSON. Try both the platform-path
+        // (`_param_identifier_array`) and the 8.9 native-adapter
+        // (`_list_param_identifier_array`) names before falling back.
         std::vector<std::string> member_ids;
-        
-        // Try to find the array field in the JSON string directly
-        std::string array_field_name = "group_get_members_info_param_identifier_array";
-        size_t field_pos = json_str.find("\"" + array_field_name + "\"");
-        if (field_pos != std::string::npos) {
-            // Find the colon after the field name
+
+        auto try_extract_array = [&](const std::string& array_field_name) -> bool {
+            size_t field_pos = json_str.find("\"" + array_field_name + "\"");
+            if (field_pos == std::string::npos) return false;
             size_t colon_pos = json_str.find(':', field_pos);
-            if (colon_pos != std::string::npos) {
-                // Find the opening bracket
-                size_t bracket_start = json_str.find('[', colon_pos);
-                if (bracket_start != std::string::npos) {
-                    // Find the matching closing bracket
-                    int bracket_count = 1;
-                    size_t bracket_end = bracket_start + 1;
-                    while (bracket_end < json_str.length() && bracket_count > 0) {
-                        if (json_str[bracket_end] == '[') bracket_count++;
-                        else if (json_str[bracket_end] == ']') bracket_count--;
-                        bracket_end++;
-                    }
-                    if (bracket_count == 0) {
-                        std::string array_str = json_str.substr(bracket_start, bracket_end - bracket_start);
-                        member_ids = ParseJsonStringArray(array_str);
-                    }
-                }
+            if (colon_pos == std::string::npos) return false;
+            size_t bracket_start = json_str.find('[', colon_pos);
+            if (bracket_start == std::string::npos) return false;
+            int bracket_count = 1;
+            size_t bracket_end = bracket_start + 1;
+            while (bracket_end < json_str.length() && bracket_count > 0) {
+                if (json_str[bracket_end] == '[') bracket_count++;
+                else if (json_str[bracket_end] == ']') bracket_count--;
+                bracket_end++;
             }
+            if (bracket_count != 0) return false;
+            std::string array_str = json_str.substr(bracket_start, bracket_end - bracket_start);
+            member_ids = ParseJsonStringArray(array_str);
+            return !member_ids.empty();
+        };
+
+        if (!try_extract_array("group_get_members_info_param_identifier_array")) {
+            try_extract_array("group_get_members_info_list_param_identifier_array");
         }
         if (member_ids.empty()) {
             std::vector<std::string> fallback_names = {"identifier_array", "memberList", "member_list"};
