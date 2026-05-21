@@ -2271,9 +2271,13 @@ void V2TIMGroupManagerImpl::GetGroupMembersInfo(
                 }
                 Tox_Err_Group_Self_Query err_role;
                 Tox_Group_Role self_role = tox_group_self_get_role(tox, group_number, &err_role);
-                uint32_t v2tim_role = (err_role == TOX_ERR_GROUP_SELF_QUERY_OK)
-                    ? toxRoleToV2timRole(self_role)
-                    : V2TIM_GROUP_MEMBER_ROLE_MEMBER;
+                // Note: branches must share a type — toxRoleToV2timRole returns
+                // uint32_t while V2TIM_GROUP_MEMBER_ROLE_MEMBER is an enum, so
+                // a `?:` would trip -Wextra (enumerated vs. non-enumerated).
+                uint32_t v2tim_role = static_cast<uint32_t>(V2TIM_GROUP_MEMBER_ROLE_MEMBER);
+                if (err_role == TOX_ERR_GROUP_SELF_QUERY_OK) {
+                    v2tim_role = toxRoleToV2timRole(self_role);
+                }
 
                 V2TIMGroupMemberFullInfo memberInfo;
                 memberInfo.userID = V2TIMString(requested_user_id_str.c_str());
