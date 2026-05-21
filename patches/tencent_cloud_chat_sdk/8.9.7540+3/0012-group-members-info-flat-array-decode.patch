@@ -1,0 +1,54 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: tim2tox-bootstrap <bootstrap@local>
+Date: Tue, 20 May 2026 10:00:00 -0700
+Subject: [PATCH 12/13] decode getGroupMembersInfo response as flat List
+
+Patch 0006 routes `getGroupMembersInfo` to the dedicated
+`DartGetGroupMembersInfo` C entry point, but `DartGetGroupMembersInfo`'s
+JSON convention is to return the by-memberList result as a FLAT JSON
+array: `[{...member1...}, {...member2...}]`. The 8.9.x upstream adapter
+still decodes the response as `V2TimGroupMemberInfoResult` — the
+paginated wrapper that expects `{memberInfoList: [...], nextSeq, ...}`
+shape returned by the older `DartGetGroupMemberList` entry point.
+
+When the C++ flat array hits the wrapper decoder, `jsonParam as Map`
+inside `V2TimGroupMemberInfoResult.fromJson` throws `_TypeError`,
+the completer never completes, and `getGroupMembersInfo` hangs until
+the surrounding test/UI timeout — surfacing as a 60s test timeout
+in `scenario_conference_peer_nick_virtual_test` /
+`scenario_conference_query_virtual_test`.
+
+Decode directly as `List<V2TimGroupMemberFullInfo>` so the JSON shape
+matches what `DartGetGroupMembersInfo` actually returns. The Tim2Tox
+platform path (Tim2ToxSdkPlatform.getGroupMembersInfo) already uses
+this typed decoder via `timValueCallback2Future`; we mirror that here.
+---
+ lib/native_im/adapter/tim_group_manager.dart | 12 ++++++++----
+ 1 file changed, 8 insertions(+), 4 deletions(-)
+
+diff --git a/lib/native_im/adapter/tim_group_manager.dart b/lib/native_im/adapter/tim_group_manager.dart
+--- a/lib/native_im/adapter/tim_group_manager.dart
++++ b/lib/native_im/adapter/tim_group_manager.dart
+@@ -420,10 +420,16 @@
+     String userData = Tools.generateUserData('getGroupMembersInfo');
+     Completer<V2TimValueCallback<List<V2TimGroupMemberFullInfo>>> completer = Completer();
+     void handleApiCallback(Map jsonResult) {
+-      V2TimValueCallback<V2TimGroupMemberInfoResult> result = V2TimValueCallback<V2TimGroupMemberInfoResult>.fromJson(jsonResult);
+-      var resultList = result.data?.memberInfoList ?? [];
+-      List<V2TimGroupMemberFullInfo> memberInfoList = resultList.where((element) => element != null).cast<V2TimGroupMemberFullInfo>().toList();
+-      completer.complete(V2TimValueCallback<List<V2TimGroupMemberFullInfo>>(code: result.code, desc: result.desc, data: memberInfoList));
++      // tim2tox patch 0006 routes this to DartGetGroupMembersInfo (by-memberList lookup),
++      // which returns a FLAT JSON array `[{...}, ...]` in `json_param` — not the nested
++      // `{memberInfoList: [...]}` shape that upstream's `DartGetGroupMemberList` returns.
++      // Decoding as V2TimGroupMemberInfoResult (the paginated wrapper) silently casts the
++      // List to a Map and throws inside V2TimValueCallback.fromJson, leaving the
++      // Completer un-completed and the await hanging until the test-level timeout.
++      // Decode directly as List<V2TimGroupMemberFullInfo>; the JSON shape matches.
++      V2TimValueCallback<List<V2TimGroupMemberFullInfo>> result =
++          V2TimValueCallback<List<V2TimGroupMemberFullInfo>>.fromJson(jsonResult);
++      completer.complete(result);
+     }
+     NativeLibraryManager.addTimApiValueCallback2Map(userData, handleApiCallback);
+
+--
+2.50.1 (Apple Git-155)

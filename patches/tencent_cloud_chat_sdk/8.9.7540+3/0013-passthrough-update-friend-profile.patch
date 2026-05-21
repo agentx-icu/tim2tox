@@ -1,0 +1,55 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: tim2tox-bootstrap <bootstrap@local>
+Date: Wed, 20 May 2026 19:00:00 -0700
+Subject: [PATCH 13/13] _handleGlobalCallback: add UpdateFriendProfile to
+ binary-listener passthrough
+
+Extension of 0008's / 0011's passthrough set: when a peer renames itself
+(`alice.setSelfInfo(nickName: ...)`), `V2TIMManagerImpl::HandleFriendName`
+on the receiver fires `OnFriendInfoChanged` which `BuildGlobalCallbackJson`
+ships as `GlobalCallbackType::UpdateFriendProfile` with the *receiver*'s
+non-zero `instance_id`. Without passthrough, the Dart side early-returns
+at `instance_id != 0 && !shouldPassthrough` and bob's binary-path
+`V2TimFriendshipListener.onFriendInfoChanged` never fires.
+
+Symptom: `scenario_events_virtual_test.dart`'s "Friendship listener
+events" subtest times out at 15s waiting for any friendship callback
+to arrive after alice changes her nickname.
+
+The pair of follow-ups making this fix work:
+
+  1. tim2tox C++ `ffi/dart_compat_listeners.cpp` — emit both
+     `friend_profile_identifier` AND `friend_profile_update_identifier`
+     fields in `FriendInfoVectorToJsonForCallback` so the Dart
+     `_handleGlobalCallback` case `UpdateFriendProfile` (line 917) can
+     read the userID. (Lives in tim2tox source, not in this SDK patch.)
+  2. tim2tox `dart/lib/sdk/tim2tox_sdk_platform.dart` — fan
+     `_notifyFriendshipListeners` / `_notifyConversationListeners` out
+     to the SDK singleton list (mirror of `_notifyAdvancedMsgListeners`)
+     and subscribe to `ffiService.nicknameUpdated` to push remote name
+     changes through the friendship listener pipe. (Lives in tim2tox
+     dart, not in this SDK patch.)
+
+Double-dispatch risk: `UpdateFriendProfile` is dispatched per
+`instance_id` payload; in toxee instance_id is always 0 so passthrough
+is a no-op for the production client. The singleton listener fans out
+once per non-zero instance — same shape as 0008/0011 carve-outs.
+---
+ .../bindings/native_library_manager.dart      | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/lib/native_im/bindings/native_library_manager.dart b/lib/native_im/bindings/native_library_manager.dart
+--- a/lib/native_im/bindings/native_library_manager.dart
++++ b/lib/native_im/bindings/native_library_manager.dart
+@@ -403,7 +403,8 @@
+           callbackType == GlobalCallbackType.UserStatusChanged.value ||
+           callbackType == GlobalCallbackType.SelfInfoUpdated.value ||
+           callbackType == GlobalCallbackType.UserInfoChanged.value ||
+-          callbackType == GlobalCallbackType.ReceiveNewMessage.value ||
++          callbackType == GlobalCallbackType.ReceiveNewMessage.value ||
++          callbackType == GlobalCallbackType.UpdateFriendProfile.value ||
+           passthroughCallbacks.contains(callbackType);
+       if (instanceId != 0 && !shouldPassthrough) {
+         return;
+--
+2.50.1 (Apple Git-155)

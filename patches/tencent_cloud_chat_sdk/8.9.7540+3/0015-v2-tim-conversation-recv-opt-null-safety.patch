@@ -1,0 +1,39 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: tim2tox-bootstrap <bootstrap@local>
+Date: Wed, 20 May 2026 20:00:00 -0700
+Subject: [PATCH 15/15] V2TimConversation.fromJson: null-safe conv_recv_opt
+ default
+
+Symmetric with 0007 (V2TimMessage risk-type) and 0009 (V2TimGroupInfo)
+null-safety patches: when the native FFI emits a partial conversation JSON
+that omits `conv_recv_opt` (typical for newly-created conversations before
+the user has set receive-message-options), `cReceiveMessageOpt2DartOpt(null)`
+crashes because the enum-mapping helper unwraps the int.
+
+Default the missing field to 0 (= ReceiveMessage) which matches the upstream
+SDK's documented default for conversations without an explicit opt.
+
+Field appears once in the source; the rewrite is the same one-liner trick
+used in 0009 for V2TimGroupInfo fields. Filed as a separate patch (not
+folded into 0009) to keep the 0009 hunk context untouched — the two files
+are unrelated and bundling would mean reflowing the 0009 patch body.
+---
+ lib/models/v2_tim_conversation.dart | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/lib/models/v2_tim_conversation.dart b/lib/models/v2_tim_conversation.dart
+index d3ce7c3..b0630aa 100644
+--- a/lib/models/v2_tim_conversation.dart
++++ b/lib/models/v2_tim_conversation.dart
+@@ -82,7 +82,7 @@ class V2TimConversation {
+     }
+     unreadCount = json['conv_unread_num'];
+     isPinned = json['conv_is_pinned'];
+-    recvOpt = EnumUtils.cReceiveMessageOpt2DartOpt(json['conv_recv_opt']).index;
++    recvOpt = EnumUtils.cReceiveMessageOpt2DartOpt(json['conv_recv_opt'] ?? 0).index;
+     orderkey = json['conv_active_time'];
+     lastMessage = json['conv_last_msg'] != null
+         ? V2TimMessage.fromJson(json['conv_last_msg'])
+--
+2.39.0
+

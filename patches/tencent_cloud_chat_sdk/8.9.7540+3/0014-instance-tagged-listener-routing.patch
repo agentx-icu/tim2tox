@@ -1,0 +1,604 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: tim2tox-bootstrap <bootstrap@local>
+Date: Wed, 20 May 2026 22:00:00 -0700
+Subject: [PATCH 14/14] instance-tagged listener routing for singleton managers
+
+Three manager singletons in the vendored SDK
+(`TIMMessageManager` / `TIMConversationManager` / `TIMFriendshipManager`)
+hold a single flat listener list each. Patches 0008 / 0011 / 0013
+intentionally fall through to those singleton lists for non-zero
+`instance_id` so callbacks delivered from the multi-instance Tim2Tox
+path still reach listeners registered via the binary-replacement API
+surface. That works fine for production toxee (always instance_id 0),
+but in tim2tox auto_tests (`scenario_message`, `scenario_events`,
+`scenario_file*`, etc.) multiple simulated peers register listeners
+against the SAME flat list — so an event meant for Bob fires Alice's
+listener too, and tests that wait on a completer from the wrong node
+complete on the wrong event.
+
+This patch adds an opt-in per-instance routing layer:
+
+1. `NativeLibraryManager` gains two static fields:
+   - `currentRegistrationInstanceId` — set by the tim2tox layer
+     (`Tim2ToxInstance.runWithInstance`) right before invoking
+     `TIMxxxManager.instance.addXxxListener(...)`; tags the listener
+     with the instance id in a per-instance bucket on the manager.
+   - `currentDispatchInstanceId` — set by `_handleGlobalCallback`
+     for the duration of listener fan-out; tells managers which
+     bucket to dispatch to.
+
+2. `_handleGlobalCallback` is split: the preamble + dispatch-context
+   wrapping live in `_handleGlobalCallback`, the per-callback switch
+   moves to `_dispatchGlobalCallback`. The wrap is a try/finally so
+   the previous dispatch id is restored on exceptions.
+
+3. Each of the three managers gets:
+   - `_instanceListeners: Map<int, List<...>>` — per-instance buckets
+   - `add*Listener` ALSO appends to the bucket keyed by
+     `currentRegistrationInstanceId` (when set and non-zero)
+   - `remove*Listener` purges from BOTH the flat list and any buckets
+   - `_listenersForCurrentDispatch()` — returns the per-instance
+     bucket for `currentDispatchInstanceId` when present and
+     non-empty, ELSE the flat list (the fallback preserves byte
+     identical behavior for single-instance toxee)
+   - `listenersForInstance(int?)` — public counterpart so
+     `Tim2ToxSdkPlatform._notifyXxxListeners` can filter its own
+     singleton fan-out the same way
+
+4. The 12 `for (var listener in v2TimAdvancedMsgListenerList)` sites
+   in `_internalInitMessageListener` (and the equivalent 13 / 15 sites
+   in the conversation / friendship managers) all switch to
+   `_listenersForCurrentDispatch()`.
+
+Hard invariant: when `currentRegistrationInstanceId` is null or 0
+(production toxee), neither bucket nor dispatch routing fires —
+`_listenersForCurrentDispatch()` and `listenersForInstance(null|0)`
+both fall back to the existing flat list. This is byte-identical to
+pre-0014 behavior; the only cost is two static null reads per
+dispatch and an unconditional null/zero check per add/remove.
+
+Companion tim2tox-side changes (NOT in this SDK patch — they live in
+the tim2tox submodule):
+  - `dart/lib/instance/tim2tox_instance.dart`: `runWithInstance` /
+    `runWithInstanceAsync` stamp `currentRegistrationInstanceId` while
+    `setCurrentInstance(handle)` is in effect.
+  - `dart/lib/sdk/tim2tox_sdk_platform.dart`: `_notifyAdvancedMsg /
+    Conversation / FriendshipListeners` accept an optional
+    `dispatchInstanceId` and route the singleton fan-out through
+    `listenersForInstance(dispatchInstanceId)` so download/upload
+    progress for instance B does not fire instance A's listener.
+---
+ lib/native_im/adapter/tim_conversation_manager.dart |  60 ++++++++--
+ lib/native_im/adapter/tim_friendship_manager.dart   |  66 +++++++++--
+ lib/native_im/adapter/tim_message_manager.dart      |  63 ++++++++++-
+ lib/native_im/bindings/native_library_manager.dart  |  38 +++++++
+ 4 files changed, 207 insertions(+), 20 deletions(-)
+
+diff --git a/lib/native_im/bindings/native_library_manager.dart b/lib/native_im/bindings/native_library_manager.dart
+--- a/lib/native_im/bindings/native_library_manager.dart
++++ b/lib/native_im/bindings/native_library_manager.dart
+@@ -105,6 +105,27 @@
+   static Future<void> Function(String callbackName,
+       Map<String, dynamic> data, Map<String, ApiCallback> apiCallbackMap)?
+       customCallbackHandler;
++
++  /// Tim2tox multi-instance listener routing — registration side.
++  ///
++  /// Set by the tim2tox layer (`Tim2ToxInstance.runWithInstance`) immediately
++  /// before invoking `TIMxxxManager.instance.addXxxListener(...)`. When non-zero
++  /// and non-null, the manager tags the listener with this instance id in its
++  /// internal per-instance map so the dispatch side can fan out only to the
++  /// listeners that belong to the instance whose callback is being delivered.
++  ///
++  /// Production toxee never sets this (singleton instance id 0). Leaving it
++  /// null preserves byte-identical behavior with the pre-0014 SDK.
++  static int? currentRegistrationInstanceId;
++
++  /// Tim2tox multi-instance listener routing — dispatch side.
++  ///
++  /// Set by `_handleGlobalCallback` (and any other dispatch entry that knows
++  /// the source instance id) for the duration of the listener fan-out. The
++  /// manager `_listenersForCurrentDispatch()` helper consults this to pick the
++  /// per-instance list when present, else falls back to the flat singleton
++  /// list (so single-instance toxee is unaffected).
++  static int? currentDispatchInstanceId;
+
+   static V2TimSDKListener? _sdkListener;
+   static V2TimAdvancedMsgListener? _advancedMessageListener;
+@@ -415,7 +436,24 @@
+       globalCallbackType = GlobalCallbackType.fromValue(callbackType);
+     } on ArgumentError {
+       return;
++    }
++    // Tim2tox multi-instance dispatch context: stamp `instanceId` so
++    // managers' `_listenersForCurrentDispatch()` helpers can fan out only to
++    // listeners registered against this instance (auto_tests pattern). When
++    // the instance has no per-instance list (production toxee, instance 0),
++    // the helpers fall back to the flat singleton list — identical behavior
++    // to pre-0014.
++    final prevDispatchInstanceId = currentDispatchInstanceId;
++    currentDispatchInstanceId = instanceId;
++    try {
++      _dispatchGlobalCallback(globalCallbackType, dataFromNativeMap);
++    } finally {
++      currentDispatchInstanceId = prevDispatchInstanceId;
+     }
++  }
++
++  static void _dispatchGlobalCallback(GlobalCallbackType globalCallbackType,
++      Map<String, dynamic> dataFromNativeMap) {
+     switch (globalCallbackType) {
+       case GlobalCallbackType.NetworkStatus: {
+         int code = dataFromNativeMap["code"];
+diff --git a/lib/native_im/adapter/tim_message_manager.dart b/lib/native_im/adapter/tim_message_manager.dart
+--- a/lib/native_im/adapter/tim_message_manager.dart
++++ b/lib/native_im/adapter/tim_message_manager.dart
+@@ -61,6 +61,19 @@
+   late V2TimAdvancedMsgListener _advancedMessageListener;
+   List<V2TimAdvancedMsgListener> v2TimAdvancedMsgListenerList = List.empty(growable: true);
+
++  /// Tim2tox multi-instance routing — per-instance listener buckets.
++  ///
++  /// When `NativeLibraryManager.currentRegistrationInstanceId` is non-null and
++  /// non-zero at `addAdvancedMsgListener` time, the listener is ALSO recorded
++  /// here keyed by that instance id. Dispatch (`_listenersForCurrentDispatch`)
++  /// then prefers the per-instance list whose id matches
++  /// `NativeLibraryManager.currentDispatchInstanceId`.
++  ///
++  /// Single-instance toxee never touches this map (registration id stays null
++  /// / 0) — dispatch falls back to the flat singleton list, byte-identical
++  /// behavior to pre-0014.
++  final Map<int, List<V2TimAdvancedMsgListener>> _instanceListeners = {};
++
+   // messageIDMap 为了兼容旧版本 sdk 的实现
+   Map<String, V2TimMessage> messageIDMap = {};
+
+@@ -80,16 +93,54 @@
+     }
+
+     v2TimAdvancedMsgListenerList.add(listener);
++    final regId = NativeLibraryManager.currentRegistrationInstanceId;
++    if (regId != null && regId != 0) {
++      final bucket = _instanceListeners[regId] ??= [];
++      if (!bucket.contains(listener)) {
++        bucket.add(listener);
++      }
++    }
+   }
+
+   void removeAdvancedMsgListener({V2TimAdvancedMsgListener? listener}) {
+     if (listener == null) {
+       v2TimAdvancedMsgListenerList.clear();
++      _instanceListeners.clear();
++      return;
+     }
+
+     v2TimAdvancedMsgListenerList.remove(listener);
++    for (final bucket in _instanceListeners.values) {
++      bucket.remove(listener);
++    }
+   }
+
++  /// Tim2tox multi-instance routing — dispatch lookup.
++  ///
++  /// If `NativeLibraryManager.currentDispatchInstanceId` is non-null /
++  /// non-zero AND has at least one registered per-instance listener, return
++  /// that bucket; otherwise fall back to the flat singleton list. The
++  /// fallback preserves byte-identical behavior for single-instance toxee.
++  List<V2TimAdvancedMsgListener> _listenersForCurrentDispatch() =>
++      listenersForInstance(NativeLibraryManager.currentDispatchInstanceId);
++
++  /// Tim2tox multi-instance routing — public dispatch lookup.
++  ///
++  /// Returns the per-instance bucket for [instanceId] when non-null /
++  /// non-zero AND non-empty; otherwise returns the flat singleton list. Used
++  /// by `Tim2ToxSdkPlatform._notifyAdvancedMsgListeners` to filter its
++  /// singleton fan-out so an event meant for instance B does not fire
++  /// instance A's listener.
++  List<V2TimAdvancedMsgListener> listenersForInstance(int? instanceId) {
++    if (instanceId != null && instanceId != 0) {
++      final bucket = _instanceListeners[instanceId];
++      if (bucket != null && bucket.isNotEmpty) {
++        return bucket;
++      }
++    }
++    return v2TimAdvancedMsgListenerList;
++  }
++
+   V2TimMsgCreateInfoResult createTextMessage({required String text}) {
+     V2TimTextElem textElem = V2TimTextElem(text: text);
+     int elemType = MessageElemType.V2TIM_ELEM_TYPE_TEXT;
+@@ -2877,62 +2928,62 @@
+   void _internalInitMessageListener() {
+     _advancedMessageListener = V2TimAdvancedMsgListener(
+       onRecvNewMessage: (V2TimMessage msg) {
+-        for (var listener in v2TimAdvancedMsgListenerList) {
++        for (var listener in _listenersForCurrentDispatch()) {
+           listener.onRecvNewMessage(msg);
+         }
+       },
+       onRecvMessageModified: (V2TimMessage msg) {
+-        for (var listener in v2TimAdvancedMsgListenerList) {
++        for (var listener in _listenersForCurrentDispatch()) {
+           listener.onRecvMessageModified(msg);
+         }
+       },
+       onSendMessageProgress: (V2TimMessage msg, int progress) {
+-        for (var listener in v2TimAdvancedMsgListenerList) {
++        for (var listener in _listenersForCurrentDispatch()) {
+           listener.onSendMessageProgress(msg, progress);
+         }
+       },
+       onMessageDownloadProgressCallback: (V2TimMessageDownloadProgress progress) {
+-        for (var listener in v2TimAdvancedMsgListenerList) {
++        for (var listener in _listenersForCurrentDispatch()) {
+           listener.onMessageDownloadProgressCallback(progress);
+         }
+       },
+       onRecvC2CReadReceipt: (List<V2TimMessageReceipt> receiptList) {
+-        for (var listener in v2TimAdvancedMsgListenerList) {
++        for (var listener in _listenersForCurrentDispatch()) {
+           listener.onRecvC2CReadReceipt(receiptList);
+         }
+       },
+       onRecvMessageReadReceipts: (List<V2TimMessageReceipt> receiptList) {
+-        for (var listener in v2TimAdvancedMsgListenerList) {
++        for (var listener in _listenersForCurrentDispatch()) {
+           listener.onRecvMessageReadReceipts(receiptList);
+         }
+       },
+       onRecvMessageRevoked: (String msgID) {
+-        for (var listener in v2TimAdvancedMsgListenerList) {
++        for (var listener in _listenersForCurrentDispatch()) {
+           listener.onRecvMessageRevoked(msgID);
+         }
+       },
+       onRecvMessageRevokedWithInfo: (String msgID, V2TimUserFullInfo operateUser, String reason) {
+-        for (var listener in v2TimAdvancedMsgListenerList) {
++        for (var listener in _listenersForCurrentDispatch()) {
+           listener.onRecvMessageRevokedWithInfo(msgID, operateUser, reason);
+         }
+       },
+       onRecvMessageExtensionsChanged: (String msgID, List<V2TimMessageExtension> extensions) {
+-        for (var listener in v2TimAdvancedMsgListenerList) {
++        for (var listener in _listenersForCurrentDispatch()) {
+           listener.onRecvMessageExtensionsChanged(msgID, extensions);
+         }
+       },
+       onRecvMessageExtensionsDeleted: (String msgID, List<String> extensionIDs) {
+-        for (var listener in v2TimAdvancedMsgListenerList) {
++        for (var listener in _listenersForCurrentDispatch()) {
+           listener.onRecvMessageExtensionsDeleted(msgID, extensionIDs);
+         }
+       },
+       onRecvMessageReactionsChanged: (List<V2TIMMessageReactionChangeInfo> reactionChangeInfos) {
+-        for (var listener in v2TimAdvancedMsgListenerList) {
++        for (var listener in _listenersForCurrentDispatch()) {
+           listener.onRecvMessageReactionsChanged(reactionChangeInfos);
+         }
+       },
+       onGroupMessagePinned: (String groupID, V2TimMessage message, bool isPinned, V2TimGroupMemberInfo opUserInfo) {
+-        for (var listener in v2TimAdvancedMsgListenerList) {
++        for (var listener in _listenersForCurrentDispatch()) {
+           listener.onGroupMessagePinned(groupID, message, isPinned, opUserInfo);
+         }
+       },
+diff --git a/lib/native_im/adapter/tim_conversation_manager.dart b/lib/native_im/adapter/tim_conversation_manager.dart
+--- a/lib/native_im/adapter/tim_conversation_manager.dart
++++ b/lib/native_im/adapter/tim_conversation_manager.dart
+@@ -29,6 +29,10 @@
+   late V2TimConversationListener _conversationListener;
+   List<V2TimConversationListener> v2TimConversationListenerList = List.empty(growable: true);
+
++  /// Tim2tox multi-instance routing — per-instance listener buckets. See
++  /// `TIMMessageManager._instanceListeners` for the design rationale.
++  final Map<int, List<V2TimConversationListener>> _instanceListeners = {};
++
+   TIMConversationManager();
+
+   void init() {
+@@ -47,14 +51,42 @@
+     }
+
+     v2TimConversationListenerList.add(listener);
++    final regId = NativeLibraryManager.currentRegistrationInstanceId;
++    if (regId != null && regId != 0) {
++      final bucket = _instanceListeners[regId] ??= [];
++      if (!bucket.contains(listener)) {
++        bucket.add(listener);
++      }
++    }
+   }
+
+   void removeConversationListener({V2TimConversationListener? listener}) {
+     if (listener == null) {
+       v2TimConversationListenerList.clear();
++      _instanceListeners.clear();
+     } else {
+       v2TimConversationListenerList.remove(listener);
++      for (final bucket in _instanceListeners.values) {
++        bucket.remove(listener);
++      }
++    }
++  }
++
++  /// Tim2tox multi-instance routing — dispatch lookup. See
++  /// `TIMMessageManager._listenersForCurrentDispatch` for the design rationale.
++  List<V2TimConversationListener> _listenersForCurrentDispatch() =>
++      listenersForInstance(NativeLibraryManager.currentDispatchInstanceId);
++
++  /// Tim2tox multi-instance routing — public dispatch lookup. See
++  /// `TIMMessageManager.listenersForInstance` for the design rationale.
++  List<V2TimConversationListener> listenersForInstance(int? instanceId) {
++    if (instanceId != null && instanceId != 0) {
++      final bucket = _instanceListeners[instanceId];
++      if (bucket != null && bucket.isNotEmpty) {
++        return bucket;
++      }
+     }
++    return v2TimConversationListenerList;
+   }
+
+   Future<V2TimValueCallback<V2TimConversationResult>> getConversationList({
+@@ -762,79 +794,79 @@
+   void _initInternalConversationListener() {
+     _conversationListener = V2TimConversationListener(
+       onSyncServerStart: () {
+-        for (var listener in v2TimConversationListenerList) {
++        for (var listener in _listenersForCurrentDispatch()) {
+           listener.onSyncServerStart();
+         }
+       },
+
+       onSyncServerFinish: () {
+-        for (var listener in v2TimConversationListenerList) {
++        for (var listener in _listenersForCurrentDispatch()) {
+           listener.onSyncServerFinish();
+         }
+       },
+
+       onSyncServerFailed: () {
+-        for (var listener in v2TimConversationListenerList) {
++        for (var listener in _listenersForCurrentDispatch()) {
+           listener.onSyncServerFailed();
+         }
+       },
+
+       onNewConversation: (List<V2TimConversation> conversationList) {
+-        for (var listener in v2TimConversationListenerList) {
++        for (var listener in _listenersForCurrentDispatch()) {
+           listener.onNewConversation(conversationList);
+         }
+       },
+
+       onConversationChanged: (List<V2TimConversation> conversationList) {
+-        for (var listener in v2TimConversationListenerList) {
++        for (var listener in _listenersForCurrentDispatch()) {
+           listener.onConversationChanged(conversationList);
+         }
+       },
+
+       onTotalUnreadMessageCountChanged: (int unreadCount) {
+-        for (var listener in v2TimConversationListenerList) {
++        for (var listener in _listenersForCurrentDispatch()) {
+           listener.onTotalUnreadMessageCountChanged(unreadCount);
+         }
+       },
+
+       onConversationGroupCreated: (String groupName, List<V2TimConversation> conversationList) {
+-        for (var listener in v2TimConversationListenerList) {
++        for (var listener in _listenersForCurrentDispatch()) {
+           listener.onConversationGroupCreated(groupName, conversationList);
+         }
+       },
+
+       onConversationGroupDeleted: (String groupName) {
+-        for (var listener in v2TimConversationListenerList) {
++        for (var listener in _listenersForCurrentDispatch()) {
+           listener.onConversationGroupDeleted(groupName);
+         }
+       },
+
+       onConversationGroupNameChanged: (String oldName, String newName) {
+-        for (var listener in v2TimConversationListenerList) {
++        for (var listener in _listenersForCurrentDispatch()) {
+           listener.onConversationGroupNameChanged(oldName, newName);
+         }
+       },
+
+       onConversationsAddedToGroup: (String groupName, List<V2TimConversation> conversationList) {
+-        for (var listener in v2TimConversationListenerList) {
++        for (var listener in _listenersForCurrentDispatch()) {
+           listener.onConversationsAddedToGroup(groupName, conversationList);
+         }
+       },
+
+       onConversationsDeletedFromGroup: (String groupName, List<V2TimConversation> conversationList) {
+-        for (var listener in v2TimConversationListenerList) {
++        for (var listener in _listenersForCurrentDispatch()) {
+           listener.onConversationsDeletedFromGroup(groupName, conversationList);
+         }
+       },
+
+       onConversationDeleted: (List<String> conversationIDList) {
+-        for (var listener in v2TimConversationListenerList) {
++        for (var listener in _listenersForCurrentDispatch()) {
+           listener.onConversationDeleted(conversationIDList);
+         }
+       },
+
+       onUnreadMessageCountChangedByFilter: (V2TimConversationFilter filter, int totalUnreadCount) {
+-        for (var listener in v2TimConversationListenerList) {
++        for (var listener in _listenersForCurrentDispatch()) {
+           listener.onUnreadMessageCountChangedByFilter(filter, totalUnreadCount);
+         }
+       }
+diff --git a/lib/native_im/adapter/tim_friendship_manager.dart b/lib/native_im/adapter/tim_friendship_manager.dart
+--- a/lib/native_im/adapter/tim_friendship_manager.dart
++++ b/lib/native_im/adapter/tim_friendship_manager.dart
+@@ -42,6 +42,10 @@
+   late V2TimFriendshipListener _friendshipListener;
+   List<V2TimFriendshipListener> v2TimFriendshipListenerList = List.empty(growable: true);
+
++  /// Tim2tox multi-instance routing — per-instance listener buckets. See
++  /// `TIMMessageManager._instanceListeners` for the design rationale.
++  final Map<int, List<V2TimFriendshipListener>> _instanceListeners = {};
++
+   TIMFriendshipManager();
+
+   void init() {
+@@ -61,17 +65,45 @@
+     }
+
+     v2TimFriendshipListenerList.add(listener);
++    final regId = NativeLibraryManager.currentRegistrationInstanceId;
++    if (regId != null && regId != 0) {
++      final bucket = _instanceListeners[regId] ??= [];
++      if (!bucket.contains(listener)) {
++        bucket.add(listener);
++      }
++    }
+     return Future.value();
+   }
+
+   Future<void> removeFriendListener({V2TimFriendshipListener? listener}) {
+     if (listener == null) {
+       v2TimFriendshipListenerList.clear();
++      _instanceListeners.clear();
+     } else {
+       v2TimFriendshipListenerList.remove(listener);
++      for (final bucket in _instanceListeners.values) {
++        bucket.remove(listener);
++      }
+     }
+
+     return Future.value();
++  }
++
++  /// Tim2tox multi-instance routing — dispatch lookup. See
++  /// `TIMMessageManager._listenersForCurrentDispatch` for the design rationale.
++  List<V2TimFriendshipListener> _listenersForCurrentDispatch() =>
++      listenersForInstance(NativeLibraryManager.currentDispatchInstanceId);
++
++  /// Tim2tox multi-instance routing — public dispatch lookup. See
++  /// `TIMMessageManager.listenersForInstance` for the design rationale.
++  List<V2TimFriendshipListener> listenersForInstance(int? instanceId) {
++    if (instanceId != null && instanceId != 0) {
++      final bucket = _instanceListeners[instanceId];
++      if (bucket != null && bucket.isNotEmpty) {
++        return bucket;
++      }
++    }
++    return v2TimFriendshipListenerList;
+   }
+
+   Future<V2TimValueCallback<List<V2TimFriendInfo>>> getFriendList() async {
+@@ -890,91 +922,91 @@
+   void _initInternalFriendshipListener() {
+     _friendshipListener = V2TimFriendshipListener(
+       onFriendApplicationListAdded: (List<V2TimFriendApplication> applicationList) {
+-        for (var listener in v2TimFriendshipListenerList) {
++        for (var listener in _listenersForCurrentDispatch()) {
+           listener.onFriendApplicationListAdded(applicationList);
+         }
+       },
+
+       onFriendApplicationListDeleted: (List<String> userIDList) {
+-        for (var listener in v2TimFriendshipListenerList) {
++        for (var listener in _listenersForCurrentDispatch()) {
+           listener.onFriendApplicationListDeleted(userIDList);
+         }
+       },
+
+       onFriendApplicationListRead: () {
+-        for (var listener in v2TimFriendshipListenerList) {
++        for (var listener in _listenersForCurrentDispatch()) {
+           listener.onFriendApplicationListRead();
+         }
+       },
+
+       onFriendListAdded: (List<V2TimFriendInfo> friendInfoList) {
+-        for (var listener in v2TimFriendshipListenerList) {
++        for (var listener in _listenersForCurrentDispatch()) {
+           listener.onFriendListAdded(friendInfoList);
+         }
+       },
+
+       onFriendListDeleted: (List<String> userIDList) {
+-        for (var listener in v2TimFriendshipListenerList) {
++        for (var listener in _listenersForCurrentDispatch()) {
+           listener.onFriendListDeleted(userIDList);
+         }
+       },
+
+       onBlackListAdd: (List<V2TimFriendInfo> friendInfoList) {
+-        for (var listener in v2TimFriendshipListenerList) {
++        for (var listener in _listenersForCurrentDispatch()) {
+           listener.onBlackListAdd(friendInfoList);
+         }
+       },
+
+       onBlackListDeleted: (List<String> userIDList) {
+-        for (var listener in v2TimFriendshipListenerList) {
++        for (var listener in _listenersForCurrentDispatch()) {
+           listener.onBlackListDeleted(userIDList);
+         }
+       },
+
+       onFriendInfoChanged: (List<V2TimFriendInfo> friendInfoList) {
+-        for (var listener in v2TimFriendshipListenerList) {
++        for (var listener in _listenersForCurrentDispatch()) {
+           listener.onFriendInfoChanged(friendInfoList);
+         }
+       },
+
+       onOfficialAccountSubscribed: (V2TimOfficialAccountInfo officialAccountInfo) {
+-        for (var listener in v2TimFriendshipListenerList) {
++        for (var listener in _listenersForCurrentDispatch()) {
+           listener.onOfficialAccountSubscribed(officialAccountInfo);
+         }
+       },
+
+       onOfficialAccountUnsubscribed: (String officialAccountID) {
+-        for (var listener in v2TimFriendshipListenerList) {
++        for (var listener in _listenersForCurrentDispatch()) {
+           listener.onOfficialAccountUnsubscribed(officialAccountID);
+         }
+       },
+
+       onOfficialAccountDeleted: (String officialAccountID) {
+-        for (var listener in v2TimFriendshipListenerList) {
++        for (var listener in _listenersForCurrentDispatch()) {
+           listener.onOfficialAccountDeleted(officialAccountID);
+         }
+       },
+
+       onOfficialAccountInfoChanged: (V2TimOfficialAccountInfo officialAccountInfo) {
+-        for (var listener in v2TimFriendshipListenerList) {
++        for (var listener in _listenersForCurrentDispatch()) {
+           listener.onOfficialAccountInfoChanged(officialAccountInfo);
+         }
+       },
+
+       onMyFollowingListChanged: (List<V2TimUserFullInfo> userInfoList, bool isAdd) {
+-        for (var listener in v2TimFriendshipListenerList) {
++        for (var listener in _listenersForCurrentDispatch()) {
+           listener.onMyFollowingListChanged(userInfoList, isAdd);
+         }
+       },
+
+       onMyFollowersListChanged: (List<V2TimUserFullInfo> userInfoList, bool isAdd) {
+-        for (var listener in v2TimFriendshipListenerList) {
++        for (var listener in _listenersForCurrentDispatch()) {
+           listener.onMyFollowersListChanged(userInfoList, isAdd);
+         }
+       },
+
+       onMutualFollowersListChanged: (List<V2TimUserFullInfo> userInfoList, bool isAdd) {
+-        for (var listener in v2TimFriendshipListenerList) {
++        for (var listener in _listenersForCurrentDispatch()) {
+           listener.onMutualFollowersListChanged(userInfoList, isAdd);
+         }
+       },
+--
+2.50.1 (Apple Git-155)

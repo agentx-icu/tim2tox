@@ -22,3 +22,7 @@
 0009-v2-tim-group-info-null-safety.patch
 0010-conference-group-created-and-member-invited.patch
 0011-broaden-multi-instance-binary-listener-passthrough.patch
+0012-group-members-info-flat-array-decode.patch
+0013-passthrough-update-friend-profile.patch
+0014-instance-tagged-listener-routing.patch
+0015-v2-tim-conversation-recv-opt-null-safety.patch

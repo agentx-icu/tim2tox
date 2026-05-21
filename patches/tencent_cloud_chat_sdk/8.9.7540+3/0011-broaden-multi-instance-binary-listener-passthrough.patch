@@ -64,7 +64,7 @@ these singleton-side callbacks now receive them. toxee is unaffected.
 diff --git a/lib/native_im/bindings/native_library_manager.dart b/lib/native_im/bindings/native_library_manager.dart
 --- a/lib/native_im/bindings/native_library_manager.dart
 +++ b/lib/native_im/bindings/native_library_manager.dart
-@@ -377,10 +377,30 @@
+@@ -377,11 +377,33 @@
        // Without GroupTipsEvent in this list, the multi-instance test path
        // (Tim2ToxSdkPlatform.dispatchInstanceGlobalCallback) early-returns on
        // `grpList.isEmpty` and the event is lost — tests waiting for
