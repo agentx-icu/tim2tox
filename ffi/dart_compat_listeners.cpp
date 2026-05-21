@@ -389,7 +389,15 @@ static std::string MessageToJsonArray(const V2TIMMessage& msg) {
         json << "{";
         json << "\"message_msg_id\":\"" << EscapeJsonString(msg_id) << "\",";
         json << "\"message_seq\":" << msg.seq << ",";
-        json << "\"message_rand\":" << msg.random << ",";
+        // V2TIMMessage::random is uint64_t and is NEVER set by Tim2Tox's C++
+        // core (V2TIMMessage::V2TIMMessage() = default; no member init),
+        // so it carries uninitialized stack bytes. When emitted as a JSON
+        // number, large values overflow Dart's int53 safe range and parse as
+        // `double`, which then trips `V2TimMessage.fromJson` (line `random =
+        // json['message_rand'];`) with "'double' is not a subtype of type
+        // 'int?'". Clamp to 0 here so the parsed value is always int-safe.
+        // The field is informational only — no Tim2Tox code path reads it.
+        json << "\"message_rand\":" << 0 << ",";
         json << "\"message_status\":" << static_cast<int>(msg.status) << ",";
         json << "\"message_sender\":\"" << EscapeJsonString(sender) << "\",";
         json << "\"message_user_id\":\"" << EscapeJsonString(user_id) << "\",";
@@ -552,7 +560,13 @@ static std::string FriendInfoVectorToJsonForCallback(const V2TIMFriendInfoVector
             std::string friend_remark = friend_info.friendRemark.CString();
             
             json << "{";
+            // Both `friend_profile_identifier` and `friend_profile_update_identifier`
+            // are emitted: Dart's `_handleGlobalCallback` case
+            // `UpdateFriendProfile` reads the `_update_identifier` form (line 917
+            // of native_library_manager.dart), but other consumers expect the
+            // plain `_identifier` form. Both point at the same userID.
             json << "\"friend_profile_identifier\":\"" << EscapeJsonString(user_id) << "\",";
+            json << "\"friend_profile_update_identifier\":\"" << EscapeJsonString(user_id) << "\",";
             json << "\"friend_profile_remark\":\"" << EscapeJsonString(friend_remark) << "\",";
             
             // friend_profile_group_name_array
@@ -1012,7 +1026,14 @@ public:
         // Note: userID should be 64-character public key (TOX_PUBLIC_KEY_SIZE * 2)
         std::string friend_profile_array_json = FriendInfoVectorToJsonForCallback(infoList);
         std::map<std::string, std::string> fields;
-        fields["json_friend_profile_update_array"] = friend_profile_array_json;
+        // Dart side (NativeLibraryManager._handleGlobalCallback case
+        // GlobalCallbackType.UpdateFriendProfile, line 921) reads
+        // "friend_info_update_array". Previously we sent under
+        // "json_friend_profile_update_array" which Dart silently ignored,
+        // _getGlobalCallbackJsonString returned "" for the missing key, and
+        // json.decode("") threw FormatException in setUpAll for any test
+        // that registered a friendship listener (group_multi, group_state_changes).
+        fields["friend_info_update_array"] = friend_profile_array_json;
         std::string user_data = UserDataToString(GetCallbackUserData(instance_id, "UpdateFriendProfile"));
         std::string json_msg = BuildGlobalCallbackJson(GlobalCallbackType::UpdateFriendProfile, fields, user_data, instance_id);
         SendCallbackToDart("globalCallback", json_msg, GetCallbackUserData(instance_id, "UpdateFriendProfile"));
@@ -2640,6 +2661,34 @@ DartAdvancedMsgListenerImpl* GetOrCreateAdvancedMsgListener() {
     return listener;
 }
 
+// Helper function to get or create AdvancedMsg listener for a specific instance_id.
+// Used by ReplayListenersForNewInstance when registering advanced-msg listener on a
+// newly-created test instance whose current_instance pointer may not yet be set.
+DartAdvancedMsgListenerImpl* GetOrCreateAdvancedMsgListenerForInstance(int64_t instance_id) {
+    std::lock_guard<std::mutex> lock(g_listeners_mutex);
+    auto it = g_advanced_msg_listeners.find(instance_id);
+    if (it != g_advanced_msg_listeners.end()) {
+        return it->second;
+    }
+    DartAdvancedMsgListenerImpl* listener = new DartAdvancedMsgListenerImpl();
+    g_advanced_msg_listeners[instance_id] = listener;
+    return listener;
+}
+
+// Helper function to get or create SDK listener for a specific instance_id.
+// Mirror of GetOrCreateAdvancedMsgListenerForInstance for SDK listeners (network
+// status, user info changed, user status changed, self info updated, etc.).
+DartSDKListenerImpl* GetOrCreateSDKListenerForInstance(int64_t instance_id) {
+    std::lock_guard<std::mutex> lock(g_listeners_mutex);
+    auto it = g_sdk_listeners.find(instance_id);
+    if (it != g_sdk_listeners.end()) {
+        return it->second;
+    }
+    DartSDKListenerImpl* listener = new DartSDKListenerImpl();
+    g_sdk_listeners[instance_id] = listener;
+    return listener;
+}
+
 // Helper function to get or create Conversation listener for current instance
 DartConversationListenerImpl* GetOrCreateConversationListener() {
     std::lock_guard<std::mutex> lock(g_listeners_mutex);
@@ -2858,13 +2907,159 @@ void ReplayListenersForNewInstance(int64_t instance_id, V2TIMManagerImpl* manage
     // but other friendship events (HandleFriendConnectionStatus, HandleFriendStatus,
     // HandleFriendName) only iterate already-registered listeners and do not auto-create.
     // Mirror the same replay here so they fire on the new instance.
-    if (void* friend_add_ud = find_existing_user_data("AddFriend")) {
-        StoreCallbackUserData(instance_id, "AddFriend", friend_add_ud);
-        DartFriendshipListenerImpl* listener = GetOrCreateFriendshipListenerForInstance(instance_id);
-        if (listener) {
-            auto* fm = manager->GetFriendshipManager();
-            if (fm) {
-                fm->AddFriendListener(listener);
+    {
+        bool friend_registered = false;
+        auto register_friend_listener = [&]() {
+            if (friend_registered) return;
+            DartFriendshipListenerImpl* listener =
+                GetOrCreateFriendshipListenerForInstance(instance_id);
+            if (listener) {
+                auto* fm = manager->GetFriendshipManager();
+                if (fm) {
+                    fm->AddFriendListener(listener);
+                    friend_registered = true;
+                }
+            }
+        };
+        static const char* kFriendCallbackNames[] = {
+            "AddFriend",          "FriendInfoChanged",
+            "FriendListAdded",    "FriendListDeleted",
+            "FriendApplicationListAdded",
+            "FriendApplicationListDeleted",
+            "FriendApplicationListRead",
+            "BlackListAdded",     "BlackListDeleted",
+        };
+        for (const char* name : kFriendCallbackNames) {
+            if (void* ud = find_existing_user_data(name)) {
+                StoreCallbackUserData(instance_id, name, ud);
+                register_friend_listener();
+            }
+        }
+        // Defense in depth: even if no prior user_data was found for any
+        // friendship callback (test registers via Dart-side addFriendListener
+        // only, which doesn't go through DartSet*Callback), still register the
+        // listener so HandleFriendName / HandleFriendStatus / HandleFriendConnectionStatus
+        // can dispatch to bob's V2TIM listener — Dart-side NativeLibraryManager
+        // fans out to the singleton v2TimFriendshipListenerList without needing
+        // a matching user_data in the C++ map.
+        if (!friend_registered) {
+            DartFriendshipListenerImpl* listener =
+                GetOrCreateFriendshipListenerForInstance(instance_id);
+            if (listener) {
+                auto* fm = manager->GetFriendshipManager();
+                if (fm) {
+                    fm->AddFriendListener(listener);
+                    V2TIM_LOG(kInfo,
+                              "[ReplayListenersForNewInstance] Unconditionally registered Friendship listener={} on instance_id={} fm={} (no prior user_data found)",
+                              (void*)listener, (long long)instance_id, (void*)fm);
+                }
+            }
+        }
+    }
+
+    // SDK listener: register only once for this instance regardless of how many
+    // SDK-listener-class callbacks were previously stored (NetworkStatus,
+    // UserStatusChanged, SelfInfoUpdated, UserInfoChanged, KickedOffline,
+    // UserSigExpired, LogCallback, AllMessageReceiveOption). Each
+    // DartSet*Callback above calls manager->AddSDKListener with the SAME
+    // DartSDKListenerImpl singleton; we mirror that here so the new instance
+    // receives every SDK-listener-class callback.
+    //
+    // Symptom without this: scenario_user_status_virtual_test,
+    // scenario_events_virtual_test, scenario_message_virtual_test,
+    // scenario_message_overflow_virtual_test, scenario_avatar_virtual_test,
+    // scenario_group_message_virtual_test all hang/timeout — the receiver
+    // node is instance 2, but the SDK listener was only registered on
+    // instance 1 (the first node whose Dart-side TIMManager.initSDK ran).
+    {
+        bool sdk_registered = false;
+        auto register_sdk_listener = [&]() {
+            if (sdk_registered) return;
+            DartSDKListenerImpl* listener = GetOrCreateSDKListenerForInstance(instance_id);
+            if (listener) {
+                manager->AddSDKListener(listener);
+                sdk_registered = true;
+            }
+        };
+        static const char* kSDKCallbackNames[] = {
+            "NetworkStatus",     "KickedOffline",        "UserSigExpired",
+            "SelfInfoUpdated",   "UserStatusChanged",    "UserInfoChanged",
+            "LogCallback",       "AllMessageReceiveOption",
+        };
+        for (const char* name : kSDKCallbackNames) {
+            if (void* ud = find_existing_user_data(name)) {
+                StoreCallbackUserData(instance_id, name, ud);
+                register_sdk_listener();
+            }
+        }
+    }
+
+    // Advanced-message listener: register only once for this instance regardless
+    // of how many AdvancedMsg-listener-class callbacks were previously stored
+    // (ReceiveNewMessage, MessageElemUploadProgress, MessageReadReceipt,
+    // MessageRevoke, MessageUpdate, MessageExtensionsChanged,
+    // MessageExtensionsDeleted, MessageReactionChange, GroupPinnedMessageChanged).
+    // Each DartSet*MsgCallback / DartAddReceiveNewMsgCallback above calls
+    // GetMessageManager()->AddAdvancedMsgListener with the SAME
+    // DartAdvancedMsgListenerImpl singleton; mirror that here so the new
+    // instance receives every advanced-msg-listener-class callback. Without
+    // this, the receiver node's V2TIMMessageManagerImpl.listeners_ is empty
+    // and V2TIMMessageManagerImpl::NotifyAdvancedListenersReceivedMessage
+    // logs "Found 0 listeners to notify" — every message-receiving test on
+    // the second instance times out.
+    {
+        bool adv_registered = false;
+        auto register_adv_listener = [&]() {
+            if (adv_registered) return;
+            DartAdvancedMsgListenerImpl* listener =
+                GetOrCreateAdvancedMsgListenerForInstance(instance_id);
+            if (listener) {
+                auto* mm = manager->GetMessageManager();
+                if (mm) {
+                    mm->AddAdvancedMsgListener(listener);
+                    adv_registered = true;
+                    V2TIM_LOG(kInfo, "[ReplayListenersForNewInstance] Registered AdvancedMsg listener={} on instance_id={} msgManager={}",
+                              (void*)listener, (long long)instance_id, (void*)mm);
+                }
+            }
+        };
+        static const char* kAdvMsgCallbackNames[] = {
+            "ReceiveNewMessage",         "MessageElemUploadProgress",
+            "MessageReadReceipt",        "MessageRevoke",
+            "MessageUpdate",             "MessageExtensionsChanged",
+            "MessageExtensionsDeleted",  "MessageReactionChange",
+            "GroupPinnedMessageChanged",
+        };
+        for (const char* name : kAdvMsgCallbackNames) {
+            if (void* ud = find_existing_user_data(name)) {
+                StoreCallbackUserData(instance_id, name, ud);
+                register_adv_listener();
+            }
+        }
+
+        // Defense in depth: even if no prior user_data was found for any
+        // advanced-msg callback (e.g. timing window where the first instance's
+        // _internalInitMessageListener hadn't completed before this replay ran,
+        // or first instance never went through Dart-side TIMManager.initSDK
+        // for some reason), still register the listener so
+        // V2TIMMessageManagerImpl::NotifyAdvancedListenersReceivedMessage can
+        // dispatch. The callback bridge tolerates empty user_data (only the
+        // JSON payload + instance_id matter for NativeLibraryManager dispatch
+        // on the Dart side). Without this, group-message receivers on the
+        // second/third test instances see "Found 0 listeners to notify" and
+        // every multi-peer message test (group_general, group_large,
+        // group_message_types text/multi-type/conference, group_multi,
+        // group_state_changes, group_vs_conference) times out.
+        if (!adv_registered) {
+            DartAdvancedMsgListenerImpl* listener =
+                GetOrCreateAdvancedMsgListenerForInstance(instance_id);
+            if (listener) {
+                auto* mm = manager->GetMessageManager();
+                if (mm) {
+                    mm->AddAdvancedMsgListener(listener);
+                    V2TIM_LOG(kInfo, "[ReplayListenersForNewInstance] Unconditionally registered AdvancedMsg listener={} on instance_id={} msgManager={} (no prior user_data found)",
+                              (void*)listener, (long long)instance_id, (void*)mm);
+                }
             }
         }
     }

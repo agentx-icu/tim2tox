@@ -2952,8 +2952,13 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
         break;
       case GlobalCallbackType.UpdateFriendProfile:
         {
+          // Key migrated from 'json_friend_profile_update_array' to
+          // 'friend_info_update_array' alongside dart_compat_listeners.cpp:1036
+          // and NativeLibraryManager._handleGlobalCallback (line 913). Reading
+          // the old key would early-break and silently drop UpdateFriendProfile
+          // on the platform path when shouldPassthrough doesn't cover it.
           final jsonFriendProfileArray =
-              dataFromNativeMap['json_friend_profile_update_array'];
+              dataFromNativeMap['friend_info_update_array'];
           if (jsonFriendProfileArray == null) break;
           List<dynamic> arr;
           if (jsonFriendProfileArray is String &&
