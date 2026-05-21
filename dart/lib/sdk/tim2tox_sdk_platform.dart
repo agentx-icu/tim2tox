@@ -3619,14 +3619,22 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
   void _notifyAdvancedMsgListeners(
       void Function(V2TimAdvancedMsgListener) callback,
       {int? dispatchInstanceId}) {
-    final listeners = List.of(_advancedMsgListeners);
     // Multi-instance routing: when a non-zero `dispatchInstanceId` is known
-    // (e.g. `progress.instanceId` from the FFI bridge), filter the SDK
-    // singleton list to only the listeners registered against that instance.
-    // Without this filter Alice's and Bob's listeners both fire for events
-    // meant for one of them. When `dispatchInstanceId` is null/0 (the toxee
-    // production case) `listenersForInstance` falls back to the flat list —
-    // byte-identical behavior to the pre-0014 platform.
+    // (e.g. `progress.instanceId` from the FFI bridge), filter BOTH the
+    // platform-local list AND the SDK singleton list to the listeners
+    // registered against that instance. Without filtering the platform
+    // list, listeners registered via `TencentCloudChatSdkPlatform.instance
+    // .addAdvancedMsgListener` from multiple instances all end up in
+    // `_advancedMsgListeners` (flat) and fire for every event regardless
+    // of the dispatch instance. `selectDispatchListeners` falls back to
+    // the flat list when the per-instance map is empty for `dispatchInstanceId`,
+    // preserving single-instance toxee behavior.
+    final listeners = List.of(selectDispatchListeners<V2TimAdvancedMsgListener>(
+      instanceId: dispatchInstanceId ?? 0,
+      instanceListeners:
+          _instanceAdvancedMsgListeners[dispatchInstanceId] ?? const [],
+      globalListeners: _advancedMsgListeners,
+    ));
     final singletonListeners = List.of(
         TIMMessageManager.instance.listenersForInstance(dispatchInstanceId));
     if (_debugLog) {
@@ -3681,8 +3689,14 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
   void _notifyConversationListeners(
       void Function(V2TimConversationListener) callback,
       {int? dispatchInstanceId}) {
-    final listeners = List.of(_conversationListeners);
     // See `_notifyAdvancedMsgListeners` for the per-instance filter rationale.
+    final listeners =
+        List.of(selectDispatchListeners<V2TimConversationListener>(
+      instanceId: dispatchInstanceId ?? 0,
+      instanceListeners:
+          _instanceConversationListeners[dispatchInstanceId] ?? const [],
+      globalListeners: _conversationListeners,
+    ));
     final singletonListeners = List.of(TIMConversationManager.instance
         .listenersForInstance(dispatchInstanceId));
     for (final listener in listeners) {
@@ -3716,8 +3730,13 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
   void _notifyFriendshipListeners(
       void Function(V2TimFriendshipListener) callback,
       {int? dispatchInstanceId}) {
-    final listeners = List.of(_friendshipListeners);
     // See `_notifyAdvancedMsgListeners` for the per-instance filter rationale.
+    final listeners = List.of(selectDispatchListeners<V2TimFriendshipListener>(
+      instanceId: dispatchInstanceId ?? 0,
+      instanceListeners:
+          _instanceFriendshipListeners[dispatchInstanceId] ?? const [],
+      globalListeners: _friendshipListeners,
+    ));
     final singletonListeners = List.of(
         TIMFriendshipManager.instance.listenersForInstance(dispatchInstanceId));
     for (final listener in listeners) {
