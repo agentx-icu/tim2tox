@@ -186,6 +186,60 @@ class TestNode {
             List<V2TimGroupMemberInfo> memberList) {
           print(
               '[TestNode] $alias: onMemberInvited callback triggered for groupID=$groupID, memberCount=${memberList.length}');
+          // V2TIM onMemberInvited fires on EVERY current group member when a
+          // new member is invited (so existing members can refresh their UI).
+          // Auto_tests use this as a stand-in for "I was invited" (there is
+          // no separate onSelfInvited callback) but if we mark it
+          // unconditionally, later invites to other members overwrite the
+          // local node's stored invite groupID — joinGroup then receives a
+          // groupID for which we have no pending invite and returns 6017
+          // "Pending invite not found".
+          //
+          // Filter: only treat this as "I was invited" when the invited
+          // memberList contains this node's public key. The C++
+          // HandleGroupInvite pushes self into memberList right before
+          // firing onMemberInvited (V2TIMManagerImpl.cpp ~580), so on the
+          // invitee's side memberList[0].userID == self's 64-char public key.
+          // On peer (existing-member) sides, memberList[0].userID is the
+          // newly-invited peer's public key, NOT ours, so we skip.
+          //
+          // Read self's pubkey from the existing cache rather than calling
+          // getPublicKey() here — getPublicKey()->getToxId()->runWithInstance
+          // would re-enter the instance switching machinery from inside a
+          // dispatch callback. That has caused getToxId() to transiently
+          // return an empty string when establishFriendshipVirtual is racing
+          // with this listener firing during setUpAll (symptom:
+          // "Invalid Alice Tox ID:  (expected 76 hex characters)"). If the
+          // cache isn't populated yet (listener fires before any test code
+          // has called getToxId() once), fall back to legacy "mark
+          // unconditionally" behaviour — better to flake the way we used to
+          // than to silently drop a self-invite.
+          String selfPk = '';
+          final cachedToxId = _toxIdCache;
+          if (cachedToxId != null && cachedToxId.length >= 64) {
+            selfPk = cachedToxId.substring(0, 64).toUpperCase();
+          }
+          bool isForSelf = selfPk.isEmpty;
+          if (!isForSelf && memberList.isNotEmpty) {
+            for (final m in memberList) {
+              final uid = (m.userID ?? '').toUpperCase();
+              final uidPrefix = uid.length >= 64 ? uid.substring(0, 64) : uid;
+              if (uidPrefix == selfPk) {
+                isForSelf = true;
+                break;
+              }
+            }
+          }
+          if (!isForSelf) {
+            final memberPks = memberList
+                .map((m) =>
+                    (m.userID ?? '').length >= 16 ? (m.userID ?? '').substring(0, 16) : (m.userID ?? ''))
+                .toList();
+            final selfPkPrefix = selfPk.length >= 16 ? selfPk.substring(0, 16) : selfPk;
+            print(
+                '[TestNode] $alias: onMemberInvited skipped (peer-invite, not self); selfPk=$selfPkPrefix memberPks=$memberPks');
+            return;
+          }
           markCallbackReceived('onGroupInvited',
               data: {'groupID': groupID, 'memberCount': memberList.length});
         },
@@ -353,6 +407,18 @@ class TestNode {
       print(
           '[Test] Node $alias: Set loggedIn=true after successful login API call');
       clearToxIdCache();
+      // Warm the Tox ID cache eagerly so the _groupListener.onMemberInvited
+      // filter (which compares memberList[*].userID against self's pubkey)
+      // can read it synchronously without re-entering runWithInstance from
+      // inside a dispatch callback. Without this, the first onMemberInvited
+      // can fire before _toxIdCache is populated and the filter falls back
+      // to "mark unconditionally" — which re-introduces the late-invite
+      // overwrite bug that broke scenario_group_state_changes_virtual_test.
+      try {
+        getToxId();
+      } catch (_) {
+        // best-effort; non-fatal if FFI not yet ready
+      }
       enableAutoAccept();
 
       // Wait for real Tox DHT connection (tox_self_get_connection_status), not just loginStatus

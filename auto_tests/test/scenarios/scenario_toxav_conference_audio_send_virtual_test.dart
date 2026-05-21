@@ -196,6 +196,10 @@ void main() {
       final bobGroupListener = V2TimGroupListener(
         onMemberInvited:
             (String groupID, V2TimGroupMemberInfo opUser, List<V2TimGroupMemberInfo> memberList) {
+          // V2TIM onMemberInvited fires on every group member for any new invite;
+          // only capture entries where Bob himself is among the invited members.
+          final memberIDs = memberList.map((m) => (m.userID ?? '').toUpperCase()).toSet();
+          if (!memberIDs.contains(bobPub.toUpperCase())) return;
           bobReceivedInvite = true;
           bobInvitedGroupId = groupID;
           bob.markCallbackReceived('onMemberInvited');
@@ -204,6 +208,8 @@ void main() {
       final charlieGroupListener = V2TimGroupListener(
         onMemberInvited:
             (String groupID, V2TimGroupMemberInfo opUser, List<V2TimGroupMemberInfo> memberList) {
+          final memberIDs = memberList.map((m) => (m.userID ?? '').toUpperCase()).toSet();
+          if (!memberIDs.contains(charliePub.toUpperCase())) return;
           charlieReceivedInvite = true;
           charlieInvitedGroupId = groupID;
           charlie.markCallbackReceived('onMemberInvited');
