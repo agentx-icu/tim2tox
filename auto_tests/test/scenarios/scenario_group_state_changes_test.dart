@@ -515,9 +515,26 @@ void main() {
           ? nonAliceMembers.first.userID
           : bobPublicKey;
       var bobReceivedRoleChange = false;
+      final bobIdLower = bobUserIDInGroup.toLowerCase();
+      final bobPkLower = bobPublicKey.toLowerCase();
+      bool isBobUserID(String? raw) {
+        final uid = (raw ?? '').toLowerCase();
+        if (uid.isEmpty) return false;
+        return uid == bobIdLower ||
+            uid == bobPkLower ||
+            (uid.length >= 64 && uid.startsWith(bobPkLower)) ||
+            (bobPkLower.length >= 64 && bobPkLower.startsWith(uid));
+      }
+
       final bobListener = V2TimGroupListener(
+        // tim2tox assigns per-instance LOCAL group IDs, so the groupID Bob's own
+        // onMemberInfoChanged carries (his invite-derived id, e.g. tox_inv_<n>_<ts>)
+        // need not equal Alice's groupId or the onGroupInvited id captured above.
+        // Accept the notification either when the groupID is one we know, or — more
+        // robustly — when the change is about Bob himself (his role just changed).
         onMemberInfoChanged: (groupID, changeInfos) {
-          if (expectedGroupIds.contains(groupID)) {
+          final aboutBob = changeInfos.any((c) => isBobUserID(c.userID));
+          if (expectedGroupIds.contains(groupID) || aboutBob) {
             bobReceivedRoleChange = true;
             bob.markCallbackReceived('onMemberInfoChanged');
           }

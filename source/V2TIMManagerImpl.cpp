@@ -6896,8 +6896,6 @@ void V2TIMManagerImpl::HandleGroupModeration(Tox_Group_Number group_number, Tox_
     Tox_Group_Peer_Number self_peer_id = tox_group_self_get_peer_id(tox, group_number, &err_self);
     const bool self_is_target =
         (err_self == TOX_ERR_GROUP_SELF_QUERY_OK && target_peer_id == self_peer_id);
-    V2TIM_LOG(kInfo, "[HandleGroupModeration] self_peer_id={} err_self={} target_peer={} self_is_target={}",
-              self_peer_id, static_cast<int>(err_self), target_peer_id, self_is_target ? 1 : 0);
 
     // Get target peer public key (self vs. other-peer path).
     uint8_t target_pubkey[TOX_PUBLIC_KEY_SIZE];
