@@ -1776,10 +1776,16 @@ static std::string GroupChangeInfoVectorToJson(const V2TIMGroupChangeInfoVector&
 
 // Helper function to convert V2TIMGroupMemberChangeInfo to JSON
 static std::string GroupMemberChangeInfoToJson(const V2TIMGroupMemberChangeInfo& change) {
+    // Field names MUST match Dart's V2TimGroupMemberChangeInfo.fromJson, which reads
+    // group_tips_member_change_info_identifier / _shutupTime — NOT userID / muteTime.
+    // Emitting the wrong keys made Dart parse an empty userID, so onMemberInfoChanged
+    // listeners could not tell which member changed (e.g. scenario_group_state_changes_test's
+    // role-change notification fired but carried no identity). Mirrors the correct names
+    // already used by dart_compat_group.cpp's NotifyTargetUserMemberInfoChanged.
     std::ostringstream json;
     json << "{";
-    json << "\"userID\":\"" << EscapeJsonString(change.userID.CString()) << "\",";
-    json << "\"muteTime\":" << change.muteTime;
+    json << "\"group_tips_member_change_info_identifier\":\"" << EscapeJsonString(change.userID.CString()) << "\",";
+    json << "\"group_tips_member_change_info_shutupTime\":" << change.muteTime;
     json << "}";
     return json.str();
 }
