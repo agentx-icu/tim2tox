@@ -1952,14 +1952,24 @@ public:
         // Build GroupTipsElem JSON for member info change; tip_type must be Dart CGroupTipsType.GROUP_TIPS_TYPE_GROUP_MEMBER_INFO_CHANGE(7)
         V2TIMGroupMemberInfo opMember;
         opMember.userID = V2TIMString(""); // No operator info available
-        V2TIMGroupMemberInfoVector emptyMemberList;
+        // Populate the tip's member list with the changed members. Dart's
+        // native_library_manager only delivers onMemberInfoChanged when the tip's
+        // memberList is non-empty (`if (groupMemberList.isNotEmpty)`); a member-info
+        // change with an empty member list is silently dropped. Real Tencent IM tips
+        // carry the affected members here too, so mirror that.
+        V2TIMGroupMemberInfoVector changedMembers;
+        for (size_t i = 0; i < v2TIMGroupMemberChangeInfoList.Size(); i++) {
+            V2TIMGroupMemberInfo m;
+            m.userID = v2TIMGroupMemberChangeInfoList[i].userID;
+            changedMembers.PushBack(m);
+        }
         V2TIMGroupChangeInfoVector emptyChanges;
-        
+
         std::string groupTipsJson = BuildGroupTipsElemJson(
-            groupID, 
+            groupID,
             kDartTipTypeGroupMemberInfoChange,
             opMember,
-            emptyMemberList,
+            changedMembers,
             emptyChanges,
             v2TIMGroupMemberChangeInfoList,
             0);
