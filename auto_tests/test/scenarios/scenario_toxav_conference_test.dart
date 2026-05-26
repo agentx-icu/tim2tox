@@ -296,17 +296,22 @@ void main() {
         description: 'Both Bob and Charlie received invites',
       );
       
-      final bobJoinResult = await bob.runWithInstanceAsync(() async => TIMManager.instance.joinGroup(
-        groupID: bobInvitedGroupId!,
-        message: '',
-      ));
-      expect(bobJoinResult.code, equals(0));
-      
-      final charlieJoinResult = await charlie.runWithInstanceAsync(() async => TIMManager.instance.joinGroup(
-        groupID: charlieInvitedGroupId!,
-        message: '',
-      ));
-      expect(charlieJoinResult.code, equals(0));
+      // AV conferences auto-join inside the invite callback and only map the
+      // invite's local id a moment later, so an explicit join racing that mapping
+      // can transiently return 6017. Retry until the mapping settles.
+      Future<int> joinWithRetry(TestNode node, String gid) async {
+        var res = await node.runWithInstanceAsync(
+            () async => TIMManager.instance.joinGroup(groupID: gid, message: ''));
+        for (int r = 0; r < 6 && res.code != 0; r++) {
+          await Future.delayed(const Duration(milliseconds: 500));
+          res = await node.runWithInstanceAsync(
+              () async => TIMManager.instance.joinGroup(groupID: gid, message: ''));
+        }
+        return res.code;
+      }
+
+      expect(await joinWithRetry(bob, bobInvitedGroupId!), equals(0));
+      expect(await joinWithRetry(charlie, charlieInvitedGroupId!), equals(0));
       
       await Future.delayed(const Duration(seconds: 5));
       

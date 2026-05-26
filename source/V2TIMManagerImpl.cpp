@@ -6933,8 +6933,8 @@ void V2TIMManagerImpl::HandleGroupModeration(Tox_Group_Number group_number, Tox_
 
     // When this client is the target of the moderation (e.g. role changed by someone else),
     // notify listeners with OnMemberInfoChanged so the app sees "my role changed".
-    V2TIM_LOG(kInfo, "[HandleGroupModeration] self_is_target={} listeners={} — {} OnMemberInfoChanged",
-              self_is_target ? 1 : 0, listeners_copy.size(),
+    V2TIM_LOG(kInfo, "[HandleGroupModeration] self_is_target={} listeners={} target_userID={} — {} OnMemberInfoChanged",
+              self_is_target ? 1 : 0, listeners_copy.size(), target_userID,
               (self_is_target && !listeners_copy.empty()) ? "firing" : "skipping");
     if (self_is_target && !listeners_copy.empty()) {
         V2TIMGroupMemberChangeInfo changeInfo;
