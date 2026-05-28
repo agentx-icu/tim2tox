@@ -6867,15 +6867,13 @@ void V2TIMManagerImpl::HandleGroupModeration(Tox_Group_Number group_number, Tox_
         std::lock_guard<std::mutex> lock(mutex_);
         auto it = group_number_to_group_id_.find(group_number);
         if (it == group_number_to_group_id_.end()) {
-            V2TIM_LOG(kWarning, "[HandleGroupModeration] group_number={} not in mapping (size={}) — returning early",
-                      group_number, group_number_to_group_id_.size());
             return;
         }
         groupID = it->second;
     }
 
     Tox* tox = GetToxManager()->getTox();
-    if (!tox) { V2TIM_LOG(kWarning, "[HandleGroupModeration] tox null — returning early"); return; }
+    if (!tox) return;
 
     // Resolve whether this moderation targets our own peer FIRST. The self peer is
     // not reachable through tox_group_peer_get_public_key — it resolves peers via
@@ -6904,8 +6902,6 @@ void V2TIMManagerImpl::HandleGroupModeration(Tox_Group_Number group_number, Tox_
                          && err_key == TOX_ERR_GROUP_PEER_QUERY_OK;
     }
     if (!got_target_key) {
-        V2TIM_LOG(kWarning, "[HandleGroupModeration] could not resolve target pubkey (self_is_target={}, err_key={}) — returning early",
-                  self_is_target ? 1 : 0, static_cast<int>(err_key));
         return;
     }
 
@@ -6927,9 +6923,6 @@ void V2TIMManagerImpl::HandleGroupModeration(Tox_Group_Number group_number, Tox_
 
     // When this client is the target of the moderation (e.g. role changed by someone else),
     // notify listeners with OnMemberInfoChanged so the app sees "my role changed".
-    V2TIM_LOG(kInfo, "[HandleGroupModeration] self_is_target={} listeners={} — {} OnMemberInfoChanged",
-              self_is_target ? 1 : 0, listeners_copy.size(),
-              (self_is_target && !listeners_copy.empty()) ? "firing" : "skipping");
     if (self_is_target && !listeners_copy.empty()) {
         V2TIMGroupMemberChangeInfo changeInfo;
         changeInfo.userID = V2TIMString(target_userID.c_str());
