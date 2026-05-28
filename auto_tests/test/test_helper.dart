@@ -3017,16 +3017,17 @@ Future<void> establishFriendshipVirtual(
           : remainingForP2PSec.clamp(1, maxWaitSec);
       final waitEach = Duration(seconds: waitEachSec);
       print(
-          '[establishFriendshipVirtual] Waiting for Tox P2P connection in parallel (${waitEach.inSeconds}s each)...');
+          '[establishFriendshipVirtual] Waiting for Tox P2P connection sequentially (${waitEach.inSeconds}s each)...');
+      // Sequential, not Future.wait: same reasoning as configureLocalBootstrapVirtual.
+      // Concurrent waiters share VirtualClock and stomp on the process-global
+      // current-instance pointer set by runWithInstanceAsync. Going sequentially
+      // gives each side a clean virtual budget and instance context; the other
+      // side still makes Tox-level progress through the shared pump.
       try {
-        // Both halves share the same pumpTestTick path (which advances the
-        // global virtual clock), so they effectively co-iterate.
-        await Future.wait([
-          waitForFriendConnectionVirtual(scenario, alice, bobToxId,
-              timeout: waitEach),
-          waitForFriendConnectionVirtual(scenario, bob, aliceToxId,
-              timeout: waitEach),
-        ], eagerError: false);
+        await waitForFriendConnectionVirtual(scenario, alice, bobToxId,
+            timeout: waitEach);
+        await waitForFriendConnectionVirtual(scenario, bob, aliceToxId,
+            timeout: waitEach);
         print(
             '[establishFriendshipVirtual] Both sides see friend as ONLINE');
       } catch (e) {
@@ -3182,20 +3183,26 @@ Future<void> configureLocalBootstrapVirtual(TestScenario scenario) async {
   }
   print(
       '[BootstrapVirtual] T+${stopwatch.elapsedMilliseconds}ms: Warmup done; waiting for all nodes to connect (virtual timeout 10s each)...');
-  await Future.wait(
-    scenario.nodes.map((node) async {
-      final nodeStopwatch = Stopwatch()..start();
-      try {
-        await waitForConnectionVirtual(scenario, node,
-            timeout: const Duration(seconds: 10));
-        print(
-            '[BootstrapVirtual] T+${stopwatch.elapsedMilliseconds}ms: Node ${node.alias} connected to Tox (took ${nodeStopwatch.elapsedMilliseconds}ms wall)');
-      } catch (e) {
-        print(
-            '[BootstrapVirtual] T+${stopwatch.elapsedMilliseconds}ms: Node ${node.alias} connection TIMEOUT after ${nodeStopwatch.elapsedMilliseconds}ms wall: $e');
-      }
-    }),
-  );
+  // Sequential, not Future.wait: VirtualClock is process-global, and
+  // pumpTestTick iterates every node in scenario.nodes on every tick. With N
+  // concurrent waiters each calling pumpTestTick(advanceMs: 100), the shared
+  // clock advances ~N×100ms per wall cycle and burns each waiter's deadline
+  // in ~budget/N wall time before UDP bootstrap can converge. Going
+  // sequentially gives each node its own full virtual budget, while the
+  // others still make Tox-level progress because pumpTestTick already
+  // iterates all of them.
+  for (final node in scenario.nodes) {
+    final nodeStopwatch = Stopwatch()..start();
+    try {
+      await waitForConnectionVirtual(scenario, node,
+          timeout: const Duration(seconds: 10));
+      print(
+          '[BootstrapVirtual] T+${stopwatch.elapsedMilliseconds}ms: Node ${node.alias} connected to Tox (took ${nodeStopwatch.elapsedMilliseconds}ms wall)');
+    } catch (e) {
+      print(
+          '[BootstrapVirtual] T+${stopwatch.elapsedMilliseconds}ms: Node ${node.alias} connection TIMEOUT after ${nodeStopwatch.elapsedMilliseconds}ms wall: $e');
+    }
+  }
 
   print(
       '[BootstrapVirtual] T+${stopwatch.elapsedMilliseconds}ms: Waiting for all nodes real Tox connection (virtual timeout 5s)...');
