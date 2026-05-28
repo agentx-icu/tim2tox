@@ -523,6 +523,32 @@ class FfiChatService {
 
   String _selfId = '';
   String get selfId => _selfId;
+
+  /// Returns the 76-hex-char Tox address (self public key + nospam + checksum)
+  /// for this account, or `null` when the underlying Tox instance has no
+  /// identity yet (before [login] has resolved) or the FFI call fails.
+  ///
+  /// **Use this when persisting an account identity or showing the Tox ID to
+  /// the user** — [selfId] returns the V2TIM login `userId` string passed to
+  /// [login], which integrators commonly pass as a placeholder (e.g. toxee
+  /// passes `'FlutterUIKitClient'`) and therefore does NOT identify the Tox
+  /// account.
+  ///
+  /// Returning `null` (vs an empty string) forces callers to make the
+  /// "missing identity" branch explicit — a silent empty value previously
+  /// flowed through `Prefs.addAccount(toxId: '')` and downstream string
+  /// comparisons as if it were a valid identifier.
+  String? getSelfToxId() {
+    final buf = pkgffi.malloc.allocate<ffi.Int8>(256);
+    try {
+      final n = _ffi.getSelfToxId(buf, 256);
+      if (n <= 0) return null;
+      final s = buf.cast<pkgffi.Utf8>().toDartString();
+      return s.isEmpty ? null : s;
+    } finally {
+      pkgffi.malloc.free(buf);
+    }
+  }
   Stream<ChatMessage> get messages => _messages.stream;
   Stream<bool> get connectionStatusStream => _connectionStatus.stream;
   bool _isConnected = false;
