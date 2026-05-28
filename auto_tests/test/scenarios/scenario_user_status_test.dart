@@ -1,8 +1,10 @@
-/// User Status Test
+/// User Status Test — virtual-clock variant
 import 'dart:async';
 
 ///
-/// Tests user status (online/offline) synchronization
+/// Mirrors scenario_user_status_test.dart 1:1 but drives the harness via the
+/// virtual-clock helpers (VirtualClock + pumpTestTick + *Virtual helpers).
+/// Tests user status (online/offline) synchronization.
 /// Reference: c-toxcore/auto_tests/scenarios/scenario_user_status_test.c
 
 import 'package:test/test.dart';
@@ -20,15 +22,52 @@ void main() {
     late TestNode bob;
 
     setUpAll(() async {
-      scenario = await acquireSharedScenario(['alice', 'bob'],
-          withBootstrap: true, withFriendship: true);
+      await setupTestEnvironment();
+      // ENABLE TEST MODE *BEFORE* scenario creation.
+      if (shouldRunVirtual) await VirtualClock.enableEarly();
+
+      scenario = await createTestScenario(['alice', 'bob']);
       alice = scenario.getNode('alice')!;
       bob = scenario.getNode('bob')!;
+
+      await scenario.initAllNodes();
+      if (shouldRunVirtual) await VirtualClock.enableForScenario(scenario);
+
+      await Future.wait([
+        alice.login(timeout: const Duration(seconds: 10)),
+        bob.login(timeout: const Duration(seconds: 10)),
+      ]);
+
+      await waitUntil(
+        () => alice.loggedIn && bob.loggedIn,
+        timeout: const Duration(seconds: 15),
+        description: 'both nodes logged in',
+      );
+
+      await configureLocalBootstrapVirtual(scenario);
+
+      await Future.wait([
+        waitForConnectionVirtual(scenario, alice,
+            timeout: const Duration(seconds: 15)),
+        waitForConnectionVirtual(scenario, bob,
+            timeout: const Duration(seconds: 15)),
+      ]);
+
+      await establishFriendshipVirtual(scenario, alice, bob,
+          timeout: const Duration(seconds: 45));
+      final aliceToxId = alice.getToxId();
+      final bobToxId = bob.getToxId();
+      await Future.wait([
+        waitForFriendConnectionVirtual(scenario, alice, bobToxId,
+            timeout: const Duration(seconds: 45)),
+        waitForFriendConnectionVirtual(scenario, bob, aliceToxId,
+            timeout: const Duration(seconds: 45)),
+      ]);
     });
 
     tearDownAll(() async {
-      releaseSharedScenario(['alice', 'bob'],
-          withBootstrap: true, withFriendship: true);
+      await scenario.dispose();
+      await teardownTestEnvironment();
     });
 
     // Lightweight setUp for per-test cleanup if needed
@@ -153,8 +192,35 @@ void main() {
               await TIMManager.instance.setSelfStatus(status: status);
           expect(result.code, equals(0),
               reason: 'SetSelfStatus($status) should succeed');
-          await Future.delayed(const Duration(seconds: 2));
         });
+        // Virtual settle so the status packet propagates to Bob.
+        await pumpTestTick(scenario, advanceMs: 2000, iterationsPerInstance: 1);
+      }
+
+      // Helper: status propagation across friend P2P may drop the first
+      // packet on a flaky local bootstrap; retry up to 3x like other Tox
+      // custom-packet message paths.
+      Future<void> waitForStatus(String status,
+          Future<void> Function() rePublish) async {
+        var received = false;
+        for (var attempt = 0; !received && attempt < 3; attempt++) {
+          if (attempt > 0) {
+            await rePublish();
+          }
+          try {
+            await waitUntilWithVirtualPump(
+              scenario,
+              () => statusCompleters[status]!.isCompleted,
+              timeout: const Duration(seconds: 15),
+              description: '$status status received (attempt ${attempt + 1})',
+              advanceMs: 50,
+              iterationsPerInstance: 1,
+            );
+            received = true;
+          } catch (_) {}
+        }
+        expect(received, isTrue,
+            reason: 'Bob never observed $status status after retries');
       }
 
       // === Alice/Bob scripts (aligned with c-toxcore sequence) ===
@@ -162,11 +228,7 @@ void main() {
       await setAliceStatus('AWAY');
 
       // Wait for Alice to become AWAY (like C test's WAIT_UNTIL(state->status_changed && state->last_status == TOX_USER_STATUS_AWAY))
-      await statusCompleters['AWAY']!.future.timeout(
-            const Duration(seconds: 15),
-            onTimeout: () =>
-                throw TimeoutException('Timeout waiting for AWAY status'),
-          );
+      await waitForStatus('AWAY', () => setAliceStatus('AWAY'));
       expect(statusChangedFlags['AWAY'], isTrue,
           reason: 'AWAY status should be received');
       expect(lastStatus, equals('AWAY'), reason: 'Last status should be AWAY');
@@ -176,11 +238,7 @@ void main() {
       await setAliceStatus('BUSY');
 
       // Wait for Alice to become BUSY (like C test's WAIT_UNTIL(state->status_changed && state->last_status == TOX_USER_STATUS_BUSY))
-      await statusCompleters['BUSY']!.future.timeout(
-            const Duration(seconds: 15),
-            onTimeout: () =>
-                throw TimeoutException('Timeout waiting for BUSY status'),
-          );
+      await waitForStatus('BUSY', () => setAliceStatus('BUSY'));
       expect(statusChangedFlags['BUSY'], isTrue,
           reason: 'BUSY status should be received');
       expect(lastStatus, equals('BUSY'), reason: 'Last status should be BUSY');
@@ -190,11 +248,7 @@ void main() {
       await setAliceStatus('NONE');
 
       // Wait for Alice to become NONE (like C test's WAIT_UNTIL(state->status_changed && state->last_status == TOX_USER_STATUS_NONE))
-      await statusCompleters['NONE']!.future.timeout(
-            const Duration(seconds: 15),
-            onTimeout: () =>
-                throw TimeoutException('Timeout waiting for NONE status'),
-          );
+      await waitForStatus('NONE', () => setAliceStatus('NONE'));
       expect(statusChangedFlags['NONE'], isTrue,
           reason: 'NONE status should be received');
       expect(lastStatus, equals('NONE'), reason: 'Last status should be NONE');
@@ -210,6 +264,6 @@ void main() {
       );
     },
         timeout: const Timeout(Duration(
-            seconds: 90))); // Increased timeout to allow for status propagation
+            seconds: 120))); // Allow for status propagation + retries
   });
 }

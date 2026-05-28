@@ -7,7 +7,10 @@
 #include <functional>
 #include <future>
 #include <queue>
+#include <chrono>
+#include <type_traits>
 #include "toxcore/tox_struct.h"
+#include "V2TIMLog.h"
 #include "V2TIMManager.h"
 #include "V2TIMMessageManager.h"
 #include "V2TIMGroupManager.h"
@@ -165,10 +168,18 @@ public:
     // Save Tox profile to disk (call after friend list changes to persist state)
     void SaveToxProfile();
     
+    // Upper bound for how long RunOnEventThread will block waiting on the event
+    // thread before giving up and returning a default-constructed R. Generous so
+    // legitimately slow tox API calls still complete, but finite so a stopped /
+    // never-draining event thread (e.g. after UnInitSDK) can't hang the caller.
+    static constexpr std::chrono::seconds kRunOnEventThreadTimeout{10};
+
     /** Run a function on the event thread (tox iterate loop). Use to avoid deadlock when calling tox API from another thread.
      *  If already on the event thread, runs f() inline to avoid self-deadlock.
      *  In test_mode there is no event thread; we execute inline so the caller
-     *  doesn't deadlock waiting on a future no one will fulfil. */
+     *  doesn't deadlock waiting on a future no one will fulfil.
+     *  If the event thread is not running we also run inline as a best-effort fallback;
+     *  if it stops while we wait, the bounded wait returns a default R rather than hanging. */
     template<typename R>
     R RunOnEventThread(std::function<R()> f) {
         if (std::this_thread::get_id() == event_thread_id_) {
@@ -177,11 +188,23 @@ public:
         if (test_mode_.load(std::memory_order_acquire)) {
             return f();
         }
+        // If the event thread isn't running (e.g. during/after UnInitSDK, where
+        // the loop break()s without draining task_queue_), enqueue-and-block would
+        // hang forever. Run f() inline as a best-effort fallback instead — same
+        // approach as the same-thread / test_mode_ short-circuits above.
+        if (!running_.load(std::memory_order_acquire)) {
+            return f();
+        }
         auto promise = std::make_shared<std::promise<R>>();
         auto future = promise->get_future();
         std::function<void()> task = [f, promise]() {
             try {
-                promise->set_value(f());
+                if constexpr (std::is_void_v<R>) {
+                    f();
+                    promise->set_value();
+                } else {
+                    promise->set_value(f());
+                }
             } catch (...) {
                 promise->set_exception(std::current_exception());
             }
@@ -191,6 +214,29 @@ public:
             task_queue_.push(task);
         }
         task_cv_.notify_one();
+        // Bounded wait: if the event thread is stopped after we enqueued (or never
+        // drains), future.get() would block forever. Wait with a generous timeout
+        // and return a default-constructed R so the caller unblocks instead.
+        //
+        // CONTRACT: on timeout a non-void caller gets a default-constructed R that
+        // is indistinguishable from a real default result. The enqueued tox call
+        // is effectively lost (the task may still run later, harmlessly, since it
+        // holds its own ref to the promise). Typed callers that need to tell a
+        // timeout apart from a genuine empty/false result MUST carry their own
+        // success signal — e.g. tim2tox_ffi_signaling_invite gates on
+        // `invite_id.Length() > 0 && callback.success`, so a timeout (empty id +
+        // OnSuccess never fired) is reported as failure. Log at error level: a
+        // 10s stall after we already observed `running_ == true` means the event
+        // thread is genuinely stuck and a native call was dropped.
+        if (future.wait_for(kRunOnEventThreadTimeout) != std::future_status::ready) {
+            V2TIM_LOG(kError, "[V2TIMManagerImpl::RunOnEventThread] Timed out after {}s waiting for event thread; the tox call was dropped and a default value is being returned",
+                      (long long)kRunOnEventThreadTimeout.count());
+            if constexpr (std::is_void_v<R>) {
+                return;
+            } else {
+                return R{};
+            }
+        }
         return future.get();
     }
 

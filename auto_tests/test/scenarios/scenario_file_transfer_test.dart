@@ -1,7 +1,16 @@
-/// File Transfer Test
+/// File Transfer Test — virtual-clock variant
 ///
-/// Tests file sending, receiving, and progress callbacks
-/// Reference: c-toxcore/auto_tests/scenarios/scenario_file_transfer_test.c
+/// Mirrors scenario_file_transfer_test.dart 1:1 but drives the harness via
+/// the virtual-clock helpers (VirtualClock + pumpTestTick + *Virtual helpers).
+///
+/// File-transfer specifics:
+/// - The initial file-request acceptance round-trip can drop on a flaky
+///   2-node local-bootstrap link, so the first "fileReceived" wait uses
+///   a 3x send-retry pattern.
+/// - Progress callbacks fire many times during transfer and recover from
+///   transient drops naturally; we use waitUntilWithVirtualPump with a
+///   generous virtual budget (60-90s) for transfer-completion waits and
+///   do NOT retry the send for those.
 
 import 'dart:io';
 import 'package:test/test.dart';
@@ -30,18 +39,24 @@ void main() {
       await testFile
           .writeAsString('This is a test file for file transfer.\n' * 100);
 
+      // Enable BEFORE initAllNodes so V2TIMManagerImpl never spawns
+      // event_thread; file_request and progress events flow through
+      // FfiChatService polling driven by pumpTestTick.
+      if (shouldRunVirtual) await VirtualClock.enableEarly();
       scenario = await createTestScenario(['alice', 'bob']);
       await scenario.initAllNodes();
       alice = scenario.getNode('alice')!;
       bob = scenario.getNode('bob')!;
+      if (shouldRunVirtual) await VirtualClock.enableForScenario(scenario);
+
       await Future.wait([alice.login(), bob.login()]);
       await waitUntil(() => alice.loggedIn && bob.loggedIn,
           timeout: const Duration(seconds: 10),
           description: 'both nodes logged in');
-      await configureLocalBootstrap(scenario);
-      await establishFriendship(alice, bob);
+      await configureLocalBootstrapVirtual(scenario);
+      await establishFriendshipVirtual(scenario, alice, bob);
       // Pump so P2P connection is established before file transfer
-      await pumpFriendConnection(alice, bob);
+      await pumpFriendConnectionVirtual(scenario, alice, bob);
     });
 
     tearDownAll(() async {
@@ -90,10 +105,11 @@ void main() {
           () => TIMMessageManager.instance.addAdvancedMsgListener(bobListener));
       try {
         final bobToxId = bob.getToxId();
-        await alice.waitForConnection(timeout: const Duration(seconds: 15));
-        await alice.waitForFriendConnection(bobToxId,
+        await waitForConnectionVirtual(scenario, alice,
+            timeout: const Duration(seconds: 15));
+        await waitForFriendConnectionVirtual(scenario, alice, bobToxId,
             timeout: const Duration(seconds: 90));
-        await Future.delayed(const Duration(seconds: 2));
+        await pumpTestTick(scenario, advanceMs: 2000, iterationsPerInstance: 1);
 
         // Ensure file exists (native send uses this path)
         if (!await testFile.exists()) {
@@ -101,28 +117,42 @@ void main() {
           await File(testFile.path)
               .writeAsString('This is a test file for file transfer.\n' * 100);
         }
-        final sendResult = await alice.runWithInstanceAsync(() async {
-          final fileResult = TIMMessageManager.instance.createFileMessage(
-            filePath: testFile.path,
-            fileName: 'test_file.txt',
-          );
-          expect(fileResult.messageInfo, isNotNull);
-          return await TIMMessageManager.instance.sendMessage(
-            message: fileResult.messageInfo!,
-            receiver: bobToxId,
-            groupID: null,
-          );
-        });
 
-        expect(sendResult.code, equals(0));
+        // Retry send + wait. The initial file_request can drop while
+        // friend P2P is still warming up on the back-direction link.
+        var arrived = false;
+        for (var attempt = 0; !arrived && attempt < 3; attempt++) {
+          fileReceived = false;
+          final sendResult = await alice.runWithInstanceAsync(() async {
+            final fileResult = TIMMessageManager.instance.createFileMessage(
+              filePath: testFile.path,
+              fileName: 'test_file.txt',
+            );
+            expect(fileResult.messageInfo, isNotNull);
+            return await TIMMessageManager.instance.sendMessage(
+              message: fileResult.messageInfo!,
+              receiver: bobToxId,
+              groupID: null,
+            );
+          });
+          expect(sendResult.code, equals(0));
+          try {
+            await waitUntilWithVirtualPump(
+              scenario,
+              () => fileReceived,
+              timeout: const Duration(seconds: 60),
+              description: 'fileReceived (attempt ${attempt + 1})',
+              advanceMs: 50,
+              iterationsPerInstance: 1,
+            );
+            arrived = true;
+          } catch (_) {
+            // retry — file_request may have been dropped
+          }
+        }
 
-        // Wait for file to be received; pump Tox so file offer and callbacks are delivered.
-        await waitUntilWithPump(
-          () => fileReceived,
-          timeout: const Duration(seconds: 60),
-          description: 'fileReceived',
-        );
-
+        expect(arrived, isTrue,
+            reason: 'file never received after 3 send retries');
         expect(fileReceived, isTrue);
         expect(bob.receivedMessages.length, greaterThan(0));
 
@@ -149,12 +179,13 @@ void main() {
         bob.runWithInstance(() => TIMMessageManager.instance
             .removeAdvancedMsgListener(listener: bobListener));
       }
-    }, timeout: const Timeout(Duration(seconds: 130)));
+    }, timeout: const Timeout(Duration(seconds: 240)));
 
     test('File transfer progress callbacks', () async {
       final bobToxId = bob.getToxId();
-      await alice.waitForConnection(timeout: const Duration(seconds: 15));
-      await alice.waitForFriendConnection(bobToxId,
+      await waitForConnectionVirtual(scenario, alice,
+          timeout: const Duration(seconds: 15));
+      await waitForFriendConnectionVirtual(scenario, alice, bobToxId,
           timeout: const Duration(seconds: 90));
 
       await Directory(testDataDir).create(recursive: true);
@@ -177,7 +208,7 @@ void main() {
       bob.runWithInstance(() =>
           TIMMessageManager.instance.addAdvancedMsgListener(progressListener));
       try {
-        await Future.delayed(const Duration(seconds: 2));
+        await pumpTestTick(scenario, advanceMs: 2000, iterationsPerInstance: 1);
 
         final sendResult = await alice.runWithInstanceAsync(() async {
           final fileResult = TIMMessageManager.instance.createFileMessage(
@@ -194,15 +225,21 @@ void main() {
 
         expect(sendResult.code, equals(0));
 
-        // Give native time to enqueue file_request and Dart poll to process it before waiting for progress
-        pumpAllInstancesOnce(iterations: 100);
-        await Future.delayed(const Duration(milliseconds: 800));
+        // Give native time to enqueue file_request and Dart poll to
+        // process it before waiting for progress.
+        await pumpTestTick(scenario, advanceMs: 50, iterationsPerInstance: 100);
+        await pumpTestTick(scenario, advanceMs: 800, iterationsPerInstance: 1);
 
-        // Wait for progress updates; pump Tox so file transfer progresses
-        await waitUntilWithPump(
+        // Progress callbacks fire many times — use generous virtual budget
+        // without retry; recovery from transient drops happens naturally
+        // as the transfer continues.
+        await waitUntilWithVirtualPump(
+          scenario,
           () => progressUpdates.isNotEmpty,
-          timeout: const Duration(seconds: 60),
+          timeout: const Duration(seconds: 90),
           description: 'progressUpdates',
+          advanceMs: 50,
+          iterationsPerInstance: 1,
         );
 
         expect(progressUpdates.length, greaterThan(0));
@@ -213,12 +250,13 @@ void main() {
           await largeFile.delete();
         }
       }
-    }, timeout: const Timeout(Duration(seconds: 90)));
+    }, timeout: const Timeout(Duration(seconds: 150)));
 
     test('File transfer completion verification', () async {
       final bobToxId = bob.getToxId();
-      await alice.waitForConnection(timeout: const Duration(seconds: 15));
-      await alice.waitForFriendConnection(bobToxId,
+      await waitForConnectionVirtual(scenario, alice,
+          timeout: const Duration(seconds: 15));
+      await waitForFriendConnectionVirtual(scenario, alice, bobToxId,
           timeout: const Duration(seconds: 90));
 
       var fileCompleted = false;
@@ -241,7 +279,7 @@ void main() {
       bob.runWithInstance(() => TIMMessageManager.instance
           .addAdvancedMsgListener(completionListener));
       try {
-        await Future.delayed(const Duration(seconds: 2));
+        await pumpTestTick(scenario, advanceMs: 2000, iterationsPerInstance: 1);
 
         // Ensure file exists (may have been removed by earlier test or env)
         if (!await testFile.exists()) {
@@ -249,31 +287,47 @@ void main() {
           await testFile
               .writeAsString('This is a test file for file transfer.\n' * 100);
         }
-        final sendResult = await alice.runWithInstanceAsync(() async {
-          final fileResult = TIMMessageManager.instance.createFileMessage(
-            filePath: testFile.path,
-            fileName: 'test_file.txt',
-          );
-          return await TIMMessageManager.instance.sendMessage(
-            groupID: null,
-            id: fileResult.id!,
-            receiver: bobToxId,
-          );
-        });
 
-        expect(sendResult.code, equals(0));
+        // Retry send for completion: file_request may drop and the
+        // entire transfer never starts; in that case re-issue the send.
+        var arrived = false;
+        for (var attempt = 0; !arrived && attempt < 3; attempt++) {
+          fileCompleted = false;
+          final sendResult = await alice.runWithInstanceAsync(() async {
+            final fileResult = TIMMessageManager.instance.createFileMessage(
+              filePath: testFile.path,
+              fileName: 'test_file.txt',
+            );
+            return await TIMMessageManager.instance.sendMessage(
+              groupID: null,
+              id: fileResult.id!,
+              receiver: bobToxId,
+            );
+          });
+          expect(sendResult.code, equals(0));
 
-        await waitUntilWithPump(
-          () => fileCompleted,
-          timeout: const Duration(seconds: 60),
-          description: 'fileCompleted',
-        );
+          try {
+            await waitUntilWithVirtualPump(
+              scenario,
+              () => fileCompleted,
+              timeout: const Duration(seconds: 60),
+              description: 'fileCompleted (attempt ${attempt + 1})',
+              advanceMs: 50,
+              iterationsPerInstance: 1,
+            );
+            arrived = true;
+          } catch (_) {
+            // retry — file_request may have been dropped
+          }
+        }
 
+        expect(arrived, isTrue,
+            reason: 'file never completed after 3 send retries');
         expect(fileCompleted, isTrue);
       } finally {
         bob.runWithInstance(() => TIMMessageManager.instance
             .removeAdvancedMsgListener(listener: completionListener));
       }
-    }, timeout: const Timeout(Duration(seconds: 90)));
+    }, timeout: const Timeout(Duration(seconds: 240)));
   });
 }

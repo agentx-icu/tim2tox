@@ -1,10 +1,7 @@
-/// Bootstrap Test
-/// Reference: c-toxcore/auto_tests/scenarios/scenario_bootstrap_test.c
-/// 
-/// Tests bootstrap functionality:
-/// - Bob bootstraps from Alice
-/// - Bob waits for DHT connection (self-connected)
-/// - Alice waits for Bob to finish
+/// Bootstrap Test — virtual-clock variant
+///
+/// Mirrors scenario_bootstrap_test.dart 1:1 but drives the harness via the
+/// virtual-clock helpers (VirtualClock + pumpTestTick + *Virtual helpers).
 
 import 'package:test/test.dart';
 import '../test_helper.dart';
@@ -15,57 +12,58 @@ void main() {
     late TestScenario scenario;
     late TestNode alice;
     late TestNode bob;
-    
+
     setUpAll(() async {
-      scenario = await acquireSharedScenario(['alice', 'bob'],
-          withBootstrap: true, withFriendship: false);
+      await setupTestEnvironment();
+      if (shouldRunVirtual) await VirtualClock.enableEarly();
+      scenario = await createTestScenario(['alice', 'bob']);
       alice = scenario.getNode('alice')!;
       bob = scenario.getNode('bob')!;
+
+      await scenario.initAllNodes();
+      if (shouldRunVirtual) await VirtualClock.enableForScenario(scenario);
+
+      // event_thread suppressed by enableEarly → DHT can't connect during
+      // login(), so its 10s DHT-wait would burn full timeout. 500ms is enough
+      // to set loggedIn=true and return; bootstrap happens explicitly below.
+      await Future.wait([
+        alice.login(timeout: const Duration(milliseconds: 500)),
+        bob.login(timeout: const Duration(milliseconds: 500)),
+      ]);
+      await waitUntil(
+        () => alice.loggedIn && bob.loggedIn,
+        timeout: const Duration(seconds: 10),
+        description: 'both nodes logged in',
+      );
+
+      await configureLocalBootstrapVirtual(scenario);
     });
 
     tearDownAll(() async {
-      releaseSharedScenario(['alice', 'bob'],
-          withBootstrap: true, withFriendship: false);
+      await scenario.dispose();
+      await teardownTestEnvironment();
     });
-    
-    // Lightweight setUp for per-test cleanup if needed
+
     setUp(() async {
-      // Reset any per-test state if necessary
       // Most tests don't need cleanup since they use shared scenario
     });
-    
+
     test('Bob bootstraps from Alice and connects to DHT', () async {
-      print('[Test] Starting bootstrap test...');
-      
-      // Bob's script: Wait for DHT connection (self-connected)
-      // This corresponds to WAIT_UNTIL(tox_node_is_self_connected(self)) in C test
-      print('[Test] Bob: Waiting for DHT connection...');
-      
-      // Wait for Bob to be connected
-      await bob.waitForConnection(timeout: const Duration(seconds: 30));
-      
-      // Verify Bob is connected
+      await waitForConnectionVirtual(scenario, bob,
+          timeout: const Duration(seconds: 30));
+
       final bobConnectionStatus = bob.getConnectionStatus();
-      print('[Test] Bob: Connected to DHT! (connectionStatus=$bobConnectionStatus)');
-      
-      expect(bobConnectionStatus, isNot(equals(0)), 
-        reason: 'Bob should be connected to DHT after bootstrap');
-      
-      // Alice's script: Wait for Bob to finish
-      // This corresponds to WAIT_UNTIL(tox_node_is_finished(bob)) in C test
-      // In Dart, we check if Bob is connected as a proxy for "finished"
-      print('[Test] Alice: Waiting for Bob to finish...');
-      
-      await waitUntil(
-        () {
-          final bobConnected = bob.getConnectionStatus() != 0;
-          return bobConnected;
-        },
+      expect(bobConnectionStatus, isNot(equals(0)),
+          reason: 'Bob should be connected to DHT after bootstrap');
+
+      await waitUntilWithVirtualPump(
+        scenario,
+        () => bob.getConnectionStatus() != 0,
         timeout: const Duration(seconds: 30),
         description: 'Bob finished (connected to DHT)',
+        advanceMs: 50,
+        iterationsPerInstance: 1,
       );
-      
-      print('[Test] Scenario completed successfully!');
     }, timeout: const Timeout(Duration(seconds: 90)));
   });
 }

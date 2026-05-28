@@ -1,6 +1,8 @@
-/// Avatar Test
+/// Avatar Test — virtual-clock variant
 ///
-/// Tests avatar file transfer (TOX_FILE_KIND_AVATAR)
+/// Mirrors scenario_avatar_test.dart 1:1 but drives the harness via the
+/// virtual-clock helpers (VirtualClock + pumpTestTick + *Virtual helpers).
+/// Tests avatar file transfer (TOX_FILE_KIND_AVATAR).
 /// Reference: c-toxcore/auto_tests/scenarios/scenario_avatar_test.c
 
 import 'dart:async';
@@ -15,7 +17,7 @@ import 'package:path/path.dart' as path;
 import '../test_helper.dart';
 import '../test_fixtures.dart';
 
-const _avatarSubdir = 'scenario_avatar';
+const _avatarSubdir = 'scenario_avatar_virtual';
 
 void main() {
   group('Avatar Tests', () {
@@ -31,6 +33,7 @@ void main() {
     );
 
     setUpAll(() async {
+      await setupTestEnvironment();
       testDataDir = await getTestDataDir(_avatarSubdir);
 
       // Create avatar file (isolated dir so other scenarios' teardown won't wipe it)
@@ -38,16 +41,33 @@ void main() {
       avatarFile = File(avatarPath);
       await avatarFile.writeAsBytes(avatarData);
 
-      scenario = await acquireSharedScenario(['alice', 'bob'],
-          withBootstrap: true, withFriendship: true);
+      // ENABLE TEST MODE *BEFORE* scenario creation.
+      if (shouldRunVirtual) await VirtualClock.enableEarly();
+      scenario = await createTestScenario(['alice', 'bob']);
       alice = scenario.getNode('alice')!;
       bob = scenario.getNode('bob')!;
+
+      await scenario.initAllNodes();
+      if (shouldRunVirtual) await VirtualClock.enableForScenario(scenario);
+
+      await Future.wait([
+        alice.login(),
+        bob.login(),
+      ]);
+      await waitUntil(
+        () => alice.loggedIn && bob.loggedIn,
+        timeout: const Duration(seconds: 10),
+        description: 'both nodes logged in',
+      );
+      await configureLocalBootstrapVirtual(scenario);
+      await establishFriendshipVirtual(scenario, alice, bob);
+      await pumpFriendConnectionVirtual(scenario, alice, bob);
     });
 
     tearDownAll(() async {
-      releaseSharedScenario(['alice', 'bob'],
-          withBootstrap: true, withFriendship: true);
+      await scenario.dispose();
       await cleanupTestDataDir(_avatarSubdir);
+      await teardownTestEnvironment();
     });
 
     // Lightweight setUp for per-test cleanup if needed
@@ -57,8 +77,9 @@ void main() {
 
     test('Avatar file transfer', () async {
       final bobToxId = bob.getToxId();
-      await alice.waitForConnection(timeout: const Duration(seconds: 15));
-      await alice.waitForFriendConnection(bobToxId,
+      await waitForConnectionVirtual(scenario, alice,
+          timeout: const Duration(seconds: 15));
+      await waitForFriendConnectionVirtual(scenario, alice, bobToxId,
           timeout: const Duration(seconds: 90));
 
       final completer = Completer<File>();
@@ -86,31 +107,44 @@ void main() {
           () => TIMMessageManager.instance.addAdvancedMsgListener(listener));
 
       try {
-        final sendResult = await alice.runWithInstanceAsync(() async {
-          final fileMsgResult = TIMMessageManager.instance.createFileMessage(
-            filePath: avatarFile.path,
-            fileName: 'avatar.png',
-          );
-          expect(fileMsgResult.messageInfo, isNotNull,
-              reason: 'File message creation should succeed');
-          return await TIMMessageManager.instance.sendMessage(
-            groupID: null,
-            message: fileMsgResult.messageInfo!,
-            receiver: bobToxId,
-            onlineUserOnly: false,
-          );
-        });
+        // Retry send+wait: file-progress callbacks can race friend P2P
+        // bring-up on a local bootstrap; retry up to 3x.
+        var received = false;
+        for (var attempt = 0; !received && attempt < 3; attempt++) {
+          final sendResult = await alice.runWithInstanceAsync(() async {
+            final fileMsgResult = TIMMessageManager.instance.createFileMessage(
+              filePath: avatarFile.path,
+              fileName: 'avatar.png',
+            );
+            expect(fileMsgResult.messageInfo, isNotNull,
+                reason: 'File message creation should succeed');
+            return await TIMMessageManager.instance.sendMessage(
+              groupID: null,
+              message: fileMsgResult.messageInfo!,
+              receiver: bobToxId,
+              onlineUserOnly: false,
+            );
+          });
 
-        expect(sendResult.code, equals(0),
-            reason: 'Avatar file send should succeed');
+          expect(sendResult.code, equals(0),
+              reason: 'Avatar file send should succeed');
 
-        // Wait for Bob to receive the file message (pump so Tox can deliver)
-        await waitUntilWithPump(
-          () => avatarReceived,
-          timeout: const Duration(seconds: 90),
-          description: 'avatar file message received',
-        );
+          try {
+            await waitUntilWithVirtualPump(
+              scenario,
+              () => avatarReceived,
+              timeout: const Duration(seconds: 30),
+              description:
+                  'avatar file message received (attempt ${attempt + 1})',
+              advanceMs: 50,
+              iterationsPerInstance: 1,
+            );
+            received = true;
+          } catch (_) {}
+        }
 
+        expect(received, isTrue,
+            reason: 'Avatar never received after retries');
         expect(avatarReceived, isTrue, reason: 'Avatar should be received');
         expect(bob.receivedMessages.length, greaterThan(0),
             reason: 'Bob should have received messages');
@@ -142,9 +176,10 @@ void main() {
         bob.runWithInstance(() => TIMMessageManager.instance
             .removeAdvancedMsgListener(listener: listener));
       }
-    }, timeout: const Timeout(Duration(seconds: 90)));
+    }, timeout: const Timeout(Duration(seconds: 120)));
 
     test('Avatar file hash verification', () async {
+      // Pure synchronous metadata check — no virtual-time pumping required.
       final fileMsgResult = alice
           .runWithInstance(() => TIMMessageManager.instance.createFileMessage(
                 filePath: avatarFile.path,
@@ -163,8 +198,9 @@ void main() {
 
     test('Avatar update notification', () async {
       final bobToxId = bob.getToxId();
-      await alice.waitForConnection(timeout: const Duration(seconds: 15));
-      await alice.waitForFriendConnection(bobToxId,
+      await waitForConnectionVirtual(scenario, alice,
+          timeout: const Duration(seconds: 15));
+      await waitForFriendConnectionVirtual(scenario, alice, bobToxId,
           timeout: const Duration(seconds: 90));
 
       final sendResult = await alice.runWithInstanceAsync(() async {

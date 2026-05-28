@@ -43,6 +43,15 @@ virtual void        Logout(V2TIMCallback* callback) = 0;
 virtual V2TIMString GetLoginUser() = 0;
 ```
 
+#### 认证与登录语义（务必阅读）
+
+Tim2Tox 跑在 Tox P2P 网络上，没有腾讯云 IM 那样的鉴权服务器。登录语义因此与 V2TIM 有本质区别：
+
+- **`Login(userID, userSig)` 不校验 `userSig`**。`userSig` 仅为兼容 V2TIM 的调用签名而保留，会被忽略。登录的真实含义是**打开/绑定本地 Tox 身份/profile**，**不是**服务器侧鉴权。接入方**不得**把 `Login` 成功当作"用户已通过认证"。
+- **`GetLoginStatus()` 反映的是本地登录状态，不是网络连通性**。一旦设置了本地别名，它就会返回 `LOGINED`——这只表示本地 profile 已打开，**不**代表已接入 Tox DHT/已联网。要判断真实连通性，请监听连接状态回调（connection-status listener/callback），不要依赖 `GetLoginStatus()`。
+
+逐接口状态见 [API_SUPPORT_MATRIX.md](API_SUPPORT_MATRIX.md) 的"认证 / 登录"小节。
+
 #### 子管理器入口
 
 ```cpp
@@ -100,6 +109,8 @@ virtual V2TIMMessage CreateMergerMessage(const V2TIMMessageVector& messageList,
                                          const V2TIMStringVector& abstractList,
                                          const V2TIMStringVector& compatibleText) = 0;
 ```
+
+> **媒体消息注意（务必阅读）**：`CreateImageMessage` / `CreateSoundMessage` / `CreateVideoMessage` **未实现**——调用后会把消息状态置为 `SEND_FAIL`（不会发出）。`CreateFileMessage` 以及 LOCATION / FACE 等媒体/位置/表情类型在**发送时会被降级为一条纯文本描述**（例如 `[转发文件]`），接收方收到的是文本，**不是**结构化消息。真实文件传输请改用 `FfiChatService` 文件 API（`tim2tox_ffi_send_file` / `tim2tox_ffi_file_control`）。逐接口的真实状态见 [API_SUPPORT_MATRIX.md](API_SUPPORT_MATRIX.md)。
 
 #### 发送消息
 
@@ -380,6 +391,7 @@ virtual void GetTopicInfoList(const V2TIMString& groupID,
 
 ## 相关文档
 
+- [API_SUPPORT_MATRIX.md](API_SUPPORT_MATRIX.md) — **逐接口真实支持状态矩阵**（native / dart-only / local-only / text-degraded / no-op-success / unsupported）
 - [API_REFERENCE.md](API_REFERENCE.md) — 总索引、数据类型、错误码、示例
 - [API_REFERENCE_FFI.md](API_REFERENCE_FFI.md) — C FFI 接口
 - [API_REFERENCE_DART.md](API_REFERENCE_DART.md) — Dart 包 API

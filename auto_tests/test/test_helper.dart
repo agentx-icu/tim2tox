@@ -1762,6 +1762,169 @@ void releaseSharedScenario(List<String> aliases,
         withBootstrap: withBootstrap,
         signatureSalt: signatureSalt);
 
+/// True when the suite was launched with `RUN_VIRTUAL=1` (virtual-clock mode).
+///
+/// A single scenario file can branch on this to drive either the wall-clock or
+/// the virtual-clock setup without needing a separate `*_virtual_test.dart`
+/// sibling. The runner sets `RUN_VIRTUAL` in the environment; `flutter test`
+/// propagates it to the test isolate, so `Platform.environment` reads it here.
+bool get shouldRunVirtual => Platform.environment['RUN_VIRTUAL'] == '1';
+
+/// Mode-aware scenario acquisition — the single `setUpAll` entry point for a
+/// unified scenario file that must run under both the wall-clock and the
+/// virtual-clock harness.
+///
+/// - **Wall-clock** (`RUN_VIRTUAL` unset): delegates to [acquireSharedScenario]
+///   so a bundle of files reuses one bootstrapped+friended fixture (the pool
+///   saves the 7–20 s Tox cold start per file).
+/// - **Virtual-clock** (`RUN_VIRTUAL=1`): builds a fresh scenario from scratch.
+///   The shared pool is intentionally *not* used here because it never calls
+///   [VirtualClock.enableEarly] before instance creation, which signaling-
+///   sensitive flows require (the constructor must read `test_mode` so
+///   `InitSDK` never spawns an `event_thread`). The from-scratch path mirrors
+///   the canonical virtual `setUpAll` template in `VIRTUAL_CLOCK.md` §4.
+///
+/// Either way the returned scenario is logged in, bootstrapped (when
+/// [withBootstrap]), auto-accept enabled, and meshed with friendships (when
+/// [withFriendship]). Pair with [releaseScenarioForMode] in `tearDownAll`.
+Future<TestScenario> acquireScenarioForMode(
+  List<String> aliases, {
+  bool withFriendship = false,
+  bool withBootstrap = true,
+  String? signatureSalt,
+}) async {
+  if (!shouldRunVirtual) {
+    return acquireSharedScenario(aliases,
+        withFriendship: withFriendship,
+        withBootstrap: withBootstrap,
+        signatureSalt: signatureSalt);
+  }
+
+  // Virtual-clock from-scratch setup.
+  await setupTestEnvironment();
+  // Must run BEFORE any test instance is created (process-global default).
+  await VirtualClock.enableEarly();
+  final scenario = await createTestScenario(aliases);
+  await scenario.initAllNodes();
+  // Idempotent w.r.t. enableEarly; seeds the clock + syncs the per-instance flag.
+  await VirtualClock.enableForScenario(scenario);
+  await Future.wait(scenario.nodes.map((n) => n.login()));
+  await waitUntil(
+    () => scenario.nodes.every((n) => n.loggedIn),
+    timeout: const Duration(seconds: 10),
+    description: 'all ${aliases.length} nodes logged in (virtual)',
+  );
+  if (withBootstrap) {
+    await configureLocalBootstrapVirtual(scenario);
+  }
+  for (final n in scenario.nodes) {
+    n.enableAutoAccept();
+  }
+  if (withFriendship && scenario.nodes.length >= 2) {
+    final pairs = <Future<void>>[];
+    for (int i = 0; i < scenario.nodes.length; i++) {
+      for (int j = i + 1; j < scenario.nodes.length; j++) {
+        pairs.add(establishFriendshipVirtual(
+            scenario, scenario.nodes[i], scenario.nodes[j],
+            timeout: const Duration(seconds: 60)));
+      }
+    }
+    await Future.wait(pairs);
+  }
+  return scenario;
+}
+
+/// Mode-aware teardown counterpart to [acquireScenarioForMode]. Call from
+/// `tearDownAll`.
+///
+/// - **Wall-clock**: no-op [releaseSharedScenario] (keeps the pool warm for the
+///   next file in a bundle; the OS reclaims sockets at process exit).
+/// - **Virtual-clock**: hard teardown — disposes the fresh scenario and the
+///   global test environment, matching what the old `*_virtual_test.dart`
+///   siblings did.
+Future<void> releaseScenarioForMode(
+  TestScenario scenario,
+  List<String> aliases, {
+  bool withFriendship = false,
+  bool withBootstrap = true,
+  String? signatureSalt,
+}) async {
+  if (!shouldRunVirtual) {
+    releaseSharedScenario(aliases,
+        withFriendship: withFriendship,
+        withBootstrap: withBootstrap,
+        signatureSalt: signatureSalt);
+    return;
+  }
+  await scenario.dispose();
+  await teardownTestEnvironment();
+}
+
+/// Invite [invitee] into [groupId] from [inviter], waiting for the invitee's
+/// `onGroupInvited` callback and re-issuing the invite up to [maxAttempts]
+/// times. Returns the group id the invitee should join (taken from the
+/// callback payload, falling back to [groupId]).
+///
+/// Why this exists: `inviteUserToGroup` returns `code=0` even when the
+/// underlying `tox_group_invite_friend` packet is dropped, and the first invite
+/// frequently races with friend P2P bring-up. Re-issuing the invite is the
+/// established workaround (see `VIRTUAL_CLOCK.md` §5) — it was hand-rolled in
+/// dozens of scenario files before being centralized here.
+///
+/// Mode-agnostic: waits via [waitUntilWithVirtualPump], which drives the shared
+/// virtual clock when enabled and falls back to wall-clock waiting otherwise,
+/// so one call site works under both harnesses. Throws [StateError] if an
+/// invite returns a non-zero code, or [TimeoutException] if the invitee never
+/// receives `onGroupInvited` after [maxAttempts].
+Future<String> inviteUserToGroupWithRetry(
+  TestScenario scenario,
+  TestNode inviter,
+  TestNode invitee,
+  String groupId, {
+  String context = '',
+  int maxAttempts = 3,
+  Duration timeout = const Duration(seconds: 12),
+  int advanceMs = 50,
+  int iterationsPerInstance = 1,
+}) async {
+  final label = context.isEmpty ? groupId : context;
+  final inviteePubKey = invitee.getPublicKey();
+  var arrived = false;
+  for (var attempt = 0; !arrived && attempt < maxAttempts; attempt++) {
+    invitee.clearCallbackReceived('onGroupInvited');
+    final inviteResult = await inviter.runWithInstanceAsync(() async =>
+        TIMGroupManager.instance.inviteUserToGroup(
+          groupID: groupId,
+          userList: [inviteePubKey],
+        ));
+    if (inviteResult.code != 0) {
+      throw StateError(
+          'inviteUserToGroup failed for ${invitee.alias} ($label): '
+          'code=${inviteResult.code} ${inviteResult.desc}');
+    }
+    try {
+      await waitUntilWithVirtualPump(
+        scenario,
+        () => invitee.callbackReceived['onGroupInvited'] == true,
+        timeout: timeout,
+        description:
+            '${invitee.alias} receives onGroupInvited ($label, attempt ${attempt + 1})',
+        advanceMs: advanceMs,
+        iterationsPerInstance: iterationsPerInstance,
+      );
+      arrived = true;
+    } catch (_) {
+      // Re-issue the invite on the next attempt.
+    }
+  }
+  if (!arrived) {
+    throw TimeoutException(
+        '${invitee.alias} never received onGroupInvited for $label '
+        'after $maxAttempts attempts');
+  }
+  return invitee.getLastCallbackGroupId('onGroupInvited') ?? groupId;
+}
+
 /// Configure local bootstrap for test scenario
 /// Similar to C test's tox_node_bootstrap mechanism
 /// First node acts as bootstrap node, other nodes bootstrap from it using 127.0.0.1
@@ -2019,9 +2182,20 @@ Future<void> pumpTestTick(
   Duration wallSleep = const Duration(milliseconds: 5),
 }) async {
   if (!VirtualClock.enabled) {
-    // Fallback to legacy behaviour so tests that haven't opted in keep
-    // working unchanged.
-    pumpAllInstancesOnce(iterations: 50);
+    // Wall-clock fallback. Advance the (Dart-side) virtual clock counter so
+    // inline `while (VirtualClock.nowMs < deadline)` poll loops in unified test
+    // bodies still terminate in wall mode (C++ ignores the mirrored virtual
+    // time when test_mode is off — it reads real mono_time — so this only moves
+    // the Dart-side counter). Honor the caller's iteration count and real
+    // `wallSleep` so unified bodies that replaced `Future.delayed` /
+    // `pumpAllInstancesOnce` with `pumpTestTick` keep an equivalent settle
+    // window (the event_thread is also running in wall mode).
+    VirtualClock.advance(advanceMs);
+    pumpAllInstancesOnce(
+        iterations: iterationsPerInstance > 50 ? iterationsPerInstance : 50);
+    if (wallSleep > Duration.zero) {
+      await Future.delayed(wallSleep);
+    }
     return;
   }
   VirtualClock.advance(advanceMs);
@@ -2143,7 +2317,16 @@ Future<void> pumpTestTickAv(
   Duration wallSleep = const Duration(milliseconds: 5),
 }) async {
   if (!VirtualClock.enabled) {
-    pumpAllInstancesOnce(iterations: 50);
+    // Wall-clock fallback (mirrors pumpTestTick): advance the Dart-side clock
+    // counter so inline nowMs poll loops terminate, honor the caller's
+    // iteration count + wall settle. The event_thread drives both tox_iterate
+    // and ToxAV iterate in wall mode, so no explicit av-iterate is needed here.
+    VirtualClock.advance(advanceMs);
+    pumpAllInstancesOnce(
+        iterations: iterationsPerInstance > 50 ? iterationsPerInstance : 50);
+    if (wallSleep > Duration.zero) {
+      await Future.delayed(wallSleep);
+    }
     return;
   }
   VirtualClock.advance(advanceMs);
@@ -2229,6 +2412,15 @@ Future<void> waitForConnectionVirtual(
   TestNode node, {
   Duration? timeout,
 }) async {
+  // Wall-clock fallback: the poll loop below is bounded by VirtualClock.nowMs,
+  // which is frozen when the clock is disabled — on a slow/failed connection it
+  // early-returns on success but otherwise spins forever (it never reaches the
+  // virtual deadline). Delegate to the real-time TestNode waiter, which is what
+  // the wall-clock tests used directly and which times out properly.
+  if (!VirtualClock.enabled) {
+    await node.waitForConnection(timeout: timeout);
+    return;
+  }
   if (!node.loggedIn) {
     throw Exception('Cannot wait for connection: node is not logged in');
   }
@@ -2321,6 +2513,15 @@ Future<void> pumpFriendConnectionVirtual(
   int iterationsPerPump = 50,
   int advanceMs = 50,
 }) async {
+  // Wall-clock fallback: the loop below advances on VirtualClock.nowMs, which
+  // never moves when the clock is disabled — it would spin forever. Delegate
+  // to the real-time pump so this helper is safe to call from a mode-aware
+  // (unified) test file regardless of RUN_VIRTUAL.
+  if (!VirtualClock.enabled) {
+    await pumpFriendConnection(nodeA, nodeB,
+        duration: duration, iterationsPerPump: iterationsPerPump);
+    return;
+  }
   final deadline = VirtualClock.nowMs + duration.inMilliseconds;
   while (VirtualClock.nowMs < deadline) {
     await pumpTestTick(
@@ -2341,6 +2542,13 @@ Future<void> pumpGroupPeerDiscoveryVirtual(
   int iterationsPerPump = 30,
   int advanceMs = 50,
 }) async {
+  // Wall-clock fallback (see pumpFriendConnectionVirtual) — loops on
+  // VirtualClock.nowMs, which is frozen when the clock is disabled.
+  if (!VirtualClock.enabled) {
+    await pumpGroupPeerDiscovery(nodeA, nodeB,
+        duration: duration, iterationsPerPump: iterationsPerPump);
+    return;
+  }
   final deadline = VirtualClock.nowMs + duration.inMilliseconds;
   while (VirtualClock.nowMs < deadline) {
     await pumpTestTick(
@@ -2368,6 +2576,16 @@ Future<String?> waitUntilFounderSeesMemberInGroupVirtual(
   Duration delayAfterPump = const Duration(milliseconds: 150),
   bool allowFallbackProceed = false,
 }) async {
+  // Wall-clock fallback: loops on VirtualClock.nowMs (frozen when disabled).
+  // Delegate to the real-time waiter so unified files are safe in wall mode.
+  if (!VirtualClock.enabled) {
+    return waitUntilFounderSeesMemberInGroup(founder, otherNode, groupId,
+        timeout: timeout,
+        pumpDurationPerLoop: pumpDurationPerLoop,
+        iterationsPerPump: iterationsPerPump,
+        delayAfterPump: delayAfterPump,
+        allowFallbackProceed: allowFallbackProceed);
+  }
   final founderPublicKey = founder.getPublicKey();
   final otherPublicKey = otherNode.getPublicKey();
   final deadline = VirtualClock.nowMs + timeout.inMilliseconds;
@@ -2461,6 +2679,14 @@ Future<void> waitForFriendConnectionVirtual(
   String friendUserId, {
   Duration? timeout,
 }) async {
+  // Wall-clock fallback (see waitForConnectionVirtual): the VirtualClock.nowMs
+  // poll loop never advances when the clock is disabled, so a failed friend
+  // connection would spin forever instead of timing out. Delegate to the
+  // real-time TestNode waiter.
+  if (!VirtualClock.enabled) {
+    await node.waitForFriendConnection(friendUserId, timeout: timeout);
+    return;
+  }
   final connectionTimeout = timeout ?? const Duration(seconds: 45);
   final deadline = VirtualClock.nowMs + connectionTimeout.inMilliseconds;
   final startedAtMs = VirtualClock.nowMs;
@@ -2633,6 +2859,14 @@ Future<void> establishFriendshipVirtual(
   TestNode bob, {
   Duration? timeout,
 }) async {
+  // Wall-clock fallback: this helper has fixed-duration pre-pump loops keyed on
+  // VirtualClock.nowMs, which is frozen when the clock is disabled — they would
+  // spin forever. Delegate to the real-time establishFriendship so a mode-aware
+  // (unified) test file can call this regardless of RUN_VIRTUAL.
+  if (!VirtualClock.enabled) {
+    await establishFriendship(alice, bob, timeout: timeout);
+    return;
+  }
   final friendshipTimeout = timeout ?? const Duration(seconds: 200);
   final deadline = VirtualClock.nowMs + friendshipTimeout.inMilliseconds;
 

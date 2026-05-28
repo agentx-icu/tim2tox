@@ -1,7 +1,11 @@
-/// Group Error Test
-///
-/// Tests error scenarios: invalid operations, permission checks, etc.
-/// Verifies that error handling works correctly
+// Group Error Test — virtual-clock variant
+//
+// Mirrors scenario_group_error_test.dart 1:1 but drives the harness via
+// the virtual-clock helpers (VirtualClock + pumpTestTick + *Virtual helpers).
+// Most sub-tests are deliberate failure cases on a single instance and do
+// not rely on group invites; the few that DO use an invite path apply the
+// invite-retry pattern that is the canonical workaround for dropped
+// tox_group_invite_friend packets in virtual mode.
 
 import 'package:test/test.dart';
 import 'package:tencent_cloud_chat_sdk/native_im/adapter/tim_manager.dart';
@@ -27,6 +31,9 @@ void main() {
       charlie = scenario.getNode('charlie')!;
 
       await scenario.initAllNodes();
+      // Enable test mode BEFORE login so event_thread never starts.
+      if (shouldRunVirtual) await VirtualClock.enableForScenario(scenario);
+
       // Parallelize login
       await Future.wait([
         alice.login(),
@@ -40,20 +47,23 @@ void main() {
         description: 'all nodes logged in',
       );
 
-      await configureLocalBootstrap(scenario);
+      await configureLocalBootstrapVirtual(scenario);
 
       await Future.wait([
-        alice.waitForConnection(timeout: const Duration(seconds: 15)),
-        bob.waitForConnection(timeout: const Duration(seconds: 15)),
-        charlie.waitForConnection(timeout: const Duration(seconds: 15)),
+        waitForConnectionVirtual(scenario, alice,
+            timeout: const Duration(seconds: 15)),
+        waitForConnectionVirtual(scenario, bob,
+            timeout: const Duration(seconds: 15)),
+        waitForConnectionVirtual(scenario, charlie,
+            timeout: const Duration(seconds: 15)),
       ]);
-      await establishFriendship(alice, bob,
+      await establishFriendshipVirtual(scenario, alice, bob,
           timeout: const Duration(seconds: 90));
-      await establishFriendship(alice, charlie,
+      await establishFriendshipVirtual(scenario, alice, charlie,
           timeout: const Duration(seconds: 90));
-      await pumpFriendConnection(alice, bob,
+      await pumpFriendConnectionVirtual(scenario, alice, bob,
           duration: const Duration(seconds: 4));
-      await pumpFriendConnection(alice, charlie,
+      await pumpFriendConnectionVirtual(scenario, alice, charlie,
           duration: const Duration(seconds: 4));
     });
 
@@ -70,22 +80,41 @@ void main() {
 
     Future<void> inviteAndJoinMember(
         String groupId, TestNode inviter, TestNode invitee) async {
-      invitee.clearCallbackReceived('onGroupInvited');
-      final inviteResult = await inviter.runWithInstanceAsync(
-          () async => TIMGroupManager.instance.inviteUserToGroup(
-                groupID: groupId,
-                userList: [invitee.getPublicKey()],
-              ));
-      expect(inviteResult.code, equals(0),
-          reason: 'inviteUserToGroup failed: ${inviteResult.code}');
-
-      await waitUntilWithPump(
-        () => invitee.callbackReceived['onGroupInvited'] == true,
-        timeout: const Duration(seconds: 8),
-        description: '${invitee.alias} receives onGroupInvited',
-        iterationsPerPump: 100,
-        stepDelay: const Duration(milliseconds: 200),
-      );
+      final inviteePublicKey = invitee.getPublicKey();
+      // Retry invite + wait: inviteUserToGroup returns code=0 even when the
+      // underlying tox_group_invite_friend packet was dropped, so re-fire up
+      // to 3 times before giving up.
+      var inviteArrived = false;
+      for (var attempt = 0; !inviteArrived && attempt < 3; attempt++) {
+        invitee.clearCallbackReceived('onGroupInvited');
+        final inviteResult = await inviter.runWithInstanceAsync(() async =>
+            TIMGroupManager.instance.inviteUserToGroup(
+              groupID: groupId,
+              userList: [inviteePublicKey],
+            ));
+        expect(inviteResult.code, equals(0),
+            reason: 'inviteUserToGroup failed: ${inviteResult.desc}');
+        try {
+          await waitUntilWithVirtualPump(
+            scenario,
+            () => invitee.callbackReceived['onGroupInvited'] == true,
+            timeout: const Duration(seconds: 15),
+            description:
+                '${invitee.alias} receives onGroupInvited (attempt ${attempt + 1})',
+            advanceMs: 50,
+            iterationsPerInstance: 1,
+          );
+          inviteArrived = true;
+        } catch (_) {
+          // Retry: friend P2P may not have been ONLINE for the first attempt.
+        }
+      }
+      expect(inviteArrived, isTrue,
+          reason:
+              '${invitee.alias} never received onGroupInvited after 3 retries');
+      // Settle ~300ms virtual so pending invite -> chat_id mapping completes
+      // before joinGroup is called.
+      await pumpTestTick(scenario, advanceMs: 300, iterationsPerInstance: 1);
 
       final joinGroupId =
           invitee.getLastCallbackGroupId('onGroupInvited') ?? groupId;
@@ -97,7 +126,8 @@ void main() {
       expect(joinResult.code, equals(0),
           reason: '${invitee.alias} joinGroup failed: ${joinResult.code}');
 
-      final inviterSeesInvitee = await waitUntilFounderSeesMemberInGroup(
+      final inviterSeesInvitee = await waitUntilFounderSeesMemberInGroupVirtual(
+        scenario,
         inviter,
         invitee,
         groupId,

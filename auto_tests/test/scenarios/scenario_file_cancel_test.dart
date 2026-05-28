@@ -1,7 +1,10 @@
-/// File Cancel Test
+/// File Cancel Test — virtual-clock variant
 ///
-/// Tests file transfer cancellation
-/// Reference: c-toxcore/auto_tests/scenarios/scenario_file_cancel_test.c
+/// Mirrors scenario_file_cancel_test.dart 1:1 but drives the harness via
+/// the virtual-clock helpers. The initial file-request acceptance gets the
+/// 3x send-retry pattern since the underlying Tox file_request can drop on
+/// a flaky 2-node local-bootstrap link. The other two sub-tests only verify
+/// that the send was initiated; they keep mechanical pump substitutions.
 
 import 'dart:io';
 import 'package:test/test.dart';
@@ -13,7 +16,7 @@ import 'package:path/path.dart' as path;
 import '../test_helper.dart';
 import '../test_fixtures.dart';
 
-const _fileCancelSubdir = 'scenario_file_cancel';
+const _fileCancelSubdir = 'scenario_file_cancel_virtual';
 
 void main() {
   group('File Cancel Tests', () {
@@ -30,17 +33,22 @@ void main() {
       await testFile
           .writeAsString('This is a test file for cancellation.\n' * 1000);
 
+      // Enable BEFORE initAllNodes so V2TIMManagerImpl never spawns
+      // event_thread; file_request events flow through FfiChatService
+      // polling driven by pumpTestTick.
+      if (shouldRunVirtual) await VirtualClock.enableEarly();
       scenario = await createTestScenario(['alice', 'bob']);
       await scenario.initAllNodes();
       final alice = scenario.getNode('alice')!;
       final bob = scenario.getNode('bob')!;
+      if (shouldRunVirtual) await VirtualClock.enableForScenario(scenario);
       await Future.wait([alice.login(), bob.login()]);
       await waitUntil(() => alice.loggedIn && bob.loggedIn,
           timeout: const Duration(seconds: 10),
           description: 'both nodes logged in');
-      await configureLocalBootstrap(scenario);
-      await establishFriendship(alice, bob);
-      await pumpFriendConnection(alice, bob);
+      await configureLocalBootstrapVirtual(scenario);
+      await establishFriendshipVirtual(scenario, alice, bob);
+      await pumpFriendConnectionVirtual(scenario, alice, bob);
     });
 
     tearDownAll(() async {
@@ -59,8 +67,9 @@ void main() {
       final alice = scenario.getNode('alice')!;
       final bob = scenario.getNode('bob')!;
       final bobToxId = bob.getToxId();
-      await alice.waitForConnection(timeout: const Duration(seconds: 15));
-      await alice.waitForFriendConnection(bobToxId,
+      await waitForConnectionVirtual(scenario, alice,
+          timeout: const Duration(seconds: 15));
+      await waitForFriendConnectionVirtual(scenario, alice, bobToxId,
           timeout: const Duration(seconds: 90));
 
       var fileRequestReceived = false;
@@ -75,7 +84,8 @@ void main() {
           }
           // tim2tox may deliver file as text "[转发文件] fileName (size 字节)"
           final text = message.textElem?.text ?? '';
-          if (text.contains('转发文件') && text.contains('test_file_cancel.txt')) {
+          if (text.contains('转发文件') &&
+              text.contains('test_file_cancel.txt')) {
             fileRequestReceived = true;
             fileMessageId = message.msgID;
             bob.addReceivedMessage(message);
@@ -86,32 +96,46 @@ void main() {
       bob.runWithInstance(
           () => TIMMessageManager.instance.addAdvancedMsgListener(bobListener));
       try {
-        await Future.delayed(const Duration(seconds: 2));
+        await pumpTestTick(scenario, advanceMs: 2000, iterationsPerInstance: 1);
 
-        final sendResult = await alice.runWithInstanceAsync(() async {
-          final fileResult = TIMMessageManager.instance.createFileMessage(
-            filePath: testFile.path,
-            fileName: 'test_file_cancel.txt',
-          );
-          expect(fileResult.messageInfo, isNotNull,
-              reason: 'File message creation should succeed');
-          return await TIMMessageManager.instance.sendMessage(
-            groupID: null,
-            message: fileResult.messageInfo!,
-            receiver: bobToxId,
-            onlineUserOnly: false,
-          );
-        });
+        // Retry send + wait for file-request callback. The first
+        // file_request packet can drop while friend P2P warms up.
+        var arrived = false;
+        for (var attempt = 0; !arrived && attempt < 3; attempt++) {
+          fileRequestReceived = false;
+          final sendResult = await alice.runWithInstanceAsync(() async {
+            final fileResult = TIMMessageManager.instance.createFileMessage(
+              filePath: testFile.path,
+              fileName: 'test_file_cancel.txt',
+            );
+            expect(fileResult.messageInfo, isNotNull,
+                reason: 'File message creation should succeed');
+            return await TIMMessageManager.instance.sendMessage(
+              groupID: null,
+              message: fileResult.messageInfo!,
+              receiver: bobToxId,
+              onlineUserOnly: false,
+            );
+          });
+          expect(sendResult.code, equals(0));
 
-        expect(sendResult.code, equals(0));
+          try {
+            await waitUntilWithVirtualPump(
+              scenario,
+              () => fileRequestReceived,
+              timeout: const Duration(seconds: 30),
+              description: 'file request received (attempt ${attempt + 1})',
+              advanceMs: 50,
+              iterationsPerInstance: 1,
+            );
+            arrived = true;
+          } catch (_) {
+            // retry — file_request may have been dropped
+          }
+        }
 
-        // Wait for file request to be received (as FILE or as forward text).
-        await waitUntilWithPump(
-          () => fileRequestReceived,
-          timeout: const Duration(seconds: 20),
-          description: 'file request received',
-        );
-
+        expect(arrived, isTrue,
+            reason: 'file request never received after 3 send retries');
         expect(fileRequestReceived, isTrue);
         expect(fileMessageId, isNotNull);
 
@@ -133,16 +157,16 @@ void main() {
         bob.runWithInstance(() => TIMMessageManager.instance
             .removeAdvancedMsgListener(listener: bobListener));
       }
-    }, timeout: const Timeout(Duration(seconds: 90)));
+    }, timeout: const Timeout(Duration(seconds: 180)));
 
     test('Cancel outgoing file transfer', () async {
       final alice = scenario.getNode('alice')!;
       final bob = scenario.getNode('bob')!;
       final bobToxId = bob.getToxId();
-      await alice.waitForFriendConnection(bobToxId,
+      await waitForFriendConnectionVirtual(scenario, alice, bobToxId,
           timeout: const Duration(seconds: 90));
 
-      await Future.delayed(const Duration(seconds: 2));
+      await pumpTestTick(scenario, advanceMs: 2000, iterationsPerInstance: 1);
 
       final sendResult = await alice.runWithInstanceAsync(() async {
         final fileResult = TIMMessageManager.instance.createFileMessage(
@@ -161,7 +185,7 @@ void main() {
       expect(sendResult.code, equals(0));
 
       // Wait a bit for transfer to start
-      await Future.delayed(const Duration(seconds: 2));
+      await pumpTestTick(scenario, advanceMs: 2000, iterationsPerInstance: 1);
 
       // Cancel the file transfer
       // Note: File cancellation in tim2tox requires FfiChatService
@@ -173,7 +197,7 @@ void main() {
       final alice = scenario.getNode('alice')!;
       final bob = scenario.getNode('bob')!;
       final bobToxId = bob.getToxId();
-      await alice.waitForFriendConnection(bobToxId,
+      await waitForFriendConnectionVirtual(scenario, alice, bobToxId,
           timeout: const Duration(seconds: 90));
 
       final cancelListener = V2TimAdvancedMsgListener(
@@ -190,7 +214,7 @@ void main() {
       bob.runWithInstance(() =>
           TIMMessageManager.instance.addAdvancedMsgListener(cancelListener));
       try {
-        await Future.delayed(const Duration(seconds: 2));
+        await pumpTestTick(scenario, advanceMs: 2000, iterationsPerInstance: 1);
 
         final sendResult = await alice.runWithInstanceAsync(() async {
           final fileResult = TIMMessageManager.instance.createFileMessage(

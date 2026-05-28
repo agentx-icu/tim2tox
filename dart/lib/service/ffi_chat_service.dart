@@ -155,6 +155,7 @@ ffi.Pointer<ffi.NativeFunction<_dht_nodes_response_callback_native>>
   );
   return _dhtNodesResponseCallable!.nativeFunction;
 }
+
 // Product decision: sync avatar between friends, but never expose it as chat messages.
 const bool _avatarBroadcastAsChatFileEnabled = true;
 
@@ -734,8 +735,8 @@ class FfiChatService {
         // afterMsgID may itself contain '_<peerUid>_filename' from inbound
         // generation, but the most precise match is filename equality at the
         // tail.
-        if (progressBase == afterMsgID ||
-            progressBase.endsWith('_$afterMsgID')) return true;
+        if (progressBase == afterMsgID || progressBase.endsWith('_$afterMsgID'))
+          return true;
       }
     }
     return false;
@@ -754,12 +755,12 @@ class FfiChatService {
       return;
     }
     _activePeerId = normalizedId;
-    // Update last view timestamp so restart restores 0 unread for this conversation
-    final now = DateTime.now().millisecondsSinceEpoch;
-    unawaited(_messageHistoryPersistence.updateLastViewTimestamp(
-        conversationId, now));
+    // CR-07: anchor the read barrier to the conversation's highest message
+    // timestamp rather than the local wall clock, so clock drift/rollback
+    // between this device and the remote peer can't inflate or zero the
+    // unread count on restart.
     unawaited(
-        _messageHistoryPersistence.markUnreadMessagesAsRead(conversationId));
+        _messageHistoryPersistence.markConversationViewed(conversationId));
     _unreadByPeer[normalizedId] = 0;
   }
 
@@ -1308,301 +1309,298 @@ class FfiChatService {
         }
         _pollBusy = true;
         try {
-        // Call toxav_iterate if AV is initialized
-        try {
-          _ffi.avIterate(_ffi.getCurrentInstanceId());
-        } catch (e) {
-          // AV not initialized yet, ignore
-        }
-
-        final buf = pkgffi.malloc.allocate<ffi.Int8>(4096);
-        // Poll broadcast (0), registered service instances, and known instance IDs (e.g. test nodes)
-        // so that file_request:2:... is consumed when only instance 1 has a service registered.
-        final idsToPoll = [
-          0,
-          ...synchronized(_instanceServicesLock, () {
-            final keys = List<int>.from(
-                {..._instanceServices.keys, ..._knownInstanceIds});
-            keys.sort();
-            return keys;
-          }),
-        ];
-        // Prefer receiver instance first (e.g. 2 before 1) so file_request:2 is consumed promptly in file transfer tests.
-        final nonZero = idsToPoll.where((id) => id != 0).toList();
-        final pollOrder = idsToPoll.length > 1
-            ? (hasKnownInstances && nonZero.length > 1
-                ? [
-                    ...nonZero..sort((a, b) => b.compareTo(a)),
-                    0
-                  ] // [2, 1, 0] so Bob (receiver) gets file_request first
-                : [...nonZero, 0])
-            : idsToPoll;
-        // Batch drain: process up to 200 events per poll cycle to avoid queue buildup.
-        // Without this, each poll cycle processes ONE event at 50ms intervals, so ~1779 progress
-        // chunks for a 2.4MB file would take 1779×50ms = 89 seconds to drain.
-        for (int _batchIdx = 0; _batchIdx < 200; _batchIdx++) {
-          int n = 0;
-          for (final id in pollOrder) {
-            n = _ffi.pollText(id, buf, 4096);
-            if (n > 0) break;
+          // Call toxav_iterate if AV is initialized
+          try {
+            _ffi.avIterate(_ffi.getCurrentInstanceId());
+          } catch (e) {
+            // AV not initialized yet, ignore
           }
-          if (n <= 0) break; // No more events in queue
-          if (n > 0) {
-            _lastPollActivity = DateTime.now(); // Mark activity
-            String s;
-            try {
-              s = buf.cast<pkgffi.Utf8>().toDartString();
-              // Debug: log important events (skip frequent progress_recv to reduce log spam)
-              if (s.startsWith('file_done:')) {
-                _logger?.log(
-                    '[FfiChatService] Polled file_done event (length=$n): $s');
-              } else if (s.startsWith('file_request:')) {
-                // Log file_request events for debugging - CRITICAL for file receiving
-                _logger?.log(
-                    '[FfiChatService] Polled file_request event (length=$n): $s');
-              } else if (s.startsWith('progress_recv:')) {
-                // Skip logging progress_recv events - too frequent during file transfer
-              } else if (s.startsWith('c2c:') || s.startsWith('gtext:')) {
-                // Log text messages to verify polling is working
-                _logger?.log(
-                    '[FfiChatService] Polled message event (length=$n): $s');
-              } else if (s.startsWith('conn:')) {
-                // Log connection events
-                _logger
-                    ?.log('[FfiChatService] Polled conn event (length=$n): $s');
-              } else {
-                // Log other events to see what's in the queue
-                _logger?.log(
-                    '[FfiChatService] Polled other event (length=$n): $s');
-              }
-            } catch (e) {
-              // Handle UTF-8 decoding errors gracefully
-              // This can happen if file paths contain non-UTF-8 characters or if binary data is accidentally in the text queue
-              // Try to read as bytes and convert with error handling
-              try {
-                final bytes = buf.asTypedList(n);
-                // Check if this looks like a text event (starts with known prefixes)
-                final firstBytes = bytes.take(20).toList();
-                final firstChars = String.fromCharCodes(firstBytes.where((b) =>
-                    b >= 32 && b <= 126 || b == 9 || b == 10 || b == 13));
 
-                // If it starts with a known event prefix, try to recover
-                if (firstChars.startsWith('conn:') ||
-                    firstChars.startsWith('file_') ||
-                    firstChars.startsWith('msg:') ||
-                    firstChars.startsWith('nickname_') ||
-                    firstChars.startsWith('status_') ||
-                    firstChars.startsWith('progress_') ||
-                    firstChars.startsWith('gcustom:')) {
-                  // Try to decode with replacement characters for invalid bytes
-                  s = utf8.decode(bytes, allowMalformed: true);
-                  // Debug: log file_done events even if they had decoding issues
-                  if (s.startsWith('file_done:')) {
-                    _logger?.log(
-                        '[FfiChatService] Polled file_done event (after recovery): $s');
-                  }
+          var bufCap = 4096;
+          var buf = pkgffi.malloc.allocate<ffi.Int8>(bufCap);
+          // Poll broadcast (0), registered service instances, and known instance IDs (e.g. test nodes)
+          // so that file_request:2:... is consumed when only instance 1 has a service registered.
+          final idsToPoll = [
+            0,
+            ...synchronized(_instanceServicesLock, () {
+              final keys = List<int>.from(
+                  {..._instanceServices.keys, ..._knownInstanceIds});
+              keys.sort();
+              return keys;
+            }),
+          ];
+          // Prefer receiver instance first (e.g. 2 before 1) so file_request:2 is consumed promptly in file transfer tests.
+          final nonZero = idsToPoll.where((id) => id != 0).toList();
+          final pollOrder = idsToPoll.length > 1
+              ? (hasKnownInstances && nonZero.length > 1
+                  ? [
+                      ...nonZero..sort((a, b) => b.compareTo(a)),
+                      0
+                    ] // [2, 1, 0] so Bob (receiver) gets file_request first
+                  : [...nonZero, 0])
+              : idsToPoll;
+          // Batch drain: process up to 200 events per poll cycle to avoid queue buildup.
+          // Without this, each poll cycle processes ONE event at 50ms intervals, so ~1779 progress
+          // chunks for a 2.4MB file would take 1779×50ms = 89 seconds to drain.
+          for (int _batchIdx = 0; _batchIdx < 200; _batchIdx++) {
+            int n = 0;
+            for (final id in pollOrder) {
+              n = _ffi.pollText(id, buf, bufCap);
+              // Negative => the front event is larger than the buffer. The
+              // event was left queued (not dropped/truncated), so grow to the
+              // required size and retry the same id. Terminates after one
+              // retry since the new capacity is the exact size requested.
+              while (n < 0) {
+                pkgffi.malloc.free(buf);
+                bufCap = -n;
+                buf = pkgffi.malloc.allocate<ffi.Int8>(bufCap);
+                n = _ffi.pollText(id, buf, bufCap);
+              }
+              if (n > 0) break;
+            }
+            if (n <= 0) break; // No more events in queue
+            if (n > 0) {
+              _lastPollActivity = DateTime.now(); // Mark activity
+              String s;
+              try {
+                s = buf.cast<pkgffi.Utf8>().toDartString();
+                // Debug: log important events (skip frequent progress_recv to reduce log spam)
+                if (s.startsWith('file_done:')) {
+                  _logger?.log(
+                      '[FfiChatService] Polled file_done event (length=$n): $s');
+                } else if (s.startsWith('file_request:')) {
+                  // Log file_request events for debugging - CRITICAL for file receiving
+                  _logger?.log(
+                      '[FfiChatService] Polled file_request event (length=$n): $s');
+                } else if (s.startsWith('progress_recv:')) {
+                  // Skip logging progress_recv events - too frequent during file transfer
+                } else if (s.startsWith('c2c:') || s.startsWith('gtext:')) {
+                  // Log text messages to verify polling is working
+                  _logger?.log(
+                      '[FfiChatService] Polled message event (length=$n): $s');
+                } else if (s.startsWith('conn:')) {
+                  // Log connection events
+                  _logger?.log(
+                      '[FfiChatService] Polled conn event (length=$n): $s');
                 } else {
-                  // P0-C2: log unrecognized payloads instead of silently
-                  // dropping them. Used to be a silent return which masked
-                  // FFI boundary corruption / new event types added on the
-                  // C++ side that Dart didn't yet recognise.
-                  final hexPreview = bytes
+                  // Log other events to see what's in the queue
+                  _logger?.log(
+                      '[FfiChatService] Polled other event (length=$n): $s');
+                }
+              } catch (e) {
+                // Handle UTF-8 decoding errors gracefully
+                // This can happen if file paths contain non-UTF-8 characters or if binary data is accidentally in the text queue
+                // Try to read as bytes and convert with error handling
+                try {
+                  final bytes = buf.asTypedList(n);
+                  // Check if this looks like a text event (starts with known prefixes)
+                  final firstBytes = bytes.take(20).toList();
+                  final firstChars = String.fromCharCodes(firstBytes.where(
+                      (b) =>
+                          b >= 32 && b <= 126 || b == 9 || b == 10 || b == 13));
+
+                  // If it starts with a known event prefix, try to recover.
+                  // The allowlist must cover EVERY prefix the dispatcher below handles,
+                  // otherwise a genuine event carrying a non-UTF-8 byte (e.g. a TEXT
+                  // message with an invalid/mid-codepoint-truncated byte) is silently
+                  // dropped instead of recovered with replacement chars. Handled
+                  // prefixes: conn:, typing:, c2c:, c2cbin:, gtext:, gcustom:,
+                  // progress_recv:, progress_send:, file_request:, file_done: — plus
+                  // msg:/nickname_/status_ kept from historic events.
+                  // 'c2c:' also matches 'c2cbin:'; 'file_' matches file_request/file_done;
+                  // 'progress_' matches progress_recv/progress_send.
+                  if (firstChars.startsWith('conn:') ||
+                      firstChars.startsWith('typing:') ||
+                      firstChars.startsWith('c2c:') ||
+                      firstChars.startsWith('gtext:') ||
+                      firstChars.startsWith('file_') ||
+                      firstChars.startsWith('msg:') ||
+                      firstChars.startsWith('nickname_') ||
+                      firstChars.startsWith('status_') ||
+                      firstChars.startsWith('progress_') ||
+                      firstChars.startsWith('gcustom:')) {
+                    // Try to decode with replacement characters for invalid bytes
+                    s = utf8.decode(bytes, allowMalformed: true);
+                    // Debug: log file_done events even if they had decoding issues
+                    if (s.startsWith('file_done:')) {
+                      _logger?.log(
+                          '[FfiChatService] Polled file_done event (after recovery): $s');
+                    }
+                  } else {
+                    // P0-C2: log unrecognized payloads instead of silently
+                    // dropping them. Used to be a silent return which masked
+                    // FFI boundary corruption / new event types added on the
+                    // C++ side that Dart didn't yet recognise.
+                    final hexPreview = bytes
+                        .take(64)
+                        .map((b) => b.toRadixString(16).padLeft(2, '0'))
+                        .join();
+                    _logger?.log(
+                        '[FfiChatService] Polled non-text payload, dropping (n=$n bytes=0x$hexPreview, asciiHead=${firstChars.substring(0, firstChars.length.clamp(0, 32))})');
+                    pkgffi.malloc.free(buf);
+                    _scheduleNextPoll();
+                    return;
+                  }
+                } catch (e2) {
+                  // P0-C2: log decode-recovery failures rather than swallowing.
+                  final hexPreview = buf
+                      .asTypedList(n)
                       .take(64)
                       .map((b) => b.toRadixString(16).padLeft(2, '0'))
                       .join();
                   _logger?.log(
-                      '[FfiChatService] Polled non-text payload, dropping (n=$n bytes=0x$hexPreview, asciiHead=${firstChars.substring(0, firstChars.length.clamp(0, 32))})');
+                      '[FfiChatService] Polled event UTF-8 decode failed even with recovery (n=$n bytes=0x$hexPreview): $e $e2');
                   pkgffi.malloc.free(buf);
                   _scheduleNextPoll();
                   return;
                 }
-              } catch (e2) {
-                // P0-C2: log decode-recovery failures rather than swallowing.
-                final hexPreview = buf
-                    .asTypedList(n)
-                    .take(64)
-                    .map((b) => b.toRadixString(16).padLeft(2, '0'))
-                    .join();
-                _logger?.log(
-                    '[FfiChatService] Polled event UTF-8 decode failed even with recovery (n=$n bytes=0x$hexPreview): $e $e2');
-                pkgffi.malloc.free(buf);
-                _scheduleNextPoll();
-                return;
               }
-            }
-            // Expected events via polling queue
-            if (s.startsWith('conn:')) {
-              // conn:success or conn:failed
-              if (s == 'conn:success') {
-                final wasOffline = !_isConnected;
-                _isConnected = true;
-                _connectionStatus.add(true);
-                // When connected, send avatar to all online friends
-                unawaited(_sendAvatarToAllFriendsOnConnect());
-                // P0-C1: drain any group messages queued while offline.
-                if (wasOffline) {
-                  unawaited(_drainAllPendingGroupMessages());
+              // Expected events via polling queue
+              if (s.startsWith('conn:')) {
+                // conn:success or conn:failed
+                if (s == 'conn:success') {
+                  final wasOffline = !_isConnected;
+                  _isConnected = true;
+                  _connectionStatus.add(true);
+                  // When connected, send avatar to all online friends
+                  unawaited(_sendAvatarToAllFriendsOnConnect());
+                  // P0-C1: drain any group messages queued while offline.
+                  if (wasOffline) {
+                    unawaited(_drainAllPendingGroupMessages());
+                  }
+                } else if (s == 'conn:failed') {
+                  _isConnected = false;
+                  _connectionStatus.add(false);
                 }
-              } else if (s == 'conn:failed') {
-                _isConnected = false;
-                _connectionStatus.add(false);
-              }
-            } else if (s.startsWith('typing:')) {
-              final parts = s.split(':');
-              if (parts.length >= 3) {
-                final from = parts[1];
-                final on = parts[2] == '1';
-                if (on) {
-                  _typingUntil[from] =
-                      DateTime.now().add(const Duration(seconds: 3));
-                } else {
-                  _typingUntil.remove(from);
+              } else if (s.startsWith('typing:')) {
+                final parts = s.split(':');
+                if (parts.length >= 3) {
+                  final from = parts[1];
+                  final on = parts[2] == '1';
+                  if (on) {
+                    _typingUntil[from] =
+                        DateTime.now().add(const Duration(seconds: 3));
+                  } else {
+                    _typingUntil.remove(from);
+                  }
+                  // Don't add empty message for typing indicator - UI will show it separately
                 }
-                // Don't add empty message for typing indicator - UI will show it separately
-              }
-            } else if (s.startsWith('c2c:')) {
-              final idx = s.indexOf(':', 4);
-              if (idx > 4 && idx + 1 < s.length) {
-                final from = s.substring(4, idx);
-                final text = s.substring(idx + 1);
-                // Normalize friend ID to ensure consistent storage and retrieval
-                final normalizedFrom =
-                    from.length > 64 ? _normalizeFriendId(from) : from;
-                // Generate msgID for receipt tracking
-                final timestamp = DateTime.now().millisecondsSinceEpoch;
-                final sequence = _msgIDSequence++;
-                final msgID = '${timestamp}_${sequence}_${from}';
-                final msg = ChatMessage(
-                  text: text,
-                  fromUserId: from,
-                  isSelf: from == _selfId,
-                  timestamp: DateTime.now(),
-                  msgID: msgID,
-                );
-                _lastByPeer[normalizedFrom] = msg;
-                if (_activePeerId != normalizedFrom && from != _selfId) {
-                  _unreadByPeer.update(normalizedFrom, (v) => v + 1,
-                      ifAbsent: () => 1);
+              } else if (s.startsWith('c2c:')) {
+                final idx = s.indexOf(':', 4);
+                if (idx > 4 && idx + 1 < s.length) {
+                  final from = s.substring(4, idx);
+                  final text = s.substring(idx + 1);
+                  // Normalize friend ID to ensure consistent storage and retrieval
+                  final normalizedFrom =
+                      from.length > 64 ? _normalizeFriendId(from) : from;
+                  // Generate msgID for receipt tracking
+                  final timestamp = DateTime.now().millisecondsSinceEpoch;
+                  final sequence = _msgIDSequence++;
+                  final msgID = '${timestamp}_${sequence}_${from}';
+                  final msg = ChatMessage(
+                    text: text,
+                    fromUserId: from,
+                    isSelf: from == _selfId,
+                    timestamp: DateTime.now(),
+                    msgID: msgID,
+                  );
+                  _lastByPeer[normalizedFrom] = msg;
+                  if (_activePeerId != normalizedFrom && from != _selfId) {
+                    _unreadByPeer.update(normalizedFrom, (v) => v + 1,
+                        ifAbsent: () => 1);
+                  }
+                  _appendHistory(normalizedFrom, msg);
+                  _messages.add(msg);
+                  // Auto-send received receipt for received messages (not self-sent)
+                  // Note: reaction messages are sent via custom messages and should not trigger receipts
+                  // Regular text messages will trigger receipts here
+                  if (!msg.isSelf && !_isReactionMessage(text)) {
+                    unawaited(_sendReceipt(from, msgID, 'received'));
+                  }
                 }
-                _appendHistory(normalizedFrom, msg);
-                _messages.add(msg);
-                // Auto-send received receipt for received messages (not self-sent)
-                // Note: reaction messages are sent via custom messages and should not trigger receipts
-                // Regular text messages will trigger receipts here
-                if (!msg.isSelf && !_isReactionMessage(text)) {
-                  unawaited(_sendReceipt(from, msgID, 'received'));
-                }
-              }
-            } else if (s.startsWith('gtext:')) {
-              // gtext:<groupID>|<sender>:<text>
-              final headerEnd = s.indexOf(':', 6);
-              if (headerEnd > 6) {
-                final header = s.substring(6, headerEnd);
-                final text = s.substring(headerEnd + 1);
-                final sep = header.indexOf('|');
-                if (sep > 0) {
-                  final gid = header.substring(0, sep);
-                  final from = header.substring(sep + 1);
-                  // Check if this group was quit - if so, don't add it back
-                  if (!_quitGroups.contains(gid)) {
-                    // Deduplicate: same message can be delivered twice (conference + group callback in C++)
-                    if (_isDuplicateGroupTextMessage(gid, from, text)) {
-                      _logger?.log(
-                          '[FfiChatService] Skipping duplicate group message: gid=$gid, from=$from');
-                      // If group was quit, ignore this message
-                    } else {
-                      _knownGroups.add(gid);
-                      _syncKnownGroupsToNative(); // Sync to C++ layer
-                      // Generate msgID for receipt tracking
-                      final timestamp = DateTime.now().millisecondsSinceEpoch;
-                      final sequence = _msgIDSequence++;
-                      final msgID = '${timestamp}_${sequence}_${from}_$gid';
-                      final msg = ChatMessage(
-                        text: text,
-                        fromUserId: from,
-                        isSelf: from == _selfId,
-                        timestamp: DateTime.now(),
-                        groupId: gid,
-                        msgID: msgID,
-                      );
-                      _lastByPeer[gid] = msg;
-                      if (_activePeerId == gid) {
-                        _unreadByPeer[gid] = 0;
+              } else if (s.startsWith('gtext:')) {
+                // gtext:<groupID>|<sender>:<text>
+                final headerEnd = s.indexOf(':', 6);
+                if (headerEnd > 6) {
+                  final header = s.substring(6, headerEnd);
+                  final text = s.substring(headerEnd + 1);
+                  final sep = header.indexOf('|');
+                  if (sep > 0) {
+                    final gid = header.substring(0, sep);
+                    final from = header.substring(sep + 1);
+                    // Check if this group was quit - if so, don't add it back
+                    if (!_quitGroups.contains(gid)) {
+                      // Deduplicate: same message can be delivered twice (conference + group callback in C++)
+                      if (_isDuplicateGroupTextMessage(gid, from, text)) {
+                        _logger?.log(
+                            '[FfiChatService] Skipping duplicate group message: gid=$gid, from=$from');
+                        // If group was quit, ignore this message
                       } else {
-                        _unreadByPeer.update(gid, (v) => v + 1,
-                            ifAbsent: () => 1);
-                      }
-                      _appendHistory(gid, msg);
-                      _messages.add(msg);
-                      // Auto-send received receipt for received group messages (not self-sent)
-                      // Note: reaction messages are sent via custom messages and should not trigger receipts
-                      if (!msg.isSelf && !_isReactionMessage(text)) {
-                        unawaited(_sendReceipt(from, msgID, 'received',
-                            groupID: gid));
+                        _knownGroups.add(gid);
+                        _syncKnownGroupsToNative(); // Sync to C++ layer
+                        // Generate msgID for receipt tracking
+                        final timestamp = DateTime.now().millisecondsSinceEpoch;
+                        final sequence = _msgIDSequence++;
+                        final msgID = '${timestamp}_${sequence}_${from}_$gid';
+                        final msg = ChatMessage(
+                          text: text,
+                          fromUserId: from,
+                          isSelf: from == _selfId,
+                          timestamp: DateTime.now(),
+                          groupId: gid,
+                          msgID: msgID,
+                        );
+                        _lastByPeer[gid] = msg;
+                        if (_activePeerId == gid) {
+                          _unreadByPeer[gid] = 0;
+                        } else {
+                          _unreadByPeer.update(gid, (v) => v + 1,
+                              ifAbsent: () => 1);
+                        }
+                        _appendHistory(gid, msg);
+                        _messages.add(msg);
+                        // Auto-send received receipt for received group messages (not self-sent)
+                        // Note: reaction messages are sent via custom messages and should not trigger receipts
+                        if (!msg.isSelf && !_isReactionMessage(text)) {
+                          unawaited(_sendReceipt(from, msgID, 'received',
+                              groupID: gid));
+                        }
                       }
                     }
-                  }
-                  // If group was quit, ignore this message
-                }
-              }
-            } else if (s.startsWith('progress_recv:')) {
-              // progress_recv:[<instance_id>:]<uid>:<received>:<total>:<path>  (new: instance_id first; legacy: no instance_id)
-              final parts = s.split(':');
-              int instanceId = 0;
-              int uidIdx = 1;
-              if (parts.length >= 6) {
-                instanceId = int.tryParse(parts[1]) ?? 0;
-                uidIdx = 2;
-              }
-              if (parts.length >= uidIdx + 4) {
-                final uid = parts[uidIdx];
-                final rec = int.tryParse(parts[uidIdx + 1]) ?? 0;
-                final tot = int.tryParse(parts[uidIdx + 2]) ?? 0;
-                final path =
-                    parts.sublist(uidIdx + 3).join(':'); // allow ':' in path
-                // Update last poll activity to keep polling interval short during file transfer
-                _lastPollActivity = DateTime.now();
-                // Skip logging progress_recv details - too frequent during file transfer
-
-                // Try to find the file transfer by path or by checking all pending transfers
-                String? foundMsgID;
-                int? foundFileNumber;
-                final normalizedUid =
-                    uid.length > 64 ? _normalizeFriendId(uid) : uid;
-
-                // Fast path: check cache from previous chunk (same transfer)
-                final cachedKey = _progressKeyCache[path];
-                if (cachedKey != null) {
-                  final progress = _fileReceiveProgress[cachedKey];
-                  if (progress != null) {
-                    _fileReceiveProgress[cachedKey] = (
-                      received: rec,
-                      total: tot,
-                      msgID: progress.msgID,
-                      fileName: progress.fileName,
-                      tempPath: progress.tempPath,
-                      actualPath: path,
-                    );
-                    // P1-7: stamp the last-progress epoch so the timeout
-                    // sweeper can tell a stalled transfer from a healthy
-                    // one that's mid-chunk.
-                    _lastProgressTs[cachedKey] =
-                        DateTime.now().millisecondsSinceEpoch;
-                    foundMsgID = progress.msgID;
-                    foundFileNumber = cachedKey.$2;
+                    // If group was quit, ignore this message
                   }
                 }
+              } else if (s.startsWith('progress_recv:')) {
+                // progress_recv:[<instance_id>:]<uid>:<received>:<total>:<path>  (new: instance_id first; legacy: no instance_id)
+                final parts = s.split(':');
+                int instanceId = 0;
+                int uidIdx = 1;
+                if (parts.length >= 6) {
+                  instanceId = int.tryParse(parts[1]) ?? 0;
+                  uidIdx = 2;
+                }
+                if (parts.length >= uidIdx + 4) {
+                  final uid = parts[uidIdx];
+                  final rec = int.tryParse(parts[uidIdx + 1]) ?? 0;
+                  final tot = int.tryParse(parts[uidIdx + 2]) ?? 0;
+                  final path =
+                      parts.sublist(uidIdx + 3).join(':'); // allow ':' in path
+                  // Update last poll activity to keep polling interval short during file transfer
+                  _lastPollActivity = DateTime.now();
+                  // Skip logging progress_recv details - too frequent during file transfer
 
-                // Full scan only if cache miss
-                if (foundMsgID == null) {
-                  for (final entry in _fileReceiveProgress.entries) {
-                    final key = entry.key;
-                    final progress = entry.value;
-                    if ((key.$1 == normalizedUid || key.$1 == uid) &&
-                        (progress.actualPath == path ||
-                            progress.tempPath == path ||
-                            _isSameReceiveFile(progress.tempPath, path))) {
-                      _fileReceiveProgress[key] = (
+                  // Try to find the file transfer by path or by checking all pending transfers
+                  String? foundMsgID;
+                  int? foundFileNumber;
+                  final normalizedUid =
+                      uid.length > 64 ? _normalizeFriendId(uid) : uid;
+
+                  // Fast path: check cache from previous chunk (same transfer)
+                  final cachedKey = _progressKeyCache[path];
+                  if (cachedKey != null) {
+                    final progress = _fileReceiveProgress[cachedKey];
+                    if (progress != null) {
+                      _fileReceiveProgress[cachedKey] = (
                         received: rec,
                         total: tot,
                         msgID: progress.msgID,
@@ -1610,170 +1608,555 @@ class FfiChatService {
                         tempPath: progress.tempPath,
                         actualPath: path,
                       );
-                      // P1-7: see cache-hit branch above.
-                      _lastProgressTs[key] =
+                      // P1-7: stamp the last-progress epoch so the timeout
+                      // sweeper can tell a stalled transfer from a healthy
+                      // one that's mid-chunk.
+                      _lastProgressTs[cachedKey] =
                           DateTime.now().millisecondsSinceEpoch;
                       foundMsgID = progress.msgID;
-                      foundFileNumber = key.$2;
-                      _progressKeyCache[path] =
-                          key; // Cache for subsequent chunks
-                      break;
+                      foundFileNumber = cachedKey.$2;
                     }
                   }
-                }
 
-                // If not found by path, try to find by matching path basename (for cases where path format differs)
-                if (foundMsgID == null) {
-                  final pathBasename = p.basename(path);
-                  // Extract original filename from path if it has ID prefix
-                  // Format: <sender_hex>_<friend_number>_<file_number>_<originalFileName>
-                  String? extractedFileName;
-                  if (pathBasename.contains('_') && pathBasename.length > 64) {
-                    final parts = pathBasename.split('_');
-                    if (parts.length >= 4) {
-                      // Extract original filename (everything after the first 3 parts)
-                      extractedFileName = parts.sublist(3).join('_');
-                    }
-                  } else {
-                    extractedFileName = pathBasename;
-                  }
-
-                  for (final entry in _fileReceiveProgress.entries) {
-                    final key = entry.key;
-                    final progress = entry.value;
-                    if ((key.$1 == normalizedUid || key.$1 == uid)) {
-                      // Try to match by basename, by extracted filename, or tempPath vs actual path
-                      final actualBasename = progress.actualPath != null
-                          ? p.basename(progress.actualPath!)
-                          : null;
-                      final tempBasename = progress.tempPath != null
-                          ? p.basename(progress.tempPath!)
-                          : null;
-                      final basenameMatch = actualBasename == pathBasename ||
-                          tempBasename == pathBasename ||
-                          _isSameReceiveFile(progress.tempPath, path);
-                      final fileNameMatch = extractedFileName != null &&
-                          progress.fileName == extractedFileName;
-
-                      if (basenameMatch || fileNameMatch) {
+                  // Full scan only if cache miss
+                  if (foundMsgID == null) {
+                    for (final entry in _fileReceiveProgress.entries) {
+                      final key = entry.key;
+                      final progress = entry.value;
+                      if ((key.$1 == normalizedUid || key.$1 == uid) &&
+                          (progress.actualPath == path ||
+                              progress.tempPath == path ||
+                              _isSameReceiveFile(progress.tempPath, path))) {
                         _fileReceiveProgress[key] = (
                           received: rec,
                           total: tot,
                           msgID: progress.msgID,
                           fileName: progress.fileName,
                           tempPath: progress.tempPath,
-                          actualPath:
-                              path, // Update actual path when we receive it
+                          actualPath: path,
                         );
-                        // P1-7: see other progress-update sites.
+                        // P1-7: see cache-hit branch above.
                         _lastProgressTs[key] =
                             DateTime.now().millisecondsSinceEpoch;
                         foundMsgID = progress.msgID;
                         foundFileNumber = key.$2;
-                        // Do not log every progress match - would spam logs during file transfer
+                        _progressKeyCache[path] =
+                            key; // Cache for subsequent chunks
                         break;
                       }
                     }
                   }
-                }
 
-                // If still not found, log warning but don't update any record
-                // This prevents incorrect matching when fileNumber is reused
-                if (foundMsgID == null) {
-                  _logger?.logWarning(
-                      '[FfiChatService] progress_recv: WARNING - No matching file transfer found for path=$path, total=$tot, uid=$uid. This may indicate fileNumber reuse or file transfer not tracked.');
-                }
+                  // If not found by path, try to find by matching path basename (for cases where path format differs)
+                  if (foundMsgID == null) {
+                    final pathBasename = p.basename(path);
+                    // Extract original filename from path if it has ID prefix
+                    // Format: <sender_hex>_<friend_number>_<file_number>_<originalFileName>
+                    String? extractedFileName;
+                    if (pathBasename.contains('_') &&
+                        pathBasename.length > 64) {
+                      final parts = pathBasename.split('_');
+                      if (parts.length >= 4) {
+                        // Extract original filename (everything after the first 3 parts)
+                        extractedFileName = parts.sublist(3).join('_');
+                      }
+                    } else {
+                      extractedFileName = pathBasename;
+                    }
 
-                // Throttle progress emissions: only emit when >=200ms elapsed, or at 0%/100%
-                final isComplete = tot > 0 && rec >= tot;
-                final isFirstChunk = rec <= 1371; // tox chunk size
-                final throttleKey = '$uid:${foundFileNumber ?? path}';
-                final now = DateTime.now();
-                final lastEmit = _lastProgressEmitTime[throttleKey];
-                final elapsed = lastEmit == null
-                    ? _progressThrottleMs
-                    : now.difference(lastEmit).inMilliseconds;
-                if (isFirstChunk ||
-                    isComplete ||
-                    elapsed >= _progressThrottleMs) {
-                  _lastProgressEmitTime[throttleKey] = now;
-                  _progressCtrl.add((
-                    instanceId: instanceId,
-                    peerId: uid,
-                    path: path,
-                    received: rec,
-                    total: tot,
-                    isSend: false,
-                    msgID: foundMsgID
-                  ));
-                }
-                if (isComplete) {
-                  _lastProgressEmitTime.remove(throttleKey);
-                }
+                    for (final entry in _fileReceiveProgress.entries) {
+                      final key = entry.key;
+                      final progress = entry.value;
+                      if ((key.$1 == normalizedUid || key.$1 == uid)) {
+                        // Try to match by basename, by extracted filename, or tempPath vs actual path
+                        final actualBasename = progress.actualPath != null
+                            ? p.basename(progress.actualPath!)
+                            : null;
+                        final tempBasename = progress.tempPath != null
+                            ? p.basename(progress.tempPath!)
+                            : null;
+                        final basenameMatch = actualBasename == pathBasename ||
+                            tempBasename == pathBasename ||
+                            _isSameReceiveFile(progress.tempPath, path);
+                        final fileNameMatch = extractedFileName != null &&
+                            progress.fileName == extractedFileName;
 
-                // CRITICAL: If file transfer is 100% complete, trigger file_done handling immediately
-                // This avoids waiting for the file_done event which may be blocked in the queue
-                // IMPORTANT: Only trigger if we found a matching file transfer (foundMsgID != null)
-                // This prevents fileNumber reuse from causing incorrect file completion handling
-                if (tot > 0 && rec >= tot && foundMsgID != null) {
-                  _logger?.log(
-                      '[FfiChatService] progress_recv: File transfer 100% complete, triggering file_done handling immediately');
-                  // Get the actual path from progress tracking if path is truncated or empty
-                  String? actualPath = path;
-                  if (actualPath.isEmpty || !actualPath.startsWith('/')) {
-                    // Path may be truncated, try to get it from progress tracking
-                    if (foundFileNumber != null) {
-                      final normalizedUid =
-                          uid.length > 64 ? _normalizeFriendId(uid) : uid;
-                      final progress = _fileReceiveProgress[(
-                        normalizedUid,
-                        foundFileNumber
-                      )];
-                      if (progress == null && uid != normalizedUid) {
-                        // Try original uid if normalized not found
-                        final progress2 =
-                            _fileReceiveProgress[(uid, foundFileNumber)];
-                        if (progress2 != null &&
-                            progress2.actualPath != null &&
-                            progress2.actualPath!.isNotEmpty) {
-                          actualPath = progress2.actualPath;
+                        if (basenameMatch || fileNameMatch) {
+                          _fileReceiveProgress[key] = (
+                            received: rec,
+                            total: tot,
+                            msgID: progress.msgID,
+                            fileName: progress.fileName,
+                            tempPath: progress.tempPath,
+                            actualPath:
+                                path, // Update actual path when we receive it
+                          );
+                          // P1-7: see other progress-update sites.
+                          _lastProgressTs[key] =
+                              DateTime.now().millisecondsSinceEpoch;
+                          foundMsgID = progress.msgID;
+                          foundFileNumber = key.$2;
+                          // Do not log every progress match - would spam logs during file transfer
+                          break;
                         }
-                      } else if (progress != null &&
-                          progress.actualPath != null &&
-                          progress.actualPath!.isNotEmpty) {
-                        actualPath = progress.actualPath;
                       }
                     }
                   }
-                  if (actualPath != null &&
-                      actualPath.isNotEmpty &&
-                      actualPath.startsWith('/')) {
-                    // Call _handleFileDone with the same parameters as file_done event
+
+                  // If still not found, log warning but don't update any record
+                  // This prevents incorrect matching when fileNumber is reused
+                  if (foundMsgID == null) {
+                    _logger?.logWarning(
+                        '[FfiChatService] progress_recv: WARNING - No matching file transfer found for path=$path, total=$tot, uid=$uid. This may indicate fileNumber reuse or file transfer not tracked.');
+                  }
+
+                  // Throttle progress emissions: only emit when >=200ms elapsed, or at 0%/100%
+                  final isComplete = tot > 0 && rec >= tot;
+                  final isFirstChunk = rec <= 1371; // tox chunk size
+                  final throttleKey = '$uid:${foundFileNumber ?? path}';
+                  final now = DateTime.now();
+                  final lastEmit = _lastProgressEmitTime[throttleKey];
+                  final elapsed = lastEmit == null
+                      ? _progressThrottleMs
+                      : now.difference(lastEmit).inMilliseconds;
+                  if (isFirstChunk ||
+                      isComplete ||
+                      elapsed >= _progressThrottleMs) {
+                    _lastProgressEmitTime[throttleKey] = now;
+                    _progressCtrl.add((
+                      instanceId: instanceId,
+                      peerId: uid,
+                      path: path,
+                      received: rec,
+                      total: tot,
+                      isSend: false,
+                      msgID: foundMsgID
+                    ));
+                  }
+                  if (isComplete) {
+                    _lastProgressEmitTime.remove(throttleKey);
+                  }
+
+                  // CRITICAL: If file transfer is 100% complete, trigger file_done handling immediately
+                  // This avoids waiting for the file_done event which may be blocked in the queue
+                  // IMPORTANT: Only trigger if we found a matching file transfer (foundMsgID != null)
+                  // This prevents fileNumber reuse from causing incorrect file completion handling
+                  if (tot > 0 && rec >= tot && foundMsgID != null) {
                     _logger?.log(
-                        '[FfiChatService] progress_recv: Calling _handleFileDone with actualPath=$actualPath, fileNumber=$foundFileNumber, msgID=$foundMsgID');
-                    // P1-3: an exception inside _handleFileDone used to be
-                    // dropped on the floor by unawaited() and the message would
-                    // sit forever in pending state. Capture & log here, and
-                    // mark the in-flight transfer as failed so the UI can
-                    // recover instead of waiting.
-                    unawaited(_handleFileDone(
-                            uid, 0, actualPath, foundFileNumber, foundMsgID)
-                        .catchError((e, StackTrace st) {
+                        '[FfiChatService] progress_recv: File transfer 100% complete, triggering file_done handling immediately');
+                    // Get the actual path from progress tracking if path is truncated or empty
+                    String? actualPath = path;
+                    if (actualPath.isEmpty || !actualPath.startsWith('/')) {
+                      // Path may be truncated, try to get it from progress tracking
+                      if (foundFileNumber != null) {
+                        final normalizedUid =
+                            uid.length > 64 ? _normalizeFriendId(uid) : uid;
+                        final progress = _fileReceiveProgress[(
+                          normalizedUid,
+                          foundFileNumber
+                        )];
+                        if (progress == null && uid != normalizedUid) {
+                          // Try original uid if normalized not found
+                          final progress2 =
+                              _fileReceiveProgress[(uid, foundFileNumber)];
+                          if (progress2 != null &&
+                              progress2.actualPath != null &&
+                              progress2.actualPath!.isNotEmpty) {
+                            actualPath = progress2.actualPath;
+                          }
+                        } else if (progress != null &&
+                            progress.actualPath != null &&
+                            progress.actualPath!.isNotEmpty) {
+                          actualPath = progress.actualPath;
+                        }
+                      }
+                    }
+                    if (actualPath != null &&
+                        actualPath.isNotEmpty &&
+                        actualPath.startsWith('/')) {
+                      // Call _handleFileDone with the same parameters as file_done event
+                      _logger?.log(
+                          '[FfiChatService] progress_recv: Calling _handleFileDone with actualPath=$actualPath, fileNumber=$foundFileNumber, msgID=$foundMsgID');
+                      // P1-3: an exception inside _handleFileDone used to be
+                      // dropped on the floor by unawaited() and the message would
+                      // sit forever in pending state. Capture & log here, and
+                      // mark the in-flight transfer as failed so the UI can
+                      // recover instead of waiting.
+                      unawaited(_handleFileDone(
+                              uid, 0, actualPath, foundFileNumber, foundMsgID)
+                          .catchError((e, StackTrace st) {
+                        _logger?.logError(
+                            '[FfiChatService] progress_recv: _handleFileDone failed',
+                            e,
+                            st);
+                        _markFileTransferFailed(
+                            uid, foundFileNumber, foundMsgID);
+                      }));
+                    } else {
+                      _logger?.log(
+                          '[FfiChatService] progress_recv: WARNING - actualPath is invalid, cannot trigger file_done handling');
+                    }
+                  } else if (tot > 0 && rec >= tot && foundMsgID == null) {
+                    // File is complete but we couldn't find a matching file transfer by path
+                    // Try to extract fileNumber from path and use _fileNumberToMsgID mapping
+                    int? extractedFileNumber;
+                    String? extractedFileName;
+                    if (path.isNotEmpty && path.startsWith('/')) {
+                      final pathBasename = p.basename(path);
+                      // Check path format: <uid>_<fileKind>_<fileNumber>_<originalFileName>
+                      if (pathBasename.contains('_') &&
+                          pathBasename.length > 64) {
+                        final parts = pathBasename.split('_');
+                        if (parts.length >= 3) {
+                          // Extract fileNumber (third part, index 2)
+                          extractedFileNumber = int.tryParse(parts[2]);
+                          // Extract original filename (everything after the first 3 parts)
+                          if (parts.length >= 4) {
+                            extractedFileName = parts.sublist(3).join('_');
+                          }
+                        }
+                      } else {
+                        extractedFileName = pathBasename;
+                      }
+                    }
+
+                    // Try to find msgID using _fileNumberToMsgID mapping
+                    // CRITICAL: When fileNumber is reused, we must also verify filename/path to avoid false matches
+                    if (extractedFileNumber != null) {
+                      final foundMsgIDByMapping = _fileNumberToMsgID[(
+                            normalizedUid,
+                            extractedFileNumber
+                          )] ??
+                          _fileNumberToMsgID[(uid, extractedFileNumber)];
+
+                      // Verify that the found msgID is still valid AND matches the current file
+                      if (foundMsgIDByMapping != null) {
+                        MapEntry<
+                            (String, int),
+                            ({
+                              String? actualPath,
+                              String? fileName,
+                              String msgID,
+                              int received,
+                              String? tempPath,
+                              int total
+                            })>? matchingProgressEntry;
+                        for (final entry in _fileReceiveProgress.entries) {
+                          if (entry.value.msgID == foundMsgIDByMapping &&
+                              (entry.key.$1 == normalizedUid ||
+                                  entry.key.$1 == uid) &&
+                              entry.key.$2 == extractedFileNumber) {
+                            matchingProgressEntry = entry;
+                            break;
+                          }
+                        }
+
+                        // CRITICAL: Also verify filename/path matches to prevent false matches when fileNumber is reused
+                        // This ensures we match the correct file even when multiple files use the same fileNumber
+                        bool filenameMatches = false;
+                        if (matchingProgressEntry != null &&
+                            extractedFileName != null &&
+                            extractedFileName.isNotEmpty) {
+                          final progress = matchingProgressEntry.value;
+                          final progressFileName = progress.fileName;
+                          filenameMatches = progressFileName ==
+                                  extractedFileName ||
+                              (progress.actualPath != null &&
+                                  progress.actualPath!
+                                      .contains(extractedFileName)) ||
+                              (progress.tempPath != null &&
+                                  progress.tempPath!
+                                      .contains(extractedFileName));
+                        }
+
+                        final isValid = matchingProgressEntry != null &&
+                            (extractedFileName == null ||
+                                extractedFileName.isEmpty ||
+                                filenameMatches);
+
+                        if (isValid) {
+                          foundMsgID = foundMsgIDByMapping;
+                          foundFileNumber = extractedFileNumber;
+                          _logger?.log(
+                              '[FfiChatService] progress_recv: Found valid msgID by fileNumber mapping: fileNumber=$extractedFileNumber, msgID=$foundMsgID, filenameMatches=$filenameMatches');
+                          // Trigger file_done handling with found msgID
+                          if (path.isNotEmpty && path.startsWith('/')) {
+                            _logger?.log(
+                                '[FfiChatService] progress_recv: Calling _handleFileDone with extracted fileNumber=$extractedFileNumber, msgID=$foundMsgID');
+                            // P1-3: catch async failures so they don't vanish
+                            // into the void; same rationale as the sibling call
+                            // above.
+                            unawaited(_handleFileDone(uid, 0, path,
+                                    extractedFileNumber, foundMsgID)
+                                .catchError((e, StackTrace st) {
+                              _logger?.logError(
+                                  '[FfiChatService] progress_recv: _handleFileDone failed',
+                                  e,
+                                  st);
+                              _markFileTransferFailed(
+                                  uid, extractedFileNumber, foundMsgID);
+                            }));
+                          }
+                        } else {
+                          _logger?.logWarning(
+                              '[FfiChatService] progress_recv: WARNING - Found stale or mismatched msgID in mapping: fileNumber=$extractedFileNumber, msgID=$foundMsgIDByMapping, extractedFileName=$extractedFileName, progressFileName=${matchingProgressEntry?.value.fileName}, cleaning up');
+                          // Clean up stale mapping
+                          _fileNumberToMsgID
+                              .remove((normalizedUid, extractedFileNumber));
+                          _fileNumberToMsgID.remove((uid, extractedFileNumber));
+                          _logger?.logWarning(
+                              '[FfiChatService] progress_recv: File transfer 100% complete but no valid matching file transfer found (path=$path, total=$tot). Waiting for file_done event.');
+                        }
+                      } else {
+                        _logger?.logWarning(
+                            '[FfiChatService] progress_recv: File transfer 100% complete but no matching file transfer found (path=$path, total=$tot, extractedFileNumber=$extractedFileNumber). Waiting for file_done event.');
+                      }
+                    } else {
+                      // File is complete but we couldn't find a matching file transfer
+                      // This may happen if fileNumber was reused or file transfer wasn't tracked
+                      // Wait for file_done event instead of trying to match by total size (which can cause false matches)
+                      _logger?.logWarning(
+                          '[FfiChatService] progress_recv: File transfer 100% complete but no matching file transfer found (path=$path, total=$tot). Waiting for file_done event to avoid false matches.');
+                    }
+                  }
+
+                  // Progress update will be handled by FakeChatMessageProvider via progressUpdates stream
+                }
+              } else if (s.startsWith('progress_send:')) {
+                // progress_send:<uid>:<sent>:<total>
+                final parts = s.split(':');
+                if (parts.length >= 4) {
+                  final uid = parts[1];
+                  final sent = int.tryParse(parts[2]) ?? 0;
+                  final tot = int.tryParse(parts[3]) ?? 0;
+                  final path = _lastSentPathByPeer[uid];
+                  // Find msgID for this send path.
+                  // R-1: prefer the precise per-msgID reverse map first — it
+                  // is populated on every send and is immune to the
+                  // "concurrent send to same peer overwrites _lastSentPathByPeer"
+                  // race that the legacy path-based lookup has.
+                  String? sendMsgID;
+                  if (path != null) {
+                    for (final e in _msgIDToSentPath.entries) {
+                      if (e.value == path) {
+                        sendMsgID = e.key;
+                        break;
+                      }
+                    }
+                    sendMsgID ??= _pathToMsgID[path];
+                  }
+                  // If still not found, try to find from last message for this peer.
+                  if (sendMsgID == null && path != null) {
+                    final normalizedUid =
+                        uid.length > 64 ? _normalizeFriendId(uid) : uid;
+                    final lastMsg = _lastByPeer[normalizedUid];
+                    if (lastMsg != null && lastMsg.filePath == path) {
+                      sendMsgID = lastMsg.msgID;
+                    }
+                  }
+                  _progressCtrl.add((
+                    instanceId: 0,
+                    peerId: uid,
+                    path: path,
+                    received: sent,
+                    total: tot,
+                    isSend: true,
+                    msgID: sendMsgID
+                  ));
+                }
+              } else if (s.startsWith('file_request:')) {
+                // file_request:[<instance_id>:]<uid>:<file_number>:<size>:<kind>:<filename>  (new: instance_id first)
+                // kind: 0=DATA, 1=AVATAR
+                // PROTOCOL LIMITATION (tracked for the framing redesign): the event is ':'-delimited
+                // and split() below treats every ':' as a field separator. The trailing filename is
+                // rejoined with ':' (sublist(...).join(':')) so a ':' inside the FILENAME survives,
+                // but a ':' appearing in an EARLIER field would still mis-parse. A correct fix needs
+                // delimiter escaping or a length-prefixed/JSON reframe on the C++ encoder side — a
+                // breaking ABI change, out of scope here. Do not change parsing to "fix" this.
+                _logger
+                    ?.log('[FfiChatService] Processing file_request event: $s');
+                _logger?.log(
+                    '[FfiChatService] file_request event received - this is critical for file receiving');
+                final parts = s.split(':');
+                int uidIdx = 1;
+                int? fileRequestInstanceId;
+                if (parts.length >= 7 && int.tryParse(parts[1]) != null) {
+                  fileRequestInstanceId = int.tryParse(parts[1]);
+                  uidIdx = 2; // new format with instance_id first
+                }
+                if (parts.length >= uidIdx + 5) {
+                  final uid = parts[uidIdx];
+                  final fileNumber = int.tryParse(parts[uidIdx + 1]) ?? 0;
+                  final fileSize = int.tryParse(parts[uidIdx + 2]) ?? 0;
+                  final fileKind = int.tryParse(parts[uidIdx + 3]) ?? 0;
+                  final fileName = parts.sublist(uidIdx + 4).join(':');
+
+                  final isAvatarTransfer = fileKind == 1 ||
+                      FfiChatService.isAvatarSyncFilePath(fileName);
+
+                  // For non-avatar files, create a pending message immediately to show "receiving" status.
+                  // Avatar sync files must never appear in chat history.
+                  if (!isAvatarTransfer) {
+                    // Normalize friend ID to ensure consistent storage and retrieval
+                    final normalizedUid =
+                        uid.length > 64 ? _normalizeFriendId(uid) : uid;
+                    // Use unified message ID format: timestamp_sequence_userID (same as other messages)
+                    // Add sequence number to ensure uniqueness even in high concurrency scenarios
+                    final timestamp = DateTime.now().millisecondsSinceEpoch;
+                    final sequence = _msgIDSequence++;
+                    final msgID = '${timestamp}_${sequence}_$normalizedUid';
+                    // Create a pending file message with temporary path (will be updated when file_done)
+                    // P1-2: anchor the temp path in the per-account file_recv dir
+                    // when known. Includes msgID so concurrent transfers of the
+                    // same filename from the same peer don't collide.
+                    final tempPath =
+                        '${_fileRecvDir ?? '/tmp'}/receiving_${msgID}_$fileName';
+                    final kind = _detectKind(fileName);
+                    final msg = ChatMessage(
+                      text: '',
+                      fromUserId: uid,
+                      isSelf: false,
+                      timestamp: DateTime.now(),
+                      groupId: null,
+                      filePath:
+                          tempPath, // Temporary path, will be updated in file_done
+                      fileName:
+                          fileName, // Save original file name to avoid showing id-prefixed names
+                      mediaKind: kind,
+                      msgID: msgID,
+                      isPending:
+                          true, // Mark as pending to show receiving status
+                    );
+                    // Track this file transfer for progress updates (use normalized ID for consistency)
+                    _fileReceiveProgress[(normalizedUid, fileNumber)] = (
+                      received: 0,
+                      total: fileSize,
+                      msgID: msgID,
+                      fileName: fileName,
+                      tempPath: tempPath,
+                      actualPath: null,
+                    );
+                    // P1-7: seed the idle clock at request-time so the
+                    // timeout sweeper measures from "we saw the request"
+                    // rather than from a never-set baseline.
+                    _lastProgressTs[(normalizedUid, fileNumber)] =
+                        DateTime.now().millisecondsSinceEpoch;
+                    // Store pending file transfer mapping
+                    _pendingFileTransfers[(normalizedUid, fileNumber)] = msgID;
+                    // Store msgID to file transfer mapping for progress updates
+                    _msgIDToFileTransfer[msgID] = (normalizedUid, fileNumber);
+                    // Store fileNumber to msgID mapping for fast lookup in file_done event
+                    _fileNumberToMsgID[(normalizedUid, fileNumber)] = msgID;
+                    // Add message to history and stream immediately (use normalized ID)
+                    _logger?.log(
+                        '[FfiChatService] file_request: Created pending message: msgID=$msgID, fileName=$fileName, tempPath=$tempPath, isPending=${msg.isPending}');
+                    _lastByPeer[normalizedUid] = msg;
+                    _appendHistory(normalizedUid, msg);
+                    _messages.add(msg);
+                    _logger?.log(
+                        '[FfiChatService] file_request: Message added to history and stream, will be picked up by FakeIM');
+                  }
+
+                  // Check if this is an image file
+                  final kind = _detectKind(fileName);
+                  final isImage = kind == 'image';
+
+                  // If this is an avatar file, auto-accept it
+                  // CRITICAL: Pass fileRequestInstanceId so we accept on the receiver's instance (e.g. Bob),
+                  // and AWAIT so the file is opened before we process more events (progress_recv requires fp to be set).
+                  if (isAvatarTransfer) {
+                    try {
+                      await acceptFileTransfer(uid, fileNumber,
+                          instanceId: fileRequestInstanceId);
+                      _logger?.log(
+                          '[FfiChatService] file_request: acceptFileTransfer (avatar) completed successfully');
+                    } catch (e, st) {
                       _logger?.logError(
-                          '[FfiChatService] progress_recv: _handleFileDone failed',
+                          '[FfiChatService] file_request: acceptFileTransfer (avatar) failed',
                           e,
                           st);
-                      _markFileTransferFailed(uid, foundFileNumber, foundMsgID);
-                    }));
+                    }
                   } else {
-                    _logger?.log(
-                        '[FfiChatService] progress_recv: WARNING - actualPath is invalid, cannot trigger file_done handling');
+                    // For regular files (kind == 0), auto-accept small files and all images
+                    // AWAIT so the file is opened before we process more events (progress_recv requires fp to be set).
+                    final sizeLimitMB =
+                        await (_prefs?.getAutoDownloadSizeLimit() ??
+                            Future.value(30));
+                    final autoAcceptThreshold =
+                        sizeLimitMB * 1024 * 1024; // Convert MB to bytes
+                    // P0-8: Images bypass the user-configured size limit but are
+                    // still capped — an unbounded OR was a denial-of-service risk
+                    // because a malicious peer could push an arbitrarily large
+                    // "image" (or anything spoofed with an image extension) and
+                    // we'd auto-accept it. 50 MiB is a sane upper bound for
+                    // ordinary chat imagery (photos, screenshots).
+                    if ((isImage && fileSize < _imageAutoAcceptLimitBytes) ||
+                        fileSize < autoAcceptThreshold) {
+                      if (isImage) {
+                        _logger?.log(
+                            '[FfiChatService] Auto-accepting image file: $fileName (${fileSize} bytes)');
+                      } else {
+                        _logger?.log(
+                            '[FfiChatService] Auto-accepting small file: $fileName (${fileSize} bytes, limit: ${sizeLimitMB}MB)');
+                      }
+                      _logger?.log(
+                          '[FfiChatService] file_request: Calling acceptFileTransfer(uid=$uid, fileNumber=$fileNumber, instanceId=$fileRequestInstanceId)');
+                      try {
+                        await acceptFileTransfer(uid, fileNumber,
+                            instanceId: fileRequestInstanceId);
+                        _logger?.log(
+                            '[FfiChatService] file_request: acceptFileTransfer completed successfully');
+                      } catch (e, st) {
+                        _logger?.logError(
+                            '[FfiChatService] file_request: acceptFileTransfer failed',
+                            e,
+                            st);
+                      }
+                    } else {
+                      // Large file: don't auto-accept, let UIKit's download button handle it
+                      _logger?.log(
+                          '[FfiChatService] Large file requires manual download: $fileName (${fileSize} bytes, limit: ${sizeLimitMB}MB)');
+                      _fileRequestCtrl.add((
+                        peerId: uid,
+                        fileNumber: fileNumber,
+                        fileSize: fileSize,
+                        fileName: fileName
+                      ));
+                    }
                   }
-                } else if (tot > 0 && rec >= tot && foundMsgID == null) {
-                  // File is complete but we couldn't find a matching file transfer by path
-                  // Try to extract fileNumber from path and use _fileNumberToMsgID mapping
-                  int? extractedFileNumber;
-                  String? extractedFileName;
+                }
+              } else if (s.startsWith('file_done:')) {
+                // file_done:[<instance_id>:]<uid>:<kind>:<path>  (new: instance_id first; legacy: no instance_id)
+                _logger
+                    ?.log('[FfiChatService] ===== file_done event START =====');
+                _logger?.log('[FfiChatService] Raw file_done event string: $s');
+                final parts = s.split(':');
+                _logger?.log(
+                    '[FfiChatService] file_done event split into ${parts.length} parts');
+                int fileDoneInstanceId = 0;
+                int uidIdx = 1;
+                if (parts.length >= 5) {
+                  fileDoneInstanceId = int.tryParse(parts[1]) ?? 0;
+                  uidIdx = 2;
+                }
+                if (parts.length >= uidIdx + 3) {
+                  final uid = parts[uidIdx];
+                  final fileKindStr = parts[uidIdx + 1];
+                  final fileKind = int.tryParse(fileKindStr) ?? 0;
+                  final path = parts.sublist(uidIdx + 2).join(':');
+                  // Optimization 11: Enhanced logging for file_done event
+                  _logger?.log(
+                      '[FfiChatService] file_done event parsed: uid=$uid, kindStr=$fileKindStr, kind=$fileKind, pathLength=${path.length}');
+                  _logger?.log('[FfiChatService] file_done event path: $path');
+                  // CRITICAL: Check if path is valid (not truncated)
+                  String? actualPath = path;
+                  int? fileNumber;
+                  String? msgID;
+                  final normalizedUid =
+                      uid.length > 64 ? _normalizeFriendId(uid) : uid;
+
+                  // Extract fileNumber from path if path format contains it
+                  // Format: <uid>_<fileKind>_<fileNumber>_<originalFileName>
                   if (path.isNotEmpty && path.startsWith('/')) {
                     final pathBasename = p.basename(path);
                     // Check path format: <uid>_<fileKind>_<fileNumber>_<originalFileName>
@@ -1782,440 +2165,66 @@ class FfiChatService {
                       final parts = pathBasename.split('_');
                       if (parts.length >= 3) {
                         // Extract fileNumber (third part, index 2)
-                        extractedFileNumber = int.tryParse(parts[2]);
-                        // Extract original filename (everything after the first 3 parts)
-                        if (parts.length >= 4) {
-                          extractedFileName = parts.sublist(3).join('_');
+                        fileNumber = int.tryParse(parts[2]);
+                        if (fileNumber != null) {
+                          _logger?.log(
+                              '[FfiChatService] file_done: Extracted fileNumber=$fileNumber from path basename');
                         }
                       }
-                    } else {
-                      extractedFileName = pathBasename;
                     }
                   }
 
-                  // Try to find msgID using _fileNumberToMsgID mapping
-                  // CRITICAL: When fileNumber is reused, we must also verify filename/path to avoid false matches
-                  if (extractedFileNumber != null) {
-                    final foundMsgIDByMapping = _fileNumberToMsgID[(
-                          normalizedUid,
-                          extractedFileNumber
-                        )] ??
-                        _fileNumberToMsgID[(uid, extractedFileNumber)];
+                  // Priority 1: Find msgID by fileNumber using _fileNumberToMsgID mapping
+                  if (fileNumber != null && msgID == null) {
+                    final foundMsgID =
+                        _fileNumberToMsgID[(normalizedUid, fileNumber)] ??
+                            _fileNumberToMsgID[(uid, fileNumber)];
 
-                    // Verify that the found msgID is still valid AND matches the current file
-                    if (foundMsgIDByMapping != null) {
-                      MapEntry<
-                          (String, int),
-                          ({
-                            String? actualPath,
-                            String? fileName,
-                            String msgID,
-                            int received,
-                            String? tempPath,
-                            int total
-                          })>? matchingProgressEntry;
-                      for (final entry in _fileReceiveProgress.entries) {
-                        if (entry.value.msgID == foundMsgIDByMapping &&
-                            (entry.key.$1 == normalizedUid ||
-                                entry.key.$1 == uid) &&
-                            entry.key.$2 == extractedFileNumber) {
-                          matchingProgressEntry = entry;
-                          break;
-                        }
-                      }
-
-                      // CRITICAL: Also verify filename/path matches to prevent false matches when fileNumber is reused
-                      // This ensures we match the correct file even when multiple files use the same fileNumber
-                      bool filenameMatches = false;
-                      if (matchingProgressEntry != null &&
-                          extractedFileName != null &&
-                          extractedFileName.isNotEmpty) {
-                        final progress = matchingProgressEntry.value;
-                        final progressFileName = progress.fileName;
-                        filenameMatches = progressFileName ==
-                                extractedFileName ||
-                            (progress.actualPath != null &&
-                                progress.actualPath!
-                                    .contains(extractedFileName)) ||
-                            (progress.tempPath != null &&
-                                progress.tempPath!.contains(extractedFileName));
-                      }
-
-                      final isValid = matchingProgressEntry != null &&
-                          (extractedFileName == null ||
-                              extractedFileName.isEmpty ||
-                              filenameMatches);
+                    // CRITICAL: Verify that the found msgID is still valid (file transfer still in progress)
+                    // This prevents using stale mappings when fileNumber is reused
+                    if (foundMsgID != null) {
+                      final isValid = _fileReceiveProgress.entries.any((e) =>
+                          e.value.msgID == foundMsgID &&
+                          (e.key.$1 == normalizedUid || e.key.$1 == uid) &&
+                          e.key.$2 == fileNumber);
 
                       if (isValid) {
-                        foundMsgID = foundMsgIDByMapping;
-                        foundFileNumber = extractedFileNumber;
+                        msgID = foundMsgID;
                         _logger?.log(
-                            '[FfiChatService] progress_recv: Found valid msgID by fileNumber mapping: fileNumber=$extractedFileNumber, msgID=$foundMsgID, filenameMatches=$filenameMatches');
-                        // Trigger file_done handling with found msgID
-                        if (path.isNotEmpty && path.startsWith('/')) {
-                          _logger?.log(
-                              '[FfiChatService] progress_recv: Calling _handleFileDone with extracted fileNumber=$extractedFileNumber, msgID=$foundMsgID');
-                          // P1-3: catch async failures so they don't vanish
-                          // into the void; same rationale as the sibling call
-                          // above.
-                          unawaited(_handleFileDone(
-                                  uid, 0, path, extractedFileNumber, foundMsgID)
-                              .catchError((e, StackTrace st) {
-                            _logger?.logError(
-                                '[FfiChatService] progress_recv: _handleFileDone failed',
-                                e,
-                                st);
-                            _markFileTransferFailed(
-                                uid, extractedFileNumber, foundMsgID);
-                          }));
-                        }
+                            '[FfiChatService] file_done: Found valid msgID by fileNumber mapping: fileNumber=$fileNumber, msgID=$msgID');
                       } else {
                         _logger?.logWarning(
-                            '[FfiChatService] progress_recv: WARNING - Found stale or mismatched msgID in mapping: fileNumber=$extractedFileNumber, msgID=$foundMsgIDByMapping, extractedFileName=$extractedFileName, progressFileName=${matchingProgressEntry?.value.fileName}, cleaning up');
+                            '[FfiChatService] file_done: WARNING - Found stale msgID in mapping: fileNumber=$fileNumber, msgID=$foundMsgID, cleaning up');
                         // Clean up stale mapping
-                        _fileNumberToMsgID
-                            .remove((normalizedUid, extractedFileNumber));
-                        _fileNumberToMsgID.remove((uid, extractedFileNumber));
-                        _logger?.logWarning(
-                            '[FfiChatService] progress_recv: File transfer 100% complete but no valid matching file transfer found (path=$path, total=$tot). Waiting for file_done event.');
+                        _fileNumberToMsgID.remove((normalizedUid, fileNumber));
+                        _fileNumberToMsgID.remove((uid, fileNumber));
+                        // CRITICAL: If _fileReceiveProgress is empty, this file was already processed
+                        // Skip processing to avoid false matches
+                        if (_fileReceiveProgress.isEmpty) {
+                          _logger?.logWarning(
+                              '[FfiChatService] file_done: WARNING - _fileReceiveProgress is empty, file may have already been processed. Skipping to avoid false matches. path=$actualPath');
+                          return;
+                        }
                       }
                     } else {
-                      _logger?.logWarning(
-                          '[FfiChatService] progress_recv: File transfer 100% complete but no matching file transfer found (path=$path, total=$tot, extractedFileNumber=$extractedFileNumber). Waiting for file_done event.');
-                    }
-                  } else {
-                    // File is complete but we couldn't find a matching file transfer
-                    // This may happen if fileNumber was reused or file transfer wasn't tracked
-                    // Wait for file_done event instead of trying to match by total size (which can cause false matches)
-                    _logger?.logWarning(
-                        '[FfiChatService] progress_recv: File transfer 100% complete but no matching file transfer found (path=$path, total=$tot). Waiting for file_done event to avoid false matches.');
-                  }
-                }
-
-                // Progress update will be handled by FakeChatMessageProvider via progressUpdates stream
-              }
-            } else if (s.startsWith('progress_send:')) {
-              // progress_send:<uid>:<sent>:<total>
-              final parts = s.split(':');
-              if (parts.length >= 4) {
-                final uid = parts[1];
-                final sent = int.tryParse(parts[2]) ?? 0;
-                final tot = int.tryParse(parts[3]) ?? 0;
-                final path = _lastSentPathByPeer[uid];
-                // Find msgID for this send path.
-                // R-1: prefer the precise per-msgID reverse map first — it
-                // is populated on every send and is immune to the
-                // "concurrent send to same peer overwrites _lastSentPathByPeer"
-                // race that the legacy path-based lookup has.
-                String? sendMsgID;
-                if (path != null) {
-                  for (final e in _msgIDToSentPath.entries) {
-                    if (e.value == path) {
-                      sendMsgID = e.key;
-                      break;
-                    }
-                  }
-                  sendMsgID ??= _pathToMsgID[path];
-                }
-                // If still not found, try to find from last message for this peer.
-                if (sendMsgID == null && path != null) {
-                  final normalizedUid =
-                      uid.length > 64 ? _normalizeFriendId(uid) : uid;
-                  final lastMsg = _lastByPeer[normalizedUid];
-                  if (lastMsg != null && lastMsg.filePath == path) {
-                    sendMsgID = lastMsg.msgID;
-                  }
-                }
-                _progressCtrl.add((
-                  instanceId: 0,
-                  peerId: uid,
-                  path: path,
-                  received: sent,
-                  total: tot,
-                  isSend: true,
-                  msgID: sendMsgID
-                ));
-              }
-            } else if (s.startsWith('file_request:')) {
-              // file_request:[<instance_id>:]<uid>:<file_number>:<size>:<kind>:<filename>  (new: instance_id first)
-              // kind: 0=DATA, 1=AVATAR
-              _logger
-                  ?.log('[FfiChatService] Processing file_request event: $s');
-              _logger?.log(
-                  '[FfiChatService] file_request event received - this is critical for file receiving');
-              final parts = s.split(':');
-              int uidIdx = 1;
-              int? fileRequestInstanceId;
-              if (parts.length >= 7 && int.tryParse(parts[1]) != null) {
-                fileRequestInstanceId = int.tryParse(parts[1]);
-                uidIdx = 2; // new format with instance_id first
-              }
-              if (parts.length >= uidIdx + 5) {
-                final uid = parts[uidIdx];
-                final fileNumber = int.tryParse(parts[uidIdx + 1]) ?? 0;
-                final fileSize = int.tryParse(parts[uidIdx + 2]) ?? 0;
-                final fileKind = int.tryParse(parts[uidIdx + 3]) ?? 0;
-                final fileName = parts.sublist(uidIdx + 4).join(':');
-
-                final isAvatarTransfer = fileKind == 1 ||
-                    FfiChatService.isAvatarSyncFilePath(fileName);
-
-                // For non-avatar files, create a pending message immediately to show "receiving" status.
-                // Avatar sync files must never appear in chat history.
-                if (!isAvatarTransfer) {
-                  // Normalize friend ID to ensure consistent storage and retrieval
-                  final normalizedUid =
-                      uid.length > 64 ? _normalizeFriendId(uid) : uid;
-                  // Use unified message ID format: timestamp_sequence_userID (same as other messages)
-                  // Add sequence number to ensure uniqueness even in high concurrency scenarios
-                  final timestamp = DateTime.now().millisecondsSinceEpoch;
-                  final sequence = _msgIDSequence++;
-                  final msgID = '${timestamp}_${sequence}_$normalizedUid';
-                  // Create a pending file message with temporary path (will be updated when file_done)
-                  // P1-2: anchor the temp path in the per-account file_recv dir
-                  // when known. Includes msgID so concurrent transfers of the
-                  // same filename from the same peer don't collide.
-                  final tempPath =
-                      '${_fileRecvDir ?? '/tmp'}/receiving_${msgID}_$fileName';
-                  final kind = _detectKind(fileName);
-                  final msg = ChatMessage(
-                    text: '',
-                    fromUserId: uid,
-                    isSelf: false,
-                    timestamp: DateTime.now(),
-                    groupId: null,
-                    filePath:
-                        tempPath, // Temporary path, will be updated in file_done
-                    fileName:
-                        fileName, // Save original file name to avoid showing id-prefixed names
-                    mediaKind: kind,
-                    msgID: msgID,
-                    isPending: true, // Mark as pending to show receiving status
-                  );
-                  // Track this file transfer for progress updates (use normalized ID for consistency)
-                  _fileReceiveProgress[(normalizedUid, fileNumber)] = (
-                    received: 0,
-                    total: fileSize,
-                    msgID: msgID,
-                    fileName: fileName,
-                    tempPath: tempPath,
-                    actualPath: null,
-                  );
-                  // P1-7: seed the idle clock at request-time so the
-                  // timeout sweeper measures from "we saw the request"
-                  // rather than from a never-set baseline.
-                  _lastProgressTs[(normalizedUid, fileNumber)] =
-                      DateTime.now().millisecondsSinceEpoch;
-                  // Store pending file transfer mapping
-                  _pendingFileTransfers[(normalizedUid, fileNumber)] = msgID;
-                  // Store msgID to file transfer mapping for progress updates
-                  _msgIDToFileTransfer[msgID] = (normalizedUid, fileNumber);
-                  // Store fileNumber to msgID mapping for fast lookup in file_done event
-                  _fileNumberToMsgID[(normalizedUid, fileNumber)] = msgID;
-                  // Add message to history and stream immediately (use normalized ID)
-                  _logger?.log(
-                      '[FfiChatService] file_request: Created pending message: msgID=$msgID, fileName=$fileName, tempPath=$tempPath, isPending=${msg.isPending}');
-                  _lastByPeer[normalizedUid] = msg;
-                  _appendHistory(normalizedUid, msg);
-                  _messages.add(msg);
-                  _logger?.log(
-                      '[FfiChatService] file_request: Message added to history and stream, will be picked up by FakeIM');
-                }
-
-                // Check if this is an image file
-                final kind = _detectKind(fileName);
-                final isImage = kind == 'image';
-
-                // If this is an avatar file, auto-accept it
-                // CRITICAL: Pass fileRequestInstanceId so we accept on the receiver's instance (e.g. Bob),
-                // and AWAIT so the file is opened before we process more events (progress_recv requires fp to be set).
-                if (isAvatarTransfer) {
-                  try {
-                    await acceptFileTransfer(uid, fileNumber,
-                        instanceId: fileRequestInstanceId);
-                    _logger?.log(
-                        '[FfiChatService] file_request: acceptFileTransfer (avatar) completed successfully');
-                  } catch (e, st) {
-                    _logger?.logError(
-                        '[FfiChatService] file_request: acceptFileTransfer (avatar) failed',
-                        e,
-                        st);
-                  }
-                } else {
-                  // For regular files (kind == 0), auto-accept small files and all images
-                  // AWAIT so the file is opened before we process more events (progress_recv requires fp to be set).
-                  final sizeLimitMB =
-                      await (_prefs?.getAutoDownloadSizeLimit() ??
-                          Future.value(30));
-                  final autoAcceptThreshold =
-                      sizeLimitMB * 1024 * 1024; // Convert MB to bytes
-                  // P0-8: Images bypass the user-configured size limit but are
-                  // still capped — an unbounded OR was a denial-of-service risk
-                  // because a malicious peer could push an arbitrarily large
-                  // "image" (or anything spoofed with an image extension) and
-                  // we'd auto-accept it. 50 MiB is a sane upper bound for
-                  // ordinary chat imagery (photos, screenshots).
-                  if ((isImage && fileSize < _imageAutoAcceptLimitBytes) ||
-                      fileSize < autoAcceptThreshold) {
-                    if (isImage) {
-                      _logger?.log(
-                          '[FfiChatService] Auto-accepting image file: $fileName (${fileSize} bytes)');
-                    } else {
-                      _logger?.log(
-                          '[FfiChatService] Auto-accepting small file: $fileName (${fileSize} bytes, limit: ${sizeLimitMB}MB)');
-                    }
-                    _logger?.log(
-                        '[FfiChatService] file_request: Calling acceptFileTransfer(uid=$uid, fileNumber=$fileNumber, instanceId=$fileRequestInstanceId)');
-                    try {
-                      await acceptFileTransfer(uid, fileNumber,
-                          instanceId: fileRequestInstanceId);
-                      _logger?.log(
-                          '[FfiChatService] file_request: acceptFileTransfer completed successfully');
-                    } catch (e, st) {
-                      _logger?.logError(
-                          '[FfiChatService] file_request: acceptFileTransfer failed',
-                          e,
-                          st);
-                    }
-                  } else {
-                    // Large file: don't auto-accept, let UIKit's download button handle it
-                    _logger?.log(
-                        '[FfiChatService] Large file requires manual download: $fileName (${fileSize} bytes, limit: ${sizeLimitMB}MB)');
-                    _fileRequestCtrl.add((
-                      peerId: uid,
-                      fileNumber: fileNumber,
-                      fileSize: fileSize,
-                      fileName: fileName
-                    ));
-                  }
-                }
-              }
-            } else if (s.startsWith('file_done:')) {
-              // file_done:[<instance_id>:]<uid>:<kind>:<path>  (new: instance_id first; legacy: no instance_id)
-              _logger
-                  ?.log('[FfiChatService] ===== file_done event START =====');
-              _logger?.log('[FfiChatService] Raw file_done event string: $s');
-              final parts = s.split(':');
-              _logger?.log(
-                  '[FfiChatService] file_done event split into ${parts.length} parts');
-              int fileDoneInstanceId = 0;
-              int uidIdx = 1;
-              if (parts.length >= 5) {
-                fileDoneInstanceId = int.tryParse(parts[1]) ?? 0;
-                uidIdx = 2;
-              }
-              if (parts.length >= uidIdx + 3) {
-                final uid = parts[uidIdx];
-                final fileKindStr = parts[uidIdx + 1];
-                final fileKind = int.tryParse(fileKindStr) ?? 0;
-                final path = parts.sublist(uidIdx + 2).join(':');
-                // Optimization 11: Enhanced logging for file_done event
-                _logger?.log(
-                    '[FfiChatService] file_done event parsed: uid=$uid, kindStr=$fileKindStr, kind=$fileKind, pathLength=${path.length}');
-                _logger?.log('[FfiChatService] file_done event path: $path');
-                // CRITICAL: Check if path is valid (not truncated)
-                String? actualPath = path;
-                int? fileNumber;
-                String? msgID;
-                final normalizedUid =
-                    uid.length > 64 ? _normalizeFriendId(uid) : uid;
-
-                // Extract fileNumber from path if path format contains it
-                // Format: <uid>_<fileKind>_<fileNumber>_<originalFileName>
-                if (path.isNotEmpty && path.startsWith('/')) {
-                  final pathBasename = p.basename(path);
-                  // Check path format: <uid>_<fileKind>_<fileNumber>_<originalFileName>
-                  if (pathBasename.contains('_') && pathBasename.length > 64) {
-                    final parts = pathBasename.split('_');
-                    if (parts.length >= 3) {
-                      // Extract fileNumber (third part, index 2)
-                      fileNumber = int.tryParse(parts[2]);
-                      if (fileNumber != null) {
-                        _logger?.log(
-                            '[FfiChatService] file_done: Extracted fileNumber=$fileNumber from path basename');
-                      }
-                    }
-                  }
-                }
-
-                // Priority 1: Find msgID by fileNumber using _fileNumberToMsgID mapping
-                if (fileNumber != null && msgID == null) {
-                  final foundMsgID =
-                      _fileNumberToMsgID[(normalizedUid, fileNumber)] ??
-                          _fileNumberToMsgID[(uid, fileNumber)];
-
-                  // CRITICAL: Verify that the found msgID is still valid (file transfer still in progress)
-                  // This prevents using stale mappings when fileNumber is reused
-                  if (foundMsgID != null) {
-                    final isValid = _fileReceiveProgress.entries.any((e) =>
-                        e.value.msgID == foundMsgID &&
-                        (e.key.$1 == normalizedUid || e.key.$1 == uid) &&
-                        e.key.$2 == fileNumber);
-
-                    if (isValid) {
-                      msgID = foundMsgID;
-                      _logger?.log(
-                          '[FfiChatService] file_done: Found valid msgID by fileNumber mapping: fileNumber=$fileNumber, msgID=$msgID');
-                    } else {
-                      _logger?.logWarning(
-                          '[FfiChatService] file_done: WARNING - Found stale msgID in mapping: fileNumber=$fileNumber, msgID=$foundMsgID, cleaning up');
-                      // Clean up stale mapping
-                      _fileNumberToMsgID.remove((normalizedUid, fileNumber));
-                      _fileNumberToMsgID.remove((uid, fileNumber));
-                      // CRITICAL: If _fileReceiveProgress is empty, this file was already processed
-                      // Skip processing to avoid false matches
+                      // No mapping found, but check if _fileReceiveProgress is empty
+                      // If empty, file may have already been processed OR file_request event was missed
+                      // In case of missed file_request, we should still create a message for the file
                       if (_fileReceiveProgress.isEmpty) {
                         _logger?.logWarning(
-                            '[FfiChatService] file_done: WARNING - _fileReceiveProgress is empty, file may have already been processed. Skipping to avoid false matches. path=$actualPath');
-                        return;
+                            '[FfiChatService] file_done: WARNING - No msgID mapping found and _fileReceiveProgress is empty. File may have already been processed OR file_request event was missed. path=$actualPath, fileNumber=$fileNumber');
+                        // Continue processing - _handleFileDone will check if message already exists in history
+                        // If not, it will create a new message (fallback for missed file_request events)
                       }
                     }
-                  } else {
-                    // No mapping found, but check if _fileReceiveProgress is empty
-                    // If empty, file may have already been processed OR file_request event was missed
-                    // In case of missed file_request, we should still create a message for the file
-                    if (_fileReceiveProgress.isEmpty) {
-                      _logger?.logWarning(
-                          '[FfiChatService] file_done: WARNING - No msgID mapping found and _fileReceiveProgress is empty. File may have already been processed OR file_request event was missed. path=$actualPath, fileNumber=$fileNumber');
-                      // Continue processing - _handleFileDone will check if message already exists in history
-                      // If not, it will create a new message (fallback for missed file_request events)
-                    }
                   }
-                }
 
-                // Priority 2: If msgID still null, try basename matching
-                if (msgID == null &&
-                    actualPath != null &&
-                    actualPath.isNotEmpty &&
-                    actualPath.startsWith('/')) {
-                  final pathBasename = p.basename(actualPath);
-                  for (final entry in _fileReceiveProgress.entries) {
-                    if (entry.key.$1 == normalizedUid || entry.key.$1 == uid) {
-                      final progress = entry.value;
-                      final actualBasename = progress.actualPath != null
-                          ? p.basename(progress.actualPath!)
-                          : null;
-                      final tempBasename = progress.tempPath != null
-                          ? p.basename(progress.tempPath!)
-                          : null;
-                      if (actualBasename == pathBasename ||
-                          tempBasename == pathBasename) {
-                        actualPath = progress.actualPath ?? progress.tempPath;
-                        fileNumber = entry.key.$2;
-                        msgID = progress.msgID;
-                        _logger?.log(
-                            '[FfiChatService] file_done: Found matching file transfer by basename: basename=$pathBasename, fileNumber=$fileNumber, msgID=$msgID');
-                        break;
-                      }
-                    }
-                  }
-                } else if (path.isEmpty || !path.startsWith('/')) {
-                  // Path is invalid, try to find from progress tracking by basename
-                  _logger?.log(
-                      '[FfiChatService] file_done: Path is empty or invalid, searching progress tracking');
-                  final pathBasename =
-                      path.isNotEmpty ? p.basename(path) : null;
-                  if (pathBasename != null && pathBasename.isNotEmpty) {
+                  // Priority 2: If msgID still null, try basename matching
+                  if (msgID == null &&
+                      actualPath != null &&
+                      actualPath.isNotEmpty &&
+                      actualPath.startsWith('/')) {
+                    final pathBasename = p.basename(actualPath);
                     for (final entry in _fileReceiveProgress.entries) {
                       if (entry.key.$1 == normalizedUid ||
                           entry.key.$1 == uid) {
@@ -2232,245 +2241,278 @@ class FfiChatService {
                           fileNumber = entry.key.$2;
                           msgID = progress.msgID;
                           _logger?.log(
-                              '[FfiChatService] file_done: Found path in progress tracking by basename: actualPath=$actualPath, fileNumber=$fileNumber, msgID=$msgID');
+                              '[FfiChatService] file_done: Found matching file transfer by basename: basename=$pathBasename, fileNumber=$fileNumber, msgID=$msgID');
                           break;
                         }
                       }
                     }
-                  }
-                }
-                if (actualPath != null &&
-                    actualPath.isNotEmpty &&
-                    actualPath.startsWith('/')) {
-                  final isAvatarTransfer = (fileKind == 1 ||
-                          FfiChatService.isAvatarSyncFilePath(path) ||
-                          FfiChatService.isAvatarSyncFilePath(actualPath)) &&
-                      uid != _selfId;
-                  // Handle file based on type
-                  if (isAvatarTransfer) {
+                  } else if (path.isEmpty || !path.startsWith('/')) {
+                    // Path is invalid, try to find from progress tracking by basename
                     _logger?.log(
-                        '[FfiChatService] file_done: Detected as AVATAR file (kind=$fileKind), uid=$uid, selfId=$_selfId');
-                    _logger?.log(
-                        '[FfiChatService] file_done: Calling _moveAvatarToAvatarsDir for avatar');
-                    _moveAvatarToAvatarsDir(actualPath, uid)
-                        .then((finalPath) async {
-                      _logger?.log(
-                          '[FfiChatService] file_done: _moveAvatarToAvatarsDir completed, finalPath=$finalPath');
-                      if (finalPath != null) {
-                        await _prefs?.setFriendAvatarPath(uid, finalPath);
-                      } else {
-                        _logger?.log(
-                            '[FfiChatService] file_done: Avatar move failed, using original path');
-                        await _prefs?.setFriendAvatarPath(uid, actualPath);
+                        '[FfiChatService] file_done: Path is empty or invalid, searching progress tracking');
+                    final pathBasename =
+                        path.isNotEmpty ? p.basename(path) : null;
+                    if (pathBasename != null && pathBasename.isNotEmpty) {
+                      for (final entry in _fileReceiveProgress.entries) {
+                        if (entry.key.$1 == normalizedUid ||
+                            entry.key.$1 == uid) {
+                          final progress = entry.value;
+                          final actualBasename = progress.actualPath != null
+                              ? p.basename(progress.actualPath!)
+                              : null;
+                          final tempBasename = progress.tempPath != null
+                              ? p.basename(progress.tempPath!)
+                              : null;
+                          if (actualBasename == pathBasename ||
+                              tempBasename == pathBasename) {
+                            actualPath =
+                                progress.actualPath ?? progress.tempPath;
+                            fileNumber = entry.key.$2;
+                            msgID = progress.msgID;
+                            _logger?.log(
+                                '[FfiChatService] file_done: Found path in progress tracking by basename: actualPath=$actualPath, fileNumber=$fileNumber, msgID=$msgID');
+                            break;
+                          }
+                        }
                       }
-                      _avatarUpdatedCtrl.add(uid);
-                      _cleanupReceiveTrackingForCompletedFile(
-                          uid, fileNumber, msgID);
-                    }).catchError((e) {
-                      _logger?.logError(
-                          '[FfiChatService] file_done: Error in _moveAvatarToAvatarsDir',
-                          e,
-                          StackTrace.current);
-                    });
-                  } else if (fileKind == 0) {
-                    _logger?.log(
-                        '[FfiChatService] file_done: Detected as REGULAR file (kind=0), calling _handleFileDone');
-                    _logger?.log(
-                        '[FfiChatService] file_done: Parameters - uid=$uid, fileKind=$fileKind, path=$actualPath, fileNumber=$fileNumber, existingMsgID=$msgID');
-                    // Emit 100% progress so progress listener gets transferComplete (e.g. file_seek test)
-                    final progressEntry = fileNumber != null
-                        ? (_fileReceiveProgress[(normalizedUid, fileNumber)] ??
-                            _fileReceiveProgress[(uid, fileNumber)])
-                        : null;
-                    final totalSize = progressEntry?.total ?? 0;
-                    if (totalSize > 0 && fileDoneInstanceId != 0) {
-                      _progressCtrl.add((
-                        instanceId: fileDoneInstanceId,
-                        peerId: uid,
-                        path: actualPath ?? path,
-                        received: totalSize,
-                        total: totalSize,
-                        isSend: false,
-                        msgID: msgID
-                      ));
                     }
-                    // Regular file: call unified handler
-                    // P1-3: the bare try/catch here only caught synchronous
-                    // failures (e.g. invalid argument) — async failures inside
-                    // _handleFileDone disappeared because unawaited() doesn't
-                    // forward them. Capture both paths explicitly and surface
-                    // the failure to the transfer record so it doesn't get
-                    // stuck pending.
-                    try {
-                      unawaited(_handleFileDone(
-                              uid, fileKind, actualPath, fileNumber, msgID)
-                          .catchError((e, StackTrace st) {
-                        _logger?.logError(
-                            '[FfiChatService] file_done: _handleFileDone failed (async)',
-                            e,
-                            st);
-                        _markFileTransferFailed(uid, fileNumber, msgID);
-                      }));
+                  }
+                  if (actualPath != null &&
+                      actualPath.isNotEmpty &&
+                      actualPath.startsWith('/')) {
+                    final isAvatarTransfer = (fileKind == 1 ||
+                            FfiChatService.isAvatarSyncFilePath(path) ||
+                            FfiChatService.isAvatarSyncFilePath(actualPath)) &&
+                        uid != _selfId;
+                    // Handle file based on type
+                    if (isAvatarTransfer) {
                       _logger?.log(
-                          '[FfiChatService] file_done: _handleFileDone called (async)');
-                    } catch (e, stackTrace) {
-                      _logger?.logError(
-                          '[FfiChatService] file_done: ERROR calling _handleFileDone',
-                          e,
-                          stackTrace);
-                      _markFileTransferFailed(uid, fileNumber, msgID);
+                          '[FfiChatService] file_done: Detected as AVATAR file (kind=$fileKind), uid=$uid, selfId=$_selfId');
+                      _logger?.log(
+                          '[FfiChatService] file_done: Calling _moveAvatarToAvatarsDir for avatar');
+                      _moveAvatarToAvatarsDir(actualPath, uid)
+                          .then((finalPath) async {
+                        _logger?.log(
+                            '[FfiChatService] file_done: _moveAvatarToAvatarsDir completed, finalPath=$finalPath');
+                        if (finalPath != null) {
+                          await _prefs?.setFriendAvatarPath(uid, finalPath);
+                        } else {
+                          _logger?.log(
+                              '[FfiChatService] file_done: Avatar move failed, using original path');
+                          await _prefs?.setFriendAvatarPath(uid, actualPath);
+                        }
+                        _avatarUpdatedCtrl.add(uid);
+                        _cleanupReceiveTrackingForCompletedFile(
+                            uid, fileNumber, msgID);
+                      }).catchError((e) {
+                        _logger?.logError(
+                            '[FfiChatService] file_done: Error in _moveAvatarToAvatarsDir',
+                            e,
+                            StackTrace.current);
+                      });
+                    } else if (fileKind == 0) {
+                      _logger?.log(
+                          '[FfiChatService] file_done: Detected as REGULAR file (kind=0), calling _handleFileDone');
+                      _logger?.log(
+                          '[FfiChatService] file_done: Parameters - uid=$uid, fileKind=$fileKind, path=$actualPath, fileNumber=$fileNumber, existingMsgID=$msgID');
+                      // Emit 100% progress so progress listener gets transferComplete (e.g. file_seek test)
+                      final progressEntry = fileNumber != null
+                          ? (_fileReceiveProgress[(
+                                normalizedUid,
+                                fileNumber
+                              )] ??
+                              _fileReceiveProgress[(uid, fileNumber)])
+                          : null;
+                      final totalSize = progressEntry?.total ?? 0;
+                      if (totalSize > 0 && fileDoneInstanceId != 0) {
+                        _progressCtrl.add((
+                          instanceId: fileDoneInstanceId,
+                          peerId: uid,
+                          path: actualPath ?? path,
+                          received: totalSize,
+                          total: totalSize,
+                          isSend: false,
+                          msgID: msgID
+                        ));
+                      }
+                      // Regular file: call unified handler
+                      // P1-3: the bare try/catch here only caught synchronous
+                      // failures (e.g. invalid argument) — async failures inside
+                      // _handleFileDone disappeared because unawaited() doesn't
+                      // forward them. Capture both paths explicitly and surface
+                      // the failure to the transfer record so it doesn't get
+                      // stuck pending.
+                      try {
+                        unawaited(_handleFileDone(
+                                uid, fileKind, actualPath, fileNumber, msgID)
+                            .catchError((e, StackTrace st) {
+                          _logger?.logError(
+                              '[FfiChatService] file_done: _handleFileDone failed (async)',
+                              e,
+                              st);
+                          _markFileTransferFailed(uid, fileNumber, msgID);
+                        }));
+                        _logger?.log(
+                            '[FfiChatService] file_done: _handleFileDone called (async)');
+                      } catch (e, stackTrace) {
+                        _logger?.logError(
+                            '[FfiChatService] file_done: ERROR calling _handleFileDone',
+                            e,
+                            stackTrace);
+                        _markFileTransferFailed(uid, fileNumber, msgID);
+                      }
+                    } else {
+                      _logger?.log(
+                          '[FfiChatService] file_done: WARNING - Unknown fileKind=$fileKind, uid=$uid, not handling');
                     }
                   } else {
                     _logger?.log(
-                        '[FfiChatService] file_done: WARNING - Unknown fileKind=$fileKind, uid=$uid, not handling');
+                        '[FfiChatService] file_done: ERROR - Invalid path: actualPath=$actualPath');
                   }
+                  _logger
+                      ?.log('[FfiChatService] ===== file_done event END =====');
                 } else {
                   _logger?.log(
-                      '[FfiChatService] file_done: ERROR - Invalid path: actualPath=$actualPath');
+                      '[FfiChatService] file_done: ERROR - Invalid format, expected at least 4 parts, got ${parts.length}');
+                  _logger?.log(
+                      '[FfiChatService] file_done: Parts: ${parts.join(" | ")}');
                 }
-                _logger
-                    ?.log('[FfiChatService] ===== file_done event END =====');
-              } else {
-                _logger?.log(
-                    '[FfiChatService] file_done: ERROR - Invalid format, expected at least 4 parts, got ${parts.length}');
-                _logger?.log(
-                    '[FfiChatService] file_done: Parts: ${parts.join(" | ")}');
-              }
-            } else if (s.startsWith('file_canceled:') ||
-                s.startsWith('file_cancel:') ||
-                s.startsWith('file_paused:') ||
-                s.startsWith('file_resumed:')) {
-              // P1-6: peer-initiated file control events.
-              // TODO(P1-6): wire after FFI emits file_control events — the
-              // native side does not currently publish these strings, so
-              // this branch is dead code today. The handler lives here so
-              // that once the FFI layer adds emission, no Dart change is
-              // needed beyond confirming the exact event prefix.
-              // Format: <event>:<uid>:<file_number>
-              final colonIdx = s.indexOf(':');
-              final prefix = s.substring(0, colonIdx);
-              final rest = s.substring(colonIdx + 1);
-              final parts = rest.split(':');
-              if (parts.length >= 2) {
-                final uid = parts[0];
-                final fileNumber = int.tryParse(parts[1]);
-                if (fileNumber != null) {
-                  final control = (prefix == 'file_canceled' ||
-                          prefix == 'file_cancel')
-                      ? 'cancel'
-                      : (prefix == 'file_paused' ? 'pause' : 'resume');
-                  _handleFileControl(
-                      uid: uid, fileNumber: fileNumber, control: control);
+              } else if (s.startsWith('file_canceled:') ||
+                  s.startsWith('file_cancel:') ||
+                  s.startsWith('file_paused:') ||
+                  s.startsWith('file_resumed:')) {
+                // P1-6: peer-initiated file control events.
+                // TODO(P1-6): wire after FFI emits file_control events — the
+                // native side does not currently publish these strings, so
+                // this branch is dead code today. The handler lives here so
+                // that once the FFI layer adds emission, no Dart change is
+                // needed beyond confirming the exact event prefix.
+                // Format: <event>:<uid>:<file_number>
+                final colonIdx = s.indexOf(':');
+                final prefix = s.substring(0, colonIdx);
+                final rest = s.substring(colonIdx + 1);
+                final parts = rest.split(':');
+                if (parts.length >= 2) {
+                  final uid = parts[0];
+                  final fileNumber = int.tryParse(parts[1]);
+                  if (fileNumber != null) {
+                    final control =
+                        (prefix == 'file_canceled' || prefix == 'file_cancel')
+                            ? 'cancel'
+                            : (prefix == 'file_paused' ? 'pause' : 'resume');
+                    _handleFileControl(
+                        uid: uid, fileNumber: fileNumber, control: control);
+                  }
                 }
-              }
-            } else if (s.startsWith('nickname_changed:')) {
-              // nickname_changed:<friend_id>:<nickname>
-              final parts = s.split(':');
-              if (parts.length >= 3) {
-                final friendId = parts[1];
-                final nickname =
-                    parts.sublist(2).join(':'); // Allow ':' in nickname
-                if (friendId.isNotEmpty && nickname.isNotEmpty) {
-                  unawaited(_prefs?.setFriendNickname(friendId, nickname));
-                  _nicknameUpdatedCtrl.add(friendId);
+              } else if (s.startsWith('nickname_changed:')) {
+                // nickname_changed:<friend_id>:<nickname>
+                final parts = s.split(':');
+                if (parts.length >= 3) {
+                  final friendId = parts[1];
+                  final nickname =
+                      parts.sublist(2).join(':'); // Allow ':' in nickname
+                  if (friendId.isNotEmpty && nickname.isNotEmpty) {
+                    unawaited(_prefs?.setFriendNickname(friendId, nickname));
+                    _nicknameUpdatedCtrl.add(friendId);
+                  }
                 }
-              }
-            } else if (s.startsWith('status_changed:')) {
-              // status_changed:<friend_id>:<status_message>
-              final parts = s.split(':');
-              if (parts.length >= 3) {
-                final friendId = parts[1];
-                final statusMessage =
-                    parts.sublist(2).join(':'); // Allow ':' in status message
-                if (friendId.isNotEmpty && statusMessage.isNotEmpty) {
-                  unawaited(
-                      _prefs?.setFriendStatusMessage(friendId, statusMessage));
+              } else if (s.startsWith('status_changed:')) {
+                // status_changed:<friend_id>:<status_message>
+                final parts = s.split(':');
+                if (parts.length >= 3) {
+                  final friendId = parts[1];
+                  final statusMessage =
+                      parts.sublist(2).join(':'); // Allow ':' in status message
+                  if (friendId.isNotEmpty && statusMessage.isNotEmpty) {
+                    unawaited(_prefs?.setFriendStatusMessage(
+                        friendId, statusMessage));
+                  }
                 }
-              }
-            } else if (s.startsWith('c2cbin:')) {
-              // c2cbin:<sender>:<size> - notification that custom message is available
-              // The actual data will be polled via pollCustom
-              final parts = s.split(':');
-              if (parts.length >= 3) {
-                final sender = parts[1];
-                final size = int.tryParse(parts[2]) ?? 0;
-                // Store sender for custom message parsing
-                _lastCustomSender = sender;
-                _lastCustomGroupID = null;
-              }
-            } else if (s.startsWith('gcustom:')) {
-              // gcustom:<groupID>|<sender>:<size> - notification that group custom message is available
-              final parts = s.split(':');
-              if (parts.length >= 3) {
-                final header = parts[1];
-                final size = int.tryParse(parts[2]) ?? 0;
-                final sep = header.indexOf('|');
-                if (sep > 0) {
-                  final gid = header.substring(0, sep);
-                  final sender = header.substring(sep + 1);
-                  // Store sender and groupID for custom message parsing
+              } else if (s.startsWith('c2cbin:')) {
+                // c2cbin:<sender>:<size> - notification that custom message is available
+                // The actual data will be polled via pollCustom
+                final parts = s.split(':');
+                if (parts.length >= 3) {
+                  final sender = parts[1];
+                  final size = int.tryParse(parts[2]) ?? 0;
+                  // Store sender for custom message parsing
                   _lastCustomSender = sender;
-                  _lastCustomGroupID = gid;
+                  _lastCustomGroupID = null;
+                }
+              } else if (s.startsWith('gcustom:')) {
+                // gcustom:<groupID>|<sender>:<size> - notification that group custom message is available
+                final parts = s.split(':');
+                if (parts.length >= 3) {
+                  final header = parts[1];
+                  final size = int.tryParse(parts[2]) ?? 0;
+                  final sep = header.indexOf('|');
+                  if (sep > 0) {
+                    final gid = header.substring(0, sep);
+                    final sender = header.substring(sep + 1);
+                    // Store sender and groupID for custom message parsing
+                    _lastCustomSender = sender;
+                    _lastCustomGroupID = gid;
+                  }
                 }
               }
             }
-          }
-        } // end batch drain loop
-        pkgffi.malloc.free(buf);
+          } // end batch drain loop
+          pkgffi.malloc.free(buf);
 
-        // Poll custom messages (reactions, etc.)
-        final customBuf = pkgffi.malloc.allocate<ffi.Uint8>(4096);
-        final customN = _ffi.pollCustom(customBuf, 4096);
-        if (customN > 0 && _lastCustomSender != null) {
-          _lastPollActivity = DateTime.now();
-          // The custom data itself is the reaction JSON
-          final customData = customBuf.asTypedList(customN);
+          // Poll custom messages (reactions, etc.)
+          final customBuf = pkgffi.malloc.allocate<ffi.Uint8>(4096);
+          final customN = _ffi.pollCustom(customBuf, 4096);
+          if (customN > 0 && _lastCustomSender != null) {
+            _lastPollActivity = DateTime.now();
+            // The custom data itself is the reaction JSON
+            final customData = customBuf.asTypedList(customN);
+            try {
+              final jsonString = utf8.decode(customData);
+              final json = jsonDecode(jsonString) as Map<String, dynamic>;
+              if (json['type'] == 'reaction') {
+                final msgID = json['msgID'] as String?;
+                final reactionID = json['reactionID'] as String?;
+                final action = json['action'] as String?; // 'add' or 'remove'
+                final sender = _lastCustomSender!;
+                final groupID = _lastCustomGroupID;
+                if (msgID != null && reactionID != null && action != null) {
+                  _reactionCtrl.add((
+                    msgID: msgID,
+                    reactionID: reactionID,
+                    action: action,
+                    sender: sender,
+                    groupID: groupID
+                  ));
+                }
+              } else if (json['type'] == 'receipt') {
+                // Handle receipt (received or read)
+                final msgID = json['msgID'] as String?;
+                final receiptType =
+                    json['receiptType'] as String?; // 'received' or 'read'
+                final sender = _lastCustomSender!;
+                final groupID = _lastCustomGroupID;
+                if (msgID != null && receiptType != null) {
+                  // Update message status in history (async, don't await)
+                  unawaited(
+                      _handleReceipt(msgID, receiptType, sender, groupID));
+                }
+              }
+            } catch (e) {}
+            // Clear sender after processing
+            _lastCustomSender = null;
+            _lastCustomGroupID = null;
+          }
+          pkgffi.malloc.free(customBuf);
+          // P1-7: opportunistic stale-transfer sweep. Cheap when there are no
+          // in-flight transfers; only does real work if one has gone quiet.
           try {
-            final jsonString = utf8.decode(customData);
-            final json = jsonDecode(jsonString) as Map<String, dynamic>;
-            if (json['type'] == 'reaction') {
-              final msgID = json['msgID'] as String?;
-              final reactionID = json['reactionID'] as String?;
-              final action = json['action'] as String?; // 'add' or 'remove'
-              final sender = _lastCustomSender!;
-              final groupID = _lastCustomGroupID;
-              if (msgID != null && reactionID != null && action != null) {
-                _reactionCtrl.add((
-                  msgID: msgID,
-                  reactionID: reactionID,
-                  action: action,
-                  sender: sender,
-                  groupID: groupID
-                ));
-              }
-            } else if (json['type'] == 'receipt') {
-              // Handle receipt (received or read)
-              final msgID = json['msgID'] as String?;
-              final receiptType =
-                  json['receiptType'] as String?; // 'received' or 'read'
-              final sender = _lastCustomSender!;
-              final groupID = _lastCustomGroupID;
-              if (msgID != null && receiptType != null) {
-                // Update message status in history (async, don't await)
-                unawaited(_handleReceipt(msgID, receiptType, sender, groupID));
-              }
-            }
-          } catch (e) {}
-          // Clear sender after processing
-          _lastCustomSender = null;
-          _lastCustomGroupID = null;
-        }
-        pkgffi.malloc.free(customBuf);
-        // P1-7: opportunistic stale-transfer sweep. Cheap when there are no
-        // in-flight transfers; only does real work if one has gone quiet.
-        try {
-          _checkFileTransferTimeouts();
-        } catch (e, st) {
-          _logger?.logError(
-              '[FfiChatService] _checkFileTransferTimeouts failed', e, st);
-        }
-        // Schedule next poll with adaptive interval
-        _scheduleNextPoll();
+            _checkFileTransferTimeouts();
+          } catch (e, st) {
+            _logger?.logError(
+                '[FfiChatService] _checkFileTransferTimeouts failed', e, st);
+          }
+          // Schedule next poll with adaptive interval
+          _scheduleNextPoll();
         } finally {
           // P2-19: release the reentry guard regardless of how we exit.
           _pollBusy = false;
@@ -3000,7 +3042,8 @@ class FfiChatService {
               // Use normalized ID for consistency. Persistence normalizes
               // internally; the legacy-uid fallback is preserved for callers
               // that may still query by raw id during the same tick.
-              var history = _messageHistoryPersistence.getCachedList(normalizedUid);
+              var history =
+                  _messageHistoryPersistence.getCachedList(normalizedUid);
               if (history == null && uid != normalizedUid) {
                 history = _messageHistoryPersistence.getCachedList(uid);
                 // Migrate to normalized ID if found with original ID
@@ -3010,8 +3053,8 @@ class FfiChatService {
                   _messageHistoryPersistence.removeCachedHistory(uid);
                   // Re-fetch the now-canonical list so mutations land in the
                   // persistence-owned instance (setCachedHistory copies).
-                  history = _messageHistoryPersistence
-                      .getCachedList(normalizedUid);
+                  history =
+                      _messageHistoryPersistence.getCachedList(normalizedUid);
                 }
               }
               _logger?.log(
@@ -3206,15 +3249,16 @@ class FfiChatService {
               _logger?.log(
                   '[FfiChatService] _handleFileDone: Found existing message (file doesn\'t exist), msgID=$existingMsgID');
               // Use normalized ID for consistency (see migration comment above).
-              var history = _messageHistoryPersistence.getCachedList(normalizedUid);
+              var history =
+                  _messageHistoryPersistence.getCachedList(normalizedUid);
               if (history == null && uid != normalizedUid) {
                 history = _messageHistoryPersistence.getCachedList(uid);
                 if (history != null && history.isNotEmpty) {
                   _messageHistoryPersistence.setCachedHistory(
                       normalizedUid, history);
                   _messageHistoryPersistence.removeCachedHistory(uid);
-                  history = _messageHistoryPersistence
-                      .getCachedList(normalizedUid);
+                  history =
+                      _messageHistoryPersistence.getCachedList(normalizedUid);
                 }
               }
               _logger?.log(
@@ -3689,12 +3733,25 @@ class FfiChatService {
     Set<String> dismissed,
   ) {
     if (dismissed.isEmpty) return raw;
-    String normalize(String userID) =>
-        userID.length > 64 ? userID.substring(0, 64) : userID;
     return raw.where((app) {
-      final fp = _fingerprint(normalize(app.userId), app.wording);
+      final fp = _fingerprint(
+        _normalizeApplicationUserIdValue(app.userId),
+        app.wording,
+      );
       return !dismissed.contains(fp);
     }).toList();
+  }
+
+  /// Visible-for-testing: remove every dismissed fingerprint belonging to an
+  /// accepted peer while preserving unrelated peer entries.
+  static Set<String> clearDismissedApplicationsForAcceptedUser(
+    Set<String> dismissed,
+    String userID,
+  ) {
+    if (dismissed.isEmpty) return dismissed;
+    final normalized = _normalizeApplicationUserIdValue(userID);
+    final prefix = '$normalized|';
+    return dismissed.where((fp) => !fp.startsWith(prefix)).toSet();
   }
 
   /// Load the persisted set of dismissed friend-application fingerprints.
@@ -3720,7 +3777,8 @@ class FfiChatService {
     return fingerprints.toSet();
   }
 
-  Future<void> _saveDismissedFriendApplications(Set<String> fingerprints) async {
+  Future<void> _saveDismissedFriendApplications(
+      Set<String> fingerprints) async {
     final prefs = _prefs;
     if (prefs == null) return;
     await prefs.setStringList(
@@ -3731,8 +3789,11 @@ class FfiChatService {
 
   /// Normalize a friend-application user ID to its 64-char public key for
   /// stable comparison with native data (which always emits a 64-char key).
-  String _normalizeApplicationUserId(String userID) =>
+  static String _normalizeApplicationUserIdValue(String userID) =>
       userID.length > 64 ? userID.substring(0, 64) : userID;
+
+  String _normalizeApplicationUserId(String userID) =>
+      _normalizeApplicationUserIdValue(userID);
 
   /// Read the unfiltered friend-application list from the FFI layer.
   ///
@@ -3866,16 +3927,27 @@ class FfiChatService {
     // If this user was previously dismissed and is now being accepted, clear
     // every fingerprint for that userId so a future re-request from the same
     // peer surfaces regardless of wording.
+    await clearDismissedApplicationsAfterAccept(userId);
+  }
+
+  /// Post-accept cleanup, factored out of [acceptFriendRequest] so the persist
+  /// step can run — and be verified — independently of the FFI accept it
+  /// follows (the FFI accept can't succeed in a unit test). Clears every
+  /// dismissed fingerprint for [userId] so a future re-request from the same
+  /// peer surfaces regardless of wording, drops the observed-wording snapshot,
+  /// and persists the trimmed set only when it actually changed.
+  Future<void> clearDismissedApplicationsAfterAccept(String userId) async {
     final normalized = _normalizeApplicationUserId(userId);
-    final prefix = '$normalized|';
     final dismissed = await _getDismissedFriendApplications();
-    final before = dismissed.length;
-    dismissed.removeWhere((fp) => fp.startsWith(prefix));
-    if (dismissed.length != before) {
-      await _saveDismissedFriendApplications(dismissed);
+    final updated = clearDismissedApplicationsForAcceptedUser(
+      dismissed,
+      normalized,
+    );
+    if (updated.length != dismissed.length) {
+      await _saveDismissedFriendApplications(updated);
     }
-    // Also drop the observed-wordings snapshot — once accepted, future
-    // requests from this peer are interesting again regardless of past wording.
+    // Once accepted, future requests from this peer are interesting again
+    // regardless of past wording.
     _observedApplicationWordings.remove(normalized);
   }
 
@@ -3918,8 +3990,7 @@ class FfiChatService {
     for (final path in {...affectedTempPaths, ...affectedActualPaths}) {
       try {
         final f = File(path);
-        if (await f.exists() &&
-            p.basename(path).startsWith('receiving_')) {
+        if (await f.exists() && p.basename(path).startsWith('receiving_')) {
           try {
             await f.delete();
           } catch (_) {}
@@ -4567,24 +4638,23 @@ class FfiChatService {
       });
       if (messages.length < originalLength) {
         modifiedConversations.add(conversationId);
-        // Persist the truncated list to disk. The in-memory cache mutation
-        // above (`messages.removeWhere`) already lands in the
-        // persistence-owned list — `_historyById` IS the persistence cache as
-        // of the X4 consolidation. No separate setCachedHistory call needed.
-        await _saveHistory(conversationId);
 
-        // Recompute conversation-preview state from what remains. Last
-        // message: highest-timestamp survivor, or remove the entry entirely
-        // when the conversation is now empty. Unread: recount incoming
-        // unread messages from the remaining list rather than trying to
-        // decrement against the per-message deletion (we cannot reconstruct
-        // which deleted entries were unread once they're gone, and recount
-        // is O(n) for a per-peer list that's already in memory).
         final remaining = _historyById[conversationId];
         if (remaining == null || remaining.isEmpty) {
+          // CR-05: the conversation is now empty. `_saveHistory` would no-op
+          // (saveHistory returns early on an empty list), leaving the stale
+          // on-disk JSON to resurrect the deleted message on the next launch.
+          // Delete the history file (and backup) and drop preview state.
+          await _messageHistoryPersistence.clearHistory(conversationId);
           _lastByPeer.remove(conversationId);
           _unreadByPeer.remove(conversationId);
         } else {
+          // Persist the truncated list to disk. The in-memory cache mutation
+          // above (`messages.removeWhere`) already lands in the
+          // persistence-owned list — `_historyById` IS the persistence cache.
+          await _saveHistory(conversationId);
+
+          // Recompute conversation-preview state from what remains.
           ChatMessage newest = remaining.first;
           int unread = 0;
           for (final m in remaining) {
@@ -4592,11 +4662,8 @@ class FfiChatService {
             if (!m.isSelf && !m.isRead) unread++;
           }
           _lastByPeer[conversationId] = newest;
-          // Preserve the "user is currently viewing this conversation"
-          // zero-out: `setActivePeer` already drives _unreadByPeer to 0 for
-          // the active conversation, so we don't want to bump it back up
-          // here. Treat the active peer's unread as 0 regardless of the
-          // remaining-list scan.
+          // Preserve the active-conversation zero-out (setActivePeer drives
+          // _unreadByPeer to 0 for the active conversation).
           if (_activePeerId == conversationId) {
             _unreadByPeer[conversationId] = 0;
           } else if (unread > 0) {
@@ -4764,7 +4831,7 @@ class FfiChatService {
     print(
         '[FfiChatService] quitGroup: Generated userData=$userData for callback');
     Completer<V2TimCallback> completer = Completer();
-    NativeLibraryManager.timCallback2Future(userData, completer);
+    NativeLibraryManager.addTimCallback2Map(userData, completer);
 
     // Prepare FFI pointers
     ffi.Pointer<ffi.Char> pGroupID = Tools.string2PointerChar(groupId);
@@ -4807,8 +4874,7 @@ class FfiChatService {
         // path exists for that case.
         return V2TimCallback(
             code: -1,
-            desc:
-                'quitGroup timed out after 15s waiting for native callback');
+            desc: 'quitGroup timed out after 15s waiting for native callback');
       });
       print(
           '[FfiChatService] quitGroup: Received callback result: code=${result.code}, desc=${result.desc}');
@@ -6592,9 +6658,8 @@ class FfiChatService {
       // Locate msgID by fileNumber if not supplied directly.
       String? resolvedMsgID = msgID;
       if (resolvedMsgID == null && fileNumber != null) {
-        resolvedMsgID =
-            _fileNumberToMsgID[(normalizedUid, fileNumber)] ??
-                _fileNumberToMsgID[(uid, fileNumber)];
+        resolvedMsgID = _fileNumberToMsgID[(normalizedUid, fileNumber)] ??
+            _fileNumberToMsgID[(uid, fileNumber)];
       }
 
       // Drop tracking entries so the next file_request with the same
@@ -6659,9 +6724,7 @@ class FfiChatService {
   // TODO(P1-6): wire after FFI emits file_control events ('file_canceled',
   // 'file_paused', 'file_resumed').
   void _handleFileControl(
-      {required String uid,
-      required int fileNumber,
-      required String control}) {
+      {required String uid, required int fileNumber, required String control}) {
     final normalizedUid = uid.length > 64 ? _normalizeFriendId(uid) : uid;
     final key = (normalizedUid, fileNumber);
     final altKey = (uid, fileNumber);
@@ -6752,8 +6815,7 @@ class FfiChatService {
     for (final key in stale) {
       _logger?.log(
           '[FfiChatService] _checkFileTransferTimeouts: stale transfer uid=${key.$1} fileNumber=${key.$2} — cleaning up');
-      _handleFileControl(
-          uid: key.$1, fileNumber: key.$2, control: 'timeout');
+      _handleFileControl(uid: key.$1, fileNumber: key.$2, control: 'timeout');
     }
   }
 
@@ -6798,8 +6860,7 @@ class FfiChatService {
         if (!msg.isSelf &&
             msg.isPending &&
             msg.filePath != null &&
-            (msg.filePath!.contains('/receiving_') ||
-                msg.mediaKind != null)) {
+            (msg.filePath!.contains('/receiving_') || msg.mediaKind != null)) {
           // Remove the message from history to avoid showing "receiving" status
           messages.removeAt(i);
           hasUpdates = true;

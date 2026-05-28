@@ -15,8 +15,10 @@ void main() {
 
     setUpAll(() async {
       await setupTestEnvironment();
+      if (shouldRunVirtual) await VirtualClock.enableEarly();
       scenario = await createTestScenario(['alice', 'bob']);
       await scenario.initAllNodes();
+      if (shouldRunVirtual) await VirtualClock.enableForScenario(scenario);
 
       final alice = scenario.getNode('alice')!;
       final bob = scenario.getNode('bob')!;
@@ -24,8 +26,9 @@ void main() {
         alice.login(),
         bob.login(),
       ]);
+      await waitUntil(() => alice.loggedIn && bob.loggedIn);
 
-      await configureLocalBootstrap(scenario);
+      await configureLocalBootstrapVirtual(scenario);
     });
 
     tearDownAll(() async {
@@ -42,11 +45,9 @@ void main() {
       final alice = scenario.getNode('alice')!;
       final bob = scenario.getNode('bob')!;
 
-      // Friendship is required before a conference invite can travel.
-      await establishFriendship(alice, bob,
+      await establishFriendshipVirtual(scenario, alice, bob,
           timeout: const Duration(seconds: 20));
 
-      // Alice creates the conference (V1 path uses Meeting groupType).
       final createResult = await alice.runWithInstanceAsync(() async =>
           TIMGroupManager.instance.createGroup(
             groupType: 'Meeting',
@@ -58,35 +59,36 @@ void main() {
       expect(createResult.data, isNotNull);
       final groupId = createResult.data!;
 
-      // Wait for the friend channel to be ready before inviting.
-      await pumpFriendConnection(alice, bob,
+      await pumpFriendConnectionVirtual(scenario, alice, bob,
           duration: const Duration(seconds: 5));
-      await bob.waitForConnection(timeout: const Duration(seconds: 10));
-      await alice.waitForConnection(timeout: const Duration(seconds: 10));
+      await waitForConnectionVirtual(scenario, bob,
+          timeout: const Duration(seconds: 10));
+      await waitForConnectionVirtual(scenario, alice,
+          timeout: const Duration(seconds: 10));
 
       final aliceToxId = alice.getToxId();
       final bobToxId = bob.getToxId();
       try {
-        await alice.waitForFriendConnection(bobToxId,
+        await waitForFriendConnectionVirtual(scenario, alice, bobToxId,
             timeout: const Duration(seconds: 30));
       } catch (_) {
         // Friend connection may finalize during the invite; continue.
       }
       try {
-        await bob.waitForFriendConnection(aliceToxId,
+        await waitForFriendConnectionVirtual(scenario, bob, aliceToxId,
             timeout: const Duration(seconds: 30));
       } catch (_) {
         // Friend connection may finalize during the invite; continue.
       }
-      await Future.delayed(const Duration(seconds: 2));
+      await pumpTestTick(scenario, advanceMs: 2000, iterationsPerInstance: 1);
 
       final bobPublicKey = bob.getPublicKey();
 
-      // First invite: must succeed.
       V2TimValueCallback<List<V2TimGroupMemberOperationResult>>? inviteResult1;
       for (int retry = 0; retry < 3; retry++) {
         if (retry > 0) {
-          await Future.delayed(const Duration(seconds: 2));
+          await pumpTestTick(scenario,
+              advanceMs: 2000, iterationsPerInstance: 1);
         }
         inviteResult1 = await alice.runWithInstanceAsync(() async =>
             TIMGroupManager.instance.inviteUserToGroup(
@@ -108,8 +110,7 @@ void main() {
         }
       }
 
-      // Bob joins the conference.
-      await Future.delayed(const Duration(seconds: 2));
+      await pumpTestTick(scenario, advanceMs: 2000, iterationsPerInstance: 1);
       final joinResult = await bob.runWithInstanceAsync(() async =>
           TIMManager.instance.joinGroup(
             groupID: groupId,
@@ -118,11 +119,11 @@ void main() {
       expect(joinResult.code, equals(0),
           reason: 'joinGroup failed with code ${joinResult.code}');
 
-      // Wait until Bob is visible in the conference's member list.
-      await pumpGroupPeerDiscovery(alice, bob,
+      await pumpGroupPeerDiscoveryVirtual(scenario, alice, bob,
           duration: const Duration(seconds: 5));
-      final joinedDeadline = DateTime.now().add(const Duration(seconds: 20));
-      while (DateTime.now().isBefore(joinedDeadline)) {
+      final joinedDeadline =
+          VirtualClock.nowMs + const Duration(seconds: 20).inMilliseconds;
+      while (VirtualClock.nowMs < joinedDeadline) {
         final list = await alice.runWithInstanceAsync(() async =>
             TIMGroupManager.instance.getGroupMemberList(
               groupID: groupId,
@@ -131,15 +132,12 @@ void main() {
             ));
         final count = list.data?.memberInfoList?.length ?? 0;
         if (count >= 2) break;
-        await pumpGroupPeerDiscovery(alice, bob,
+        await pumpGroupPeerDiscoveryVirtual(scenario, alice, bob,
             duration: const Duration(seconds: 1));
       }
 
       // Second invite for the same already-joined peer must not throw and
-      // must not produce a duplicate member entry. We accept either:
-      //   - the call succeeding with no observable effect (typical), or
-      //   - the call reporting a non-zero per-member result (legitimate
-      //     duplicate rejection from the V1 conference layer).
+      // must not produce a duplicate member entry.
       final inviteResult2 = await alice.runWithInstanceAsync(() async =>
           TIMGroupManager.instance.inviteUserToGroup(
             groupID: groupId,
@@ -148,9 +146,8 @@ void main() {
       expect(inviteResult2.code, isNotNull,
           reason: 'second inviteUserToGroup must return a response');
 
-      await Future.delayed(const Duration(seconds: 3));
+      await pumpTestTick(scenario, advanceMs: 3000, iterationsPerInstance: 1);
 
-      // Bob must appear at most once in the conference roster.
       final memberListResult = await alice.runWithInstanceAsync(() async =>
           TIMGroupManager.instance.getGroupMemberList(
             groupID: groupId,

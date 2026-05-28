@@ -246,8 +246,8 @@ void V2TIMGroupManagerImpl::CreateGroup(const V2TIMGroupInfo& info,
             // This ensures chat_id is available after app restart
             // Function is already declared with extern "C" at file scope
             manager_impl_->SetGroupChatIdInStorage(finalGroupID.CString(), chat_id_hex);
-            V2TIM_LOG(kInfo, "CreateGroup: Stored chat_id to persistent storage for groupID={}, chat_id={}",
-                     finalGroupID.CString(), chat_id_hex);
+            V2TIM_LOG(kInfo, "CreateGroup: Stored chat_id to persistent storage for groupID={}, chat_id={}…",
+                     finalGroupID.CString(), chat_id_hex.substr(0, 8));
         }
         
         // Store group mappings
@@ -648,7 +648,7 @@ void V2TIMGroupManagerImpl::QuitGroup(const V2TIMString& groupID, V2TIMCallback*
         bool has_stored_chat_id = manager_impl_->GetGroupChatIdFromStorage(groupID_str, stored_chat_id, sizeof(stored_chat_id));
         
         if (has_stored_chat_id) {
-            V2TIM_LOG(kInfo, "V2TIMGroupManagerImpl::QuitGroup: Found stored chat_id for groupID={}: {}", groupID_str, stored_chat_id);
+            V2TIM_LOG(kInfo, "V2TIMGroupManagerImpl::QuitGroup: Found stored chat_id for groupID={}: {}…", groupID_str, std::string(stored_chat_id).substr(0, 8));
             
             // Convert hex string to binary chat_id
             uint8_t target_chat_id[TOX_GROUP_CHAT_ID_SIZE];
@@ -724,8 +724,8 @@ void V2TIMGroupManagerImpl::QuitGroup(const V2TIMString& groupID, V2TIMCallback*
                                     // Store chat_id for future use
                                     // Function is already declared with extern "C" at file scope
                                     manager_impl_->SetGroupChatIdInStorage(groupID_str, chat_id_hex);
-                                    V2TIM_LOG(kInfo, "V2TIMGroupManagerImpl::QuitGroup: Stored chat_id={} for groupID={} for future use",
-                                              chat_id_hex, groupID_str);
+                                    V2TIM_LOG(kInfo, "V2TIMGroupManagerImpl::QuitGroup: Stored chat_id={}… for groupID={} for future use",
+                                              chat_id_hex.substr(0, 8), groupID_str);
                                 }
                             } else {
                                 V2TIM_LOG(kWarning, "V2TIMGroupManagerImpl::QuitGroup: Cannot use fallback - group_number={} already mapped to groupID={}",
@@ -1084,13 +1084,13 @@ void V2TIMGroupManagerImpl::GetJoinedGroupList(V2TIMValueCallback<V2TIMGroupInfo
                                     manager_impl_->chat_id_to_group_id_[chat_id_hex] = V2TIMString(line_trimmed.c_str());
                                 }
                                 rebuilt_count++;
-                                V2TIM_LOG(kInfo, "GetJoinedGroupList: Rebuilt mapping for groupID={} <-> group_number={}, chat_id={}",
-                                         line_trimmed, matched_group_number, stored_chat_id);
+                                V2TIM_LOG(kInfo, "GetJoinedGroupList: Rebuilt mapping for groupID={} <-> group_number={}, chat_id={}…",
+                                         line_trimmed, matched_group_number, std::string(stored_chat_id).substr(0, 8));
                                 
                                 groupIDs.push_back(line_trimmed);
                             } else {
-                                V2TIM_LOG(kInfo, "GetJoinedGroupList: GroupID={} has stored chat_id={} but group not found in Tox yet",
-                                          line_trimmed, stored_chat_id);
+                                V2TIM_LOG(kInfo, "GetJoinedGroupList: GroupID={} has stored chat_id={}… but group not found in Tox yet",
+                                          line_trimmed, std::string(stored_chat_id).substr(0, 8));
                             }
                         }
                     } else {
@@ -1574,7 +1574,7 @@ void V2TIMGroupManagerImpl::GetGroupMemberList(
         V2TIM_LOG(kInfo, "[GetGroupMemberList] Checking stored chat_id for groupID={} has_stored_chat_id={}", groupID_str, has_stored_chat_id ? 1 : 0);
 
         if (has_stored_chat_id) {
-            V2TIM_LOG(kInfo, "[GetGroupMemberList] Found stored chat_id for groupID={}: {}", groupID_str, stored_chat_id);
+            V2TIM_LOG(kInfo, "[GetGroupMemberList] Found stored chat_id for groupID={}: {}…", groupID_str, std::string(stored_chat_id).substr(0, 8));
 
             uint8_t target_chat_id[TOX_GROUP_CHAT_ID_SIZE];
             if (hexStringToChatId(std::string(stored_chat_id), target_chat_id)) {
@@ -1644,8 +1644,8 @@ void V2TIMGroupManagerImpl::GetGroupMemberList(
                         }
                         std::string chat_id_hex = oss.str();
                         
-                        V2TIM_LOG(kInfo, "[GetGroupMemberList] Fallback 2: Found unmapped group_number={} with chat_id={}, assigning to groupID={}",
-                                  group_num, chat_id_hex, groupID_str);
+                        V2TIM_LOG(kInfo, "[GetGroupMemberList] Fallback 2: Found unmapped group_number={} with chat_id={}…, assigning to groupID={}",
+                                  group_num, chat_id_hex.substr(0, 8), groupID_str);
 
                         target_manager_impl->SetGroupChatIdInStorage(groupID_str, chat_id_hex);
 
@@ -1653,8 +1653,8 @@ void V2TIMGroupManagerImpl::GetGroupMemberList(
                         lookup_impl->group_number_to_group_id_[group_num] = V2TIMString(groupID_str.c_str());
 
                         matched_group_number = group_num;
-                        V2TIM_LOG(kInfo, "[GetGroupMemberList] Rebuilt mapping from unmapped group: groupID={} <-> group_number={}, chat_id={}",
-                                  groupID_str, matched_group_number, chat_id_hex);
+                        V2TIM_LOG(kInfo, "[GetGroupMemberList] Rebuilt mapping from unmapped group: groupID={} <-> group_number={}, chat_id={}…",
+                                  groupID_str, matched_group_number, chat_id_hex.substr(0, 8));
                         break;
                     } else {
                         V2TIM_LOG(kInfo, "[GetGroupMemberList] Fallback 2: Failed to get chat_id for group_number={}, error={}", group_num, err_chat_id);
@@ -2651,7 +2651,7 @@ void V2TIMGroupManagerImpl::InviteUserToGroup(
         V2TIM_LOG(kInfo, "[InviteUserToGroup] Checking stored chat_id for groupID={} has_stored_chat_id={}", group_id_str, has_stored_chat_id ? 1 : 0);
 
         if (has_stored_chat_id) {
-            V2TIM_LOG(kInfo, "[InviteUserToGroup] Found stored chat_id for groupID={}: {}", group_id_str, stored_chat_id);
+            V2TIM_LOG(kInfo, "[InviteUserToGroup] Found stored chat_id for groupID={}: {}…", group_id_str, std::string(stored_chat_id).substr(0, 8));
 
             uint8_t target_chat_id[TOX_GROUP_CHAT_ID_SIZE];
             if (hexStringToChatId(std::string(stored_chat_id), target_chat_id)) {
@@ -2712,12 +2712,12 @@ void V2TIMGroupManagerImpl::InviteUserToGroup(
                         }
                         std::string chat_id_hex = oss.str();
 
-                        V2TIM_LOG(kInfo, "[InviteUserToGroup] Fallback 2: Found unmapped group_number={} chat_id={} assigning to groupID={}", group_num, chat_id_hex, group_id_str);
+                        V2TIM_LOG(kInfo, "[InviteUserToGroup] Fallback 2: Found unmapped group_number={} chat_id={}… assigning to groupID={}", group_num, chat_id_hex.substr(0, 8), group_id_str);
                         manager_impl_->SetGroupChatIdInStorage(group_id_str, chat_id_hex);
                         manager_impl_->group_id_to_group_number_[V2TIMString(group_id_str.c_str())] = group_num;
                         manager_impl_->group_number_to_group_id_[group_num] = V2TIMString(group_id_str.c_str());
                         matched_group_number = group_num;
-                        V2TIM_LOG(kInfo, "[InviteUserToGroup] Rebuilt mapping: groupID={} <-> group_number={} chat_id={}", group_id_str, matched_group_number, chat_id_hex);
+                        V2TIM_LOG(kInfo, "[InviteUserToGroup] Rebuilt mapping: groupID={} <-> group_number={} chat_id={}…", group_id_str, matched_group_number, chat_id_hex.substr(0, 8));
                         break;
                     } else {
                         V2TIM_LOG(kInfo, "[InviteUserToGroup] Fallback 2: Failed to get chat_id for group_number={} error={}", group_num, err_chat_id);

@@ -550,6 +550,26 @@ class MessageHistoryPersistence {
       if (!_lastViewTimestampById.containsKey(targetId)) {
         _lastViewTimestampById[targetId] = 0;
       }
+
+      // Reconcile the persisted read state with the view barrier: a non-self
+      // message at or before the last-viewed timestamp was seen, so mark it
+      // read even if its stored isRead flag predates read-state tracking. This
+      // makes isRead the authoritative unread signal in [getUnreadCount], so a
+      // later message that arrives with a timestamp <= the barrier (clock skew
+      // or same-millisecond) is still counted instead of being silently
+      // suppressed by a strict `ts > lastView` comparison. In-memory only —
+      // not persisted here, so it re-applies cheaply on each load.
+      final barrierForReconcile = _lastViewTimestampById[targetId] ?? 0;
+      if (barrierForReconcile > 0) {
+        for (int i = 0; i < deduplicatedList.length; i++) {
+          final m = deduplicatedList[i];
+          if (!m.isSelf &&
+              !m.isRead &&
+              m.timestamp.millisecondsSinceEpoch <= barrierForReconcile) {
+            deduplicatedList[i] = m.copyWith(isRead: true);
+          }
+        }
+      }
       
       // Save the updated history (with isPending=false and deduplicated) to disk if any changes were made.
       // The save is fire-and-forget so a slow disk write doesn't block load,
@@ -1054,6 +1074,26 @@ class MessageHistoryPersistence {
       _historyById.remove(key);
     }
     
+    // Await any in-flight write for this conversation before deleting. A
+    // debounced `saveHistory` whose timer already FIRED (so the cancel above
+    // was a no-op) may be mid `tempFile.rename(file.path)` holding a
+    // pre-clear snapshot; if we delete first, its rename lands afterwards and
+    // resurrects the file (re-introducing the message the caller just
+    // deleted). Awaiting the per-conversation write fence lets that rename
+    // complete first, so our delete below removes the final state. The cache
+    // is already cleared above, so no NEW debounced save can be scheduled for
+    // this id (a later incoming message is a legitimate new conversation).
+    for (final fenceId in <String>{normalizedConversationId, conversationId}) {
+      final fence = _writeFences[fenceId];
+      if (fence != null) {
+        try {
+          await fence;
+        } catch (_) {
+          // A failed write must not block the delete.
+        }
+      }
+    }
+
     // H7: filenames are deterministic — `_getHistoryFile` derives them from
     // `ConversationIdUtils.normalize` + `sanitizeForFilename`. Compute both
     // candidates (normalized + legacy un-normalized) and delete only those,
@@ -1138,22 +1178,27 @@ class MessageHistoryPersistence {
   /// Safely update file path for a message
   /// 
   /// This method ensures atomic file path updates with integrity checks:
-  /// 1. Verifies the new file exists
+  /// 1. Verifies the new file exists (refuses the update otherwise unless
+  ///    [allowMissing] is set)
   /// 2. Gets file metadata (size, etc.)
   /// 3. Updates the message atomically
   /// 4. Optionally deletes the old temporary file after successful update
   /// 
   /// [conversationId] - Will be normalized before update
   /// [msgID] - Message ID to update
-  /// [newFilePath] - New file path (must exist)
+  /// [newFilePath] - New file path (must exist unless [allowMissing] is true)
   /// [deleteOldTempFile] - Whether to delete old temp file after successful update
-  /// 
+  /// [allowMissing] - Opt into the legacy behavior of repointing history at a
+  ///   path that does not exist yet (the old temp file is never deleted in
+  ///   that case). Defaults to false, which refuses the update.
+  ///
   /// Returns true if update was successful, false otherwise.
   Future<bool> updateFilePathSafely(
     String conversationId,
     String msgID,
     String newFilePath, {
     bool deleteOldTempFile = true,
+    bool allowMissing = false,
   }) async {
     final normalizedId = ConversationIdUtils.normalize(conversationId);
     final list = _historyById[normalizedId];
@@ -1165,22 +1210,24 @@ class MessageHistoryPersistence {
     final existing = list[index];
     final oldFilePath = existing.filePath;
     
-    // 1. Verify new file exists
+    // 1. Verify the new file exists. CR-06: the documented contract is that
+    // the new path must exist; refuse to repoint history at a dangling path
+    // (and do NOT delete the old temp below) unless the caller explicitly
+    // opts into the compatibility behavior via [allowMissing].
     final newFile = File(newFilePath);
-    if (!await newFile.exists()) {
-      // File doesn't exist, but we still update the path (file might be moved later)
-      // This handles edge cases where file is moved but not yet visible
-      // We'll verify on next access
+    final newFileExists = await newFile.exists();
+    if (!newFileExists && !allowMissing) {
+      return false;
     }
-    
-    // 2. Get file metadata if file exists
+
+    // 2. Get file metadata if the file exists.
     int? fileSize;
-    try {
-      if (await newFile.exists()) {
+    if (newFileExists) {
+      try {
         fileSize = await newFile.length();
+      } catch (e) {
+        // Ignore errors getting file size.
       }
-    } catch (e) {
-      // Ignore errors getting file size
     }
     
     // 3. Create updated message
@@ -1202,8 +1249,14 @@ class MessageHistoryPersistence {
       return false;
     }
 
-    // 5. Delete old temp file if requested and update was successful
-    if (deleteOldTempFile && oldFilePath != null && existing.isTempPath) {
+    // 5. Delete old temp file if requested and update was successful. CR-06:
+    // never delete the old temp when the new file is missing, or we'd lose
+    // both files (the legacy [allowMissing] path can repoint to a dangling
+    // path that may never materialize).
+    if (deleteOldTempFile &&
+        newFileExists &&
+        oldFilePath != null &&
+        existing.isTempPath) {
       // Delay deletion to ensure update is persisted
       Future.delayed(Duration(seconds: 5), () async {
         try {
@@ -1381,8 +1434,10 @@ class MessageHistoryPersistence {
   /// messages re-counted) or zero it out (new messages stamped earlier than
   /// the local clock). The right fix is to anchor `lastViewTimestamp` to the
   /// highest message timestamp in the conversation at view-time, or to also
-  /// persist a read-msgID set. Both options touch every caller of
-  /// `updateLastViewTimestamp` / `markUnreadMessagesAsRead`, so deferring.
+  /// persist a read-msgID set. `setActivePeer` now calls
+  /// [markConversationViewed], which anchors the barrier to the max message
+  /// timestamp (the wall-clock path remains on the legacy
+  /// `updateLastViewTimestamp` for any external callers).
   ///
   /// [conversationId] - Will be normalized before lookup
   int getUnreadCount(String conversationId) {
@@ -1392,20 +1447,20 @@ class MessageHistoryPersistence {
       return 0;
     }
     
-    final lastViewTimestamp = _lastViewTimestampById[normalizedId] ?? 0;
     int count = 0;
-    
+
     for (final msg in messages) {
-      final msgTimestamp = msg.timestamp.millisecondsSinceEpoch;
-      // Count messages that are:
-      // 1. After the last view timestamp
-      // 2. Not self-sent
-      // 3. Not marked as read
-      if (msgTimestamp > lastViewTimestamp && !msg.isSelf && !msg.isRead) {
+      // isRead is authoritative: markConversationViewed flags every message
+      // present at view-time, loadHistory reconciles persisted history against
+      // the view barrier, and new arrivals come in unread. Counting `!isRead`
+      // (rather than the old strict `ts > lastView`) means a same-millisecond
+      // or clock-skewed arrival — timestamp <= the barrier yet genuinely new —
+      // is still counted instead of being silently dropped.
+      if (!msg.isSelf && !msg.isRead) {
         count++;
       }
     }
-    
+
     return count;
   }
   
@@ -1442,7 +1497,65 @@ class MessageHistoryPersistence {
       await saveHistory(normalizedId, messages);
     }
   }
-  
+
+  /// Mark a conversation as viewed with a clock-drift-immune read barrier.
+  ///
+  /// Instead of stamping `lastViewTimestamp` with the local wall clock (which
+  /// drifts relative to the remote `msg.timestamp` values it is compared
+  /// against in [getUnreadCount]), anchor the barrier to the highest message
+  /// timestamp currently in the conversation and flag every current non-self
+  /// message `isRead`. Messages that arrive afterwards carry a strictly
+  /// greater timestamp and are still counted as unread.
+  ///
+  /// [conversationId] - Will be normalized before use.
+  Future<void> markConversationViewed(String conversationId) async {
+    final normalizedId = ConversationIdUtils.normalize(conversationId);
+    var messages = _historyById[normalizedId];
+    // If history exists on disk but isn't loaded into memory yet, load it so
+    // the barrier anchors to — and is persisted alongside — the real messages.
+    // Without this, viewing an unloaded conversation only stamped an in-memory
+    // barrier that was lost on restart (loadHistory would then restore the
+    // older on-disk barrier, re-counting already-seen messages as unread).
+    if (messages == null) {
+      final file = await _getHistoryFile(normalizedId);
+      if (await file.exists()) {
+        await loadHistory(normalizedId);
+        messages = _historyById[normalizedId];
+      }
+    }
+    if (messages == null || messages.isEmpty) {
+      // Genuinely empty/new conversation: no messages to anchor to. Stamp an
+      // in-memory wall-clock barrier; it is persisted by the next saveHistory
+      // once a message arrives, and until then there is nothing to be unread.
+      final now = DateTime.now().millisecondsSinceEpoch;
+      final prevBarrier = _lastViewTimestampById[normalizedId] ?? 0;
+      if (now > prevBarrier) {
+        _lastViewTimestampById[normalizedId] = now;
+      }
+      return;
+    }
+
+    int maxTimestamp = _lastViewTimestampById[normalizedId] ?? 0;
+    bool updated = false;
+    for (int i = 0; i < messages.length; i++) {
+      final msg = messages[i];
+      final ts = msg.timestamp.millisecondsSinceEpoch;
+      if (ts > maxTimestamp) maxTimestamp = ts;
+      if (!msg.isSelf && !msg.isRead) {
+        messages[i] = msg.copyWith(isRead: true);
+        updated = true;
+      }
+    }
+    final prevBarrier = _lastViewTimestampById[normalizedId] ?? 0;
+    if (maxTimestamp > prevBarrier) {
+      _lastViewTimestampById[normalizedId] = maxTimestamp;
+      updated = true;
+    }
+    if (updated) {
+      await saveHistory(normalizedId, messages);
+    }
+  }
+
   /// Clean up temporary files on startup
   /// 
   /// Removes temporary files and old backups that are no longer needed.

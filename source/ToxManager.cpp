@@ -4,6 +4,7 @@
 #include "V2TIMLog.h"
 #include "toxcore/tox.h"
 #include <fstream>
+#include <filesystem> // For std::filesystem::rename (Windows atomic-replace fallback)
 #include <chrono>
 #include <string> // Required for std::to_string
 #include <vector> // Required for std::vector
@@ -11,6 +12,13 @@
 #include <sstream> // For std::ostringstream
 #include <iomanip> // For std::setw, std::setfill
 #include <cstring> // For memcmp
+#include <cstdio> // For std::remove
+#include <cerrno> // For errno, EINTR
+#ifndef _WIN32
+#include <unistd.h> // For ::write, ::fsync, ::close
+#include <fcntl.h>  // For ::open, O_* flags
+#include <sys/stat.h> // For ::chmod, mode constants
+#endif
 
 // 默认实例（用于向后兼容）
 static ToxManager* g_default_instance = nullptr;
@@ -86,8 +94,9 @@ static void toxcore_log_callback(Tox * /*tox*/, Tox_Log_Level level, const char 
                                  void * /*user_data*/) {
     if (level >= TOX_LOG_LEVEL_WARNING) {
         const char *lvl_str = (level == TOX_LOG_LEVEL_ERROR) ? "ERR" : "WRN";
-        fprintf(stdout, "[Toxcore-%s] %s:%u %s: %s\n", lvl_str, file, line, func, message);
-        fflush(stdout);
+        // Route c-toxcore's internal log through the project logger at kDebug so it
+        // is gated rather than written to raw stdout.
+        V2TIM_LOG(kDebug, "[Toxcore-{}] {}:{} {}: {}", lvl_str, file, line, func, message);
     }
 }
 
@@ -318,9 +327,6 @@ void ToxManager::onFriendRequest(Tox* tox, const uint8_t* public_key, const uint
     }
     V2TIM_LOG(kDebug, "[ToxManager::onFriendRequest] public_key (first 20 bytes): {}...", hex_ss.str());
     V2TIM_LOG(kDebug, "[ToxManager::onFriendRequest] message length: {}", length);
-    if (length > 0 && length <= 100) {
-        V2TIM_LOG(kDebug, "[ToxManager::onFriendRequest] message (first {} chars): {}", length, std::string(reinterpret_cast<const char*>(message), length));
-    }
 
     ToxManager* manager = static_cast<ToxManager*>(user_data);
     if (manager && manager->friend_request_cb_) {
@@ -932,17 +938,20 @@ bool ToxManager::getGroupTopic(Tox_Group_Number group_number, uint8_t* topic, si
         return false;
     }
     
-    size_t topic_size = tox_group_get_topic_size(tox_.get(), group_number, error);
-    if (topic_size == 0 || *error != TOX_ERR_GROUP_STATE_QUERY_OK) {
+    Tox_Err_Group_State_Query local_error = TOX_ERR_GROUP_STATE_QUERY_OK;
+    Tox_Err_Group_State_Query* err = error ? error : &local_error;
+
+    size_t topic_size = tox_group_get_topic_size(tox_.get(), group_number, err);
+    if (topic_size == 0 || *err != TOX_ERR_GROUP_STATE_QUERY_OK) {
         return false;
     }
-    
+
     if (topic_size > max_length) {
-        if (error) *error = TOX_ERR_GROUP_STATE_QUERY_GROUP_NOT_FOUND;
+        *err = TOX_ERR_GROUP_STATE_QUERY_GROUP_NOT_FOUND;
         return false;
     }
-    
-    return tox_group_get_topic(tox_.get(), group_number, topic, error);
+
+    return tox_group_get_topic(tox_.get(), group_number, topic, err);
 }
 
 bool ToxManager::getGroupName(Tox_Group_Number group_number, uint8_t* name, size_t max_length,
@@ -953,17 +962,20 @@ bool ToxManager::getGroupName(Tox_Group_Number group_number, uint8_t* name, size
         return false;
     }
     
-    size_t name_size = tox_group_get_name_size(tox_.get(), group_number, error);
-    if (name_size == 0 || *error != TOX_ERR_GROUP_STATE_QUERY_OK) {
+    Tox_Err_Group_State_Query local_error = TOX_ERR_GROUP_STATE_QUERY_OK;
+    Tox_Err_Group_State_Query* err = error ? error : &local_error;
+
+    size_t name_size = tox_group_get_name_size(tox_.get(), group_number, err);
+    if (name_size == 0 || *err != TOX_ERR_GROUP_STATE_QUERY_OK) {
         return false;
     }
-    
+
     if (name_size > max_length) {
-        if (error) *error = TOX_ERR_GROUP_STATE_QUERY_GROUP_NOT_FOUND;
+        *err = TOX_ERR_GROUP_STATE_QUERY_GROUP_NOT_FOUND;
         return false;
     }
-    
-    return tox_group_get_name(tox_.get(), group_number, name, error);
+
+    return tox_group_get_name(tox_.get(), group_number, name, err);
 }
 
 bool ToxManager::getGroupPeerName(Tox_Group_Number group_number, Tox_Group_Peer_Number peer_id,
@@ -975,17 +987,20 @@ bool ToxManager::getGroupPeerName(Tox_Group_Number group_number, Tox_Group_Peer_
         return false;
     }
     
-    size_t name_size = tox_group_peer_get_name_size(tox_.get(), group_number, peer_id, error);
-    if (name_size == 0 || *error != TOX_ERR_GROUP_PEER_QUERY_OK) {
+    Tox_Err_Group_Peer_Query local_error = TOX_ERR_GROUP_PEER_QUERY_OK;
+    Tox_Err_Group_Peer_Query* err = error ? error : &local_error;
+
+    size_t name_size = tox_group_peer_get_name_size(tox_.get(), group_number, peer_id, err);
+    if (name_size == 0 || *err != TOX_ERR_GROUP_PEER_QUERY_OK) {
         return false;
     }
-    
+
     if (name_size > max_length) {
-        if (error) *error = TOX_ERR_GROUP_PEER_QUERY_PEER_NOT_FOUND;
+        *err = TOX_ERR_GROUP_PEER_QUERY_PEER_NOT_FOUND;
         return false;
     }
-    
-    return tox_group_peer_get_name(tox_.get(), group_number, peer_id, name, error);
+
+    return tox_group_peer_get_name(tox_.get(), group_number, peer_id, name, err);
 }
 
 uint32_t ToxManager::getGroupPeerCount(Tox_Group_Number group_number, Tox_Err_Group_Peer_Query* error) {
@@ -994,11 +1009,48 @@ uint32_t ToxManager::getGroupPeerCount(Tox_Group_Number group_number, Tox_Err_Gr
         if (error) *error = TOX_ERR_GROUP_PEER_QUERY_GROUP_NOT_FOUND;
         return 0;
     }
-    // Note: tox group doesn't have a direct peer_count API
-    // We need to iterate through peer IDs. For now, return 0 and let caller handle it differently
-    // This is a limitation - we'll need to track peer count via callbacks
-    if (error) *error = TOX_ERR_GROUP_PEER_QUERY_GROUP_NOT_FOUND;
-    return 0; // TODO: Implement proper peer counting via callback tracking
+    // toxcore's NGCv2 group API exposes no direct peer-count or peer-list function, so we
+    // enumerate by probing peer ids with tox_group_peer_get_public_key (the same per-peer
+    // validation GetGroupMemberList uses). toxcore assigns the lowest currently-unused id
+    // (get_new_peer_id), so an active peer's id is always < the group's peer limit — probing
+    // the full [0, peer_limit) range therefore covers every assignable id and makes the count
+    // authoritative rather than an undercounting guess. (V2TIMGroupManagerImpl still keeps the
+    // live peer set in a callback-populated cache — see GetGroupMemberList — as the primary
+    // source; this is the fallback path.)
+    Tox_Err_Group_Self_Query self_error = TOX_ERR_GROUP_SELF_QUERY_OK;
+    Tox_Group_Peer_Number self_peer_id = tox_group_self_get_peer_id(tox_.get(), group_number, &self_error);
+    if (self_error != TOX_ERR_GROUP_SELF_QUERY_OK) {
+        if (error) *error = TOX_ERR_GROUP_PEER_QUERY_GROUP_NOT_FOUND;
+        return 0;
+    }
+
+    // Probe the FULL assignable peer-id space, not [0, peer_limit). toxcore
+    // assigns each peer the lowest currently-free id (get_new_peer_id), so a
+    // live id is bounded only by the peak number of peers ever concurrently in
+    // the group — which is bounded by max-peers, a uint16 (<= 65535). The
+    // founder can LOWER max-peers below ids already handed out without
+    // renumbering or evicting anyone (gc_founder_set_max_peers), so the current
+    // peer_limit is NOT an upper bound on live ids; nor is a join-callback
+    // high-water mark, since tox_group_peer_get_public_key also returns
+    // not-yet-confirmed peers that never fired peer_join. UINT16_MAX+1 is the
+    // only bound guaranteed to see every live peer. This is O(65536 * numpeers)
+    // and is a fallback path — the authoritative member count is the
+    // callback-populated cache in V2TIMGroupManagerImpl (GetGroupMemberList).
+    constexpr uint32_t kMaxGroupPeerIdProbe = 65536u;
+
+    uint32_t count = 1; // self is always a member of a group we belong to
+    for (Tox_Group_Peer_Number peer_id = 0; peer_id < kMaxGroupPeerIdProbe; ++peer_id) {
+        if (peer_id == self_peer_id) continue; // already counted as self
+        uint8_t public_key[TOX_PUBLIC_KEY_SIZE];
+        Tox_Err_Group_Peer_Query peer_error = TOX_ERR_GROUP_PEER_QUERY_OK;
+        if (tox_group_peer_get_public_key(tox_.get(), group_number, peer_id, public_key, &peer_error) &&
+            peer_error == TOX_ERR_GROUP_PEER_QUERY_OK) {
+            ++count;
+        }
+    }
+
+    if (error) *error = TOX_ERR_GROUP_PEER_QUERY_OK;
+    return count;
 }
 
 bool ToxManager::isGroupConnected(Tox_Group_Number group_number, Tox_Err_Group_Is_Connected* error) {
@@ -1091,7 +1143,9 @@ Tox_Group_Number ToxManager::getGroupByChatId(const uint8_t chat_id[TOX_GROUP_CH
         V2TIM_LOG(kDebug, "[ToxManager] getGroupByChatId: tox_={}, chat_id={}", (void*)tox_.get(), (void*)chat_id);
         return UINT32_MAX;
     }
-    uint32_t group_count = tox_group_get_number_groups(tox_.get());
+    // toxcore does NOT guarantee group numbers are dense/sequential. Use the real
+    // group-list API to obtain the actual valid group numbers and iterate only those.
+    uint32_t group_count = tox_group_get_group_list_size(tox_.get());
     V2TIM_LOG(kDebug, "[ToxManager] getGroupByChatId: Searching through {} groups", group_count);
 
     std::ostringstream target_oss;
@@ -1100,9 +1154,17 @@ Tox_Group_Number ToxManager::getGroupByChatId(const uint8_t chat_id[TOX_GROUP_CH
     }
     std::string target_chat_id_hex = target_oss.str();
     V2TIM_LOG(kDebug, "[ToxManager] getGroupByChatId: Looking for chat_id={}", target_chat_id_hex.c_str());
-    
+
+    if (group_count == 0) {
+        V2TIM_LOG(kDebug, "[ToxManager] getGroupByChatId: No groups present");
+        return UINT32_MAX;
+    }
+
+    std::vector<Tox_Group_Number> group_numbers(group_count);
+    tox_group_get_group_list(tox_.get(), group_numbers.data());
+
     for (uint32_t i = 0; i < group_count; ++i) {
-        Tox_Group_Number group_number = i; // Assuming group numbers are sequential
+        Tox_Group_Number group_number = group_numbers[i]; // real, possibly non-sequential group number
         uint8_t group_chat_id[TOX_GROUP_CHAT_ID_SIZE];
         Tox_Err_Group_State_Query error;
         if (tox_group_get_chat_id(tox_.get(), group_number, group_chat_id, &error)) {
@@ -1113,7 +1175,7 @@ Tox_Group_Number ToxManager::getGroupByChatId(const uint8_t chat_id[TOX_GROUP_CH
                     group_oss << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(group_chat_id[j]);
                 }
                 std::string group_chat_id_hex = group_oss.str();
-                
+
                 if (memcmp(chat_id, group_chat_id, TOX_GROUP_CHAT_ID_SIZE) == 0) {
                     V2TIM_LOG(kDebug, "[ToxManager] getGroupByChatId: Found match! group_number={}, chat_id={}", group_number, group_chat_id_hex.c_str());
                     return group_number;
@@ -1237,11 +1299,14 @@ size_t ToxManager::getGroupListSize() const {
 void ToxManager::getGroupList(Tox_Group_Number* group_list, size_t list_size) const {
     std::lock_guard<std::mutex> lock(mutex_);
     if (!tox_ || !group_list || list_size == 0) return;
-    // Note: tox_group_get_number_groups returns count, but there's no direct get_list API
-    // We assume group numbers are sequential from 0 to count-1
-    uint32_t count = tox_group_get_number_groups(tox_.get());
+    // Group numbers are NOT guaranteed dense/sequential; obtain the real valid group
+    // numbers via the toxcore list API, then copy up to list_size into the caller buffer.
+    uint32_t count = tox_group_get_group_list_size(tox_.get());
+    if (count == 0) return;
+    std::vector<Tox_Group_Number> group_numbers(count);
+    tox_group_get_group_list(tox_.get(), group_numbers.data());
     for (size_t i = 0; i < list_size && i < count; ++i) {
-        group_list[i] = i;
+        group_list[i] = group_numbers[i];
     }
 }
 
@@ -1292,20 +1357,23 @@ bool ToxManager::getConferenceTitle(uint32_t conference_number, uint8_t* title, 
         return false;
     }
     
+    TOX_ERR_CONFERENCE_TITLE local_error = TOX_ERR_CONFERENCE_TITLE_OK;
+    TOX_ERR_CONFERENCE_TITLE* err = error ? error : &local_error;
+
     // Get title size first
-    size_t title_size = tox_conference_get_title_size(tox_.get(), conference_number, error);
-    if (title_size == 0 || *error != TOX_ERR_CONFERENCE_TITLE_OK) {
+    size_t title_size = tox_conference_get_title_size(tox_.get(), conference_number, err);
+    if (title_size == 0 || *err != TOX_ERR_CONFERENCE_TITLE_OK) {
         return false;
     }
-    
+
     // Check if buffer is large enough
     if (title_size > max_length) {
-        if (error) *error = TOX_ERR_CONFERENCE_TITLE_INVALID_LENGTH;
+        *err = TOX_ERR_CONFERENCE_TITLE_INVALID_LENGTH;
         return false;
     }
-    
+
     // Get the actual title
-    return tox_conference_get_title(tox_.get(), conference_number, title, error);
+    return tox_conference_get_title(tox_.get(), conference_number, title, err);
 }
 
 // 离线成员相关实现
@@ -1334,20 +1402,23 @@ bool ToxManager::getConferenceOfflinePeerName(uint32_t conference_number, uint32
         return false;
     }
     
+    TOX_ERR_CONFERENCE_PEER_QUERY local_error = TOX_ERR_CONFERENCE_PEER_QUERY_OK;
+    TOX_ERR_CONFERENCE_PEER_QUERY* err = error ? error : &local_error;
+
     // Get name size first
-    size_t name_size = tox_conference_offline_peer_get_name_size(tox_.get(), conference_number, offline_peer_number, error);
-    if (name_size == 0 || *error != TOX_ERR_CONFERENCE_PEER_QUERY_OK) {
+    size_t name_size = tox_conference_offline_peer_get_name_size(tox_.get(), conference_number, offline_peer_number, err);
+    if (name_size == 0 || *err != TOX_ERR_CONFERENCE_PEER_QUERY_OK) {
         return false;
     }
-    
+
     // Check if buffer is large enough
     if (name_size > max_length) {
-        if (error) *error = TOX_ERR_CONFERENCE_PEER_QUERY_PEER_NOT_FOUND;
+        *err = TOX_ERR_CONFERENCE_PEER_QUERY_PEER_NOT_FOUND;
         return false;
     }
-    
+
     // Get the actual name
-    return tox_conference_offline_peer_get_name(tox_.get(), conference_number, offline_peer_number, name, error);
+    return tox_conference_offline_peer_get_name(tox_.get(), conference_number, offline_peer_number, name, err);
 }
 
 bool ToxManager::getConferenceOfflinePeerPublicKey(uint32_t conference_number, uint32_t offline_peer_number, uint8_t public_key[TOX_PUBLIC_KEY_SIZE], TOX_ERR_CONFERENCE_PEER_QUERY* error) const {
@@ -1393,11 +1464,106 @@ bool ToxManager::saveTo(const std::string& path) const {
         auto data = getSaveData();
         if (data.empty()) return false;
 
-        std::ofstream file(path, std::ios::binary);
-        if (!file) return false;
+        // Atomic, durable save: write to a temp file, flush to disk, restrict
+        // permissions to 0600, then atomically rename over the destination. On any
+        // failure the temp file is removed and the existing valid file is left intact.
+        const std::string tmp_path = path + ".tmp";
 
-        file.write(reinterpret_cast<const char*>(data.data()), data.size());
+#ifndef _WIN32
+        // POSIX atomic + durable save.
+        // Open with O_TRUNC so a stale temp from a previous crash is overwritten.
+        int fd = ::open(tmp_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+        if (fd < 0) {
+            return false;
+        }
+
+        // Ensure mode is 0600 even if a restrictive umask altered the open() mode.
+        if (::chmod(tmp_path.c_str(), 0600) != 0) {
+            ::close(fd);
+            ::remove(tmp_path.c_str());
+            return false;
+        }
+
+        const char* buf = reinterpret_cast<const char*>(data.data());
+        size_t remaining = data.size();
+        size_t offset = 0;
+        while (remaining > 0) {
+            ssize_t written = ::write(fd, buf + offset, remaining);
+            if (written < 0) {
+                if (errno == EINTR) continue; // interrupted, retry
+                ::close(fd);
+                ::remove(tmp_path.c_str());
+                return false;
+            }
+            offset += static_cast<size_t>(written);
+            remaining -= static_cast<size_t>(written);
+        }
+
+        // Flush file contents to disk before rename so the rename can't expose a
+        // truncated/empty file after a crash.
+        if (::fsync(fd) != 0) {
+            ::close(fd);
+            ::remove(tmp_path.c_str());
+            return false;
+        }
+        if (::close(fd) != 0) {
+            ::remove(tmp_path.c_str());
+            return false;
+        }
+
+        // Atomic replace of the destination.
+        if (::rename(tmp_path.c_str(), path.c_str()) != 0) {
+            ::remove(tmp_path.c_str());
+            return false;
+        }
+
+        // Flush the parent directory so the rename's directory entry is itself
+        // durable. Without this, a crash right after rename() can lose the new
+        // name even though the file contents were fsync'd. Best-effort: the
+        // data is already atomically in place, so a failure here is non-fatal.
+        {
+            const auto slash = path.find_last_of('/');
+            const std::string dir = (slash == std::string::npos)
+                                        ? std::string(".")
+                                        : path.substr(0, slash == 0 ? 1 : slash);
+            int dir_fd = ::open(dir.c_str(), O_RDONLY
+#ifdef O_DIRECTORY
+                                    | O_DIRECTORY
+#endif
+            );
+            if (dir_fd >= 0) {
+                ::fsync(dir_fd);
+                ::close(dir_fd);
+            }
+        }
+
         return true;
+#else
+        // Windows fallback: the POSIX fd/fsync/chmod headers are excluded under
+        // _WIN32, so write via ofstream, flush, then atomically replace with
+        // std::filesystem::rename (MoveFileEx + REPLACE_EXISTING underneath).
+        // File permissions are governed by the user profile's ACLs.
+        {
+            std::ofstream out(tmp_path, std::ios::binary | std::ios::trunc);
+            if (!out) return false;
+            out.write(reinterpret_cast<const char*>(data.data()),
+                      static_cast<std::streamsize>(data.size()));
+            out.flush();
+            if (!out) {
+                out.close();
+                std::remove(tmp_path.c_str());
+                return false;
+            }
+            out.close();
+        }
+        std::error_code ec;
+        std::filesystem::rename(tmp_path, path, ec);
+        if (ec) {
+            std::remove(tmp_path.c_str());
+            return false;
+        }
+        return true;
+#endif
     } catch (const std::exception&) {
         return false;
     }

@@ -1,7 +1,13 @@
-/// Multi-instance test scenario
-/// 
+/// Multi-instance test scenario — virtual-clock variant
+///
 /// Verifies that each TestNode has its own independent Tox instance,
-/// UDP port, and DHT ID, and that nodes can connect via 127.0.0.1
+/// UDP port, and DHT ID, and that nodes can connect via 127.0.0.1.
+///
+/// Mirrors scenario_multi_instance_test.dart 1:1 but enables
+/// VirtualClock.enableEarly() before initAllNodes() so V2TIMManagerImpl
+/// inherits test_mode and InitSDK skips event_thread. Inter-instance waits
+/// (port-ready, connection wait, friendship, message delivery) are driven
+/// through pumpTestTick / waitUntilWithVirtualPump.
 
 import 'package:flutter_test/flutter_test.dart';
 import '../test_helper.dart';
@@ -15,6 +21,9 @@ void main() {
   group('Multi-instance Tox support', () {
     test('Each node has independent Tox instance, port, and DHT ID', () async {
       await setupTestEnvironment();
+      // ENABLE TEST MODE *BEFORE* scenario creation so V2TIMManagerImpl
+      // constructor inherits test_mode and InitSDK skips event_thread.
+      if (shouldRunVirtual) await VirtualClock.enableEarly();
       final scenario = await createTestScenario(['alice', 'bob', 'charlie']);
 
       try {
@@ -22,72 +31,64 @@ void main() {
         print('[Test] Initializing all nodes...');
         for (int i = 0; i < scenario.nodes.length; i++) {
           final node = scenario.nodes[i];
-          print('[Test] Initializing node ${i + 1}/${scenario.nodes.length}: ${node.alias}');
+          print(
+              '[Test] Initializing node ${i + 1}/${scenario.nodes.length}: ${node.alias}');
           try {
             await node.initSDK();
-            print('[Test] ✅ Node ${node.alias} SDK initialized');
-            
-            // Call login with timeout to prevent hanging
-            // With local bootstrap, login should complete quickly (1-5 seconds)
+            print('[Test] OK Node ${node.alias} SDK initialized');
+
             print('[Test] Calling login for node ${node.alias}...');
             try {
               await node.login(timeout: const Duration(seconds: 5));
-              print('[Test] ✅ Node ${node.alias} login completed (loggedIn=${node.loggedIn})');
+              print(
+                  '[Test] OK Node ${node.alias} login completed (loggedIn=${node.loggedIn})');
             } catch (e) {
-              print('[Test] ⚠️  Node ${node.alias} login timeout or error: $e');
-              // Continue anyway if login was called (loggedIn may be true)
+              print(
+                  '[Test] Node ${node.alias} login timeout or error: $e');
               if (!node.loggedIn) {
                 rethrow;
               }
             }
           } catch (e) {
-            print('[Test] ❌ Failed to initialize node ${node.alias}: $e');
+            print('[Test] Failed to initialize node ${node.alias}: $e');
             rethrow;
           }
         }
+        // Refresh per-instance test_mode for visibility (idempotent).
+        if (shouldRunVirtual) await VirtualClock.enableForScenario(scenario);
 
         // Wait for all nodes to be logged in
         print('[Test] Waiting for all nodes to be logged in...');
-        print('[Test] Current login status: ${scenario.nodes.map((n) => '${n.alias}=${n.loggedIn}').join(', ')}');
         try {
           await waitUntil(
-            () {
-              final allLoggedIn = scenario.nodes.every((node) => node.loggedIn);
-              if (!allLoggedIn) {
-                final status = scenario.nodes.map((n) => '${n.alias}=${n.loggedIn}').join(', ');
-                if (DateTime.now().millisecondsSinceEpoch % 2000 < 100) {
-                  // Print status every ~2 seconds
-                  print('[Test] Still waiting for login: $status');
-                }
-              }
-              return allLoggedIn;
-            },
+            () => scenario.nodes.every((node) => node.loggedIn),
             timeout: const Duration(seconds: 10),
             description: 'all nodes logged in',
           );
-          print('[Test] ✅ All nodes are logged in');
+          print('[Test] All nodes are logged in');
         } catch (e) {
-          print('[Test] ❌ Timeout waiting for all nodes to log in: $e');
-          print('[Test] Final login status: ${scenario.nodes.map((n) => '${n.alias}=${n.loggedIn}').join(', ')}');
+          print('[Test] Timeout waiting for all nodes to log in: $e');
           rethrow;
         }
 
         final Map<String, Map<String, dynamic>> nodeInfo = {};
         final List<String> failedNodes = [];
 
-        // Process all nodes using instance scope (runWithInstanceAsync sets current instance per node)
+        // Process all nodes using instance scope.
         for (final node in scenario.nodes) {
           try {
             if (node.testInstanceHandle == null) {
-              throw Exception('Node ${node.alias} does not have a test instance handle');
+              throw Exception(
+                  'Node ${node.alias} does not have a test instance handle');
             }
 
             await node.runWithInstanceAsync(() async {
               final ffiInstance = ffi_lib.Tim2ToxFfi.open();
 
-              // Get UDP port (retry with optimized attempts)
-              // With local bootstrap, port should be available quickly (1-3 seconds)
-              await Future.delayed(const Duration(milliseconds: 500));
+              // Get UDP port — pump virtual time so Tox's bind/iterate ticks
+              // before we query, then retry a few times if needed.
+              await pumpTestTick(scenario,
+                  advanceMs: 500, iterationsPerInstance: 1);
               int port = 0;
               for (int retry = 0; retry < 5; retry++) {
                 port = ffiInstance.getUdpPort(ffiInstance.getCurrentInstanceId());
@@ -95,15 +96,18 @@ void main() {
                   break;
                 }
                 if (retry % 2 == 0) {
-                  print('[Test] getUdpPort() attempt ${retry + 1} for node ${node.alias}: $port');
+                  print(
+                      '[Test] getUdpPort() attempt ${retry + 1} for node ${node.alias}: $port');
                 }
                 if (retry < 4) {
-                  await Future.delayed(const Duration(milliseconds: 200));
+                  await pumpTestTick(scenario,
+                      advanceMs: 200, iterationsPerInstance: 1);
                 }
               }
 
               if (port == 0) {
-                throw Exception('Failed to get UDP port for node ${node.alias} after retries');
+                throw Exception(
+                    'Failed to get UDP port for node ${node.alias} after retries');
               }
 
               // Get DHT ID
@@ -112,7 +116,9 @@ void main() {
               try {
                 final dhtIdLen = ffiInstance.getDhtIdNative(dhtIdBuf, 65);
                 if (dhtIdLen > 0 && dhtIdLen <= 64) {
-                  dhtId = dhtIdBuf.cast<pkgffi.Utf8>().toDartString(length: dhtIdLen);
+                  dhtId = dhtIdBuf
+                      .cast<pkgffi.Utf8>()
+                      .toDartString(length: dhtIdLen);
                 }
               } finally {
                 pkgffi.malloc.free(dhtIdBuf);
@@ -128,36 +134,40 @@ void main() {
                 'dhtId': dhtId,
               };
 
-              print('[Test] ✅ Node ${node.alias}: instance=${node.testInstanceHandle}, port=$port, dhtId=$dhtId');
+              print(
+                  '[Test] OK Node ${node.alias}: instance=${node.testInstanceHandle}, port=$port, dhtId=$dhtId');
             });
           } catch (e) {
-            print('[Test] ❌ Failed to get info for node ${node.alias}: $e');
+            print('[Test] Failed to get info for node ${node.alias}: $e');
             failedNodes.add(node.alias);
           }
         }
 
-        // Report failures
         if (failedNodes.isNotEmpty) {
-          throw Exception('Failed to get info for nodes: ${failedNodes.join(", ")}');
+          throw Exception(
+              'Failed to get info for nodes: ${failedNodes.join(", ")}');
         }
 
         // Verify all nodes have different instance handles
-        final instanceHandles = nodeInfo.values.map((info) => info['instanceHandle'] as int).toSet();
+        final instanceHandles = nodeInfo.values
+            .map((info) => info['instanceHandle'] as int)
+            .toSet();
         expect(instanceHandles.length, equals(scenario.nodes.length),
             reason: 'All nodes should have unique instance handles');
 
         // Verify all nodes have different ports
-        final ports = nodeInfo.values.map((info) => info['port'] as int).toSet();
+        final ports =
+            nodeInfo.values.map((info) => info['port'] as int).toSet();
         expect(ports.length, equals(scenario.nodes.length),
             reason: 'All nodes should have unique UDP ports');
 
         // Verify all nodes have different DHT IDs
-        final dhtIds = nodeInfo.values.map((info) => info['dhtId'] as String).toSet();
+        final dhtIds =
+            nodeInfo.values.map((info) => info['dhtId'] as String).toSet();
         expect(dhtIds.length, equals(scenario.nodes.length),
             reason: 'All nodes should have unique DHT IDs');
 
-        print('[Test] ✅ All nodes have independent instances, ports, and DHT IDs');
-
+        print('[Test] OK All nodes have independent instances, ports, and DHT IDs');
       } finally {
         await scenario.dispose();
       }
@@ -165,6 +175,9 @@ void main() {
 
     test('Nodes can connect via 127.0.0.1 bootstrap', () async {
       await setupTestEnvironment();
+      // ENABLE TEST MODE *BEFORE* scenario creation so V2TIMManagerImpl
+      // constructor inherits test_mode and InitSDK skips event_thread.
+      if (shouldRunVirtual) await VirtualClock.enableEarly();
       final scenario = await createTestScenario(['alice', 'bob']);
 
       try {
@@ -172,66 +185,56 @@ void main() {
         print('[Test] Initializing all nodes...');
         for (int i = 0; i < scenario.nodes.length; i++) {
           final node = scenario.nodes[i];
-          print('[Test] Initializing node ${i + 1}/${scenario.nodes.length}: ${node.alias}');
+          print(
+              '[Test] Initializing node ${i + 1}/${scenario.nodes.length}: ${node.alias}');
           try {
             await node.initSDK();
-            print('[Test] ✅ Node ${node.alias} SDK initialized');
-            
-            // Call login with timeout to prevent hanging
-            // With local bootstrap, login should complete quickly (1-5 seconds)
+            print('[Test] OK Node ${node.alias} SDK initialized');
+
             print('[Test] Calling login for node ${node.alias}...');
             try {
               await node.login(timeout: const Duration(seconds: 5));
-              print('[Test] ✅ Node ${node.alias} login completed (loggedIn=${node.loggedIn})');
+              print(
+                  '[Test] OK Node ${node.alias} login completed (loggedIn=${node.loggedIn})');
             } catch (e) {
-              print('[Test] ⚠️  Node ${node.alias} login timeout or error: $e');
-              // Continue anyway if login was called (loggedIn may be true)
+              print(
+                  '[Test] Node ${node.alias} login timeout or error: $e');
               if (!node.loggedIn) {
                 rethrow;
               }
             }
           } catch (e) {
-            print('[Test] ❌ Failed to initialize node ${node.alias}: $e');
+            print('[Test] Failed to initialize node ${node.alias}: $e');
             rethrow;
           }
         }
+        // Refresh per-instance test_mode for visibility (idempotent).
+        if (shouldRunVirtual) await VirtualClock.enableForScenario(scenario);
 
         // Wait for all nodes to be logged in
         print('[Test] Waiting for all nodes to be logged in...');
-        print('[Test] Current login status: ${scenario.nodes.map((n) => '${n.alias}=${n.loggedIn}').join(', ')}');
         try {
           await waitUntil(
-            () {
-              final allLoggedIn = scenario.nodes.every((node) => node.loggedIn);
-              if (!allLoggedIn) {
-                final status = scenario.nodes.map((n) => '${n.alias}=${n.loggedIn}').join(', ');
-                if (DateTime.now().millisecondsSinceEpoch % 2000 < 100) {
-                  // Print status every ~2 seconds
-                  print('[Test] Still waiting for login: $status');
-                }
-              }
-              return allLoggedIn;
-            },
+            () => scenario.nodes.every((node) => node.loggedIn),
             timeout: const Duration(seconds: 10),
             description: 'all nodes logged in',
           );
-          print('[Test] ✅ All nodes are logged in');
+          print('[Test] All nodes are logged in');
         } catch (e) {
-          print('[Test] ❌ Timeout waiting for all nodes to log in: $e');
-          print('[Test] Final login status: ${scenario.nodes.map((n) => '${n.alias}=${n.loggedIn}').join(', ')}');
+          print('[Test] Timeout waiting for all nodes to log in: $e');
           rethrow;
         }
 
-        // Wait a bit for Tox instances to fully initialize
-        await Future.delayed(const Duration(seconds: 2));
+        // Pump virtual time so Tox instances finish bind/init.
+        await pumpTestTick(scenario, advanceMs: 2000, iterationsPerInstance: 1);
 
         // Configure local bootstrap
         print('[Test] Configuring local bootstrap...');
         try {
-          await configureLocalBootstrap(scenario);
-          print('[Test] ✅ Bootstrap configuration completed');
+          await configureLocalBootstrapVirtual(scenario);
+          print('[Test] Bootstrap configuration completed');
         } catch (e) {
-          print('[Test] ❌ Bootstrap configuration failed: $e');
+          print('[Test] Bootstrap configuration failed: $e');
           rethrow;
         }
 
@@ -239,11 +242,11 @@ void main() {
         print('[Test] Waiting for nodes to connect...');
         await Future.wait(scenario.nodes.map((node) async {
           try {
-            await node.waitForConnection(timeout: const Duration(seconds: 10));
-            print('[Test] ✅ Node ${node.alias} is connected');
+            await waitForConnectionVirtual(scenario, node,
+                timeout: const Duration(seconds: 10));
+            print('[Test] Node ${node.alias} is connected');
           } catch (e) {
-            print('[Test] ⚠️  Node ${node.alias} connection timeout: $e');
-            // Continue to verify what we can
+            print('[Test] Node ${node.alias} connection timeout: $e');
           }
         }));
 
@@ -251,35 +254,36 @@ void main() {
         final alice = scenario.nodes[0];
         final bob = scenario.nodes[1];
 
-        // Check if nodes have connection status
         if (alice.connectionStatusCalled) {
           expect(alice.lastConnectionStatus, greaterThan(0),
               reason: 'Alice should have a connection status > 0 (TCP or UDP)');
-          print('[Test] ✅ Alice connection status: ${alice.lastConnectionStatus}');
+          print('[Test] Alice connection status: ${alice.lastConnectionStatus}');
         } else {
-          print('[Test] ⚠️  Alice connection status not called yet');
+          print('[Test] Alice connection status not called yet');
         }
 
         if (bob.connectionStatusCalled) {
           expect(bob.lastConnectionStatus, greaterThan(0),
               reason: 'Bob should have a connection status > 0 (TCP or UDP)');
-          print('[Test] ✅ Bob connection status: ${bob.lastConnectionStatus}');
+          print('[Test] Bob connection status: ${bob.lastConnectionStatus}');
         } else {
-          print('[Test] ⚠️  Bob connection status not called yet');
+          print('[Test] Bob connection status not called yet');
         }
 
         // Try to establish friendship and verify they can communicate
         print('[Test] Attempting to establish friendship...');
         try {
-          await establishFriendship(alice, bob, timeout: const Duration(seconds: 30));
-          print('[Test] ✅ Friendship established');
+          await establishFriendshipVirtual(scenario, alice, bob,
+              timeout: const Duration(seconds: 30));
+          print('[Test] Friendship established');
 
           // Try sending a message to verify connectivity (run in Alice's instance context)
           print('[Test] Testing message delivery...');
-          final bobToxId = bob.getToxId(); // Use actual Tox ID
+          final bobToxId = bob.getToxId();
           final testMessage = 'Hello from Alice!';
           await alice.runWithInstanceAsync(() async {
-            final messageResult = TIMMessageManager.instance.createTextMessage(text: testMessage);
+            final messageResult = TIMMessageManager.instance
+                .createTextMessage(text: testMessage);
             final sendResult = await TIMMessageManager.instance.sendMessage(
               message: messageResult.messageInfo,
               receiver: bobToxId,
@@ -287,34 +291,40 @@ void main() {
               onlineUserOnly: false,
             );
             if (sendResult.code != 0) {
-              print('[Test] ⚠️  Message send failed: ${sendResult.desc}');
+              print('[Test] Message send failed: ${sendResult.desc}');
             } else {
-              print('[Test] ✅ Message sent successfully');
+              print('[Test] Message sent successfully');
             }
           });
 
-          // Wait for message to be received
-          await Future.delayed(const Duration(seconds: 5));
+          // Wait for message delivery via virtual-clock pump.
+          await waitUntilWithVirtualPump(
+            scenario,
+            () => bob.receivedMessages
+                .any((msg) => msg.textElem?.text == testMessage),
+            timeout: const Duration(seconds: 10),
+            description: 'Bob receives test message',
+            advanceMs: 50,
+            iterationsPerInstance: 1,
+          ).catchError((_) {
+            // Best-effort: original test also tolerates no-receive here.
+          });
 
-          // Check if Bob received the message
           final bobReceivedMessages = bob.receivedMessages
               .where((msg) => msg.textElem?.text == testMessage)
               .toList();
 
           if (bobReceivedMessages.isNotEmpty) {
-            print('[Test] ✅ Message successfully delivered via local bootstrap');
+            print('[Test] Message successfully delivered via local bootstrap');
           } else {
-            print('[Test] ⚠️  Message not received yet (may need more time for Tox network)');
+            print('[Test] Message not received yet (may need more time)');
           }
         } catch (e) {
-          print('[Test] ⚠️  Could not establish friendship or send message: $e');
+          print('[Test] Could not establish friendship or send message: $e');
           print('[Test] This may be due to Tox network connection delays');
-          // Don't fail the test if friendship establishment fails
-          // The test should still verify that bootstrap configuration worked
         }
 
-        print('[Test] ✅ Local bootstrap configuration completed');
-
+        print('[Test] Local bootstrap configuration completed');
       } finally {
         await scenario.dispose();
       }

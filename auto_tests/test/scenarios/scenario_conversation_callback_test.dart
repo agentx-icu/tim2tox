@@ -1,9 +1,17 @@
-/// Conversation callback test — wall-clock variant
+/// Conversation callback test (mode-aware: wall-clock, or virtual under RUN_VIRTUAL=1)
 ///
-/// Mirror of `scenario_conversation_callback_virtual_test.dart` for wall-clock
-/// mode. Split out of `scenario_conversation_test.dart` for the same reason
-/// as the virtual variant — the conversation-changed fan-out's stream
-/// re-entry guard composes badly when 4 sub-tests share one scenario.
+/// Isolated scenario for the `onConversationChanged` callback after a
+/// binary-path `TIMMessageManager.sendMessage`. Split out of
+/// `scenario_conversation_test.dart` because the conversation-changed
+/// fan-out (Tim2ToxSdkPlatform + binary singleton list + per-instance dispatch)
+/// composes badly with the shared-scenario harness's stream re-entry guard
+/// when multiple sub-tests in one file each issue sends and accumulate state
+/// — the test isolate dies with `Bad state: Cannot add event while adding stream`
+/// on the 4th sub-test even though the callback itself fires correctly.
+///
+/// Each sub-test in this file owns its own scenario (`setUpAll` per `group`),
+/// so the dispatch state never crosses test boundaries and the Flutter test
+/// runner's `_GuaranteeSink` never sees re-entrant adds.
 
 import 'dart:async';
 import 'package:test/test.dart';
@@ -23,11 +31,13 @@ void main() {
 
     setUpAll(() async {
       await setupTestEnvironment();
+      if (shouldRunVirtual) await VirtualClock.enableEarly();
       scenario = await createTestScenario(['alice', 'bob']);
       alice = scenario.getNode('alice')!;
       bob = scenario.getNode('bob')!;
 
       await scenario.initAllNodes();
+      if (shouldRunVirtual) await VirtualClock.enableForScenario(scenario);
 
       await Future.wait([
         alice.login(),
@@ -40,11 +50,13 @@ void main() {
         description: 'both nodes logged in',
       );
 
-      await configureLocalBootstrap(scenario);
-      await establishFriendship(alice, bob);
+      await configureLocalBootstrapVirtual(scenario);
+      await establishFriendshipVirtual(scenario, alice, bob);
+      await pumpFriendConnectionVirtual(scenario, alice, bob);
     });
 
     tearDownAll(() async {
+      await pumpTestTick(scenario, advanceMs: 1000, iterationsPerInstance: 1);
       await scenario.dispose();
       await teardownTestEnvironment();
     });
@@ -52,9 +64,11 @@ void main() {
     test('Conversation callback - onConversationChanged', () async {
       alice.clearCallbackReceived('onConversationChanged');
       final bobToxId = bob.getToxId();
-      await alice.waitForConnection(timeout: const Duration(seconds: 15));
-      await alice.waitForFriendConnection(bobToxId,
-          timeout: const Duration(seconds: 45));
+      await pumpTestTick(scenario, advanceMs: 50, iterationsPerInstance: 80);
+      await waitForConnectionVirtual(scenario, alice,
+          timeout: const Duration(seconds: 15));
+      await waitForFriendConnectionVirtual(scenario, alice, bobToxId,
+          timeout: const Duration(seconds: 90));
 
       final listener = V2TimConversationListener(
         onConversationChanged: (List<V2TimConversation> conversationList) {
@@ -85,12 +99,16 @@ void main() {
           });
           expect(sendResult.code, equals(0));
 
+          await pumpTestTick(scenario,
+              advanceMs: 50, iterationsPerInstance: 100);
           try {
-            await waitUntil(
+            await waitUntilWithVirtualPump(
+              scenario,
               () => alice.callbackReceived['onConversationChanged'] == true,
-              timeout: const Duration(seconds: 30),
-              description:
-                  'onConversationChanged callback (attempt ${attempt + 1})',
+              timeout: const Duration(seconds: 60),
+              description: 'onConversationChanged callback (attempt ${attempt + 1})',
+              advanceMs: 50,
+              iterationsPerInstance: 1,
             );
             callbackArrived = true;
           } catch (_) {

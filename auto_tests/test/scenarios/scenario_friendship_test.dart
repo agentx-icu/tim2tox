@@ -1,8 +1,9 @@
-/// Friendship Test
+/// Friendship Test — virtual-clock variant
 import 'dart:async';
-/// 
-/// Tests friend management: add, delete, query, and friend request handling
-/// Reference: c-toxcore/auto_tests/scenarios/scenario_friend_request_test.c
+///
+/// Mirrors scenario_friendship_test.dart 1:1 but enables
+/// VirtualClock.enableEarly() before initAllNodes() and uses
+/// configureLocalBootstrapVirtual.
 
 import 'package:test/test.dart';
 import 'package:tencent_cloud_chat_sdk/native_im/adapter/tim_friendship_manager.dart';
@@ -16,22 +17,29 @@ void main() {
     late TestNode bob;
 
     setUpAll(() async {
-      // Uses the SharedScenarioPool: when another test file in the same
-      // `flutter test` invocation already prepared an [alice, bob] scenario
-      // with the same options (bootstrap only, no friendship), we reuse it
-      // and skip the 10-22 s cold start. Standalone invocations still pay
-      // the cold start once.
-      scenario = await acquireSharedScenario(['alice', 'bob'],
-          withBootstrap: true, withFriendship: false);
+      await setupTestEnvironment();
+      // ENABLE TEST MODE *BEFORE* scenario creation.
+      if (shouldRunVirtual) await VirtualClock.enableEarly();
+      scenario = await createTestScenario(['alice', 'bob']);
       alice = scenario.getNode('alice')!;
       bob = scenario.getNode('bob')!;
+
+      await scenario.initAllNodes();
+      if (shouldRunVirtual) await VirtualClock.enableForScenario(scenario);
+      // event_thread suppressed by enableEarly → DHT can't connect during
+      // login(), so its 10s DHT-wait would burn full timeout. 500ms is enough
+      // to set loggedIn=true and return; bootstrap happens explicitly below.
+      await Future.wait([
+        alice.login(timeout: const Duration(milliseconds: 500)),
+        bob.login(timeout: const Duration(milliseconds: 500)),
+      ]);
+      await waitUntil(() => alice.loggedIn && bob.loggedIn);
+      await configureLocalBootstrapVirtual(scenario);
     });
 
     tearDownAll(() async {
-      // No-op release: the pool keeps the scenario alive for the next
-      // test file in the bundle. Final teardown happens at process exit.
-      releaseSharedScenario(['alice', 'bob'],
-          withBootstrap: true, withFriendship: false);
+      await scenario.dispose();
+      await teardownTestEnvironment();
     });
 
     setUp(() async {});

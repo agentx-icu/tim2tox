@@ -43,6 +43,14 @@ class BinaryReplacementHistoryHook {
   /// installed per session — repeated calls are idempotent.
   static V2TimAdvancedMsgListener? _standaloneListener;
 
+  /// CR-04: messages received via the standalone listener before the real
+  /// selfId is known are buffered here (rather than persisted with an
+  /// incorrect isSelf=false, which would also defeat the
+  /// (text,fromUserId,isSelf,timestamp) dedup fallback and duplicate the
+  /// FFI-path copy). Drained by [updateSelfId] once selfId resolves.
+  static final List<V2TimMessage> _pendingSelfIdBuffer = <V2TimMessage>[];
+  static const int _maxPendingSelfIdBuffer = 1000;
+
   /// Initialize the hook with persistence service and self ID
   static void initialize(MessageHistoryPersistence persistence, String selfId,
       {LoggerService? logger}) {
@@ -63,6 +71,15 @@ class BinaryReplacementHistoryHook {
   /// generation here because no session boundary was crossed.
   static void updateSelfId(String selfId) {
     _selfId = selfId;
+    if (selfId.isNotEmpty && _pendingSelfIdBuffer.isNotEmpty) {
+      final buffered = List<V2TimMessage>.from(_pendingSelfIdBuffer);
+      _pendingSelfIdBuffer.clear();
+      for (final msg in buffered) {
+        // Replay now that isSelf can be resolved correctly.
+        // ignore: discarded_futures
+        saveMessage(msg);
+      }
+    }
   }
 
   /// Install a standalone V2TimAdvancedMsgListener that persists messages
@@ -91,6 +108,32 @@ class BinaryReplacementHistoryHook {
     _standaloneListener = listener;
   }
 
+  /// Uninstall the standalone listener and reset all session-scoped static
+  /// state. Bumps [_generation] so any in-flight [saveMessage] captured under
+  /// the previous session aborts before writing into the next account's
+  /// persistence — closing the post-logout / pre-next-login late-message
+  /// window. Idempotent: safe to call when nothing is installed.
+  static Future<void> uninstallStandalone() async {
+    final listener = _standaloneListener;
+    if (listener != null) {
+      try {
+        TIMMessageManager.instance
+            .removeAdvancedMsgListener(listener: listener);
+      } catch (_) {
+        // Best-effort: the SDK message manager may already be torn down.
+      }
+      _standaloneListener = null;
+    }
+    _persistence = null;
+    _selfId = null;
+    _logger = null;
+    _pendingSelfIdBuffer.clear();
+    _warnedEmptySelfIdThisGeneration = false;
+    // Bump generation last so a concurrent saveMessage that already captured
+    // the old generation fails its fence check.
+    _generation++;
+  }
+
   /// Visible-for-tests: the current generation counter. Used by the X8
   /// regression test to assert re-init bumps the counter.
   static int get generation => _generation;
@@ -114,37 +157,43 @@ class BinaryReplacementHistoryHook {
   /// However, since we can't easily distinguish between messages from FfiChatService
   /// and messages from UIKit listeners, we check for duplicates before saving.
   static Future<void> saveMessage(V2TimMessage v2Msg) async {
-    // Snapshot the session-scoped fields at entry. If `initialize` runs again
-    // before we return (e.g. logout-then-login during await points below),
-    // [_generation] will diverge from [capturedGeneration] and we abort
-    // rather than write under the new account's persistence/selfId.
+    // Snapshot session-scoped fields at entry (see [_generation] doc).
     final capturedGeneration = _generation;
     final capturedPersistence = _persistence;
     final capturedSelfId = _selfId;
     if (capturedPersistence == null || capturedSelfId == null) return;
 
-    // M6 deferred-selfId window: the standalone listener may have been
-    // installed before the connection event delivered a real selfId. In that
-    // case `isSelf` from MessageConverter cannot be trusted (will be false for
-    // self-sent echoes). We still persist the message — better than dropping
-    // it — but surface the window once per generation so it is observable.
-    if (capturedSelfId.isEmpty && !_warnedEmptySelfIdThisGeneration) {
-      _warnedEmptySelfIdThisGeneration = true;
-      _logFallback(
-          'BinaryReplacementHistoryHook: selfId empty during saveMessage — '
-          'isSelf may be inaccurate until updateSelfId() runs');
+    // Skip m-prefix temp IDs from native FFI callbacks — the same message
+    // arrives through the Dart stream path with a real ID; persisting both
+    // duplicates history.
+    final msgID = v2Msg.msgID ?? v2Msg.id ?? '';
+    if (msgID.startsWith('m') && RegExp(r'^m\d+-\d+$').hasMatch(msgID)) {
+      return;
+    }
+
+    // CR-04: selfId not yet resolved. Buffer instead of persisting with an
+    // unreliable isSelf — replayed by [updateSelfId] once the connection
+    // event delivers the real selfId.
+    if (capturedSelfId.isEmpty) {
+      if (!_warnedEmptySelfIdThisGeneration) {
+        _warnedEmptySelfIdThisGeneration = true;
+        _logFallback(
+            'BinaryReplacementHistoryHook: selfId empty during saveMessage — '
+            'buffering message until updateSelfId() runs');
+      }
+      if (_pendingSelfIdBuffer.length >= _maxPendingSelfIdBuffer) {
+        // Safety valve so a selfId that never resolves can't grow this
+        // unbounded; drop the oldest buffered message.
+        _logFallback(
+            'BinaryReplacementHistoryHook: pending selfId buffer full '
+            '($_maxPendingSelfIdBuffer) — dropping oldest buffered message');
+        _pendingSelfIdBuffer.removeAt(0);
+      }
+      _pendingSelfIdBuffer.add(v2Msg);
+      return;
     }
 
     try {
-      // CRITICAL: Skip messages with m-prefix IDs from native FFI callbacks.
-      // These are duplicate messages created by HandleFriendMessage in C++ with temporary IDs.
-      // The same message will arrive through the Dart stream path with a real ID.
-      // Saving m-prefix messages causes duplicates in persistence/history.
-      final msgID = v2Msg.msgID ?? v2Msg.id ?? '';
-      if (msgID.startsWith('m') && RegExp(r'^m\d+-\d+$').hasMatch(msgID)) {
-        return;
-      }
-
       // Convert V2TimMessage to ChatMessage using the captured selfId so the
       // `isSelf` bit reflects the session that received the callback, not
       // whatever account is logged in by the time we reach this point.

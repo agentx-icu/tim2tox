@@ -301,20 +301,31 @@ public:
     // instance_id: only return events for this instance (or broadcast events with id 0).
     int poll_text(int64_t instance_id, char* buf, int len) {
         std::lock_guard<std::mutex> lock(m_);
-        if (text_q_.empty()) {
-            return 0;
-        }
         const size_t qsize = text_q_.size();
         for (size_t i = 0; i < qsize; ++i) {
-            auto p = std::move(text_q_.front());
-            text_q_.pop();
-            if (p.first == 0 || p.first == instance_id) {
-                const std::string& s = p.second;
-                int n = (int)std::min(s.size(), (size_t)(len - 1));
+            // Peek the front before consuming it, so a too-small buffer leaves
+            // the event queued for a retry instead of truncating it.
+            auto& front = text_q_.front();
+            if (front.first == 0 || front.first == instance_id) {
+                const std::string& s = front.second;
+                const size_t cap = (len > 0) ? static_cast<size_t>(len) : 0;
+                // Need room for the bytes plus the NUL terminator. If it does
+                // not fit, return the required size as a NEGATIVE value and
+                // leave the event queued — the caller grows its buffer and
+                // retries. (Previously the event was copied truncated and
+                // popped, silently losing the tail of a long file path.)
+                if (s.size() + 1 > cap) {
+                    return -static_cast<int>(s.size() + 1);
+                }
+                const int n = static_cast<int>(s.size());
                 if (n > 0) memcpy(buf, s.data(), n);
                 buf[n] = 0;
+                text_q_.pop();
                 return n;
             }
+            // Not for this instance: rotate to the back and keep scanning.
+            auto p = std::move(front);
+            text_q_.pop();
             text_q_.push(std::move(p));
         }
         return 0;
@@ -489,10 +500,22 @@ static void RegisterToxManagerFileCallbacks(V2TIMManagerImpl* manager_impl) {
             std::lock_guard<std::mutex> lk(G.send_mtx);
             G.recv_files[instance_id][key] = {nullptr, file_size, 0, full, sender_hex, kind};
         }
-        char line[2048];
-        snprintf(line, sizeof(line), "file_request:%lld:%s:%u:%llu:%u:%s", (long long)instance_id, sender_hex.c_str(), file_number,
-                 (unsigned long long)file_size, kind, name.c_str());
-        G.simple_listener.enqueue_text_line(line);
+        // PROTOCOL LIMITATION (tracked for the framing redesign): this event is a ':'-delimited
+        // string parsed by Dart via split(':'). A filename/path containing ':' will mis-parse on
+        // the Dart side. A correct fix needs delimiter escaping or a length-prefixed/JSON reframe,
+        // which is a breaking ABI change and out of scope here. Do not "fix" by changing delimiters.
+        // Build the event with std::string (no fixed buffer) so a long filename/path is never
+        // silently truncated by the encoder. Field order/delimiters unchanged:
+        //   file_request:<instance_id>:<sender_hex>:<file_number>:<file_size>:<kind>:<name>
+        {
+            char hdr[128];
+            snprintf(hdr, sizeof(hdr), "file_request:%lld:%s:%u:%llu:%u:", (long long)instance_id,
+                     sender_hex.c_str(), file_number, (unsigned long long)file_size, kind);
+            std::string line;
+            line.reserve(strlen(hdr) + name.size());
+            line.append(hdr).append(name);
+            G.simple_listener.enqueue_text_line(line);
+        }
         // File messages are handled solely by FfiChatService via file_request polling.
         // Do NOT call NotifyAdvancedListenersReceivedMessage here - it causes duplicate
         // messages in chat UI (C++ msgID differs from FfiChatService msgID, so dedup fails).
@@ -545,15 +568,33 @@ static void RegisterToxManagerFileCallbacks(V2TIMManagerImpl* manager_impl) {
             }
             /* Send final progress_recv (100%) so Dart progress listener gets transferComplete */
             if (final_size > 0) {
-                char line[1024];
-                snprintf(line, sizeof(line), "progress_recv:%lld:%s:%llu:%llu:%s", (long long)instance_id, sender_hex.c_str(),
-                         (unsigned long long)final_size, (unsigned long long)final_size, full.c_str());
+                // PROTOCOL LIMITATION (tracked for the framing redesign): ':'-delimited; a path
+                // containing ':' mis-parses on the Dart split(':') side (Dart mitigates by re-joining
+                // the trailing path with ':', but a ':' inside an earlier field would still break).
+                // Escaping/reframing is a breaking ABI change and out of scope. Build with std::string
+                // so the path is never silently truncated by the encoder. Field order/delimiters
+                // unchanged: progress_recv:<instance_id>:<uid>:<received>:<total>:<path>
+                char hdr[160];
+                snprintf(hdr, sizeof(hdr), "progress_recv:%lld:%s:%llu:%llu:", (long long)instance_id,
+                         sender_hex.c_str(), (unsigned long long)final_size, (unsigned long long)final_size);
+                std::string line;
+                line.reserve(strlen(hdr) + full.size());
+                line.append(hdr).append(full);
                 G.simple_listener.enqueue_text_line(line);
             }
             struct stat st{};
             if (stat(full.c_str(), &st) == 0 && st.st_size > 0) {
-                char line[2048];
-                snprintf(line, sizeof(line), "file_done:%lld:%s:%u:%s", (long long)instance_id, sender_hex.c_str(), file_kind, full.c_str());
+                // PROTOCOL LIMITATION (tracked for the framing redesign): ':'-delimited; a path
+                // containing ':' will mis-parse on the Dart split(':') side. Escaping/reframing is
+                // a breaking ABI change and out of scope. Build with std::string so the path is
+                // never silently truncated by the encoder. Field order/delimiters unchanged:
+                //   file_done:<instance_id>:<sender_hex>:<kind>:<path>
+                char hdr[128];
+                snprintf(hdr, sizeof(hdr), "file_done:%lld:%s:%u:", (long long)instance_id,
+                         sender_hex.c_str(), file_kind);
+                std::string line;
+                line.reserve(strlen(hdr) + full.size());
+                line.append(hdr).append(full);
                 V2TIM_LOG(kInfo, "[ffi] Sending file_done event: {}", line);
                 G.simple_listener.enqueue_text_line(line);
             } else {
@@ -578,11 +619,18 @@ static void RegisterToxManagerFileCallbacks(V2TIMManagerImpl* manager_impl) {
                 auto it = instance_it->second.find(key);
                 if (it != instance_it->second.end()) {
                     it->second.received = position + length;
-                    char line[1024];
-                    snprintf(line, sizeof(line), "progress_recv:%lld:%s:%llu:%llu:%s", (long long)instance_id, sender_hex.c_str(),
-                             (unsigned long long)it->second.received,
-                             (unsigned long long)it->second.size,
-                             it->second.path.c_str());
+                    // PROTOCOL LIMITATION (tracked for the framing redesign): ':'-delimited; a path
+                    // containing ':' mis-parses on the Dart split(':') side. Escaping/reframing is a
+                    // breaking ABI change and out of scope. Build with std::string so the path is
+                    // never silently truncated by the encoder. Field order/delimiters unchanged:
+                    //   progress_recv:<instance_id>:<uid>:<received>:<total>:<path>
+                    char hdr[160];
+                    snprintf(hdr, sizeof(hdr), "progress_recv:%lld:%s:%llu:%llu:", (long long)instance_id,
+                             sender_hex.c_str(), (unsigned long long)it->second.received,
+                             (unsigned long long)it->second.size);
+                    std::string line;
+                    line.reserve(strlen(hdr) + it->second.path.size());
+                    line.append(hdr).append(it->second.path);
                     G.simple_listener.enqueue_text_line(line);
                 }
             }

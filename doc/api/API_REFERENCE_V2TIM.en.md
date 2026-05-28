@@ -43,6 +43,15 @@ virtual void        Logout(V2TIMCallback* callback) = 0;
 virtual V2TIMString GetLoginUser() = 0;
 ```
 
+#### Authentication & login semantics (read this)
+
+Tim2Tox runs over the Tox P2P network and has no authentication server like Tencent Cloud IM. Login semantics therefore differ fundamentally from V2TIM:
+
+- **`Login(userID, userSig)` does NOT verify `userSig`.** `userSig` is accepted only for V2TIM call-signature compatibility and is ignored. Login actually means **open/bind the LOCAL Tox identity/profile**, NOT server-side authentication. Integrators must **NOT** treat a successful `Login` as "the user is authenticated."
+- **`GetLoginStatus()` reflects local login state, not network connectivity.** It returns `LOGINED` as soon as a local alias is set — that only means the local profile is open; it does **NOT** mean the client is connected to the Tox DHT / online. For actual connectivity, observe the connection-status listener/callback; do not rely on `GetLoginStatus()`.
+
+For the per-API status see the "Authentication / Login" section of [API_SUPPORT_MATRIX.en.md](API_SUPPORT_MATRIX.en.md).
+
 #### Sub-manager accessors
 
 ```cpp
@@ -100,6 +109,8 @@ virtual V2TIMMessage CreateMergerMessage(const V2TIMMessageVector& messageList,
                                          const V2TIMStringVector& abstractList,
                                          const V2TIMStringVector& compatibleText) = 0;
 ```
+
+> **Media message caveat (read this)**: `CreateImageMessage` / `CreateSoundMessage` / `CreateVideoMessage` are **NOT implemented** — calling them sets the message status to `SEND_FAIL` (nothing is sent). `CreateFileMessage`, and the LOCATION / FACE and other media/location/face types, are **degraded to a plain text description on send** (e.g. `[转发文件]` "forwarded file"); the recipient receives text, **not** a structured message. For real file transfer use the `FfiChatService` file APIs (`tim2tox_ffi_send_file` / `tim2tox_ffi_file_control`). For the per-API real status see [API_SUPPORT_MATRIX.en.md](API_SUPPORT_MATRIX.en.md).
 
 #### Send message
 
@@ -382,6 +393,7 @@ Offline-push manager (`include/V2TIMOfflinePushManager.h`). tim2tox provides onl
 
 ## Related documents
 
+- [API_SUPPORT_MATRIX.en.md](API_SUPPORT_MATRIX.en.md) — **per-API real support-status matrix** (native / dart-only / local-only / text-degraded / no-op-success / unsupported)
 - [API_REFERENCE.en.md](API_REFERENCE.en.md) — index, data types, error codes, examples
 - [API_REFERENCE_FFI.en.md](API_REFERENCE_FFI.en.md) — C FFI interface
 - [API_REFERENCE_DART.en.md](API_REFERENCE_DART.en.md) — Dart package API

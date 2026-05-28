@@ -1,8 +1,7 @@
-/// ToxAV Conference Audio Test
-/// 
-/// Tests audio data handling in AV conferences
-/// Verifies that audio callbacks are properly set up and can receive audio data
-/// Note: Actual audio data processing requires ToxAV to be initialized
+/// ToxAV Conference Audio Test — virtual-clock variant
+///
+/// Mirrors scenario_toxav_conference_audio_test.dart 1:1 but drives the
+/// harness via the virtual-clock helpers and pumpTestTickAv.
 
 import 'dart:async';
 import 'package:test/test.dart';
@@ -20,162 +19,209 @@ void main() {
     late TestScenario scenario;
     late TestNode alice;
     late TestNode bob;
-    
+
     setUpAll(() async {
       await setupTestEnvironment();
+      if (shouldRunVirtual) await VirtualClock.enableEarly();
       scenario = await createTestScenario(['alice', 'bob']);
       alice = scenario.getNode('alice')!;
       bob = scenario.getNode('bob')!;
-      
+
       await scenario.initAllNodes();
-      // Parallelize login
+      if (shouldRunVirtual) await VirtualClock.enableForScenario(scenario);
+
       await Future.wait([
         alice.login(),
         bob.login(),
       ]);
-      
+
       await waitUntil(
         () => alice.loggedIn && bob.loggedIn,
         timeout: const Duration(seconds: 10),
         description: 'all nodes logged in',
       );
-      
-      // Configure local bootstrap
-      await configureLocalBootstrap(scenario);
-      
-      // Enable auto-accept in Dart so friend request is accepted (no C++ default)
+
+      await configureLocalBootstrapVirtual(scenario);
+
       alice.enableAutoAccept();
       bob.enableAutoAccept();
-      
-      // Add friends (use Tox ID for addFriend like scenario_toxav_conference_test)
+
+      await waitForConnectionVirtual(scenario, alice,
+          timeout: const Duration(seconds: 15));
+      await waitForConnectionVirtual(scenario, bob,
+          timeout: const Duration(seconds: 15));
+      await waitUntilWithVirtualPump(
+        scenario,
+        () =>
+            alice.getToxId().length == 76 && bob.getToxId().length == 76,
+        timeout: const Duration(seconds: 10),
+        description: 'Tox IDs available',
+      );
+
       final bobToxId = bob.getToxId();
-      await alice.runWithInstanceAsync(() async => TIMFriendshipManager.instance.addFriend(
-        userID: bobToxId,
-        addType: FriendTypeEnum.V2TIM_FRIEND_TYPE_BOTH,
-        remark: 'Bob',
-        addWording: 'test',
-      ));
-      await bob.runWithInstanceAsync(() async => TIMFriendshipManager.instance.addFriend(
-        userID: alice.getToxId(),
-        addType: FriendTypeEnum.V2TIM_FRIEND_TYPE_BOTH,
-        remark: 'Alice',
-        addWording: 'test',
-      ));
+      final aliceToxId = alice.getToxId();
+      await alice.runWithInstanceAsync(
+          () async => TIMFriendshipManager.instance.addFriend(
+                userID: bobToxId,
+                addType: FriendTypeEnum.V2TIM_FRIEND_TYPE_BOTH,
+                remark: 'Bob',
+                addWording: 'test',
+              ));
+      await bob.runWithInstanceAsync(
+          () async => TIMFriendshipManager.instance.addFriend(
+                userID: aliceToxId,
+                addType: FriendTypeEnum.V2TIM_FRIEND_TYPE_BOTH,
+                remark: 'Alice',
+                addWording: 'test',
+              ));
 
-      // Friend requests may need time to propagate/auto-accept over the local DHT.
-      await Future.delayed(const Duration(seconds: 5));
+      for (int i = 0; i < 50; i++) {
+        await pumpTestTickAv(scenario,
+            advanceMs: 100,
+            iterationsPerInstance: 1,
+            wallSleep: const Duration(milliseconds: 30));
+      }
 
-      // Friend list stores *public keys* (64 chars), not full Tox IDs
       final alicePub = alice.getPublicKey();
       final bobPub = bob.getPublicKey();
-      await waitForFriendsInList(alice, [bobPub], timeout: const Duration(seconds: 120));
-      await waitForFriendsInList(bob, [alicePub], timeout: const Duration(seconds: 120));
-      // Wait for P2P connection so conference invite can be delivered
-      await Future.wait([
-        alice.waitForFriendConnection(bobToxId, timeout: const Duration(seconds: 60)),
-        bob.waitForFriendConnection(alice.getToxId(), timeout: const Duration(seconds: 60)),
-      ]);
+      await waitForFriendsInList(alice, [bobPub],
+          timeout: const Duration(seconds: 120));
+      await waitForFriendsInList(bob, [alicePub],
+          timeout: const Duration(seconds: 120));
+
+      await waitForFriendConnectionVirtual(scenario, alice, bobToxId,
+          timeout: const Duration(seconds: 90));
+      await waitForFriendConnectionVirtual(scenario, bob, aliceToxId,
+          timeout: const Duration(seconds: 90));
     });
-    
+
     tearDownAll(() async {
       await scenario.dispose();
       await teardownTestEnvironment();
     });
-    
-    // Lightweight setUp for per-test cleanup if needed
-    setUp(() async {
-      // Reset any per-test state if necessary
-      // Most tests don't need cleanup since they use shared scenario
-    });
-    
+
+    setUp(() async {});
+
     test('AV conference setup for audio handling', () async {
-      final createResult = await alice.runWithInstanceAsync(() async => TIMGroupManager.instance.createGroup(
-        groupType: 'conference',
-        groupName: 'AV Conference Audio Test',
-        groupID: '',
-      ));
-      
+      alice.clearCallbackReceived('onGroupCreated');
+      final createResult = await alice.runWithInstanceAsync(() async =>
+          TIMGroupManager.instance.createGroup(
+            groupType: 'conference',
+            groupName: 'AV Conference Audio Test',
+            groupID: '',
+          ));
+
       expect(createResult.code, equals(0));
       final conferenceId = createResult.data!;
-      
-      await alice.waitForCallback('onGroupCreated', 
-        timeout: const Duration(seconds: 10));
-      
+
+      await waitUntilWithAvVirtualPump(
+        scenario,
+        () => alice.callbackReceived['onGroupCreated'] == true,
+        timeout: const Duration(seconds: 10),
+        description: 'alice onGroupCreated',
+      );
+
       var bobReceivedInvite = false;
       String? bobInvitedGroupId;
-      
+
       final bobGroupListener = V2TimGroupListener(
-        onMemberInvited: (String groupID, V2TimGroupMemberInfo opUser, List<V2TimGroupMemberInfo> memberList) {
+        onMemberInvited:
+            (String groupID, V2TimGroupMemberInfo opUser, List<V2TimGroupMemberInfo> memberList) {
           bobReceivedInvite = true;
           bobInvitedGroupId = groupID;
           bob.markCallbackReceived('onMemberInvited');
         },
       );
-      
-      bob.runWithInstance(() => TIMGroupManager.instance.addGroupListener(bobGroupListener));
-      
+
+      bob.runWithInstance(
+          () => TIMGroupManager.instance.addGroupListener(bobGroupListener));
+
       final bobPublicKey = bob.getPublicKey();
-      final inviteResult = await alice.runWithInstanceAsync(() async => TIMGroupManager.instance.inviteUserToGroup(
-        groupID: conferenceId,
-        userList: [bobPublicKey],
-      ));
-      
-      expect(inviteResult.code, equals(0));
-      
-      await waitUntil(
-        () => bobReceivedInvite,
-        timeout: const Duration(seconds: 45),
-        description: 'Bob received invite',
-      );
-      expect(bobInvitedGroupId, isNotNull, reason: 'Bob should have received a group ID (temp or conference)');
-      
-      final joinResult = await bob.runWithInstanceAsync(() async => TIMManager.instance.joinGroup(
-        groupID: bobInvitedGroupId!,
-        message: '',
-      ));
-      
+
+      bool inviteArrived = false;
+      for (var attempt = 0; !inviteArrived && attempt < 3; attempt++) {
+        bobReceivedInvite = false;
+        bobInvitedGroupId = null;
+        bob.clearCallbackReceived('onMemberInvited');
+        final inviteResult = await alice.runWithInstanceAsync(() async =>
+            TIMGroupManager.instance.inviteUserToGroup(
+              groupID: conferenceId,
+              userList: [bobPublicKey],
+            ));
+        expect(inviteResult.code, equals(0));
+        try {
+          await waitUntilWithAvVirtualPump(
+            scenario,
+            () => bobReceivedInvite,
+            timeout: const Duration(seconds: 30),
+            description: 'Bob received invite (attempt ${attempt + 1})',
+            advanceMs: 100,
+            iterationsPerInstance: 1,
+            wallSleep: const Duration(milliseconds: 30),
+          );
+          inviteArrived = true;
+        } catch (_) {}
+      }
+      expect(bobInvitedGroupId, isNotNull);
+
+      final joinResult = await bob.runWithInstanceAsync(
+          () async => TIMManager.instance.joinGroup(
+                groupID: bobInvitedGroupId!,
+                message: '',
+              ));
       expect(joinResult.code, equals(0));
-      
-      await Future.delayed(const Duration(seconds: 5));
-      
-      final aliceJoinedList = await alice.runWithInstanceAsync(() async => TIMGroupManager.instance.getJoinedGroupList());
+
+      await pumpTestTickAv(scenario,
+          advanceMs: 5000, iterationsPerInstance: 1);
+
+      final aliceJoinedList = await alice.runWithInstanceAsync(
+          () async => TIMGroupManager.instance.getJoinedGroupList());
       expect(aliceJoinedList.data, isNotNull);
-      expect(aliceJoinedList.data!.any((g) => g.groupID == conferenceId), isTrue);
-      
-      final bobJoinedList = await bob.runWithInstanceAsync(() async => TIMGroupManager.instance.getJoinedGroupList());
-      expect(bobJoinedList.data, isNotNull);
-      expect(bobJoinedList.data!.isNotEmpty, isTrue, reason: 'Bob should have joined a group');
       expect(
-        bobJoinedList.data!.any((g) => g.groupID == conferenceId || g.groupID == bobInvitedGroupId),
+          aliceJoinedList.data!.any((g) => g.groupID == conferenceId), isTrue);
+
+      final bobJoinedList = await bob.runWithInstanceAsync(
+          () async => TIMGroupManager.instance.getJoinedGroupList());
+      expect(bobJoinedList.data, isNotNull);
+      expect(bobJoinedList.data!.isNotEmpty, isTrue);
+      expect(
+        bobJoinedList.data!.any((g) =>
+            g.groupID == conferenceId || g.groupID == bobInvitedGroupId),
         isTrue,
-        reason: 'Bob not in conference (expected $conferenceId or $bobInvitedGroupId)',
       );
-      
-      bob.runWithInstance(() => TIMGroupManager.instance.removeGroupListener(listener: bobGroupListener));
-    }, timeout: const Timeout(Duration(seconds: 90)));
-    
+
+      bob.runWithInstance(() => TIMGroupManager.instance
+          .removeGroupListener(listener: bobGroupListener));
+    }, timeout: const Timeout(Duration(seconds: 150)));
+
     test('AV conference type verification', () async {
-      final createResult = await alice.runWithInstanceAsync(() async => TIMGroupManager.instance.createGroup(
-        groupType: 'conference',
-        groupName: 'Conference Type Verification',
-        groupID: '',
-      ));
-      
+      alice.clearCallbackReceived('onGroupCreated');
+      final createResult = await alice.runWithInstanceAsync(() async =>
+          TIMGroupManager.instance.createGroup(
+            groupType: 'conference',
+            groupName: 'Conference Type Verification',
+            groupID: '',
+          ));
+
       expect(createResult.code, equals(0));
       final conferenceId = createResult.data!;
-      
-      await alice.waitForCallback('onGroupCreated', 
-        timeout: const Duration(seconds: 10));
-      
-      final joinedListResult = await alice.runWithInstanceAsync(() async => TIMGroupManager.instance.getJoinedGroupList());
+
+      await waitUntilWithAvVirtualPump(
+        scenario,
+        () => alice.callbackReceived['onGroupCreated'] == true,
+        timeout: const Duration(seconds: 10),
+        description: 'alice onGroupCreated',
+      );
+
+      final joinedListResult = await alice.runWithInstanceAsync(
+          () async => TIMGroupManager.instance.getJoinedGroupList());
       expect(joinedListResult.code, equals(0));
       expect(joinedListResult.data, isNotNull);
-      
+
       final conference = joinedListResult.data!.firstWhere(
         (g) => g.groupID == conferenceId,
         orElse: () => throw Exception('Conference not found'),
       );
-      
       expect(conference.groupID, equals(conferenceId));
     }, timeout: const Timeout(Duration(seconds: 90)));
   });

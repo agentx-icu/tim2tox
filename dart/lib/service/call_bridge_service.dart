@@ -1,6 +1,6 @@
-/// Call Bridge Service
-///
-/// Bridges signaling events to ToxAV connections
+// Call Bridge Service
+//
+// Bridges signaling events to ToxAV connections
 
 import 'dart:async';
 import 'package:tencent_cloud_chat_sdk/enum/V2TimSignalingListener.dart';
@@ -29,6 +29,14 @@ class CallInfo {
   CallState state;
   int? friendNumber; // Tox friend number
 
+  /// True once the ToxAV media leg has actually been started for this call
+  /// (`startCall` for outgoing, `answerCall` for incoming). The `calling`
+  /// state is set by [CallBridgeService.registerOutgoingCall] BEFORE the
+  /// adapter starts the AV leg, so teardown paths must check this flag — not
+  /// the `state` — before calling `endCall`, or they'd end a never-started
+  /// call (native endCall with no call in progress can block or error).
+  bool avLegStarted;
+
   CallInfo({
     required this.inviteID,
     required this.inviter,
@@ -37,6 +45,7 @@ class CallInfo {
     required this.data,
     this.state = CallState.idle,
     this.friendNumber,
+    this.avLegStarted = false,
   });
 }
 
@@ -67,8 +76,7 @@ class CallBridgeService {
   void Function(String inviteID, CallState state, {String? endReason})?
       onCallStateChanged;
 
-  CallBridgeService(this._sdkPlatform, this._avService,
-      {LoggerService? logger})
+  CallBridgeService(this._sdkPlatform, this._avService, {LoggerService? logger})
       : _logger = logger {
     _setupSignalingListener();
   }
@@ -104,53 +112,28 @@ class CallBridgeService {
         // Caller cancelled the invitation before it was answered.
         final callInfo = _activeCalls[inviteID];
         if (callInfo != null) {
-          // Only tear down the ToxAV leg if it was actually wired up — for a
-          // pure ringing/calling state the callee never invoked answerCall,
-          // and `endCall` would either no-op noisily or try to control a
-          // friend number that has no active ToxAV session.
-          final priorState = callInfo.state;
           callInfo.state = CallState.ended;
-          if (callInfo.friendNumber != null &&
-              (priorState == CallState.ringing ||
-                  priorState == CallState.inCall)) {
-            _avService.endCall(callInfo.friendNumber!);
-          }
+          // Only ends the ToxAV leg if it was actually started (avLegStarted).
+          _endAvLegIfStarted(callInfo);
           _activeCalls.remove(inviteID);
           onCallStateChanged?.call(inviteID, CallState.ended,
               endReason: 'cancel');
         }
       },
-      onInviteeAccepted: (inviteID, invitee, data) async {
+      onInviteeAccepted: (inviteID, invitee, data) {
         // Invitee accepted - this callback is for the inviter (caller)
-        // The inviter should already have started the call, so we just update state
+        // The inviter already started the ToxAV leg after the signaling invite
+        // succeeded (see TUICallKitAdapter._handleCall). Do not call
+        // startCall() again here: a second toxav_call for the same friend can
+        // fail with FRIEND_ALREADY_IN_CALL or disturb the active media leg.
         final callInfo = _activeCalls[inviteID];
-        if (callInfo != null) {
-          // If we're the inviter and haven't started the call yet, start it now
-          if (callInfo.state == CallState.calling &&
-              callInfo.friendNumber != null) {
-            try {
-              // Mid-tier opening targets in kbit/s; the integrator (e.g.
-              // toxee's CallCodecProfile) can be wired to push different
-              // targets in response to bitrate-change callbacks once the
-              // call is up. See `tim2tox/source/ToxAVManager.h` for the
-              // peer-suggested bitrate callbacks.
-              const audioBitRate = 48;
-              const videoBitRate = 2000;
-
-              final success = await _avService.startCall(callInfo.friendNumber!,
-                  audioBitRate: audioBitRate, videoBitRate: videoBitRate);
-              if (success) {
-                callInfo.state = CallState.inCall;
-                onCallStateChanged?.call(inviteID, CallState.inCall);
-              }
-            } catch (e, st) {
-              _logger?.logError('[CallBridge] Error starting call', e, st);
-            }
-          } else {
-            // Call already started, just update state
-            callInfo.state = CallState.inCall;
-            onCallStateChanged?.call(inviteID, CallState.inCall);
-          }
+        // Idempotency guard: the signaling transport can redeliver an accept
+        // for a call that is already established. Re-firing `inCall` would
+        // re-run enterCall / _startMediaCapture on a live call, so only
+        // transition (and notify) on the first accept.
+        if (callInfo != null && callInfo.state != CallState.inCall) {
+          callInfo.state = CallState.inCall;
+          onCallStateChanged?.call(inviteID, CallState.inCall);
         }
       },
       onInviteeRejected: (inviteID, invitee, data) {
@@ -158,6 +141,7 @@ class CallBridgeService {
         final callInfo = _activeCalls[inviteID];
         if (callInfo != null) {
           callInfo.state = CallState.ended;
+          _endAvLegIfStarted(callInfo);
           _activeCalls.remove(inviteID);
           onCallStateChanged?.call(inviteID, CallState.ended,
               endReason: 'reject');
@@ -167,13 +151,8 @@ class CallBridgeService {
         // Invitation rang out without an answer.
         final callInfo = _activeCalls[inviteID];
         if (callInfo != null) {
-          final priorState = callInfo.state;
           callInfo.state = CallState.ended;
-          if (callInfo.friendNumber != null &&
-              (priorState == CallState.ringing ||
-                  priorState == CallState.inCall)) {
-            _avService.endCall(callInfo.friendNumber!);
-          }
+          _endAvLegIfStarted(callInfo);
           _activeCalls.remove(inviteID);
           onCallStateChanged?.call(inviteID, CallState.ended,
               endReason: 'timeout');
@@ -183,6 +162,23 @@ class CallBridgeService {
 
     // Register listener with SDK platform
     _sdkPlatform.addSignalingListener(listener: _signalingListener!);
+  }
+
+  void _endAvLegIfStarted(CallInfo callInfo) {
+    final friendNumber = callInfo.friendNumber;
+    // Only tear down the ToxAV leg if it was actually started. `calling` is
+    // recorded by registerOutgoingCall BEFORE the adapter calls startCall(), so
+    // a reject/cancel/timeout in that gap must NOT call endCall() on a
+    // never-started call (native endCall with no call in progress can block or
+    // error — see TUICallKitAdapter._handleCall).
+    if (friendNumber == null || !callInfo.avLegStarted) {
+      return;
+    }
+    unawaited(
+        _avService.endCall(friendNumber).catchError((Object e, StackTrace st) {
+      _logger?.logError('[CallBridge] Error ending ToxAV leg', e, st);
+      return false;
+    }));
   }
 
   /// Register a just-created outgoing signaling call so later cancel/end events
@@ -203,7 +199,17 @@ class CallBridgeService {
       data: data,
       state: CallState.calling,
       friendNumber: friendNumber,
+      // avLegStarted stays false until the adapter calls [markAvLegStarted]
+      // after _avService.startCall() succeeds.
     );
+  }
+
+  /// Mark the outgoing call's ToxAV media leg as started. The adapter calls
+  /// this right after `_avService.startCall()` succeeds, so teardown paths
+  /// (cancel/reject/timeout/endCall) know there is a real media leg to stop.
+  /// No-op if the invite is already gone (e.g. a fast cancel removed it).
+  void markAvLegStarted(String inviteID) {
+    _activeCalls[inviteID]?.avLegStarted = true;
   }
 
   /// Accept an invitation and start call.
@@ -239,6 +245,7 @@ class CallBridgeService {
     final avResult = await _avService.answerCall(callInfo.friendNumber!,
         audioBitRate: audioBitRate, videoBitRate: videoBitRate);
     if (avResult) {
+      callInfo.avLegStarted = true;
       callInfo.state = CallState.inCall;
       onCallStateChanged?.call(inviteID, CallState.inCall);
       return true;
@@ -261,8 +268,7 @@ class CallBridgeService {
   /// then `_sdkPlatform.cancel(...)` as a best-effort signaling fallback —
   /// the caller's `onInvitationCancelled` path already maps inCall→ended
   /// correctly, so a post-accept `cancel` is consumable on the caller side.
-  Future<void> _failAccept(String inviteID,
-      {required bool postAccept}) async {
+  Future<void> _failAccept(String inviteID, {required bool postAccept}) async {
     // Capture friendNumber before remove(); endCall() needs it and the entry
     // is still in the map when acceptInvitation calls into _failAccept.
     final int? friendNumber =
@@ -295,8 +301,7 @@ class CallBridgeService {
     final result = await _sdkPlatform.reject(inviteID: inviteID);
     if (result.code == 0) {
       _activeCalls.remove(inviteID);
-      onCallStateChanged?.call(inviteID, CallState.ended,
-          endReason: 'reject');
+      onCallStateChanged?.call(inviteID, CallState.ended, endReason: 'reject');
       return true;
     }
     return false;
@@ -309,7 +314,10 @@ class CallBridgeService {
     final callInfo = _activeCalls[inviteID];
     if (callInfo == null) return false;
 
-    if (callInfo.friendNumber != null) {
+    // Only end the ToxAV leg if it was actually started — an outgoing call torn
+    // down during the registerOutgoingCall→startCall gap has friendNumber set
+    // but no media leg yet, and endCall on a never-started call can block/error.
+    if (callInfo.friendNumber != null && callInfo.avLegStarted) {
       await _avService.endCall(callInfo.friendNumber!);
     }
 

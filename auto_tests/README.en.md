@@ -31,13 +31,12 @@ tim2tox/auto_tests/
 ├── test/
 │   ├── test_helper.dart            # Test helpers (TestNode, waitUntil, TestScenario)
 │   ├── test_fixtures.dart          # Test data / mocks
-│   ├── scenarios/                  # Business scenarios (139 total: 70 wall-clock + 69 *_virtual_test siblings)
-│   │   ├── scenario_sdk_init_test.dart
-│   │   ├── scenario_sdk_init_virtual_test.dart
-│   │   ├── scenario_login_test.dart
-│   │   ├── scenario_login_virtual_test.dart
-│   │   ├── scenario_virtual_clock_smoke_test.dart   # Smoke test for the virtual-clock plumbing
-│   │   └── ... (other files follow the same naming convention)
+│   ├── scenarios/                  # Business scenarios (74 files: 73 mode-aware + 1 virtual-clock smoke)
+│   │   ├── scenario_sdk_init_test.dart               # Each scenario is a single mode-aware file:
+│   │   ├── scenario_login_test.dart                  # runs wall-clock by default, virtual under
+│   │   ├── scenario_message_test.dart                # RUN_VIRTUAL=1 (no separate *_virtual_test.dart)
+│   │   ├── scenario_virtual_clock_smoke_test.dart    # Smoke test for the virtual-clock plumbing
+│   │   └── ... (one file per scenario)
 │   ├── scenarios_binary/           # Binary-replacement path scenarios (Phase 13, 3 files)
 │   │   ├── scenario_native_callback_dispatch_test.dart  # NativeLibraryManager static listener dispatch
 │   │   ├── scenario_custom_callback_handler_test.dart   # customCallbackHandler registration + dispatch
@@ -154,8 +153,7 @@ Tox protocol constants run in seconds (DHT heartbeat, friend reconnect, group an
 ### Usage
 
 ```bash
-# Run every phase with the virtual clock (swaps each test for its *_virtual_test.dart
-# sibling when one exists; falls back to the wall-clock original otherwise).
+# Run every phase with the virtual clock.
 RUN_VIRTUAL=1 ./run_tests_ordered.sh
 
 # Single phase / range / list work the same way
@@ -163,7 +161,16 @@ RUN_VIRTUAL=1 ./run_tests_ordered.sh 4
 RUN_VIRTUAL=1 ./run_tests_ordered.sh 10-12
 ```
 
-`RUN_VIRTUAL=0` (default) keeps the existing wall-clock behavior.
+`RUN_VIRTUAL=0` (default) keeps wall-clock behavior.
+
+Each scenario is a **single mode-aware file** — there are no separate
+`*_virtual_test.dart` siblings. `RUN_VIRTUAL` is exported into the test process,
+and the file reads it via `shouldRunVirtual` (`test_helper.dart`): in virtual
+mode it calls `VirtualClock.enableEarly()` / `enableForScenario()` before
+creating instances; in wall mode it skips them and the event_thread runs as
+usual. The body helpers (`pumpTestTick`, `waitUntilWithVirtualPump`,
+`establishFriendshipVirtual`, `waitForConnectionVirtual`, …) all fall back to
+real-time behavior when the clock is disabled, so one body works in both modes.
 
 ### Parallel execution (PARALLEL_WORKERS)
 
@@ -185,15 +192,15 @@ Some tests are fundamentally incompatible with concurrent execution (cross-proce
 // SKIP_IN_PARALLEL: <one-line reason>
 ```
 
-When `PARALLEL_WORKERS>=2`, the runner greps for that marker and drops matching files from every phase array before dispatch, regardless of which path (bundle, parallel-xargs, or sequential-inside-an-N>=2-invocation) would have run them. The marker is sibling-symmetric: if either the wall-clock `_test.dart` or its `_virtual_test.dart` sibling carries it, both variants are filtered. Skipped files show up in the runner's "Skipped Tests" summary section with the declared reason.
+When `PARALLEL_WORKERS>=2`, the runner greps for that marker and drops matching files from every phase array before dispatch, regardless of which path (bundle, parallel-xargs, or sequential-inside-an-N>=2-invocation) would have run them. Skipped files show up in the runner's "Skipped Tests" summary section with the declared reason.
 
 Current users of the marker:
 
-- `scenario_lan_discovery_test.dart` / `scenario_lan_discovery_virtual_test.dart` — Tox LAN multicast on the loopback 33445-33545 port range needs sole occupancy; with other parallel test processes broadcasting on the same range, discovery becomes ambiguous and the assertion fails.
+- `scenario_lan_discovery_test.dart` — Tox LAN multicast on the loopback 33445-33545 port range needs sole occupancy; with other parallel test processes broadcasting on the same range, discovery becomes ambiguous and the assertion fails.
 
 ### Phase coverage
 
-Phase 1–12 have `*_virtual_test.dart` siblings (~69 files plus `scenario_virtual_clock_smoke_test.dart`), covering basics / friendship / message / group / ToxAV / profile / conversation / file / conference / group-ext / network / other. Phase 13 (Binary Replacement) and Phase 14 (unit_tests) do not depend on Tox protocol timers and **do not need** virtual variants.
+All scenario files run under both modes — wall-clock by default, virtual under `RUN_VIRTUAL=1`. Phase 13 (Binary Replacement) and Phase 14 (unit_tests) do not depend on Tox protocol timers, so virtual mode is a no-op for them.
 
 ### About flakes
 
@@ -263,7 +270,7 @@ flutter test --name "login"                # by test name
 
 ### Environment variables
 
-- `RUN_VIRTUAL=1` — swap each test for its `*_virtual_test.dart` sibling when present (see [Virtual clock mode](#virtual-clock-mode)).
+- `RUN_VIRTUAL=1` — run scenarios under the virtual clock; each mode-aware file self-selects via `shouldRunVirtual` (see [Virtual clock mode](#virtual-clock-mode)).
 - `PARALLEL_WORKERS=N` — flatten selected tests into one queue and run N concurrently (see above).
 - `ASSERTION_GUARD=0` — skip the `check_test_assertions.sh` pre-flight.
 - `RUN_NATIVE_CRASH_TESTS=0` — exclude `scenario_dht_nodes_response_api_test` from Phase 11.

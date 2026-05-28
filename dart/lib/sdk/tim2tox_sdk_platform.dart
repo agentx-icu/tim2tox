@@ -1913,8 +1913,7 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
             final cachedMsg = entry.value;
             final cachedId = cachedMsg.id;
             final cachedMsgID = cachedMsg.msgID;
-            final keyMatches =
-                entry.key == v2MsgID || entry.key == v2Id;
+            final keyMatches = entry.key == v2MsgID || entry.key == v2Id;
             final idMatches = (cachedId != null &&
                     (cachedId == v2MsgID || cachedId == v2Id)) ||
                 (cachedMsgID != null &&
@@ -2467,8 +2466,7 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
     final now = DateTime.now().millisecondsSinceEpoch;
     // Drop stale entries opportunistically so this map cannot grow
     // unboundedly across many quits.
-    _recentQuitNotifyMs.removeWhere(
-        (_, ts) => now - ts > _quitNotifyDedupMs);
+    _recentQuitNotifyMs.removeWhere((_, ts) => now - ts > _quitNotifyDedupMs);
     final prev = _recentQuitNotifyMs[groupID];
     _recentQuitNotifyMs[groupID] = now;
     return prev != null && now - prev < _quitNotifyDedupMs;
@@ -2727,8 +2725,7 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
                   .toList();
             } catch (e, st) {
               // Parse failure: surface but don't fan out.
-              _logListenerError(
-                  'ConversationEvent.parse', e, st);
+              _logListenerError('ConversationEvent.parse', e, st);
             }
             if (conversationList.isNotEmpty) {
               // Per-listener isolation around the fan-out.
@@ -2737,9 +2734,7 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
                   l.onConversationChanged?.call(conversationList);
                 } catch (e, st) {
                   _logListenerError(
-                      'V2TimConversationListener.onConversationChanged',
-                      e,
-                      st);
+                      'V2TimConversationListener.onConversationChanged', e, st);
                 }
               }
             }
@@ -2804,8 +2799,7 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
               try {
                 l.onSelfInfoUpdated(v2);
               } catch (e, st) {
-                _logListenerError(
-                    'V2TimSDKListener.onSelfInfoUpdated', e, st);
+                _logListenerError('V2TimSDKListener.onSelfInfoUpdated', e, st);
               }
             }
           }
@@ -2842,8 +2836,7 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
               try {
                 l.onUserInfoChanged(userInfoList);
               } catch (e, st) {
-                _logListenerError(
-                    'V2TimSDKListener.onUserInfoChanged', e, st);
+                _logListenerError('V2TimSDKListener.onUserInfoChanged', e, st);
               }
             }
           }
@@ -2932,12 +2925,10 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
                 // lines 1226-1231. Wrapped in try/catch so a persistence
                 // error doesn't break callback dispatch.
                 try {
-                  final conversationId =
-                      v2Msg.groupID ?? v2Msg.userID ?? '';
+                  final conversationId = v2Msg.groupID ?? v2Msg.userID ?? '';
                   if (conversationId.isNotEmpty) {
-                    final chatMsg =
-                        MessageConverter.v2TimMessageToChatMessage(
-                            v2Msg, ffiService.selfId);
+                    final chatMsg = MessageConverter.v2TimMessageToChatMessage(
+                        v2Msg, ffiService.selfId);
                     await ffiService.messageHistoryPersistence
                         .appendHistory(conversationId, chatMsg);
                   }
@@ -3295,8 +3286,7 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
                 try {
                   l.onMemberLeave(groupID, opUser);
                 } catch (e, st) {
-                  _logListenerError(
-                      'V2TimGroupListener.onMemberLeave', e, st);
+                  _logListenerError('V2TimGroupListener.onMemberLeave', e, st);
                 }
               }
               break;
@@ -5218,9 +5208,8 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
             try {
               final originalName = soundPath.split('/').last;
               final dotIdx = originalName.lastIndexOf('.');
-              final base = dotIdx > 0
-                  ? originalName.substring(0, dotIdx)
-                  : originalName;
+              final base =
+                  dotIdx > 0 ? originalName.substring(0, dotIdx) : originalName;
               final ext = dotIdx > 0 ? originalName.substring(dotIdx) : '';
               encodedName = '${base}__dur$soundDuration$ext';
               final srcFile = File(soundPath);
@@ -5295,8 +5284,7 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
           // Video uses `videoPath` (not `path`); verified against
           // tencent_cloud_chat_sdk/lib/models/v2_tim_video_elem.dart:15.
           final videoPath = messageToSend.videoElem!.videoPath!;
-          print(
-              '[Tim2ToxSdkPlatform] Sending video message: $videoPath');
+          print('[Tim2ToxSdkPlatform] Sending video message: $videoPath');
           await provider.sendFile(
             userID: userID,
             groupID: groupID.isNotEmpty ? groupID : null,
@@ -5342,8 +5330,7 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
             text: payload,
           );
           if (_debugLog)
-            print(
-                '[Tim2ToxSdkPlatform] Location message sent successfully');
+            print('[Tim2ToxSdkPlatform] Location message sent successfully');
         } else if (messageToSend.customElem != null &&
             messageToSend.customElem!.data != null &&
             messageToSend.customElem!.data!.isNotEmpty) {
@@ -5352,8 +5339,7 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
           // into a customElem instead of rendering as plain text.
           // Receiver-side parsing is deferred (TODO(P0-1)).
           final payload = '__custom__:${messageToSend.customElem!.data}';
-          if (_debugLog)
-            print('[Tim2ToxSdkPlatform] Sending custom message');
+          if (_debugLog) print('[Tim2ToxSdkPlatform] Sending custom message');
           await provider.sendText(
             userID: userID,
             groupID: groupID.isNotEmpty ? groupID : null,
@@ -5542,7 +5528,8 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
       if (id != null && _forwardMessageCache.containsKey(id)) {
         failedMsg = _forwardMessageCache[id]!;
       } else {
-        failedMsg = V2TimMessage(elemType: MessageElemType.V2TIM_ELEM_TYPE_TEXT);
+        failedMsg =
+            V2TimMessage(elemType: MessageElemType.V2TIM_ELEM_TYPE_TEXT);
         failedMsg.msgID = id;
         failedMsg.id = id;
       }
@@ -5968,8 +5955,8 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
       final soundDuration = entry['soundDuration'] as int?;
       final videoDuration = entry['videoDuration'] as int?;
 
-      int elemType = entry['elemType'] as int? ??
-          MessageElemType.V2TIM_ELEM_TYPE_TEXT;
+      int elemType =
+          entry['elemType'] as int? ?? MessageElemType.V2TIM_ELEM_TYPE_TEXT;
       // mediaKind takes precedence when present (v2 entries).
       switch (mediaKind) {
         case 'image':
@@ -6867,8 +6854,7 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
             final convId = chatMsg.groupId ?? senderUid;
             try {
               // Make sure we have history loaded for this conversation.
-              await ffiService.messageHistoryPersistence
-                  .loadHistory(convId);
+              await ffiService.messageHistoryPersistence.loadHistory(convId);
             } catch (_) {
               // Best-effort: continue with whatever is in memory.
             }
@@ -8421,7 +8407,7 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
       String userData = Tools.generateUserData('getGroupMemberList');
       Completer<V2TimValueCallback<V2TimGroupMemberInfoResult>> completer =
           Completer();
-      NativeLibraryManager.timValueCallback2Future<V2TimGroupMemberInfoResult>(
+      NativeLibraryManager.addTimValueCallback2Map<V2TimGroupMemberInfoResult>(
           userData, completer);
 
       final nextSeqInt = int.tryParse(nextSeq) ?? 0;
@@ -8583,7 +8569,7 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
       // Create completer for async callback
       Completer<V2TimValueCallback<List<V2TimGroupMemberFullInfo>>> completer =
           Completer();
-      NativeLibraryManager.timValueCallback2Future<
+      NativeLibraryManager.addTimValueCallback2Map<
           List<V2TimGroupMemberFullInfo>>(userData, completer);
 
       // Build JSON parameter with required field names

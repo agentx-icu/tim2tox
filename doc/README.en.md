@@ -19,6 +19,7 @@
 
 - [architecture/ARCHITECTURE.en.md](architecture/ARCHITECTURE.en.md) - Overall architecture (deep technical reference): layer responsibilities, call chains, FFI/callbacks/dual paths, Bootstrap and polling, risks and testing
 - [api/API_REFERENCE.en.md](api/API_REFERENCE.en.md) - V2TIM, FFI and Dart layer API reference (sub-pages: [V2TIM](api/API_REFERENCE_V2TIM.en.md), [FFI](api/API_REFERENCE_FFI.en.md), [Dart](api/API_REFERENCE_DART.en.md))
+- [api/API_SUPPORT_MATRIX.en.md](api/API_SUPPORT_MATRIX.en.md) - Per-API real support-status matrix (native / dart-only / local-only / text-degraded / no-op-success / unsupported); read this before integrating to see which APIs actually work
 - [api/API_REFERENCE_TEMPLATE.en.md](api/API_REFERENCE_TEMPLATE.en.md) - API reference writing template (entry structure, classification and tagging)
 - [development/DEVELOPMENT_GUIDE.en.md](development/DEVELOPMENT_GUIDE.en.md) - Development process, building, testing and debugging advice
 - [architecture/MODULARIZATION.en.md](architecture/MODULARIZATION.en.md) - FFI module split structure and module responsibilities

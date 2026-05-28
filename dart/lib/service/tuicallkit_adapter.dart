@@ -1,11 +1,11 @@
-/// TUICallKit Adapter
-///
-/// Adapts TUICallKit service calls to ToxAV implementation
-/// This allows chat-uikit-flutter to use ToxAV without modification
-///
-/// Usage:
-///   await TUICallKitAdapter.initialize(sdkPlatform, avService, callBridge);
-///   This will intercept TUICallKit calls and route them to ToxAV
+// TUICallKit Adapter
+//
+// Adapts TUICallKit service calls to ToxAV implementation.
+// This allows chat-uikit-flutter to use ToxAV without modification.
+//
+// Usage:
+//   await TUICallKitAdapter.initialize(sdkPlatform, avService, callBridge);
+//   This will intercept TUICallKit calls and route them to ToxAV.
 
 import 'dart:async';
 import 'dart:convert';
@@ -70,8 +70,8 @@ class TUICallKitAdapter {
   }) async {
     if (_instance != null) return _instance!;
 
-    _instance = TUICallKitAdapter._(sdkPlatform, avService, callBridge,
-        logger: logger);
+    _instance =
+        TUICallKitAdapter._(sdkPlatform, avService, callBridge, logger: logger);
     _globalAdapter = _instance;
     await _instance!._registerService();
     return _instance!;
@@ -211,6 +211,18 @@ class TUICallKitAdapter {
         audioBitRate: audioBitRate, videoBitRate: videoBitRate);
     _logger?.log(
         '[TUICallKitAdapter] _handleCall startCall result=$callResult friendNumber=$resolvedFriendNumber');
+    if (!callResult) {
+      _userToInviteId.remove(userID);
+      await _callBridge.endCall(inviteID);
+      throw Exception(
+          'ToxAV startCall failed for friendNumber=$resolvedFriendNumber');
+    }
+
+    // The ToxAV media leg is now live. Tell the bridge so a later
+    // cancel/reject/timeout/endCall tears it down — and, crucially, so a
+    // teardown that lands in the registerOutgoingCall→startCall gap above does
+    // NOT call endCall() on a leg that never started.
+    _callBridge.markAvLegStarted(inviteID);
   }
 
   /// Dispose

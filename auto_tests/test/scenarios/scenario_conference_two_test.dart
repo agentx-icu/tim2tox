@@ -11,13 +11,16 @@ void main() {
 
     setUpAll(() async {
       await setupTestEnvironment();
+      if (shouldRunVirtual) await VirtualClock.enableEarly();
       scenario = await createTestScenario(['node']);
       await scenario.initAllNodes();
+      if (shouldRunVirtual) await VirtualClock.enableForScenario(scenario);
 
       final node = scenario.getNode('node')!;
       await node.login();
+      await waitUntil(() => node.loggedIn);
 
-      await configureLocalBootstrap(scenario);
+      await configureLocalBootstrapVirtual(scenario);
     });
 
     tearDownAll(() async {
@@ -33,7 +36,6 @@ void main() {
         () async {
       final node = scenario.getNode('node')!;
 
-      // Conference 1.
       final create1 = await node.runWithInstanceAsync(() async =>
           TIMGroupManager.instance.createGroup(
             groupType: 'Meeting',
@@ -45,7 +47,6 @@ void main() {
       expect(create1.data, isNotNull);
       final groupId1 = create1.data!;
 
-      // Conference 2.
       final create2 = await node.runWithInstanceAsync(() async =>
           TIMGroupManager.instance.createGroup(
             groupType: 'Meeting',
@@ -57,13 +58,10 @@ void main() {
       expect(create2.data, isNotNull);
       final groupId2 = create2.data!;
 
-      // Different conferences must have different group IDs.
       expect(groupId1, isNot(equals(groupId2)),
           reason: 'Two conferences must have distinct group IDs');
 
-      // Both conferences must be queryable independently and keep their
-      // own names (no state bleed across the two).
-      await Future.delayed(const Duration(seconds: 1));
+      await pumpTestTick(scenario, advanceMs: 1000, iterationsPerInstance: 1);
 
       final info1 = await node.runWithInstanceAsync(() async =>
           TIMGroupManager.instance.getGroupsInfo(
@@ -85,7 +83,6 @@ void main() {
       expect(info2.data!.first.groupInfo?.groupName, equals('Conference Two'),
           reason: 'Conference 2 must keep its own name');
 
-      // Both conferences must appear in the joined-list together.
       final joined = await node.runWithInstanceAsync(
           () async => TIMGroupManager.instance.getJoinedGroupList());
       expect(joined.code, equals(0));

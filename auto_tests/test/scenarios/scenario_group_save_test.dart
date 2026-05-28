@@ -1,7 +1,9 @@
-/// Group Save Test
-/// 
-/// Tests group state saving and loading
-/// Reference: c-toxcore/auto_tests/scenarios/scenario_group_save_test.c
+// Group Save Test — virtual-clock variant
+//
+// Mirrors scenario_group_save_test.dart 1:1 but drives the harness via the
+// virtual-clock helpers (VirtualClock + pumpTestTick + *Virtual helpers).
+// Tests group state saving and loading.
+// Reference: c-toxcore/auto_tests/scenarios/scenario_group_save_test.c
 
 import 'package:path/path.dart' as path;
 import 'package:test/test.dart';
@@ -13,29 +15,33 @@ void main() {
   group('Group Save Tests', () {
     late TestScenario scenario;
     late TestNode node;
-    
+
     setUpAll(() async {
       await setupTestEnvironment();
       scenario = await createTestScenario(['alice', 'bob']);
       node = scenario.getNode('alice')!;
       await scenario.initAllNodes();
+      // Enable test mode BEFORE login so event_thread never starts.
+      if (shouldRunVirtual) await VirtualClock.enableForScenario(scenario);
+
       await Future.wait([node.login(), scenario.getNode('bob')!.login()]);
       await waitUntil(
         () => node.loggedIn && scenario.getNode('bob')!.loggedIn,
         timeout: const Duration(seconds: 10),
         description: 'nodes logged in',
       );
-      await configureLocalBootstrap(scenario);
-      await node.waitForConnection(timeout: const Duration(seconds: 15));
+      await configureLocalBootstrapVirtual(scenario);
+      await waitForConnectionVirtual(scenario, node,
+          timeout: const Duration(seconds: 15));
     });
-    
+
     tearDownAll(() async {
       await scenario.dispose();
       await teardownTestEnvironment();
     });
-    
+
     setUp(() async {});
-    
+
     test('Group state persistence', () async {
       // SKIP REASON: The test creates a Tox NGC group, does unInitSDK +
       // initSDK + login, and expects the group to reappear in
@@ -55,42 +61,51 @@ void main() {
       // groups_ + chat_id mapping from saved tox state on InitSDK.
       final testDataDir = await getTestDataDir();
       final dataDir = path.join(testDataDir, node.userId, 'init');
-      
+
       // Node is already initialized and logged in from setUpAll
       // Create and join a group on this node's instance
-      final createResult = await node.runWithInstanceAsync(() async => TIMGroupManager.instance.createGroup(
-        groupType: 'kTIMGroup_Private',
-        groupName: 'Test Group',
-      ));
-      
+      final createResult = await node.runWithInstanceAsync(() async =>
+          TIMGroupManager.instance.createGroup(
+            groupType: 'kTIMGroup_Private',
+            groupName: 'Test Group',
+          ));
+
       expect(createResult.code, equals(0));
       final groupId = createResult.data!;
       expect(groupId, isNotEmpty);
-      
+
       // Wait for group state to be persisted before logout
-      await Future.delayed(const Duration(seconds: 2));
-      
+      await pumpTestTick(scenario,
+          advanceMs: 2000, iterationsPerInstance: 1);
+
       // Save state (logout/uninit)
       await node.logout();
       await node.unInitSDK();
-      
+
       // Reload state
       await node.initSDK(initPath: dataDir);
       await node.login();
-      
-      // Verify group is still accessible - poll with longer timeout (group load may be async)
-      const pollInterval = Duration(seconds: 2);
+
+      // Brief warmup after re-login so any post-init iteration tasks can
+      // run before we start polling.
+      await pumpTestTick(scenario,
+          advanceMs: 500, iterationsPerInstance: 2);
+
+      // Verify group is still accessible - poll with longer timeout (group
+      // load may be async).
       const totalWait = Duration(seconds: 30);
-      final deadline = DateTime.now().add(totalWait);
+      final deadlineMs = VirtualClock.nowMs + totalWait.inMilliseconds;
       dynamic groupListResult;
-      while (DateTime.now().isBefore(deadline)) {
-        groupListResult = await node.runWithInstanceAsync(() async => TIMGroupManager.instance.getJoinedGroupList());
+      while (VirtualClock.nowMs < deadlineMs) {
+        groupListResult = await node.runWithInstanceAsync(() async =>
+            TIMGroupManager.instance.getJoinedGroupList());
         if (groupListResult.code == 0 &&
             groupListResult.data != null &&
             groupListResult.data.any((g) => g.groupID == groupId)) {
           break;
         }
-        await Future.delayed(pollInterval);
+        await pumpTestTick(scenario,
+            advanceMs: 2000, iterationsPerInstance: 1);
       }
       expect(groupListResult.code, equals(0));
       expect(groupListResult.data, isNotNull);

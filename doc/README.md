@@ -19,6 +19,7 @@
 
 - [architecture/ARCHITECTURE.md](architecture/ARCHITECTURE.md) - 整体架构（深度技术参考）：分层职责、调用链、FFI/回调/双路径、Bootstrap 与轮询、风险与测试
 - [api/API_REFERENCE.md](api/API_REFERENCE.md) - V2TIM、FFI 与 Dart 层 API 参考（子页：[V2TIM](api/API_REFERENCE_V2TIM.md)、[FFI](api/API_REFERENCE_FFI.md)、[Dart](api/API_REFERENCE_DART.md)）
+- [api/API_SUPPORT_MATRIX.md](api/API_SUPPORT_MATRIX.md) - 逐接口真实支持状态矩阵（native / dart-only / local-only / text-degraded / no-op-success / unsupported）；接入前先看这里判断哪些接口真的能用
 - [api/API_REFERENCE_TEMPLATE.md](api/API_REFERENCE_TEMPLATE.md) - API 参考文档写作模板（条目结构、分类与标记约定）
 - [development/DEVELOPMENT_GUIDE.md](development/DEVELOPMENT_GUIDE.md) - 开发流程、构建、测试与调试建议
 - [architecture/MODULARIZATION.md](architecture/MODULARIZATION.md) - FFI 模块拆分结构与模块职责

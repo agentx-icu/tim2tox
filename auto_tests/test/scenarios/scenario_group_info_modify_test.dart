@@ -1,7 +1,9 @@
-/// Group Info Modify Test
-/// 
-/// Tests modifying group information: name, introduction, notification, etc.
-/// Verifies that group info changes are synchronized across members
+// Group Info Modify Test — virtual-clock variant
+//
+// Mirrors scenario_group_info_modify_test.dart 1:1 but drives the harness
+// via the virtual-clock helpers (VirtualClock + pumpTestTick + *Virtual
+// helpers). Tests modifying group information: name, introduction,
+// notification, multi-field, and cross-instance change notification.
 
 import 'package:test/test.dart';
 import 'package:tencent_cloud_chat_sdk/native_im/adapter/tim_manager.dart';
@@ -16,169 +18,176 @@ void main() {
     late TestScenario scenario;
     late TestNode alice;
     late TestNode bob;
-    
+
     setUpAll(() async {
       await setupTestEnvironment();
       scenario = await createTestScenario(['alice', 'bob']);
       alice = scenario.getNode('alice')!;
       bob = scenario.getNode('bob')!;
-      
+
       await scenario.initAllNodes();
-      // Parallelize login
+      // Enable test mode BEFORE login so event_thread never starts.
+      if (shouldRunVirtual) await VirtualClock.enableForScenario(scenario);
+
       await Future.wait([
         alice.login(),
         bob.login(),
       ]);
-      
+
       await waitUntil(
         () => alice.loggedIn && bob.loggedIn,
         timeout: const Duration(seconds: 10),
         description: 'both nodes logged in',
       );
-      
-      await configureLocalBootstrap(scenario);
+
+      await configureLocalBootstrapVirtual(scenario);
 
       // tim2tox inviteUserToGroup needs invitee as friend. Only one sub-test
       // exercises the cross-instance join+sync flow, but doing it once in
       // setUpAll keeps the friendship warm for all tests.
       try {
-        await establishFriendship(alice, bob,
+        await establishFriendshipVirtual(scenario, alice, bob,
             timeout: const Duration(seconds: 90));
       } catch (e) {
-        print('[setUpAll] establishFriendship best-effort: $e');
+        print('[setUpAll] establishFriendshipVirtual best-effort: $e');
       }
     });
-    
+
     tearDownAll(() async {
       await scenario.dispose();
       await teardownTestEnvironment();
     });
-    
-    // Lightweight setUp for per-test cleanup if needed
+
     setUp(() async {
-      // Reset any per-test state if necessary
       // Most tests don't need cleanup since they use shared scenario
     });
-    
+
     test('Modify group name', () async {
       // Create group on alice's instance
-      final createResult = await alice.runWithInstanceAsync(() async => TIMGroupManager.instance.createGroup(
-        groupType: 'group',
-        groupName: 'Original Name',
-        groupID: '',
-      ));
-      
+      final createResult = await alice.runWithInstanceAsync(
+          () async => TIMGroupManager.instance.createGroup(
+                groupType: 'group',
+                groupName: 'Original Name',
+                groupID: '',
+              ));
+
       expect(createResult.code, equals(0));
       final groupId = createResult.data!;
-      
-      await Future.delayed(const Duration(milliseconds: 500));
-      
+
+      await pumpTestTick(scenario, advanceMs: 500, iterationsPerInstance: 1);
+
       final groupInfo = V2TimGroupInfo(
         groupID: groupId,
         groupType: 'group',
         groupName: 'Modified Name',
       );
-      
-      final setInfoResult = await alice.runWithInstanceAsync(() async => TIMGroupManager.instance.setGroupInfo(
-        info: groupInfo,
-      ));
-      
+
+      final setInfoResult = await alice.runWithInstanceAsync(() async =>
+          TIMGroupManager.instance.setGroupInfo(info: groupInfo));
+
       expect(setInfoResult.code, equals(0));
-      
-      await Future.delayed(const Duration(milliseconds: 500));
-      final groupsInfoResult = await alice.runWithInstanceAsync(() async => TIMGroupManager.instance.getGroupsInfo(
-        groupIDList: [groupId],
-      ));
-      
-      if (groupsInfoResult.code == 0 && groupsInfoResult.data != null && groupsInfoResult.data!.isNotEmpty) {
-        expect(groupsInfoResult.data!.first.groupInfo?.groupName, equals('Modified Name'));
+
+      await pumpTestTick(scenario, advanceMs: 500, iterationsPerInstance: 1);
+      final groupsInfoResult = await alice.runWithInstanceAsync(() async =>
+          TIMGroupManager.instance.getGroupsInfo(groupIDList: [groupId]));
+
+      if (groupsInfoResult.code == 0 &&
+          groupsInfoResult.data != null &&
+          groupsInfoResult.data!.isNotEmpty) {
+        expect(groupsInfoResult.data!.first.groupInfo?.groupName,
+            equals('Modified Name'));
       }
     }, timeout: const Timeout(Duration(seconds: 60)));
-    
+
     test('Modify group introduction', () async {
-      final createResult = await alice.runWithInstanceAsync(() async => TIMGroupManager.instance.createGroup(
-        groupType: 'group',
-        groupName: 'Test Group',
-        introduction: 'Original Introduction',
-        groupID: '',
-      ));
-      
+      final createResult = await alice.runWithInstanceAsync(
+          () async => TIMGroupManager.instance.createGroup(
+                groupType: 'group',
+                groupName: 'Test Group',
+                introduction: 'Original Introduction',
+                groupID: '',
+              ));
+
       expect(createResult.code, equals(0));
       final groupId = createResult.data!;
-      
-      await Future.delayed(const Duration(milliseconds: 500));
-      
+
+      await pumpTestTick(scenario, advanceMs: 500, iterationsPerInstance: 1);
+
       final groupInfo = V2TimGroupInfo(
         groupID: groupId,
         groupType: 'group',
         introduction: 'Modified Introduction',
       );
-      
-      final setInfoResult = await alice.runWithInstanceAsync(() async => TIMGroupManager.instance.setGroupInfo(
-        info: groupInfo,
-      ));
-      
+
+      final setInfoResult = await alice.runWithInstanceAsync(() async =>
+          TIMGroupManager.instance.setGroupInfo(info: groupInfo));
+
       expect(setInfoResult.code, equals(0));
-      
-      await Future.delayed(const Duration(milliseconds: 500));
-      final groupsInfoResult = await alice.runWithInstanceAsync(() async => TIMGroupManager.instance.getGroupsInfo(
-        groupIDList: [groupId],
-      ));
-      
-      if (groupsInfoResult.code == 0 && groupsInfoResult.data != null && groupsInfoResult.data!.isNotEmpty) {
-        expect(groupsInfoResult.data!.first.groupInfo?.introduction, equals('Modified Introduction'));
+
+      await pumpTestTick(scenario, advanceMs: 500, iterationsPerInstance: 1);
+      final groupsInfoResult = await alice.runWithInstanceAsync(() async =>
+          TIMGroupManager.instance.getGroupsInfo(groupIDList: [groupId]));
+
+      if (groupsInfoResult.code == 0 &&
+          groupsInfoResult.data != null &&
+          groupsInfoResult.data!.isNotEmpty) {
+        expect(groupsInfoResult.data!.first.groupInfo?.introduction,
+            equals('Modified Introduction'));
       }
     }, timeout: const Timeout(Duration(seconds: 60)));
-    
+
     test('Modify group notification', () async {
-      final createResult = await alice.runWithInstanceAsync(() async => TIMGroupManager.instance.createGroup(
-        groupType: 'group',
-        groupName: 'Test Group',
-        notification: 'Original Notification',
-        groupID: '',
-      ));
-      
+      final createResult = await alice.runWithInstanceAsync(
+          () async => TIMGroupManager.instance.createGroup(
+                groupType: 'group',
+                groupName: 'Test Group',
+                notification: 'Original Notification',
+                groupID: '',
+              ));
+
       expect(createResult.code, equals(0));
       final groupId = createResult.data!;
-      
-      await Future.delayed(const Duration(milliseconds: 500));
-      
+
+      await pumpTestTick(scenario, advanceMs: 500, iterationsPerInstance: 1);
+
       final groupInfo = V2TimGroupInfo(
         groupID: groupId,
         groupType: 'group',
         notification: 'Modified Notification',
       );
-      
-      final setInfoResult = await alice.runWithInstanceAsync(() async => TIMGroupManager.instance.setGroupInfo(
-        info: groupInfo,
-      ));
-      
+
+      final setInfoResult = await alice.runWithInstanceAsync(() async =>
+          TIMGroupManager.instance.setGroupInfo(info: groupInfo));
+
       expect(setInfoResult.code, equals(0));
-      
-      await Future.delayed(const Duration(milliseconds: 500));
-      final groupsInfoResult = await alice.runWithInstanceAsync(() async => TIMGroupManager.instance.getGroupsInfo(
-        groupIDList: [groupId],
-      ));
-      
-      if (groupsInfoResult.code == 0 && groupsInfoResult.data != null && groupsInfoResult.data!.isNotEmpty) {
-        expect(groupsInfoResult.data!.first.groupInfo?.notification, equals('Modified Notification'));
+
+      await pumpTestTick(scenario, advanceMs: 500, iterationsPerInstance: 1);
+      final groupsInfoResult = await alice.runWithInstanceAsync(() async =>
+          TIMGroupManager.instance.getGroupsInfo(groupIDList: [groupId]));
+
+      if (groupsInfoResult.code == 0 &&
+          groupsInfoResult.data != null &&
+          groupsInfoResult.data!.isNotEmpty) {
+        expect(groupsInfoResult.data!.first.groupInfo?.notification,
+            equals('Modified Notification'));
       }
     }, timeout: const Timeout(Duration(seconds: 60)));
-    
+
     test('Modify multiple group info fields', () async {
-      final createResult = await alice.runWithInstanceAsync(() async => TIMGroupManager.instance.createGroup(
-        groupType: 'group',
-        groupName: 'Original Name',
-        introduction: 'Original Introduction',
-        notification: 'Original Notification',
-        groupID: '',
-      ));
-      
+      final createResult = await alice.runWithInstanceAsync(
+          () async => TIMGroupManager.instance.createGroup(
+                groupType: 'group',
+                groupName: 'Original Name',
+                introduction: 'Original Introduction',
+                notification: 'Original Notification',
+                groupID: '',
+              ));
+
       expect(createResult.code, equals(0));
       final groupId = createResult.data!;
-      
-      await Future.delayed(const Duration(milliseconds: 500));
-      
+
+      await pumpTestTick(scenario, advanceMs: 500, iterationsPerInstance: 1);
+
       final groupInfo = V2TimGroupInfo(
         groupID: groupId,
         groupType: 'group',
@@ -186,93 +195,104 @@ void main() {
         introduction: 'New Introduction',
         notification: 'New Notification',
       );
-      
-      final setInfoResult = await alice.runWithInstanceAsync(() async => TIMGroupManager.instance.setGroupInfo(
-        info: groupInfo,
-      ));
-      
+
+      final setInfoResult = await alice.runWithInstanceAsync(() async =>
+          TIMGroupManager.instance.setGroupInfo(info: groupInfo));
+
       expect(setInfoResult.code, equals(0));
-      
-      await Future.delayed(const Duration(milliseconds: 500));
-      final groupsInfoResult = await alice.runWithInstanceAsync(() async => TIMGroupManager.instance.getGroupsInfo(
-        groupIDList: [groupId],
-      ));
-      
-      if (groupsInfoResult.code == 0 && groupsInfoResult.data != null && groupsInfoResult.data!.isNotEmpty) {
+
+      await pumpTestTick(scenario, advanceMs: 500, iterationsPerInstance: 1);
+      final groupsInfoResult = await alice.runWithInstanceAsync(() async =>
+          TIMGroupManager.instance.getGroupsInfo(groupIDList: [groupId]));
+
+      if (groupsInfoResult.code == 0 &&
+          groupsInfoResult.data != null &&
+          groupsInfoResult.data!.isNotEmpty) {
         final info = groupsInfoResult.data!.first.groupInfo!;
         expect(info.groupName, equals('New Name'));
         expect(info.introduction, equals('New Introduction'));
         expect(info.notification, equals('New Notification'));
       }
     }, timeout: const Timeout(Duration(seconds: 60)));
-    
+
     test('Modify group info for conference type', () async {
-      final createResult = await alice.runWithInstanceAsync(() async => TIMGroupManager.instance.createGroup(
-        groupType: 'Meeting',
-        groupName: 'Original Conference Name',
-        groupID: '',
-      ));
-      
+      final createResult = await alice.runWithInstanceAsync(
+          () async => TIMGroupManager.instance.createGroup(
+                groupType: 'Meeting',
+                groupName: 'Original Conference Name',
+                groupID: '',
+              ));
+
       expect(createResult.code, equals(0));
       final conferenceId = createResult.data!;
-      
-      await Future.delayed(const Duration(milliseconds: 500));
-      
+
+      await pumpTestTick(scenario, advanceMs: 500, iterationsPerInstance: 1);
+
       final groupInfo = V2TimGroupInfo(
         groupID: conferenceId,
         groupType: 'Meeting',
         groupName: 'Modified Conference Name',
       );
-      
-      final setInfoResult = await alice.runWithInstanceAsync(() async => TIMGroupManager.instance.setGroupInfo(
-        info: groupInfo,
-      ));
-      
+
+      final setInfoResult = await alice.runWithInstanceAsync(() async =>
+          TIMGroupManager.instance.setGroupInfo(info: groupInfo));
+
       expect(setInfoResult.code, equals(0));
-      
-      await Future.delayed(const Duration(milliseconds: 500));
-      final groupsInfoResult = await alice.runWithInstanceAsync(() async => TIMGroupManager.instance.getGroupsInfo(
-        groupIDList: [conferenceId],
-      ));
-      
-      if (groupsInfoResult.code == 0 && groupsInfoResult.data != null && groupsInfoResult.data!.isNotEmpty) {
-        expect(groupsInfoResult.data!.first.groupInfo?.groupName, equals('Modified Conference Name'));
+
+      await pumpTestTick(scenario, advanceMs: 500, iterationsPerInstance: 1);
+      final groupsInfoResult = await alice.runWithInstanceAsync(() async =>
+          TIMGroupManager.instance.getGroupsInfo(groupIDList: [conferenceId]));
+
+      if (groupsInfoResult.code == 0 &&
+          groupsInfoResult.data != null &&
+          groupsInfoResult.data!.isNotEmpty) {
+        expect(groupsInfoResult.data!.first.groupInfo?.groupName,
+            equals('Modified Conference Name'));
       }
     }, timeout: const Timeout(Duration(seconds: 60)));
-    
+
     test('Group info change notification to members', () async {
-      final createResult = await alice.runWithInstanceAsync(() async => TIMGroupManager.instance.createGroup(
-        groupType: 'group',
-        groupName: 'Original Name',
-        groupID: '',
-      ));
-      
+      final createResult = await alice.runWithInstanceAsync(
+          () async => TIMGroupManager.instance.createGroup(
+                groupType: 'group',
+                groupName: 'Original Name',
+                groupID: '',
+              ));
+
       expect(createResult.code, equals(0));
       final groupId = createResult.data!;
-      
+
+      // Friend P2P needs periodic keepalive packets which only fire on real
+      // wall time. Between setUpAll friendship and this (the last) sub-test,
+      // the prior 5 Alice-local sub-tests don't drive enough iterates to keep
+      // Alice<->Bob's friend connection alive, so by the time we get here
+      // the C++ side may report `Friend X connection status: 0 (NONE)` and
+      // the invite packet drops. Pump aggressively to revive friend keepalives
+      // before the invite. Best-effort: if DHT itself is down, this can't
+      // help — that's a separate setUpAll-level flake.
+      await pumpTestTick(scenario,
+          advanceMs: 2000,
+          iterationsPerInstance: 40,
+          wallSleep: const Duration(milliseconds: 15));
+
       // Bob needs an invite before joinGroup can succeed (joinGroup wants a
-      // stored chat_id or pending invite; chat_id only lives on Alice's instance).
-      bob.clearCallbackReceived('onGroupInvited');
-      final inviteResult = await alice.runWithInstanceAsync(() async =>
-          TIMGroupManager.instance.inviteUserToGroup(
-            groupID: groupId,
-            userList: [bob.getPublicKey()],
-          ));
-      expect(inviteResult.code, equals(0),
-          reason: 'inviteUserToGroup failed: ${inviteResult.desc}');
-      await waitUntilWithPump(
-        () => bob.callbackReceived['onGroupInvited'] == true,
-        timeout: const Duration(seconds: 30),
-        description: 'bob receives onGroupInvited',
-        iterationsPerPump: 100,
-        stepDelay: const Duration(milliseconds: 200),
-      );
-      await Future.delayed(const Duration(milliseconds: 300));
+      // stored chat_id or pending invite; chat_id only lives on Alice's
+      // instance). inviteUserToGroupWithRetry re-issues the invite and waits for
+      // onGroupInvited (inviteUserToGroup returns code=0 even when the underlying
+      // tox_group_invite_friend packet drops, and the first invite often races
+      // with friend P2P bring-up).
+      // Invite + wait via the shared helper, but join with the ORIGINAL groupId
+      // (not the helper's returned invite chat-id): this subtest's later
+      // onGroupInfoChanged listener and getGroupsInfo checks are all keyed on
+      // groupId, so bob must join under that id.
+      await inviteUserToGroupWithRetry(scenario, alice, bob, groupId,
+          context: 'bob join', timeout: const Duration(seconds: 15));
+      await pumpTestTick(scenario, advanceMs: 300, iterationsPerInstance: 1);
       final bobJoinResult = await bob.runWithInstanceAsync(() async =>
           TIMManager.instance.joinGroup(groupID: groupId, message: ''));
       expect(bobJoinResult.code, equals(0),
           reason: 'bob joinGroup failed: ${bobJoinResult.desc}');
-      await Future.delayed(const Duration(milliseconds: 500));
+      await pumpTestTick(scenario, advanceMs: 500, iterationsPerInstance: 1);
 
       var bobReceivedInfoChange = false;
       final bobListener = V2TimGroupListener(
@@ -283,32 +303,54 @@ void main() {
           }
         },
       );
-      
-      bob.runWithInstance(() => TIMManager.instance.addGroupListener(listener: bobListener));
-      
+
+      bob.runWithInstance(
+          () => TIMManager.instance.addGroupListener(listener: bobListener));
+
       final groupInfo = V2TimGroupInfo(
         groupID: groupId,
         groupType: 'group',
         groupName: 'Changed Name',
       );
-      
-      await alice.runWithInstanceAsync(() async => TIMGroupManager.instance.setGroupInfo(info: groupInfo));
-      
+
+      await alice.runWithInstanceAsync(
+          () async => TIMGroupManager.instance.setGroupInfo(info: groupInfo));
+
+      // NGC topic-change propagation needs (a) Alice's iterate to emit the
+      // topic packet, (b) UDP loopback delivery, (c) Bob's iterate to process
+      // it. With 5 prior groups already announcing on Alice's instance,
+      // iterate budget per group is divided — give the topic packet enough
+      // densely-packed iterates AND real wall time on both ends to settle.
+      // Without the larger advanceMs/wallSleep, virtual mode runs ~200 sparse
+      // iterates within ~1s real wall (vs ~23s wall in the wall-clock test),
+      // not enough for NGC topic sync. Pump aggressively first, then wait.
+      // The high wallSleep (50ms) is critical: UDP loopback packets need real
+      // wall time to be delivered between iterate bursts.
+      await pumpTestTick(scenario,
+          advanceMs: 3000,
+          iterationsPerInstance: 60,
+          wallSleep: const Duration(milliseconds: 50));
+
       // Callback may be delayed on some runs; query is the authoritative fallback.
       try {
-        await waitUntil(
+        await waitUntilWithVirtualPump(
+          scenario,
           () => bobReceivedInfoChange,
-          timeout: const Duration(seconds: 10),
+          timeout: const Duration(seconds: 45),
           description: 'Bob receives group info change',
+          advanceMs: 1000,
+          iterationsPerInstance: 20,
+          wallSleep: const Duration(milliseconds: 50),
         );
       } catch (e) {
-        print('[GroupInfoModify] onGroupInfoChanged callback not observed in time, fallback to state query: $e');
+        print(
+            '[GroupInfoModify] onGroupInfoChanged callback not observed in time, fallback to state query: $e');
       }
 
-      final bobGroupInfoResult = await bob.runWithInstanceAsync(() async => TIMGroupManager.instance.getGroupsInfo(
-        groupIDList: [groupId],
-      ));
-      expect(bobGroupInfoResult.code, equals(0), reason: 'Bob should be able to query group info');
+      final bobGroupInfoResult = await bob.runWithInstanceAsync(() async =>
+          TIMGroupManager.instance.getGroupsInfo(groupIDList: [groupId]));
+      expect(bobGroupInfoResult.code, equals(0),
+          reason: 'Bob should be able to query group info');
       final bobObservedChangedName = bobGroupInfoResult.data != null &&
           bobGroupInfoResult.data!.isNotEmpty &&
           bobGroupInfoResult.data!.first.groupInfo?.groupName == 'Changed Name';
@@ -320,10 +362,12 @@ void main() {
       expect(
         bobReceivedInfoChange || bobObservedChangedName,
         isTrue,
-        reason: 'Bob should observe group info change via callback or state query',
+        reason:
+            'Bob should observe group info change via callback or state query',
       );
-      
-      bob.runWithInstance(() => TIMManager.instance.removeGroupListener(listener: bobListener));
-    }, timeout: const Timeout(Duration(seconds: 60)));
+
+      bob.runWithInstance(
+          () => TIMManager.instance.removeGroupListener(listener: bobListener));
+    }, timeout: const Timeout(Duration(seconds: 120)));
   });
 }

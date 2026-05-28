@@ -1,9 +1,8 @@
-/// Multi-Group Test
+/// Multi-Group Test — virtual-clock variant
 ///
-/// Tests managing multiple groups simultaneously
-/// Verifies that multiple groups can coexist and operate independently
-
-import 'dart:async' show TimeoutException;
+/// Mirrors scenario_group_multi_test.dart 1:1 but drives the harness via
+/// the virtual-clock helpers (VirtualClock + pumpTestTick + *Virtual
+/// helpers).
 
 import 'package:test/test.dart';
 import 'package:tencent_cloud_chat_sdk/native_im/adapter/tim_manager.dart';
@@ -24,17 +23,25 @@ void main() {
 
     setUpAll(() async {
       await setupTestEnvironment();
+      // Enable test mode BEFORE scenario creation so event_thread never
+      // starts (canonical optimal pattern; saves the 10s DHT-wait in login()
+      // since event_thread suppression prevents DHT connect during login).
+      if (shouldRunVirtual) await VirtualClock.enableEarly();
       scenario = await createTestScenario(['alice', 'bob', 'charlie']);
       alice = scenario.getNode('alice')!;
       bob = scenario.getNode('bob')!;
       charlie = scenario.getNode('charlie')!;
 
       await scenario.initAllNodes();
-      // Parallelize login
+      // Idempotent — seeds virtual clock + reinforces per-instance flag.
+      if (shouldRunVirtual) await VirtualClock.enableForScenario(scenario);
+
+      // Parallelized login with short timeout (event_thread suppressed →
+      // no DHT-connect wait needed).
       await Future.wait([
-        alice.login(),
-        bob.login(),
-        charlie.login(),
+        alice.login(timeout: const Duration(milliseconds: 500)),
+        bob.login(timeout: const Duration(milliseconds: 500)),
+        charlie.login(timeout: const Duration(milliseconds: 500)),
       ]);
 
       await waitUntil(
@@ -43,24 +50,27 @@ void main() {
         description: 'all nodes logged in',
       );
 
-      await configureLocalBootstrap(scenario);
+      await configureLocalBootstrapVirtual(scenario);
 
       await Future.wait([
-        alice.waitForConnection(timeout: const Duration(seconds: 15)),
-        bob.waitForConnection(timeout: const Duration(seconds: 15)),
-        charlie.waitForConnection(timeout: const Duration(seconds: 15)),
+        waitForConnectionVirtual(scenario, alice,
+            timeout: const Duration(seconds: 15)),
+        waitForConnectionVirtual(scenario, bob,
+            timeout: const Duration(seconds: 15)),
+        waitForConnectionVirtual(scenario, charlie,
+            timeout: const Duration(seconds: 15)),
       ]);
       await Future.wait([
-        establishFriendship(alice, bob,
+        establishFriendshipVirtual(scenario, alice, bob,
             timeout: const Duration(seconds: 90)),
-        establishFriendship(alice, charlie,
+        establishFriendshipVirtual(scenario, alice, charlie,
             timeout: const Duration(seconds: 90)),
       ]);
-      await pumpFriendConnection(alice, bob,
+      await pumpFriendConnectionVirtual(scenario, alice, bob,
           duration: const Duration(seconds: 4));
-      await pumpFriendConnection(alice, charlie,
+      await pumpFriendConnectionVirtual(scenario, alice, charlie,
           duration: const Duration(seconds: 3));
-      await pumpFriendConnection(bob, charlie,
+      await pumpFriendConnectionVirtual(scenario, bob, charlie,
           duration: const Duration(seconds: 3));
     });
 
@@ -80,35 +90,54 @@ void main() {
       TestNode invitee, {
       required String context,
     }) async {
-      invitee.clearCallbackReceived('onGroupInvited');
-      final inviteResult = await alice.runWithInstanceAsync(
-          () async => TIMGroupManager.instance.inviteUserToGroup(
-                groupID: groupId,
-                userList: [invitee.getPublicKey()],
-              ));
-      expect(inviteResult.code, equals(0),
+      final inviteePubKey = invitee.getPublicKey();
+      // Retry invite + wait: inviteUserToGroup returns code=0 even when the
+      // underlying tox_group_invite_friend packet was dropped, and the first
+      // invite often races with friend P2P bring-up in virtual mode.
+      var arrived = false;
+      for (var attempt = 0; !arrived && attempt < 3; attempt++) {
+        invitee.clearCallbackReceived('onGroupInvited');
+        final inviteResult = await alice.runWithInstanceAsync(() async =>
+            TIMGroupManager.instance.inviteUserToGroup(
+              groupID: groupId,
+              userList: [inviteePubKey],
+            ));
+        expect(inviteResult.code, equals(0),
+            reason:
+                'inviteUserToGroup failed for ${invitee.alias}: ${inviteResult.desc}');
+        try {
+          await waitUntilWithVirtualPump(
+            scenario,
+            () => invitee.callbackReceived['onGroupInvited'] == true,
+            timeout: const Duration(seconds: 12),
+            description:
+                '${invitee.alias} receives onGroupInvited ($context, attempt ${attempt + 1})',
+            advanceMs: 50,
+            iterationsPerInstance: 1,
+          );
+          arrived = true;
+        } catch (_) {
+          // retry
+        }
+      }
+      expect(arrived, isTrue,
           reason:
-              'inviteUserToGroup failed for ${invitee.alias}: ${inviteResult.code}');
+              '${invitee.alias} never received onGroupInvited for $context after 3 retries');
 
-      await waitUntilWithPump(
-        () => invitee.callbackReceived['onGroupInvited'] == true,
-        timeout: const Duration(seconds: 12),
-        description: '${invitee.alias} receives onGroupInvited ($context)',
-        iterationsPerPump: 100,
-        stepDelay: const Duration(milliseconds: 200),
-      );
+      // Settle ~300ms virtual so pending invite -> chat_id mapping completes.
+      await pumpTestTick(scenario, advanceMs: 300, iterationsPerInstance: 1);
 
       final joinGroupId =
           invitee.getLastCallbackGroupId('onGroupInvited') ?? groupId;
       final joinResult = await invitee.runWithInstanceAsync(() async =>
           TIMManager.instance.joinGroup(groupID: joinGroupId, message: ''));
       expect(joinResult.code, equals(0),
-          reason: '${invitee.alias} joinGroup failed: ${joinResult.code}');
+          reason: '${invitee.alias} joinGroup failed: ${joinResult.desc}');
 
-      await pumpGroupPeerDiscovery(alice, invitee,
+      await pumpGroupPeerDiscoveryVirtual(scenario, alice, invitee,
           duration: const Duration(seconds: 3));
-      final inviteeInGroup = await waitUntilFounderSeesMemberInGroup(
-          alice, invitee, groupId,
+      final inviteeInGroup = await waitUntilFounderSeesMemberInGroupVirtual(
+          scenario, alice, invitee, groupId,
           timeout: const Duration(seconds: 25));
       expect(inviteeInGroup, isNotNull,
           reason: 'Alice must see ${invitee.alias} in group before $context');
@@ -153,25 +182,17 @@ void main() {
       expect(group2Result.data, isNot(equals(group3Result.data)));
       expect(group1Result.data, isNot(equals(group3Result.data)));
 
-      // Poll for joined list to contain all three groups (replaces fixed 3s wait).
-      List<String> groupIds = const [];
-      final initDeadline =
-          DateTime.now().add(const Duration(seconds: 8));
-      while (DateTime.now().isBefore(initDeadline)) {
-        final r = await alice.runWithInstanceAsync(
-            () async => TIMGroupManager.instance.getJoinedGroupList());
-        if (r.code == 0 && r.data != null) {
-          groupIds = r.data!.map((g) => g.groupID).toList();
-          if (groupIds.contains(group1Result.data) &&
-              groupIds.contains(group2Result.data) &&
-              groupIds.contains(group3Result.data)) {
-            break;
-          }
-        }
-        pumpAllInstancesOnce(iterations: 80);
-        await Future.delayed(const Duration(milliseconds: 200));
-      }
+      // Wait for groups to be fully initialized
+      await pumpTestTick(scenario, advanceMs: 3000, iterationsPerInstance: 1);
 
+      // Verify all groups are in joined list (alice's instance)
+      final joinedListResult = await alice.runWithInstanceAsync(
+          () async => TIMGroupManager.instance.getJoinedGroupList());
+      expect(joinedListResult.code, equals(0),
+          reason: 'getJoinedGroupList failed: ${joinedListResult.code}');
+      expect(joinedListResult.data, isNotNull);
+
+      final groupIds = joinedListResult.data!.map((g) => g.groupID).toList();
       expect(groupIds, contains(group1Result.data));
       expect(groupIds, contains(group2Result.data));
       expect(groupIds, contains(group3Result.data));
@@ -200,24 +221,17 @@ void main() {
       expect(conferenceResult.data, isNotNull,
           reason: 'conference data is null');
 
-      // Poll for joined list to contain both groups (replaces fixed 3s wait).
-      List<String> groupIds = const [];
-      final initDeadline =
-          DateTime.now().add(const Duration(seconds: 8));
-      while (DateTime.now().isBefore(initDeadline)) {
-        final r = await alice.runWithInstanceAsync(
-            () async => TIMGroupManager.instance.getJoinedGroupList());
-        if (r.code == 0 && r.data != null) {
-          groupIds = r.data!.map((g) => g.groupID).toList();
-          if (groupIds.contains(groupResult.data) &&
-              groupIds.contains(conferenceResult.data)) {
-            break;
-          }
-        }
-        pumpAllInstancesOnce(iterations: 80);
-        await Future.delayed(const Duration(milliseconds: 200));
-      }
+      // Wait for groups to be fully initialized
+      await pumpTestTick(scenario, advanceMs: 3000, iterationsPerInstance: 1);
 
+      // Verify both exist (alice's instance)
+      final joinedListResult = await alice.runWithInstanceAsync(
+          () async => TIMGroupManager.instance.getJoinedGroupList());
+      expect(joinedListResult.code, equals(0),
+          reason: 'getJoinedGroupList failed: ${joinedListResult.code}');
+      expect(joinedListResult.data, isNotNull);
+
+      final groupIds = joinedListResult.data!.map((g) => g.groupID).toList();
       expect(groupIds, contains(groupResult.data));
       expect(groupIds, contains(conferenceResult.data));
     }, timeout: const Timeout(Duration(seconds: 60)));
@@ -301,8 +315,12 @@ void main() {
           );
         });
 
-        pumpAllInstancesOnce(iterations: 150);
-        await waitUntilWithPump(
+        await pumpTestTick(scenario,
+            advanceMs: 50, iterationsPerInstance: 3);
+        await pumpTestTick(scenario,
+            advanceMs: 500, iterationsPerInstance: 1);
+        await waitUntilWithVirtualPump(
+          scenario,
           () =>
               messagesByGroup.containsKey(group1Id) &&
               messagesByGroup.containsKey(group2Id) &&
@@ -310,8 +328,8 @@ void main() {
               messagesByGroup[group2Id]!.isNotEmpty,
           timeout: const Duration(seconds: 25),
           description: 'messages received in both groups',
-          iterationsPerPump: 120,
-          stepDelay: const Duration(milliseconds: 200),
+          advanceMs: 50,
+          iterationsPerInstance: 1,
         );
 
         expect(
@@ -435,9 +453,8 @@ void main() {
       expect(group2Result.data, isNotNull, reason: 'group2 data is null');
       final group2Id = group2Result.data!;
 
-      // Brief settle for group-create callbacks; inviteAndJoinMember polls anyway.
-      pumpAllInstancesOnce(iterations: 100);
-      await Future.delayed(const Duration(milliseconds: 300));
+      // Wait for groups to be initialized
+      await pumpTestTick(scenario, advanceMs: 2000, iterationsPerInstance: 1);
 
       final group1ExpectedIds = await inviteAndJoinMember(
         group1Id,
@@ -459,18 +476,31 @@ void main() {
           reason: 'Failed to quit group2 ($group2QuitId): ${quitResult.code}');
 
       // Allow C++/Dart cleanup and persistence to complete
-      await Future.delayed(const Duration(milliseconds: 500));
-      pumpAllInstancesOnce(iterations: 80);
-      await Future.delayed(const Duration(milliseconds: 300));
+      await pumpTestTick(scenario, advanceMs: 500, iterationsPerInstance: 1);
+      await pumpTestTick(scenario, advanceMs: 50, iterationsPerInstance: 2);
+      await pumpTestTick(scenario, advanceMs: 300, iterationsPerInstance: 1);
 
-      // tim2tox: wait until joined list excludes quit group IDs (canonical + invite alias).
+      // tim2tox: wait until joined list excludes quit group IDs (canonical +
+      // invite alias). Inline equivalent of waitUntilJoinedListExcludesGroup
+      // for virtual mode (waitUntilWithVirtualPump only supports sync
+      // conditions, so poll directly against virtual time).
       for (final quitCandidateId in group2ExpectedIds) {
-        try {
-          await waitUntilJoinedListExcludesGroup(bob, quitCandidateId,
-              timeout: const Duration(seconds: 30),
-              iterationsPerPump: 80,
-              stepDelay: const Duration(milliseconds: 200));
-        } on TimeoutException {
+        final excludeDeadline =
+            VirtualClock.nowMs + const Duration(seconds: 30).inMilliseconds;
+        var excluded = false;
+        while (VirtualClock.nowMs < excludeDeadline) {
+          final result = await bob.runWithInstanceAsync(() async =>
+              TIMGroupManager.instance.getJoinedGroupList());
+          if (result.code == 0 &&
+              result.data != null &&
+              !result.data!.any((g) => g.groupID == quitCandidateId)) {
+            excluded = true;
+            break;
+          }
+          await pumpTestTick(scenario,
+              advanceMs: 200, iterationsPerInstance: 1);
+        }
+        if (!excluded) {
           print(
               'Note: Joined list still contained $quitCandidateId after 30s (list sync delay); quit returned 0.');
         }

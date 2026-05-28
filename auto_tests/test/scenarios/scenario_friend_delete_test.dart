@@ -1,7 +1,8 @@
-/// Friend Delete Test
-/// 
-/// Tests friend deletion
-/// Reference: c-toxcore/auto_tests/scenarios/scenario_friend_delete_test.c
+/// Friend Delete Test — virtual-clock variant
+///
+/// Mirrors scenario_friend_delete_test.dart 1:1 but enables
+/// VirtualClock.enableEarly() before initAllNodes() and uses
+/// establishFriendshipVirtual / virtual pump for delete-callback wait.
 
 import 'dart:async';
 import 'package:test/test.dart';
@@ -16,53 +17,79 @@ void main() {
     late TestScenario scenario;
     late TestNode alice;
     late TestNode bob;
-    
+
     setUpAll(() async {
-      scenario = await acquireSharedScenario(['alice', 'bob'],
-          withBootstrap: true, withFriendship: false);
+      await setupTestEnvironment();
+      // ENABLE TEST MODE *BEFORE* scenario creation.
+      if (shouldRunVirtual) await VirtualClock.enableEarly();
+      scenario = await createTestScenario(['alice', 'bob']);
       alice = scenario.getNode('alice')!;
       bob = scenario.getNode('bob')!;
+
+      await scenario.initAllNodes();
+      if (shouldRunVirtual) await VirtualClock.enableForScenario(scenario);
+
+      // Parallelize login
+      await Future.wait([
+        alice.login(),
+        bob.login(),
+      ]);
+
+      await waitUntil(() => alice.loggedIn && bob.loggedIn);
+
+      // Configure local bootstrap (virtual)
+      await configureLocalBootstrapVirtual(scenario);
     });
 
     tearDownAll(() async {
-      releaseSharedScenario(['alice', 'bob'],
-          withBootstrap: true, withFriendship: false);
+      await scenario.dispose();
+      await teardownTestEnvironment();
     });
-    
-    // Lightweight setUp for per-test cleanup if needed
+
     setUp(() async {
-      // Reset any per-test state if necessary
       // Most tests don't need cleanup since they use shared scenario
     });
-    
+
     test('Delete friend', () async {
-      // Establish friendship (alice adds bob); all ops in alice's instance context
-      await establishFriendship(alice, bob);
-      
+      // Establish friendship (alice adds bob) — virtual
+      await establishFriendshipVirtual(scenario, alice, bob);
+
       // Delete friend from alice's instance; native may expect 64-char public key
       final bobPublicKey = bob.getPublicKey();
       final deleteResult = await alice.runWithInstanceAsync(() async =>
           TIMFriendshipManager.instance.deleteFromFriendList(
-        userIDList: [bobPublicKey],
-        deleteType: FriendTypeEnum.V2TIM_FRIEND_TYPE_SINGLE,
-      ));
-      
+            userIDList: [bobPublicKey],
+            deleteType: FriendTypeEnum.V2TIM_FRIEND_TYPE_SINGLE,
+          ));
+
       expect(deleteResult.code, equals(0));
-      
-      // Verify friend is deleted (query alice's friend list in her context)
-      await Future.delayed(const Duration(seconds: 2));
+
+      // Verify friend is deleted (inline pump loop because predicate is async).
+      final delDeadline = VirtualClock.nowMs + 10000;
+      while (VirtualClock.nowMs < delDeadline) {
+        final list = await alice.runWithInstanceAsync(() async =>
+            TIMFriendshipManager.instance.getFriendList());
+        if (list.data == null) break;
+        if (!list.data!.any((friend) => friend.userID == bobPublicKey)) {
+          break;
+        }
+        await pumpTestTick(scenario, advanceMs: 50, iterationsPerInstance: 1);
+      }
+
       final friendListResult = await alice.runWithInstanceAsync(() async =>
           TIMFriendshipManager.instance.getFriendList());
       expect(friendListResult.code, equals(0));
       if (friendListResult.data != null) {
-        final bobInList = friendListResult.data!.any((friend) => friend.userID == bobPublicKey);
-        expect(bobInList, isFalse, reason: 'Bob should not be in friend list after deletion');
+        final bobInList =
+            friendListResult.data!.any((friend) => friend.userID == bobPublicKey);
+        expect(bobInList, isFalse,
+            reason: 'Bob should not be in friend list after deletion');
       }
-    }, timeout: const Timeout(Duration(seconds: 60)));
-    
+    }, timeout: const Timeout(Duration(seconds: 90)));
+
     test('Friend deletion callback', () async {
       final completer = Completer<void>();
-      
+
       final listener = V2TimFriendshipListener(
         onFriendListDeleted: (List<String> userIDList) {
           alice.markCallbackReceived('onFriendListDeleted');
@@ -71,29 +98,53 @@ void main() {
           }
         },
       );
-      
+
       alice.runWithInstance(() {
         TIMFriendshipManager.instance.addFriendListener(listener: listener);
       });
-      
-      // Establish and then delete friendship in alice's context
-      await establishFriendship(alice, bob);
+
+      // Establish and then delete friendship in alice's context (virtual)
+      await establishFriendshipVirtual(scenario, alice, bob);
       final bobPublicKey = bob.getPublicKey();
-      await alice.runWithInstanceAsync(() async =>
-          TIMFriendshipManager.instance.deleteFromFriendList(
-        userIDList: [bobPublicKey],
-        deleteType: FriendTypeEnum.V2TIM_FRIEND_TYPE_SINGLE,
-      ));
-      
-      // Wait for deletion callback
-      await completer.future.timeout(
-        const Duration(seconds: 30),
-        onTimeout: () {
-          // Callback may not be triggered in all cases
-        },
-      );
-      
-      expect(alice.runWithInstance(() => TIMFriendshipManager.instance.v2TimFriendshipListenerList.contains(listener)), isTrue);
-    }, timeout: const Timeout(Duration(seconds: 60)));
+
+      // Retry: delete + wait for callback up to 3 attempts.
+      var arrived = false;
+      for (var attempt = 0; !arrived && attempt < 3; attempt++) {
+        if (attempt > 0) {
+          // Re-fire delete; callback may have been missed on first attempt.
+          await alice.runWithInstanceAsync(() async =>
+              TIMFriendshipManager.instance.deleteFromFriendList(
+                userIDList: [bobPublicKey],
+                deleteType: FriendTypeEnum.V2TIM_FRIEND_TYPE_SINGLE,
+              ));
+        } else {
+          await alice.runWithInstanceAsync(() async =>
+              TIMFriendshipManager.instance.deleteFromFriendList(
+                userIDList: [bobPublicKey],
+                deleteType: FriendTypeEnum.V2TIM_FRIEND_TYPE_SINGLE,
+              ));
+        }
+        try {
+          await waitUntilWithVirtualPump(
+            scenario,
+            () => alice.callbackReceived['onFriendListDeleted'] == true,
+            timeout: const Duration(seconds: 30),
+            description: 'onFriendListDeleted (attempt ${attempt + 1})',
+            advanceMs: 50,
+            iterationsPerInstance: 1,
+          );
+          arrived = true;
+        } catch (_) {
+          // retry
+        }
+      }
+      // Callback may not be triggered in all cases (mirrors wall-clock onTimeout no-op).
+
+      expect(
+          alice.runWithInstance(() => TIMFriendshipManager
+              .instance.v2TimFriendshipListenerList
+              .contains(listener)),
+          isTrue);
+    }, timeout: const Timeout(Duration(seconds: 120)));
   });
 }

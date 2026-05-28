@@ -38,10 +38,12 @@ Options:
   -h, --help       Show this help
 
 Environment:
-  RUN_VIRTUAL=1       Swap each test file to its *_virtual_test.dart sibling
-                      when one exists (virtual-clock variants in test/scenarios/).
-                      Falls back to wall-clock original when no virtual variant
-                      has been authored.
+  RUN_VIRTUAL=1       Run scenarios under the virtual clock. Each scenario is a
+                      single mode-aware file (no *_virtual_test.dart siblings);
+                      it reads RUN_VIRTUAL via shouldRunVirtual (test_helper.dart)
+                      and enables the virtual clock when set. Default (0) is
+                      wall-clock. (The legacy *_virtual_test.dart swap below is a
+                      harmless no-op now that siblings are unified.)
   PARALLEL_WORKERS=N  Run up to N tests concurrently (each spawns its own
                       flutter_tester). Default 1 (sequential). 2-3 is usually
                       safe on a developer Mac; higher values risk CPU
@@ -73,7 +75,84 @@ Environment:
 EOF
 }
 
-# Resolve selector token to phase number (1-14)
+# ───────────────────────────────────────────────────────────────────────────
+# Phase manifest — single source of truth for phase metadata.
+#
+# One entry per phase: num|ARRAY_VAR|Display Name|PARALLEL_LABEL|alias1,alias2
+#
+#   num            phase number (1..N)
+#   ARRAY_VAR      name of the bash array holding this phase's test files
+#                  (defined further down; the file list is the only per-phase
+#                  data that is NOT derived from this manifest)
+#   Display Name   shown as "Phase N: <Display Name>"
+#   PARALLEL_LABEL single-token label emitted by parallel workers
+#   aliases        extra selector tokens (comma-separated). Numbers, "PHASEn",
+#                  and ARRAY_VAR itself are always accepted generically, so
+#                  only the *semantic* aliases need to be listed here.
+#
+# Every phase->metadata mapping (selector resolution, display name, parallel
+# label, array size, array contents, dispatch) derives from this table via the
+# accessors below. Add a phase by adding one row here plus its ARRAY_VAR.
+# ───────────────────────────────────────────────────────────────────────────
+PHASE_MANIFEST=(
+  "1|PHASE1_BASIC|Basic Tests|P1_BASIC|BASIC"
+  "2|PHASE2_FRIENDSHIP|Friendship Tests|P2_FRIENDSHIP|FRIENDSHIP"
+  "3|PHASE3_MESSAGE|Message Tests|P3_MESSAGE|MESSAGE"
+  "4|PHASE4_GROUP|Group Tests|P4_GROUP|GROUP"
+  "5|PHASE5_TOXAV|ToxAV Tests|P5_TOXAV|TOXAV"
+  "6|PHASE6_PROFILE|Profile Tests|P6_PROFILE|PROFILE"
+  "7|PHASE7_CONVERSATION|Conversation Tests|P7_CONVERSATION|CONVERSATION"
+  "8|PHASE8_FILE|File Tests|P8_FILE|FILE"
+  "9|PHASE9_CONFERENCE|Conference Tests|P9_CONFERENCE|CONFERENCE"
+  "10|PHASE10_GROUP_EXT|Group Extended Tests|P10_GROUP_EXT|GROUP_EXT,GROUPEXT"
+  "11|PHASE11_NETWORK|Network Tests|P11_NETWORK|NETWORK"
+  "12|PHASE12_OTHER|Other Tests|P12_OTHER|OTHER"
+  "13|PHASE13_BINARY_REPLACEMENT|Binary Replacement Tests|P13_BINARY|BINARY,BINARY_REPLACEMENT,PHASE13_BINARY"
+  "14|PHASE14_UNIT|Unit Tests|P14_UNIT|UNIT,UNIT_TEST,UNIT_TESTS"
+)
+
+# Number of phases (derived — never hardcode 14 below this line).
+PHASE_COUNT=${#PHASE_MANIFEST[@]}
+
+# Return a manifest field for a phase number.
+# field index (cut -f): 1=num 2=ARRAY_VAR 3=Display 4=Label 5=aliases
+_manifest_field_for_num() {
+  local num="$1" field="$2" entry
+  for entry in "${PHASE_MANIFEST[@]}"; do
+    if [ "${entry%%|*}" = "$num" ]; then
+      printf '%s\n' "$entry" | cut -d'|' -f"$field"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# num -> name of the PHASEN_* array variable holding its test files.
+phase_varname_for_num() { _manifest_field_for_num "$1" 2; }
+
+# num -> "Phase N: <Display Name>"
+phase_name_for_num() {
+  local d
+  if d=$(_manifest_field_for_num "$1" 3); then
+    echo "Phase $1: $d"
+  else
+    echo "Phase ?: Unknown"
+  fi
+}
+
+# num -> single-token label used in parallel worker status output (e.g. P3_MESSAGE).
+phase_label_for_num() { _manifest_field_for_num "$1" 4 || echo "P?"; }
+
+# num -> number of test files in that phase's array.
+# Indirect expansion (eval) keeps this bash-3.2 compatible (no `declare -A`).
+phase_array_size_for_num() {
+  local var
+  var=$(phase_varname_for_num "$1") || { echo 0; return; }
+  eval "echo \"\${#${var}[@]}\""
+}
+
+# Resolve a selector token (number / "PHASEn" / ARRAY_VAR / semantic alias) to
+# a phase number. Echoes the empty string for unknown tokens.
 resolve_phase_arg() {
   local arg="$1"
   if [ -z "$arg" ]; then
@@ -84,50 +163,35 @@ resolve_phase_arg() {
   local upper
   upper=$(echo "$arg" | tr '[:lower:]' '[:upper:]')
 
+  # Plain phase number.
   if [ "$upper" -eq "$upper" ] 2>/dev/null; then
-    if [ "$upper" -ge 1 ] && [ "$upper" -le 14 ]; then
+    if [ "$upper" -ge 1 ] && [ "$upper" -le "$PHASE_COUNT" ]; then
       echo "$upper"
       return
     fi
   fi
 
-  case "$upper" in
-    1|BASIC|PHASE1|PHASE1_BASIC) echo "1" ;;
-    2|FRIENDSHIP|PHASE2|PHASE2_FRIENDSHIP) echo "2" ;;
-    3|MESSAGE|PHASE3|PHASE3_MESSAGE) echo "3" ;;
-    4|GROUP|PHASE4|PHASE4_GROUP) echo "4" ;;
-    5|TOXAV|PHASE5|PHASE5_TOXAV) echo "5" ;;
-    6|PROFILE|PHASE6|PHASE6_PROFILE) echo "6" ;;
-    7|CONVERSATION|PHASE7|PHASE7_CONVERSATION) echo "7" ;;
-    8|FILE|PHASE8|PHASE8_FILE) echo "8" ;;
-    9|CONFERENCE|PHASE9|PHASE9_CONFERENCE) echo "9" ;;
-    10|GROUP_EXT|GROUPEXT|PHASE10|PHASE10_GROUP_EXT) echo "10" ;;
-    11|NETWORK|PHASE11|PHASE11_NETWORK) echo "11" ;;
-    12|OTHER|PHASE12|PHASE12_OTHER) echo "12" ;;
-    13|BINARY|PHASE13|PHASE13_BINARY|PHASE13_BINARY_REPLACEMENT|BINARY_REPLACEMENT) echo "13" ;;
-    14|UNIT|UNIT_TEST|UNIT_TESTS|PHASE14|PHASE14_UNIT) echo "14" ;;
-    *) echo "" ;;
-  esac
-}
+  local entry e_num e_var e_aliases a
+  for entry in "${PHASE_MANIFEST[@]}"; do
+    e_num=$(printf '%s\n' "$entry" | cut -d'|' -f1)
+    e_var=$(printf '%s\n' "$entry" | cut -d'|' -f2)
+    e_aliases=$(printf '%s\n' "$entry" | cut -d'|' -f5)
+    # "PHASE<n>" or the array variable name itself (e.g. PHASE3 / PHASE3_MESSAGE).
+    if [ "$upper" = "PHASE${e_num}" ] || [ "$upper" = "$e_var" ]; then
+      echo "$e_num"
+      return
+    fi
+    # Semantic aliases (comma-separated).
+    IFS=',' read -r -a _aliases <<< "$e_aliases"
+    for a in "${_aliases[@]}"; do
+      if [ -n "$a" ] && [ "$upper" = "$a" ]; then
+        echo "$e_num"
+        return
+      fi
+    done
+  done
 
-phase_name_for_num() {
-  case "$1" in
-    1) echo "Phase 1: Basic Tests" ;;
-    2) echo "Phase 2: Friendship Tests" ;;
-    3) echo "Phase 3: Message Tests" ;;
-    4) echo "Phase 4: Group Tests" ;;
-    5) echo "Phase 5: ToxAV Tests" ;;
-    6) echo "Phase 6: Profile Tests" ;;
-    7) echo "Phase 7: Conversation Tests" ;;
-    8) echo "Phase 8: File Tests" ;;
-    9) echo "Phase 9: Conference Tests" ;;
-    10) echo "Phase 10: Group Extended Tests" ;;
-    11) echo "Phase 11: Network Tests" ;;
-    12) echo "Phase 12: Other Tests" ;;
-    13) echo "Phase 13: Binary Replacement Tests" ;;
-    14) echo "Phase 14: Unit Tests" ;;
-    *) echo "Phase ?: Unknown" ;;
-  esac
+  echo ""
 }
 
 # Parse args
@@ -168,7 +232,7 @@ add_phase() {
 
 SELECTED_PHASES=()
 if [ ${#SELECTOR_TOKENS[@]} -eq 0 ]; then
-  for p in $(seq 1 14); do
+  for p in $(seq 1 "$PHASE_COUNT"); do
     add_phase "$p"
   done
 else
@@ -311,7 +375,7 @@ else
   echo -e "${YELLOW}Dependencies appear up to date (skipping flutter pub get; set SKIP_PUB_GET=0 to force).${NC}"
 fi
 
-# Test files organized by complexity/dependencies (69 scenario + 3 binary + 1 unit)
+# Test files organized by complexity/dependencies (73 scenario + 3 binary + 1 unit)
 PHASE1_BASIC=(
   "test/scenarios/scenario_sdk_init_test.dart"
   "test/scenarios/scenario_login_test.dart"
@@ -563,11 +627,8 @@ if [[ "$_parallel_workers_for_filter" =~ ^[0-9]+$ ]] && [ "$_parallel_workers_fo
     eval "$arr_name=($quoted)"
   }
 
-  for _arr_name in PHASE1_BASIC PHASE2_FRIENDSHIP PHASE3_MESSAGE PHASE4_GROUP \
-                   PHASE5_TOXAV PHASE6_PROFILE PHASE7_CONVERSATION PHASE8_FILE \
-                   PHASE9_CONFERENCE PHASE10_GROUP_EXT PHASE11_NETWORK \
-                   PHASE12_OTHER PHASE13_BINARY_REPLACEMENT PHASE14_UNIT; do
-    filter_phase_array_for_parallel "$_arr_name"
+  for _manifest_entry in "${PHASE_MANIFEST[@]}"; do
+    filter_phase_array_for_parallel "$(printf '%s\n' "$_manifest_entry" | cut -d'|' -f2)"
   done
 fi
 
@@ -575,27 +636,8 @@ fi
 # Adds each skipped phase's test count to TOTAL_SKIPPED and records a single
 # "Phase N (SKIP_PHASES env)" entry per skipped phase. Done here (after the
 # PHASEN_* arrays are populated and unstable filters applied) so the counts
-# match what would have actually run.
-phase_array_size_for_num() {
-  case "$1" in
-    1)  echo "${#PHASE1_BASIC[@]}" ;;
-    2)  echo "${#PHASE2_FRIENDSHIP[@]}" ;;
-    3)  echo "${#PHASE3_MESSAGE[@]}" ;;
-    4)  echo "${#PHASE4_GROUP[@]}" ;;
-    5)  echo "${#PHASE5_TOXAV[@]}" ;;
-    6)  echo "${#PHASE6_PROFILE[@]}" ;;
-    7)  echo "${#PHASE7_CONVERSATION[@]}" ;;
-    8)  echo "${#PHASE8_FILE[@]}" ;;
-    9)  echo "${#PHASE9_CONFERENCE[@]}" ;;
-    10) echo "${#PHASE10_GROUP_EXT[@]}" ;;
-    11) echo "${#PHASE11_NETWORK[@]}" ;;
-    12) echo "${#PHASE12_OTHER[@]}" ;;
-    13) echo "${#PHASE13_BINARY_REPLACEMENT[@]}" ;;
-    14) echo "${#PHASE14_UNIT[@]}" ;;
-    *) echo 0 ;;
-  esac
-}
-
+# match what would have actually run. phase_array_size_for_num is defined with
+# the other manifest accessors near the top of this script.
 if [ ${#SKIP_PHASE_NUMS[@]} -gt 0 ]; then
   for skipped in "${SKIP_PHASE_NUMS[@]}"; do
     skipped_count=$(phase_array_size_for_num "$skipped")
@@ -1002,50 +1044,15 @@ run_test_worker() {
 }
 export -f get_test_timeout_for_file run_test_worker
 
-# Phase number -> single-token label used in parallel worker status output.
-phase_label_for_num() {
-  case "$1" in
-    1) echo "P1_BASIC" ;;
-    2) echo "P2_FRIENDSHIP" ;;
-    3) echo "P3_MESSAGE" ;;
-    4) echo "P4_GROUP" ;;
-    5) echo "P5_TOXAV" ;;
-    6) echo "P6_PROFILE" ;;
-    7) echo "P7_CONVERSATION" ;;
-    8) echo "P8_FILE" ;;
-    9) echo "P9_CONFERENCE" ;;
-    10) echo "P10_GROUP_EXT" ;;
-    11) echo "P11_NETWORK" ;;
-    12) echo "P12_OTHER" ;;
-    13) echo "P13_BINARY" ;;
-    14) echo "P14_UNIT" ;;
-    *) echo "P?" ;;
-  esac
-}
+# phase_label_for_num is defined with the other manifest accessors near the top.
 
 # Build "test_file<TAB>phase_label" pairs for every test in the
 # selected phases. Used only by parallel mode.
 build_parallel_queue() {
-  local pn arr ref test
+  local pn var label test
   for pn in "${SELECTED_PHASES[@]}"; do
-    case "$pn" in
-      1)  arr=("${PHASE1_BASIC[@]}") ;;
-      2)  arr=("${PHASE2_FRIENDSHIP[@]}") ;;
-      3)  arr=("${PHASE3_MESSAGE[@]}") ;;
-      4)  arr=("${PHASE4_GROUP[@]}") ;;
-      5)  arr=("${PHASE5_TOXAV[@]}") ;;
-      6)  arr=("${PHASE6_PROFILE[@]}") ;;
-      7)  arr=("${PHASE7_CONVERSATION[@]}") ;;
-      8)  arr=("${PHASE8_FILE[@]}") ;;
-      9)  arr=("${PHASE9_CONFERENCE[@]}") ;;
-      10) arr=("${PHASE10_GROUP_EXT[@]}") ;;
-      11) arr=("${PHASE11_NETWORK[@]}") ;;
-      12) arr=("${PHASE12_OTHER[@]}") ;;
-      13) arr=("${PHASE13_BINARY_REPLACEMENT[@]}") ;;
-      14) arr=("${PHASE14_UNIT[@]}") ;;
-      *)  arr=() ;;
-    esac
-    local label
+    var=$(phase_varname_for_num "$pn") || continue
+    eval "local arr=(\"\${${var}[@]}\")"
     label=$(phase_label_for_num "$pn")
     for test in "${arr[@]}"; do
       printf '%s\t%s\n' "$test" "$label"
@@ -1056,25 +1063,10 @@ build_parallel_queue() {
 # Aggregate parallel status files back into the global counters and
 # print phase-grouped output, sorted by dispatch order.
 collect_parallel_results() {
-  local pn arr label total phase_total phase_passed phase_failed
+  local pn var arr label total phase_total phase_passed phase_failed
   for pn in "${SELECTED_PHASES[@]}"; do
-    case "$pn" in
-      1)  arr=("${PHASE1_BASIC[@]}") ;;
-      2)  arr=("${PHASE2_FRIENDSHIP[@]}") ;;
-      3)  arr=("${PHASE3_MESSAGE[@]}") ;;
-      4)  arr=("${PHASE4_GROUP[@]}") ;;
-      5)  arr=("${PHASE5_TOXAV[@]}") ;;
-      6)  arr=("${PHASE6_PROFILE[@]}") ;;
-      7)  arr=("${PHASE7_CONVERSATION[@]}") ;;
-      8)  arr=("${PHASE8_FILE[@]}") ;;
-      9)  arr=("${PHASE9_CONFERENCE[@]}") ;;
-      10) arr=("${PHASE10_GROUP_EXT[@]}") ;;
-      11) arr=("${PHASE11_NETWORK[@]}") ;;
-      12) arr=("${PHASE12_OTHER[@]}") ;;
-      13) arr=("${PHASE13_BINARY_REPLACEMENT[@]}") ;;
-      14) arr=("${PHASE14_UNIT[@]}") ;;
-      *)  arr=() ;;
-    esac
+    var=$(phase_varname_for_num "$pn") || continue
+    eval "arr=(\"\${${var}[@]}\")"
     label=$(phase_name_for_num "$pn")
     total=${#arr[@]}
     phase_passed=0
@@ -1147,26 +1139,14 @@ run_phase_by_number() {
   if [ "${BUNDLE:-0}" = "1" ]; then
     runner=run_phase_bundled
   fi
-  case "$num" in
-    1) "$runner" "Phase 1: Basic Tests" "${PHASE1_BASIC[@]}" || true ;;
-    2) "$runner" "Phase 2: Friendship Tests" "${PHASE2_FRIENDSHIP[@]}" || true ;;
-    3) "$runner" "Phase 3: Message Tests" "${PHASE3_MESSAGE[@]}" || true ;;
-    4) "$runner" "Phase 4: Group Tests" "${PHASE4_GROUP[@]}" || true ;;
-    5) "$runner" "Phase 5: ToxAV Tests" "${PHASE5_TOXAV[@]}" || true ;;
-    6) "$runner" "Phase 6: Profile Tests" "${PHASE6_PROFILE[@]}" || true ;;
-    7) "$runner" "Phase 7: Conversation Tests" "${PHASE7_CONVERSATION[@]}" || true ;;
-    8) "$runner" "Phase 8: File Tests" "${PHASE8_FILE[@]}" || true ;;
-    9) "$runner" "Phase 9: Conference Tests" "${PHASE9_CONFERENCE[@]}" || true ;;
-    10) "$runner" "Phase 10: Group Extended Tests" "${PHASE10_GROUP_EXT[@]}" || true ;;
-    11) "$runner" "Phase 11: Network Tests" "${PHASE11_NETWORK[@]}" || true ;;
-    12) "$runner" "Phase 12: Other Tests" "${PHASE12_OTHER[@]}" || true ;;
-    13) "$runner" "Phase 13: Binary Replacement Tests" "${PHASE13_BINARY_REPLACEMENT[@]}" || true ;;
-    14) "$runner" "Phase 14: Unit Tests" "${PHASE14_UNIT[@]}" || true ;;
-    *)
-      echo -e "${RED}Internal error: unsupported phase number: $num${NC}"
-      exit 3
-      ;;
-  esac
+  local var name
+  var=$(phase_varname_for_num "$num") || {
+    echo -e "${RED}Internal error: unsupported phase number: $num${NC}"
+    exit 3
+  }
+  name=$(phase_name_for_num "$num")
+  eval "local _files=(\"\${${var}[@]}\")"
+  "$runner" "$name" "${_files[@]}" || true
 }
 
 # PARALLEL_WORKERS=N runs the entire selected queue across N concurrent

@@ -54,7 +54,7 @@ C++ does **not** persist message history. Persistence lives entirely on the Dart
   - `models/` — `ChatMessage`, fake UIKit models.
   - `tim2tox_dart.dart` is the public barrel.
 - `third_party/c-toxcore` — vendored Tox protocol implementation. CMake guards against double-add with `if(NOT TARGET toxcore_static)`.
-- `auto_tests/` — Dart/Flutter scenario suite. 139 test files (each scenario has wall-clock + `*_virtual_test.dart` virtual-clock variants). Borrows test-case design from `c-toxcore/auto_tests/`. See `auto_tests/README.md` and `auto_tests/VIRTUAL_CLOCK.md`.
+- `auto_tests/` — Dart/Flutter scenario suite. 74 scenario files (73 mode-aware + 1 virtual-clock smoke). Each scenario is a **single file** that runs wall-clock by default and virtual-clock under `RUN_VIRTUAL=1` (it reads `shouldRunVirtual` and gates `VirtualClock.enableEarly/enableForScenario`; the `*Virtual` body helpers fall back to real-time when the clock is off). There are no `*_virtual_test.dart` siblings. Borrows test-case design from `c-toxcore/auto_tests/`. See `auto_tests/README.md` and `auto_tests/VIRTUAL_CLOCK.md`.
 - `test/` — small C++ unit tests (`ToxUtilTest.cpp`, `V2TIMMessageTest.cpp`, `V2TIMStringTest.cpp`), gated by `-DTIM2TOX_BUILD_TESTS=ON`.
 - `example/` — standalone C/C++ usage examples (echo bot, client). Not part of the Flutter integration path.
 - `doc/` — canonical documentation; new design docs go here. Most pages are bilingual (`*.md` Chinese + `*.en.md` English).
@@ -124,7 +124,7 @@ cd auto_tests
 ./run_tests_ordered.sh 4                           # single phase
 ./run_tests_ordered.sh 5,6                         # comma list
 ./run_tests_ordered.sh 7-9                         # range
-RUN_VIRTUAL=1 ./run_tests_ordered.sh               # virtual-clock mode: swap each test for its *_virtual_test.dart sibling when present, dramatically faster
+RUN_VIRTUAL=1 ./run_tests_ordered.sh               # virtual-clock mode: each mode-aware scenario self-selects via shouldRunVirtual, dramatically faster
 ./run_tests_ordered.sh --merge-output 13           # merge logs to merged_results/ for one phase
 ```
 

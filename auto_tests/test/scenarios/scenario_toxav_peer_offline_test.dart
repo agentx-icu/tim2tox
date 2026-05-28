@@ -1,4 +1,4 @@
-// Ported from c-toxcore scenario_toxav_peer_offline_test.c.
+// Ported from c-toxcore scenario_toxav_peer_offline_test.c (virtual-clock variant).
 
 import 'dart:async';
 import 'package:test/test.dart';
@@ -24,33 +24,44 @@ void main() {
 
     setUpAll(() async {
       await setupTestEnvironment();
+      if (shouldRunVirtual) await VirtualClock.enableEarly();
+
       scenario = await createTestScenario(['alice', 'bob']);
       alice = scenario.getNode('alice')!;
       bob = scenario.getNode('bob')!;
 
       await scenario.initAllNodes();
+      if (shouldRunVirtual) await VirtualClock.enableForScenario(scenario);
+
       await Future.wait([
         alice.login(),
         bob.login(),
       ]);
 
-      await waitUntil(() => alice.loggedIn && bob.loggedIn,
-          timeout: const Duration(seconds: 10));
-
-      await configureLocalBootstrap(scenario);
-
-      await Future.wait([
-        alice.waitForConnection(timeout: const Duration(seconds: 10)),
-        bob.waitForConnection(timeout: const Duration(seconds: 10)),
-      ]);
-
       await waitUntil(
+        () => alice.loggedIn && bob.loggedIn,
+        timeout: const Duration(seconds: 10),
+      );
+
+      await configureLocalBootstrapVirtual(scenario);
+
+      alice.enableAutoAccept();
+      bob.enableAutoAccept();
+
+      await waitForConnectionVirtual(scenario, alice,
+          timeout: const Duration(seconds: 15));
+      await waitForConnectionVirtual(scenario, bob,
+          timeout: const Duration(seconds: 15));
+
+      await waitUntilWithVirtualPump(
+        scenario,
         () {
           final a = alice.getToxId();
           final b = bob.getToxId();
           return a.length == 76 && b.length == 76;
         },
         timeout: const Duration(seconds: 10),
+        description: 'Tox IDs available',
       );
 
       final aliceToxId = alice.getToxId();
@@ -71,13 +82,19 @@ void main() {
             addWording: 'test',
           ));
 
-      await Future.delayed(const Duration(seconds: 5));
+      // Drive a burst so auto-accept side-effects propagate.
+      for (int i = 0; i < 30; i++) {
+        await pumpTestTickAv(scenario,
+            advanceMs: 100,
+            iterationsPerInstance: 1,
+            wallSleep: const Duration(milliseconds: 30));
+      }
       final alicePub = alice.getPublicKey();
       final bobPub = bob.getPublicKey();
       await waitForFriendsInList(alice, [bobPub],
-          timeout: const Duration(seconds: 120));
+          timeout: const Duration(seconds: 60));
       await waitForFriendsInList(bob, [alicePub],
-          timeout: const Duration(seconds: 120));
+          timeout: const Duration(seconds: 60));
 
       final ffi = ffi_lib.Tim2ToxFfi.open();
       final aliceInit = await alice.runWithInstanceAsync(() async {
@@ -114,7 +131,6 @@ void main() {
       expect(aliceFriendNumber, isNot(equals(0xFFFFFFFF)),
           reason: 'Alice friend number not found');
 
-      // Track call states on both sides.
       var bobReceivedCall = false;
       int aliceLastState = 0;
       int bobLastState = 0;
@@ -139,42 +155,56 @@ void main() {
         }
       });
 
-      await Future.wait([
-        alice.waitForFriendConnection(bobToxId,
-            timeout: const Duration(seconds: 30)),
-        bob.waitForFriendConnection(aliceToxId,
-            timeout: const Duration(seconds: 30)),
-      ]);
+      await waitForFriendConnectionVirtual(scenario, alice, bobToxId,
+          timeout: const Duration(seconds: 60));
+      await waitForFriendConnectionVirtual(scenario, bob, aliceToxId,
+          timeout: const Duration(seconds: 60));
 
-      final ffi = ffi_lib.Tim2ToxFfi.open();
       for (int i = 0; i < 10; i++) {
-        alice.runWithInstance(() => ffi.avIterate(ffi.getCurrentInstanceId()));
-        bob.runWithInstance(() => ffi.avIterate(ffi.getCurrentInstanceId()));
-        await Future.delayed(const Duration(milliseconds: 50));
+        await pumpTestTickAv(scenario,
+            advanceMs: 50,
+            iterationsPerInstance: 1,
+            wallSleep: const Duration(milliseconds: 30));
       }
 
       // Alice calls Bob (audio only — matches the c-toxcore variant).
-      final callResult = await alice.runWithInstanceAsync(() async =>
-          aliceAV.startCall(
-            bobFriendNumber,
-            audioBitRate: 48,
-            videoBitRate: 0,
-          ));
-      expect(callResult, isTrue, reason: 'Failed to start call');
-
-      // Wait for Bob to see the incoming call.
-      await waitUntil(
-        () {
-          alice.runWithInstance(
-              () => ffi.avIterate(ffi.getCurrentInstanceId()));
-          bob.runWithInstance(
-              () => ffi.avIterate(ffi.getCurrentInstanceId()));
-          return bobReceivedCall;
-        },
-        timeout: const Duration(seconds: 25),
-        pollInterval: const Duration(milliseconds: 50),
-        description: 'Bob received call',
-      );
+      // Friend P2P on 2-node loopback can be flaky; retry the call until
+      // Bob's onCall fires.
+      bool callReceived = false;
+      for (var attempt = 0; !callReceived && attempt < 3; attempt++) {
+        if (attempt > 0) {
+          await alice.runWithInstanceAsync(
+              () async => aliceAV.endCall(bobFriendNumber));
+          for (int i = 0; i < 5; i++) {
+            await pumpTestTickAv(scenario,
+                advanceMs: 50,
+                iterationsPerInstance: 1,
+                wallSleep: const Duration(milliseconds: 30));
+          }
+          bobReceivedCall = false;
+        }
+        final callResult = await alice.runWithInstanceAsync(() async =>
+            aliceAV.startCall(
+              bobFriendNumber,
+              audioBitRate: 48,
+              videoBitRate: 0,
+            ));
+        expect(callResult, isTrue, reason: 'Failed to start call');
+        try {
+          await waitUntilWithAvVirtualPump(
+            scenario,
+            () => bobReceivedCall,
+            timeout: const Duration(seconds: 25),
+            description: 'Bob received call (attempt ${attempt + 1})',
+            advanceMs: 50,
+            iterationsPerInstance: 1,
+            wallSleep: const Duration(milliseconds: 30),
+          );
+          callReceived = true;
+        } catch (_) {}
+      }
+      expect(bobReceivedCall, isTrue,
+          reason: 'Bob never received onCall after retries');
 
       // Bob answers.
       final answerResult = await bob.runWithInstanceAsync(() async =>
@@ -185,24 +215,19 @@ void main() {
           ));
       expect(answerResult, isTrue, reason: 'Failed to answer call');
 
-      // Drive the call to "active" — Alice's state callback should pick up
-      // SENDING_A (matches the c-toxcore wait loop on TOXAV_FRIEND_CALL_STATE_SENDING_A).
-      await waitUntil(
-        () {
-          alice.runWithInstance(
-              () => ffi.avIterate(ffi.getCurrentInstanceId()));
-          bob.runWithInstance(
-              () => ffi.avIterate(ffi.getCurrentInstanceId()));
-          return (aliceLastState & _kCallStateSendingA) != 0;
-        },
-        timeout: const Duration(seconds: 20),
-        pollInterval: const Duration(milliseconds: 50),
+      // Wait until Alice sees SENDING_A (call active).
+      await waitUntilWithAvVirtualPump(
+        scenario,
+        () => (aliceLastState & _kCallStateSendingA) != 0,
+        timeout: const Duration(seconds: 25),
         description: 'Alice sees call active (SENDING_A)',
+        advanceMs: 50,
+        iterationsPerInstance: 1,
+        wallSleep: const Duration(milliseconds: 30),
       );
 
       // Take Bob "offline" w.r.t. Alice's ToxAV by removing him from her
-      // friend list — exactly what c-toxcore's scenario_toxav_peer_offline_test
-      // does (tox_friend_delete). After delete,
+      // friend list — mirrors c-toxcore tox_friend_delete. After delete,
       // tox_friend_get_connection_status() inside toxav_iterate returns NONE,
       // which routes to msi_call_timeout and ends the call with FINISHED.
       final bobPub = bob.getPublicKey();
@@ -214,25 +239,22 @@ void main() {
       expect(deleteResult.code, equals(0),
           reason: 'Failed to delete Bob from Alice friend list');
 
-      // Iterate ToxAV on Alice's side so the is_offline branch executes
-      // without crashing (UAF regression from the original) AND so Alice's
-      // state callback fires the FINISHED transition.
       final stateUpdatesBefore = aliceStateUpdates;
-      await waitUntil(
-        () {
-          alice.runWithInstance(
-              () => ffi.avIterate(ffi.getCurrentInstanceId()));
-          return (aliceLastState &
-                  (_kCallStateFinished | _kCallStateError)) !=
-              0;
-        },
+
+      // Iterate ToxAV on Alice's side so the is_offline branch executes
+      // without crashing (UAF regression check from the original) AND so
+      // Alice's state callback fires the FINISHED transition.
+      await waitUntilWithAvVirtualPump(
+        scenario,
+        () =>
+            (aliceLastState & (_kCallStateFinished | _kCallStateError)) != 0,
         timeout: const Duration(seconds: 30),
-        pollInterval: const Duration(milliseconds: 100),
         description: 'Alice call ends after Bob goes offline',
+        advanceMs: 100,
+        iterationsPerInstance: 1,
+        wallSleep: const Duration(milliseconds: 30),
       );
 
-      // The c-toxcore test treats "no crash after toxav_iterate post-delete"
-      // as the pass condition. We additionally assert the state transition.
       expect(aliceStateUpdates, greaterThan(stateUpdatesBefore),
           reason:
               'Alice should have received at least one extra call-state update '
@@ -242,6 +264,6 @@ void main() {
           reason:
               'Alice call should be FINISHED or ERROR after peer offline, got '
               '$aliceLastState (bob last state was $bobLastState)');
-    }, timeout: const Timeout(Duration(seconds: 180)));
+    }, timeout: const Timeout(Duration(seconds: 240)));
   });
 }

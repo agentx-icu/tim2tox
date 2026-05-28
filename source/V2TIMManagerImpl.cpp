@@ -523,14 +523,14 @@ bool V2TIMManagerImpl::InitSDK(uint32_t sdkAppID, const V2TIMSDKConfig& config) 
             V2TIM_LOG(kInfo, "[GroupInvite] ========== Received group invite ==========");
             V2TIM_LOG(kInfo, "[GroupInvite] friend_number={}, invite_data_length={}", friend_number, invite_data_length);
             
-            // Log first few bytes of invite_data for debugging
+            // Log a redacted prefix of invite_data for debugging (avoid leaking the full invite bytes)
             if (invite_data && invite_data_length > 0) {
                 std::ostringstream invite_hex;
-                size_t bytes_to_log = std::min(invite_data_length, static_cast<size_t>(16));
+                size_t bytes_to_log = std::min(invite_data_length, static_cast<size_t>(4));
                 for (size_t i = 0; i < bytes_to_log; ++i) {
                     invite_hex << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(invite_data[i]);
                 }
-                V2TIM_LOG(kInfo, "[GroupInvite] invite_data (first {} bytes): {}", bytes_to_log, invite_hex.str());
+                V2TIM_LOG(kInfo, "[GroupInvite] invite_data (first 8 hex chars): {}…", invite_hex.str().substr(0, 8));
             }
             
             // Get inviter's public key for onMemberInvited callback
@@ -540,7 +540,7 @@ bool V2TIMManagerImpl::InitSDK(uint32_t sdkAppID, const V2TIMSDKConfig& config) 
                 uint8_t inviter_pubkey[TOX_PUBLIC_KEY_SIZE];
                 if (tox_friend_get_public_key(tox_for_inviter, friend_number, inviter_pubkey, nullptr)) {
                     inviterUserID = ToxUtil::tox_bytes_to_hex(inviter_pubkey, TOX_PUBLIC_KEY_SIZE);
-                    V2TIM_LOG(kInfo, "[GroupInvite] Got inviter public key: {} (length={})", inviterUserID, inviterUserID.length());
+                    V2TIM_LOG(kInfo, "[GroupInvite] Got inviter public key: {}… (length={})", inviterUserID.substr(0, 8), inviterUserID.length());
                 } else {
                     V2TIM_LOG(kWarning, "[GroupInvite] Failed to get inviter public key for friend_number={}", friend_number);
                 }
@@ -576,9 +576,7 @@ bool V2TIMManagerImpl::InitSDK(uint32_t sdkAppID, const V2TIMSDKConfig& config) 
             // This notifies listeners that we received an invitation
             // Note: We use temporary groupID here, and will trigger again with actual groupID in HandleGroupSelfJoin
             if (!inviterUserID.empty()) {
-                V2TIM_LOG(kInfo, "[GroupInvite] Triggering onMemberInvited callback immediately: tempGroupID={}, inviter={}", gid, inviterUserID);
-                fprintf(stdout, "[GroupInvite] Triggering onMemberInvited callback immediately: tempGroupID=%s, inviter=%s\n", gid, inviterUserID.c_str());
-                fflush(stdout);
+                V2TIM_LOG(kInfo, "[GroupInvite] Triggering onMemberInvited callback immediately: tempGroupID={}, inviter={}…", gid, inviterUserID.substr(0, 8));
                 
                 // Build member list (contains self, as we are being invited)
                 V2TIMGroupMemberInfoVector memberList;
@@ -590,7 +588,7 @@ bool V2TIMManagerImpl::InitSDK(uint32_t sdkAppID, const V2TIMSDKConfig& config) 
                     std::string selfUserID = ToxUtil::tox_bytes_to_hex(self_pubkey, TOX_PUBLIC_KEY_SIZE);
                     selfMember.userID = V2TIMString(selfUserID.c_str());
                     memberList.PushBack(selfMember);
-                    V2TIM_LOG(kInfo, "[GroupInvite] Added self to member list: {}", selfUserID);
+                    V2TIM_LOG(kInfo, "[GroupInvite] Added self to member list: {}…", selfUserID.substr(0, 8));
                 }
                 
                 // Build opUser (inviter)
@@ -606,11 +604,8 @@ bool V2TIMManagerImpl::InitSDK(uint32_t sdkAppID, const V2TIMSDKConfig& config) 
                 
                 for (V2TIMGroupListener* listener : listeners_copy) {
                     if (listener) {
-                        fprintf(stdout, "[GroupInvite] Calling OnMemberInvited immediately with tempGroupID=%s, inviter=%s, memberCount=%zu\n",
-                                gid, inviterUserID.c_str(), memberList.Size());
-                        fflush(stdout);
-                        V2TIM_LOG(kInfo, "[GroupInvite] Calling OnMemberInvited immediately: tempGroupID={}, inviter={}, memberCount={}",
-                                 gid, inviterUserID, memberList.Size());
+                        V2TIM_LOG(kInfo, "[GroupInvite] Calling OnMemberInvited immediately: tempGroupID={}, inviter={}…, memberCount={}",
+                                 gid, inviterUserID.substr(0, 8), memberList.Size());
                         listener->OnMemberInvited(tempGroupID, opUser, memberList);
                     }
                 }
@@ -820,7 +815,7 @@ bool V2TIMManagerImpl::InitSDK(uint32_t sdkAppID, const V2TIMSDKConfig& config) 
                 uint8_t inviter_pubkey[TOX_PUBLIC_KEY_SIZE];
                 if (tox_friend_get_public_key(tox, friend_number, inviter_pubkey, nullptr)) {
                     inviterUserID = ToxUtil::tox_bytes_to_hex(inviter_pubkey, TOX_PUBLIC_KEY_SIZE);
-                    V2TIM_LOG(kInfo, "[GroupInvite-Conference] Got inviter public key: {} (length={})", inviterUserID, inviterUserID.length());
+                    V2TIM_LOG(kInfo, "[GroupInvite-Conference] Got inviter public key: {}… (length={})", inviterUserID.substr(0, 8), inviterUserID.length());
                 } else {
                     V2TIM_LOG(kWarning, "[GroupInvite-Conference] Failed to get inviter public key for friend_number={}", friend_number);
                 }
@@ -844,8 +839,8 @@ bool V2TIMManagerImpl::InitSDK(uint32_t sdkAppID, const V2TIMSDKConfig& config) 
                 }
                 for (V2TIMGroupListener* listener : listeners_copy) {
                     if (listener) {
-                        V2TIM_LOG(kInfo, "[GroupInvite-Conference] Triggering OnMemberInvited: tempGroupID={}, inviter={}, memberCount={}",
-                                 gid, inviterUserID, memberList.Size());
+                        V2TIM_LOG(kInfo, "[GroupInvite-Conference] Triggering OnMemberInvited: tempGroupID={}, inviter={}…, memberCount={}",
+                                 gid, inviterUserID.substr(0, 8), memberList.Size());
                         listener->OnMemberInvited(groupID, opUser, memberList);
                     }
                 }
@@ -1750,7 +1745,7 @@ V2TIMString V2TIMManagerImpl::SendC2CTextMessage(
 
     if (find_err != TOX_ERR_FRIEND_BY_PUBLIC_KEY_OK) {
         lock.unlock();
-        fprintf(stdout, "[SendC2CTextMessage] ERROR: Friend not found: userID=%.64s, find_err=%d\n", userID.CString(), find_err);
+        fprintf(stdout, "[SendC2CTextMessage] ERROR: Friend not found: userID=%.8s…, find_err=%d\n", userID.CString(), find_err);
         fflush(stdout);
         if (callback) {
             // Use appropriate error code based on V2TIMErrorCode.h
@@ -1760,7 +1755,7 @@ V2TIMString V2TIMManagerImpl::SendC2CTextMessage(
             const char* err_msg = (find_err == TOX_ERR_FRIEND_BY_PUBLIC_KEY_NOT_FOUND)
                                 ? "Target user is not your friend"
                                 : "Friend lookup failed";
-            V2TIM_LOG(kError, "SendC2CTextMessage failed: userID=%s, error=%d (%s)", userID.CString(), v2_err, err_msg);
+            V2TIM_LOG(kError, "SendC2CTextMessage failed: userID={}…, error={} ({})", std::string(userID.CString()).substr(0, 8), v2_err, err_msg);
             callback->OnError(v2_err, err_msg);
         }
         return "";
@@ -1787,7 +1782,7 @@ V2TIMString V2TIMManagerImpl::SendC2CTextMessage(
         
         if (connection_status == TOX_CONNECTION_NONE) {
             lock.unlock();
-            fprintf(stdout, "[SendC2CTextMessage] ERROR: Friend still not connected after wait: userID=%.64s, friend_number=%u\n", 
+            fprintf(stdout, "[SendC2CTextMessage] ERROR: Friend still not connected after wait: userID=%.8s…, friend_number=%u\n",
                     userID.CString(), friend_number);
             fflush(stdout);
             if (callback) callback->OnError(ERR_SDK_NET_DISCONNECT, "Friend not connected");
@@ -1918,7 +1913,7 @@ V2TIMString V2TIMManagerImpl::SendC2CTextMessage(
                   break;
             // Add other specific Tox errors if needed
         }
-        V2TIM_LOG(kError, "SendC2CTextMessage failed: userID=%s, error=%d (%s), tox_err=%d", userID.CString(), v2_err_code, v2_err_msg, send_err);
+        V2TIM_LOG(kError, "SendC2CTextMessage failed: userID={}…, error={} ({}), tox_err={}", std::string(userID.CString()).substr(0, 8), v2_err_code, v2_err_msg, send_err);
         if (callback) callback->OnError(v2_err_code, v2_err_msg);
         return "";
     }
@@ -1962,7 +1957,7 @@ V2TIMString V2TIMManagerImpl::SendC2CCustomMessage(const V2TIMBuffer& customData
     TOX_ERR_FRIEND_BY_PUBLIC_KEY find_err;
     uint32_t friend_number = tox_friend_by_public_key(tox, public_key, &find_err);
     if (find_err != TOX_ERR_FRIEND_BY_PUBLIC_KEY_OK) {
-        fprintf(stdout, "[SendC2CCustomMessage] ERROR: Friend not found: userID=%.64s, find_err=%d\n", userID.CString(), find_err);
+        fprintf(stdout, "[SendC2CCustomMessage] ERROR: Friend not found: userID=%.8s…, find_err=%d\n", userID.CString(), find_err);
         fflush(stdout);
         if (callback) callback->OnError(ERR_SVR_FRIENDSHIP_ACCOUNT_NOT_FOUND, "Target user is not your friend");
         return "";
@@ -1986,7 +1981,7 @@ V2TIMString V2TIMManagerImpl::SendC2CCustomMessage(const V2TIMBuffer& customData
         fflush(stdout);
         
         if (connection_status == TOX_CONNECTION_NONE) {
-            fprintf(stdout, "[SendC2CCustomMessage] ERROR: Friend still not connected after wait: userID=%.64s, friend_number=%u\n", 
+            fprintf(stdout, "[SendC2CCustomMessage] ERROR: Friend still not connected after wait: userID=%.8s…, friend_number=%u\n",
                     userID.CString(), friend_number);
             fflush(stdout);
             if (callback) callback->OnError(ERR_SDK_NET_DISCONNECT, "Friend not connected");

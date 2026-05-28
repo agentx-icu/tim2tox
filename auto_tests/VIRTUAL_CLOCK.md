@@ -2,7 +2,7 @@
 
 A detailed guide for writing or migrating a `tim2tox/auto_tests` test to virtual-clock mode. Pair with `README.md` (which has a high-level overview); this file covers the API surface, patterns, gotchas, and internals.
 
-**Audience:** engineers authoring new `*_virtual_test.dart` files or porting wall-clock tests over.
+**Audience:** engineers authoring or maintaining mode-aware scenario files (a single file runs both wall-clock and virtual-clock; there are no `*_virtual_test.dart` siblings — see §9).
 
 ---
 
@@ -193,16 +193,39 @@ The ceiling is set by loopback wall sleeps inside `pumpTestTick` — increasing 
 
 ---
 
-## 9. Migration checklist (wall → virtual)
+## 9. Authoring a mode-aware scenario
 
-1. Copy `scenario_foo_test.dart` to `scenario_foo_virtual_test.dart`.
-2. Add `await VirtualClock.enableEarly();` immediately after `setupTestEnvironment()`.
-3. Add `await VirtualClock.enableForScenario(scenario);` immediately after `initAllNodes()`.
-4. Replace every helper in the table from §3 with its `*Virtual` sibling, threading `scenario` through.
-5. Replace `Future.delayed(Duration(milliseconds: N))` with `pumpTestTick(scenario, advanceMs: N)`.
-6. For ToxAV tests, replace `pumpTestTick` / `waitUntilWithVirtualPump` with the `*Av` siblings.
-7. Run `flutter test test/scenarios/scenario_foo_virtual_test.dart` and compare against the wall-clock baseline — virtual mode should match wall reliability, not exceed it.
-8. Add the new file under `test/scenarios/`. `run_tests_ordered.sh` auto-detects `*_virtual_test.dart` siblings when `RUN_VIRTUAL=1`.
+Scenarios are **single mode-aware files** — there are no `*_virtual_test.dart`
+siblings. One file runs wall-clock by default and virtual-clock under
+`RUN_VIRTUAL=1`. Write a new `scenario_foo_test.dart` so it works in both modes:
+
+1. Gate the clock-enable calls on `shouldRunVirtual` (from `test_helper.dart`):
+   `if (shouldRunVirtual) await VirtualClock.enableEarly();` immediately after
+   `setupTestEnvironment()`, and
+   `if (shouldRunVirtual) await VirtualClock.enableForScenario(scenario);`
+   immediately after `initAllNodes()`. In wall mode these are skipped and the
+   event_thread runs normally.
+2. Use the `*Virtual` body helpers from §3 unconditionally (thread `scenario`
+   through). They all fall back to real-time behavior when the clock is
+   disabled, so the same body serves both modes:
+   - fixed-deadline pumps (`pumpFriendConnectionVirtual`,
+     `pumpGroupPeerDiscoveryVirtual`, `establishFriendshipVirtual`,
+     `waitUntilFounderSeesMemberInGroupVirtual`) delegate to their wall-clock
+     equivalents when `!VirtualClock.enabled`;
+   - the connection waiters (`waitForConnectionVirtual`,
+     `waitForFriendConnectionVirtual`) delegate to the `TestNode` real-time
+     methods; `pumpTestTick` / `waitUntilWithVirtualPump` delegate to
+     `pumpAllInstancesOnce` / `waitUntilWithPump`.
+3. Use `pumpTestTick(scenario, advanceMs: N)` instead of
+   `Future.delayed(Duration(milliseconds: N))`. For ToxAV use the `*Av` pumps.
+4. **Inline poll loops must not gate on `VirtualClock.nowMs`** unless they pump
+   via `pumpTestTick` (whose wall fallback also advances the Dart-side counter).
+   A bare `while (VirtualClock.nowMs < deadline)` with no `pumpTestTick` inside
+   spins forever in wall mode — use a `DateTime`-based deadline there.
+5. Verify **both** modes:
+   `flutter test test/scenarios/scenario_foo_test.dart` and
+   `RUN_VIRTUAL=1 flutter test test/scenarios/scenario_foo_test.dart`.
+   Virtual mode should match wall reliability, not exceed it.
 
 ---
 
