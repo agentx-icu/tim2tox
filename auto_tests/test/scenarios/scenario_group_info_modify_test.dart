@@ -294,6 +294,37 @@ void main() {
           reason: 'bob joinGroup failed: ${bobJoinResult.desc}');
       await pumpTestTick(scenario, advanceMs: 500, iterationsPerInstance: 1);
 
+      // The topic broadcast that carries the new group name is a lossless
+      // packet sent to the peers that are CONNECTED at broadcast time.
+      // joinGroup returning code=0 only means the join was initiated — the
+      // NGC handshake with Alice completes asynchronously. CI logs from the
+      // 2026-06-04 failure show SetGroupInfo's broadcast landing ~2s BEFORE
+      // Bob's HandleGroupSelfJoin/onMemberEnter, so Bob wasn't a recipient
+      // and only the slow ping-driven GF_TOPIC version sync could have
+      // delivered it (which doesn't reliably converge inside the virtual
+      // pump budget on 2-core CI runners). Gate the info change on BOTH
+      // sides observing the peer link for THIS group so the direct broadcast
+      // deterministically includes Bob — same ordering discipline as
+      // inviteUserToGroupWithRetry above. The groupID-scoped queue check
+      // (not the bare callback flag) keeps earlier sub-tests' callbacks from
+      // satisfying the wait.
+      bool memberLinkUp() =>
+          alice.callbackQueue.any((c) =>
+              c.callbackName == 'onMemberEnter' &&
+              c.data['groupID'] == groupId) &&
+          bob.callbackQueue.any((c) =>
+              c.callbackName == 'onMemberEnter' &&
+              c.data['groupID'] == groupId);
+      await waitUntilWithVirtualPump(
+        scenario,
+        memberLinkUp,
+        timeout: const Duration(seconds: 30),
+        description: 'Alice and Bob both observe the group peer link',
+        advanceMs: 500,
+        iterationsPerInstance: 10,
+        wallSleep: const Duration(milliseconds: 30),
+      );
+
       var bobReceivedInfoChange = false;
       final bobListener = V2TimGroupListener(
         onGroupInfoChanged: (groupID, changeInfos) {
