@@ -19,8 +19,10 @@ class ChatMessage {
     this.fileSize, // File size in bytes
     this.mimeType, // MIME type of the file
     this.fileHash, // SHA256 hash of file content (optional)
+    this.altMsgIds = const [], // ids of cross-path duplicates absorbed here
+    this.cloudCustomData, // structured reply/forward metadata (JSON string)
   });
-  
+
   final String text;
   final String fromUserId;
   final bool isSelf;
@@ -33,7 +35,33 @@ class ChatMessage {
   final bool isReceived;
   final bool isRead;
   final String? msgID;
-  
+
+  /// Additional msgIDs that resolve to this same logical message.
+  ///
+  /// toxee's hybrid runtime delivers one inbound message through two paths
+  /// (binary-replacement V2TimAdvancedMsgListener with a native
+  /// `msg_<n>_<nanos>_<seq>` id, and the FfiChatService poll path with a
+  /// `<millis>_<n>_<toxId>` id). When [MessageHistoryPersistence.appendHistory]
+  /// content-dedups the two copies into this one row, the id that did NOT
+  /// become [msgID] is recorded here so later exact-id lookups (updateMessage /
+  /// removeMessage / revoke via either path) still resolve to this row. Stored
+  /// ON the row so it persists, reloads, and is trimmed together with the
+  /// message — no external alias map to desync or leak.
+  final List<String> altMsgIds;
+
+  /// Structured per-message metadata as a JSON string (the V2TIM
+  /// `cloudCustomData`). Carries the reply quote
+  /// (`{"messageReply":{messageID,messageAbstract,messageSender,...}}`) that the
+  /// UIKit composer builds when replying to a message. Persisted sender-side so
+  /// the quote survives a reload (previously it lived only on the in-memory
+  /// V2TimMessage and was lost on cold start).
+  ///
+  /// WIRE LIMITATION: toxee's Tox send (`_ffi.sendText`) carries plain text
+  /// only, so this is NOT delivered to the peer today — it is a local
+  /// sender-side record. The peer-receives-the-quote leg needs a Tox
+  /// wire-format change (out of scope). Null for plain messages.
+  final String? cloudCustomData;
+
   // New fields for enhanced data integrity
   final int version; // Message format version
   final int? fileSize; // File size in bytes
@@ -57,6 +85,10 @@ class ChatMessage {
     if (fileSize != null) 'fileSize': fileSize,
     if (mimeType != null) 'mimeType': mimeType,
     if (fileHash != null) 'fileHash': fileHash,
+    if (altMsgIds.isNotEmpty) 'altMsgIds': altMsgIds,
+    // Backward compatible: gated so plain messages serialize byte-identically
+    // (existing on-disk history has no cloudCustomData key).
+    if (cloudCustomData != null) 'cloudCustomData': cloudCustomData,
   };
 
   factory ChatMessage.fromJson(Map<String, dynamic> json) => ChatMessage(
@@ -76,6 +108,13 @@ class ChatMessage {
     fileSize: json['fileSize'] as int?,
     mimeType: json['mimeType'] as String?,
     fileHash: json['fileHash'] as String?,
+    // Backward compatible: pre-existing history has no altMsgIds key.
+    altMsgIds: (json['altMsgIds'] as List?)
+            ?.map((e) => e as String)
+            .toList() ??
+        const [],
+    // Backward compatible: pre-existing history has no cloudCustomData key.
+    cloudCustomData: json['cloudCustomData'] as String?,
   );
   
   ChatMessage copyWith({
@@ -87,6 +126,8 @@ class ChatMessage {
     int? fileSize,
     String? mimeType,
     String? fileHash,
+    List<String>? altMsgIds,
+    String? cloudCustomData,
   }) {
     return ChatMessage(
       text: text,
@@ -105,6 +146,8 @@ class ChatMessage {
       fileSize: fileSize ?? this.fileSize,
       mimeType: mimeType ?? this.mimeType,
       fileHash: fileHash ?? this.fileHash,
+      altMsgIds: altMsgIds ?? this.altMsgIds,
+      cloudCustomData: cloudCustomData ?? this.cloudCustomData,
     );
   }
   

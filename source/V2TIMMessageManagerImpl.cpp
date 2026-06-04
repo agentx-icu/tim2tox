@@ -758,13 +758,59 @@ void V2TIMMessageManagerImpl::SetC2CReceiveMessageOpt(const V2TIMStringVector& u
         return;
     }
     
-    std::lock_guard<std::mutex> lock(receive_opt_mutex_);
-    // CRITICAL: Use the safe std::string copies instead of V2TIMString objects
-    for (const auto& user_id_str : user_id_strings) {
-        c2c_receive_opts_[user_id_str] = opt;
-        V2TIM_LOG(kInfo, "SetC2CReceiveMessageOpt: userID={}, opt={}", user_id_str.c_str(), static_cast<int>(opt));
-    }
+    {
+        std::lock_guard<std::mutex> lock(receive_opt_mutex_);
+        // CRITICAL: Use the safe std::string copies instead of V2TIMString objects.
+        // Normalize the key to the 64-char Tox public key (a 76-char full Tox ID
+        // caller would otherwise store under a key the C2C conversation
+        // materializers — which query by the conversationID's 64-char peer id —
+        // can never find, re-emitting a stale recvOpt=0 for a muted peer).
+        for (const auto& user_id_str : user_id_strings) {
+            const std::string key =
+                user_id_str.size() > 64 ? user_id_str.substr(0, 64) : user_id_str;
+            c2c_receive_opts_[key] = opt;
+            V2TIM_LOG(kInfo, "SetC2CReceiveMessageOpt: userID={}, opt={}", key.c_str(), static_cast<int>(opt));
+        }
+    }  // release receive_opt_mutex_ before notifying listeners
+
+    // Push the recvOpt change to the conversation manager so the binary-
+    // replacement path fires OnConversationChanged carrying the new recvOpt.
+    // Without this, a real-UI mute only updated this in-memory map and never
+    // reached toxee's conversation cache / notification suppression. Done
+    // OUTSIDE receive_opt_mutex_ to avoid lock-ordering issues with the
+    // conversation manager's locks (mirrors the post-send path at ~line 713).
+    try {
+        V2TIMManagerImpl* manager = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(manager_impl_mutex_);
+            manager = manager_impl_;
+        }
+        if (manager) {
+            V2TIMConversationManagerImpl* cm =
+                dynamic_cast<V2TIMConversationManagerImpl*>(manager->GetConversationManager());
+            if (cm) {
+                for (const auto& user_id_str : user_id_strings) {
+                    cm->UpdateC2CReceiveOptAndNotify(user_id_str, static_cast<int>(opt));
+                }
+            }
+        }
+    } catch (...) {}
+
     if (callback) callback->OnSuccess();
+}
+
+int V2TIMMessageManagerImpl::GetC2CReceiveOptSync(const std::string& userID) {
+    if (userID.empty()) return 0;
+    // Normalize to the 64-char public key the UIKit conversation paths use
+    // (conversationID minus the "c2c_" prefix); the set path stores whatever
+    // the caller passed, so try the exact key first, then the truncated form.
+    std::lock_guard<std::mutex> lock(receive_opt_mutex_);
+    auto it = c2c_receive_opts_.find(userID);
+    if (it == c2c_receive_opts_.end() && userID.size() > 64) {
+        it = c2c_receive_opts_.find(userID.substr(0, 64));
+    }
+    if (it == c2c_receive_opts_.end()) return 0;
+    return static_cast<int>(it->second);
 }
 
 void V2TIMMessageManagerImpl::GetC2CReceiveMessageOpt(const V2TIMStringVector& userIDList, V2TIMValueCallback<V2TIMReceiveMessageOptInfoVector>* callback) {
@@ -798,12 +844,17 @@ void V2TIMMessageManagerImpl::GetC2CReceiveMessageOpt(const V2TIMStringVector& u
     V2TIMReceiveMessageOptInfoVector resultVector;
     std::lock_guard<std::mutex> lock(receive_opt_mutex_);
     
-    // CRITICAL: Use the safe std::string copies instead of V2TIMString objects
+    // CRITICAL: Use the safe std::string copies instead of V2TIMString objects.
+    // Lookups normalize to the 64-char public key — the store writes normalized
+    // keys (see SetC2CReceiveMessageOpt), so a 76-char full-Tox-ID query must
+    // match the same entry.
     for (const auto& user_id_str : user_id_strings) {
         V2TIMReceiveMessageOptInfo info;
         // Create new V2TIMString directly from the safe std::string
         info.userID = V2TIMString(user_id_str.c_str());
-        auto it = c2c_receive_opts_.find(user_id_str);
+        const std::string key =
+            user_id_str.size() > 64 ? user_id_str.substr(0, 64) : user_id_str;
+        auto it = c2c_receive_opts_.find(key);
         if (it != c2c_receive_opts_.end()) {
             info.receiveOpt = it->second;
         } else {

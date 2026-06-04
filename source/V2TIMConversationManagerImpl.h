@@ -111,6 +111,15 @@ public:
     // successful send to refresh the sender's conversation row.
     void NotifyConversationChangedForConvID(const V2TIMString& conversationID);
 
+    // Update the cached C2C conversation's receive option (mute/DND state) and
+    // fire OnConversationChanged carrying that recvOpt, so the Dart binary-
+    // replacement path learns a real-UI mute immediately (the message manager's
+    // SetC2CReceiveMessageOpt only writes an in-memory opt map otherwise, which
+    // never reached toxee's conversation cache / notification suppression).
+    // If no cached snapshot exists, emits a fully-initialized minimal C2C
+    // conversation with the recvOpt WITHOUT creating a phantom cache row.
+    void UpdateC2CReceiveOptAndNotify(const std::string& userID, int opt);
+
 private:
     std::vector<V2TIMConversationListener*> listeners_;
     std::mutex listeners_mutex_;

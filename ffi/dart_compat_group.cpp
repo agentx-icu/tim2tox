@@ -655,7 +655,34 @@ extern "C" {
         SendCallbackToDart("groupQuitNotification", json.str(), nullptr);
         V2TIM_LOG(kInfo, "DartNotifyGroupQuit: Notification sent for group %s", group_id_str.c_str());
     }
-    
+
+    // DartNotifyGroupJoin: Notify Dart layer to register a self-join the Dart
+    // layer did NOT initiate (e.g. auto-accepting an invite — the C++ joins via
+    // tox_group_invite_accept + HandleGroupSelfJoin, but the Dart _knownGroups is
+    // only updated on the Dart-initiated joinGroup path, so an invite auto-join
+    // never surfaces in knownGroups). Mirrors DartNotifyGroupQuit (inverse).
+    // Signature: void DartNotifyGroupJoin(const char* group_id)
+    void DartNotifyGroupJoin(const char* group_id) {
+        if (!group_id) {
+            V2TIM_LOG(kWarning, "DartNotifyGroupJoin: group_id is null");
+            return;
+        }
+
+        std::string group_id_str = CStringToString(group_id);
+        V2TIM_LOG(kInfo, "DartNotifyGroupJoin: Notifying Dart layer to register group %s", group_id_str.c_str());
+
+        // Build JSON message for Dart layer
+        std::ostringstream json;
+        json << "{";
+        json << "\"callback\":\"groupJoinNotification\",";
+        json << "\"group_id\":\"" << EscapeJsonString(group_id_str) << "\"";
+        json << "}";
+
+        // Send notification to Dart layer
+        SendCallbackToDart("groupJoinNotification", json.str(), nullptr);
+        V2TIM_LOG(kInfo, "DartNotifyGroupJoin: Notification sent for group %s", group_id_str.c_str());
+    }
+
     // DartDeleteGroup: Delete group (dismiss group)
     // Signature: int DartDeleteGroup(Pointer<Char> group_id, Pointer<Void> user_data)
     int DartDeleteGroup(const char* group_id, void* user_data) {

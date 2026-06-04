@@ -5,6 +5,7 @@
 #include "V2TIMManager.h"
 #include "V2TIMManagerImpl.h"
 #include "V2TIMMessageManager.h"
+#include "V2TIMMessageManagerImpl.h" // C2CRecvOptForUser: authoritative mute/DND lookup
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
@@ -16,6 +17,29 @@
 // Conversation-specific error codes
 namespace {
     constexpr int ERR_SDK_CONVERSATION_NOT_FOUND = 6010;
+}
+
+// Multi-instance-aware manager accessor (defined in V2TIMManagerImpl.cpp);
+// also forward-declared further down for the older call sites.
+extern V2TIMManager* SafeGetV2TIMManager(void);
+
+// Authoritative C2C receive-option (mute/DND) lookup. Reads the message
+// manager's in-memory opt map so EVERY C2C conversation emit/materialization
+// carries the current value. Any path that hardcodes recvOpt=0 for a C2C
+// conversation re-emits a stale "un-muted" state, which the Dart projection
+// cache (C2CRecvOptCache) would treat as authoritative and persist — silently
+// clearing a user's mute (the recvOpt "clobber" bug). Returns 0 on any failure.
+static int C2CRecvOptForUser(const std::string& userID) {
+    if (userID.empty()) return 0;
+    try {
+        V2TIMManager* mgr = SafeGetV2TIMManager();
+        if (!mgr) return 0;
+        auto* mm = dynamic_cast<V2TIMMessageManagerImpl*>(mgr->GetMessageManager());
+        if (!mm) return 0;
+        return mm->GetC2CReceiveOptSync(userID);
+    } catch (...) {
+        return 0;
+    }
 }
 
 static ConversationSnapshot ToSnapshot(const V2TIMConversation& c) {
@@ -48,7 +72,19 @@ static V2TIMConversation MaterializeConversation(const ConversationSnapshot& s) 
     conv.faceUrl = s.face_url.c_str();
     conv.draftText = s.draft_text.c_str();
     conv.unreadCount = s.unread_count;
-    conv.recvOpt = static_cast<V2TIMReceiveMessageOpt>(s.recv_opt);
+    // C2C recvOpt: the message manager's opt map is the single source of truth
+    // (see C2CRecvOptForUser). Snapshots can be created or rebuilt with a default
+    // recv_opt (CreateConversationFromFriend, RefreshConversationCache), so the
+    // stored snapshot value may be stale — always read the live map for C2C.
+    if (static_cast<V2TIMConversationType>(s.type) == V2TIM_C2C) {
+        std::string uid = s.user_id;
+        if (uid.empty() && s.conversation_id.rfind("c2c_", 0) == 0) {
+            uid = s.conversation_id.substr(4);
+        }
+        conv.recvOpt = static_cast<V2TIMReceiveMessageOpt>(C2CRecvOptForUser(uid));
+    } else {
+        conv.recvOpt = static_cast<V2TIMReceiveMessageOpt>(s.recv_opt);
+    }
     conv.draftTimestamp = s.draft_timestamp;
     conv.orderKey = s.order_key;
     conv.c2cReadTimestamp = s.c2c_read_timestamp;
@@ -104,23 +140,27 @@ void V2TIMConversationManagerImpl::NotifyConversationChangedForConvID(const V2TI
         // struct's default ctor; leaving it as garbage segfaulted the JSON
         // builder when called from a group/conference SendMessage path).
         conv.conversationID = conv_id.c_str();
-        conv.userID = "";
+        const bool is_c2c = conv_id.size() >= 4 && conv_id.substr(0, 4) == "c2c_";
+        const std::string c2c_uid = is_c2c ? conv_id.substr(4) : std::string();
+        conv.userID = c2c_uid.c_str();
         conv.groupID = "";
         conv.groupType = "";
         conv.showName = "";
         conv.faceUrl = "";
         conv.draftText = "";
         conv.unreadCount = 0;
-        conv.recvOpt = static_cast<V2TIMReceiveMessageOpt>(0);
+        // C2C recvOpt must come from the authoritative opt map — a hardcoded 0
+        // here re-announced a muted peer as un-muted on every post-send notify
+        // (the recvOpt "clobber" bug); the Dart projection cache would persist it.
+        conv.recvOpt = static_cast<V2TIMReceiveMessageOpt>(
+            is_c2c ? C2CRecvOptForUser(c2c_uid) : 0);
         conv.draftTimestamp = 0;
         conv.orderKey = 0;
         conv.c2cReadTimestamp = 0;
         conv.groupReadSequence = 0;
         conv.isPinned = false;
         // Use C2C as default type for c2c_-prefixed IDs, GROUP otherwise.
-        conv.type = (conv_id.size() >= 4 && conv_id.substr(0, 4) == "c2c_")
-                        ? V2TIM_C2C
-                        : V2TIM_GROUP;
+        conv.type = is_c2c ? V2TIM_C2C : V2TIM_GROUP;
         conv.lastMessage = nullptr;
     }
 
@@ -132,6 +172,64 @@ void V2TIMConversationManagerImpl::NotifyConversationChangedForConvID(const V2TI
     // when the callback path takes another manager-level lock (observed:
     // SIGSEGV in callback_bridge when group/conference tests send and the
     // bridge's per-instance dispatch contends with this lock).
+    std::vector<V2TIMConversationListener*> listeners_copy;
+    {
+        std::lock_guard<std::mutex> lock(listeners_mutex_);
+        listeners_copy = listeners_;
+    }
+    for (auto* l : listeners_copy) {
+        if (!l) continue;
+        try { l->OnConversationChanged(changed); } catch (...) {}
+    }
+}
+
+void V2TIMConversationManagerImpl::UpdateC2CReceiveOptAndNotify(const std::string& userID, int opt) {
+    std::string uid = userID;
+    if (uid.size() >= 64) uid = uid.substr(0, 64);
+    if (uid.empty()) return;
+    const std::string conv_id = std::string("c2c_") + uid;
+
+    V2TIMConversation conv;
+    {
+        std::lock_guard<std::mutex> lock(cache_mutex_);
+        auto it = std::find_if(cached_conversations_.begin(), cached_conversations_.end(),
+                               [&](const ConversationSnapshot& s) { return s.conversation_id == conv_id; });
+        if (it != cached_conversations_.end()) {
+            // Existing row: update the cached recvOpt so future getConversationList /
+            // MaterializeConversation carry it too, then emit the full snapshot.
+            it->recv_opt = opt;
+            conv = MaterializeConversation(*it);
+        } else {
+            // No cached row (mute set from the friend profile before any message).
+            // Emit a fully-initialized minimal C2C conversation WITH the recvOpt so
+            // listeners learn the opt, but do NOT add a phantom row to the cache.
+            // (Full init mirrors NotifyConversationChangedForConvID's not-materialized
+            // branch so the JSON builder's SafeGetCString never reads garbage and the
+            // raw lastMessage* is null.)
+            conv.conversationID = conv_id.c_str();
+            conv.userID = uid.c_str();
+            conv.groupID = "";
+            conv.groupType = "";
+            conv.showName = "";
+            conv.faceUrl = "";
+            conv.draftText = "";
+            conv.unreadCount = 0;
+            conv.recvOpt = static_cast<V2TIMReceiveMessageOpt>(opt);
+            conv.draftTimestamp = 0;
+            conv.orderKey = 0;
+            conv.c2cReadTimestamp = 0;
+            conv.groupReadSequence = 0;
+            conv.isPinned = false;
+            conv.type = V2TIM_C2C;
+            conv.lastMessage = nullptr;
+        }
+    }
+
+    V2TIMConversationVector changed;
+    changed.PushBack(conv);
+
+    // Snapshot listener pointers under lock, then release before invoking (same
+    // deadlock-avoidance rationale as NotifyConversationChangedForConvID).
     std::vector<V2TIMConversationListener*> listeners_copy;
     {
         std::lock_guard<std::mutex> lock(listeners_mutex_);
@@ -272,7 +370,18 @@ V2TIMConversation V2TIMConversationManagerImpl::CreateConversationFromFriend(uin
     }
     
     conv.conversationID = V2TIMString(convID.c_str());
-    
+
+    // C2C recvOpt from the authoritative opt map — this conv seeds the snapshot
+    // cache (RefreshConversationCache -> ToSnapshot), and a default 0 here would
+    // rebuild a muted peer's snapshot as un-muted on every cache refresh.
+    {
+        const char* uid_cstr = conv.userID.CString();
+        if (uid_cstr && *uid_cstr) {
+            conv.recvOpt =
+                static_cast<V2TIMReceiveMessageOpt>(C2CRecvOptForUser(uid_cstr));
+        }
+    }
+
     // 检查置顶状态
     {
         std::lock_guard<std::mutex> lock(pinned_mutex_);
@@ -660,6 +769,10 @@ void V2TIMConversationManagerImpl::SetConversationDraft(const V2TIMString& conve
             conv.type = V2TIM_C2C;
             conv.userID = V2TIMString(conv_id.substr(4).c_str());
             conv.groupID = V2TIMString("");
+            // Sparse emit: recvOpt must come from the authoritative opt map, not
+            // a hardcoded 0 (would re-announce a muted peer as un-muted).
+            conv.recvOpt = static_cast<V2TIMReceiveMessageOpt>(
+                C2CRecvOptForUser(conv_id.substr(4)));
         } else if (conv_id.length() >= 6 && conv_id.substr(0, 6) == "group_") {
             conv.type = V2TIM_GROUP;
             conv.userID = V2TIMString("");
@@ -750,6 +863,10 @@ void V2TIMConversationManagerImpl::PinConversation(const V2TIMString& conversati
             conv.showName = V2TIMString(fallback_show_name.c_str());
             conv.faceUrl = V2TIMString(fallback_face_url.c_str());
             conv.draftText = V2TIMString(fallback_draft_text.c_str());
+            // Sparse emit: recvOpt from the authoritative opt map (see
+            // C2CRecvOptForUser) — a hardcoded 0 would clobber a mute.
+            conv.recvOpt = static_cast<V2TIMReceiveMessageOpt>(
+                C2CRecvOptForUser(fallback_user_id));
         } else if (convID.length() >= 6 && convID.substr(0, 6) == "group_") {
             conv.type = V2TIM_GROUP;
             fallback_group_id = convID.substr(6);
@@ -886,6 +1003,10 @@ void V2TIMConversationManagerImpl::CleanConversationUnreadMessageCount(const V2T
                     conv.userID = V2TIMString(conv_id.substr(4).c_str());
                     conv.groupID = V2TIMString("");
                     conv.groupType = V2TIMString("");
+                    // Sparse emit: recvOpt from the authoritative opt map (see
+                    // C2CRecvOptForUser) — a hardcoded 0 would clobber a mute.
+                    conv.recvOpt = static_cast<V2TIMReceiveMessageOpt>(
+                        C2CRecvOptForUser(conv_id.substr(4)));
                 } else if (conv_id.length() >= 6 && conv_id.substr(0, 6) == "group_") {
                     conv.type = V2TIM_GROUP;
                     conv.userID = V2TIMString("");

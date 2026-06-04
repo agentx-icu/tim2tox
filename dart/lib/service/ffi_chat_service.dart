@@ -339,6 +339,43 @@ String _assertResolverPath(String path, String which) {
   return path;
 }
 
+/// Result of a [FfiChatService.addFriend] call.
+///
+/// `resultCode == 0` is the only success signal. Non-zero codes come from the
+/// V2TIMFriendOperationResult the C++ layer surfaces via the
+/// `friendAddResult` Dart callback — most notably `6770` for
+/// "Friend add requires full Tox address". `dispatched == false` means the
+/// synchronous FFI dispatch failed (SDK not initialized, native lib not
+/// loaded, etc.) and no async callback ever arrived; `resultCode == -1` and
+/// [resultInfo] describes the failure.
+class AddFriendResult {
+  const AddFriendResult({
+    required this.resultCode,
+    required this.userId,
+    required this.resultInfo,
+    required this.dispatched,
+  });
+
+  /// 0 = success; non-zero = V2TIM operation failure code (e.g. 6770).
+  /// `-1` means the call never reached the V2TIM layer.
+  final int resultCode;
+
+  /// The user_id the caller passed to [FfiChatService.addFriend]; echoed back
+  /// from C++ so concurrent calls don't get crossed.
+  final String userId;
+
+  /// Human-readable description from V2TIMFriendOperationResult.resultInfo,
+  /// or a Dart-side reason when [dispatched] is false. May be empty on
+  /// success.
+  final String resultInfo;
+
+  /// `true` if the sync FFI dispatch returned non-zero (i.e. the request
+  /// reached the V2TIM layer and an async result arrived).
+  final bool dispatched;
+
+  bool get isSuccess => dispatched && resultCode == 0;
+}
+
 class FfiChatService {
   // Static counter for msgID sequence to ensure uniqueness
   static int _msgIDSequence = 0;
@@ -564,6 +601,36 @@ class FfiChatService {
   Set<String> _quitGroups =
       {}; // Cache of quit groups to avoid async calls in timer
   Set<String> get quitGroups => Set.unmodifiable(_quitGroups);
+
+  /// S29 block/unblock: in-memory cache of blocked peer Tox IDs (normalized to
+  /// 64-char) so the SYNCHRONOUS inbound paths can drop a blocked sender's
+  /// message without an async Prefs read. Loaded at login from
+  /// `_prefs.getBlackList(_selfId)` (the same account-scoped key the platform's
+  /// addToBlackList writes) and refreshed by [refreshBlockedUsers] whenever the
+  /// UI / L3 mutates the blacklist. Mirrors the `_quitGroups` cache pattern.
+  /// NOTE: Tox has no network-layer block — this is a LOCAL receive-side hide.
+  final Set<String> _blockedUsers = {};
+  Set<String> get blockedUsers => Set.unmodifiable(_blockedUsers);
+
+  /// True if [peerId] is on the local blacklist (normalized compare, so a
+  /// 76-char inbound `from` matches a 64-char stored id and vice-versa).
+  bool isBlocked(String peerId) {
+    if (_blockedUsers.isEmpty || peerId.isEmpty) return false;
+    return _blockedUsers.contains(normalizeToxId(peerId));
+  }
+
+  /// Reload the blocked-user cache from persistence. Called at the end of
+  /// `login()` (selfId is known by then) and by the platform's add/delete
+  /// FromBlackList so a UI / L3 block takes effect mid-session.
+  Future<void> refreshBlockedUsers() async {
+    if (_selfId.isEmpty) return;
+    final stored = await _prefs?.getBlackList(_selfId) ?? const <String>{};
+    _blockedUsers
+      ..clear()
+      ..addAll(stored.map(normalizeToxId));
+    _logger?.log(
+        '[FfiChatService] refreshBlockedUsers: ${_blockedUsers.length} blocked');
+  }
   String?
       _lastCustomSender; // Track last custom message sender for reaction parsing
   String?
@@ -723,6 +790,22 @@ class FfiChatService {
     _offlineQueuePersistence.addMessage(peerId, item);
   }
 
+  /// True if history [row] is the optimistic pending row that offline queue
+  /// [item] created. Prefers the durable [OfflineMessageItem.msgID] (added
+  /// 2026-05-29) — an exact identity that cannot cross two messages. Falls back
+  /// to EXACT-ms timestamp equality for queue files written before the msgID
+  /// field existed (msgID == null): the row and the item are stamped from one
+  /// shared `now` at enqueue time (see the INVARIANT comments at the
+  /// `_queueOffline*` sites), so [itemMs] (== item.timestamp in ms) pins the
+  /// row. The remaining same-exact-ms ambiguity only affects those legacy
+  /// no-msgID items; new items match by msgID and have no ambiguity.
+  bool _offlineRowMatchesItem(ChatMessage row, OfflineMessageItem item,
+      int itemMs) {
+    final id = item.msgID;
+    if (id != null && id.isNotEmpty) return row.msgID == id;
+    return row.timestamp.millisecondsSinceEpoch == itemMs;
+  }
+
   Future<void> _clearOfflineQueue(String peerId) async {
     print('[FfiChatService] _clearOfflineQueue: ENTRY - peerId=$peerId');
     await _offlineQueuePersistence.removeMessages(peerId);
@@ -790,7 +873,87 @@ class FfiChatService {
     _unreadByPeer[normalizedId] = 0;
   }
 
-  int getUnreadOf(String peerId) => _unreadByPeer[peerId] ?? 0;
+  /// Mark a conversation read WITHOUT making it the active conversation.
+  ///
+  /// This is the "mark as read" action that does not open the conversation
+  /// (e.g. the conversation-list context-menu item). It advances the
+  /// persisted read barrier and flags the conversation's current non-self
+  /// messages `isRead` — exactly like [setActivePeer] does on open, so the
+  /// read state survives a restart — and zeroes the in-memory GROUP counter,
+  /// but unlike [setActivePeer] it does NOT change [_activePeerId] (the user
+  /// did not navigate into the conversation).
+  ///
+  /// C2C unread is derived from persistence ([getC2CUnreadCount] →
+  /// [MessageHistoryPersistence.getUnreadCount]), so advancing the barrier +
+  /// flagging messages read is sufficient to zero it. GROUP unread reads the
+  /// in-memory `_unreadByPeer` counter, which is zeroed here.
+  ///
+  /// Awaitable so callers (the Platform `cleanConversationUnreadMessageCount`)
+  /// can fire the conversation-list refresh only after the barrier is saved.
+  Future<void> markConversationRead(String conversationId) async {
+    final normalizedId = ConversationIdUtils.normalize(conversationId);
+    if (normalizedId.isEmpty) return;
+    // Zero the in-memory GROUP counter BEFORE the awaited barrier write below.
+    // `markConversationViewed` can await disk I/O; if a group message arrived
+    // DURING that await and we zeroed afterwards, we would clobber the
+    // freshly-incremented unread (the group inbound path bumps `_unreadByPeer`
+    // synchronously). Zeroing first means an inbound during the await leaves
+    // the counter at the new (correct) value, not 0.
+    if (_unreadByPeer.containsKey(normalizedId)) {
+      _unreadByPeer[normalizedId] = 0;
+    }
+    await _messageHistoryPersistence.markConversationViewed(conversationId);
+  }
+
+  /// Unread count for the product sidebar / conversation list.
+  ///
+  /// #27 fix: C2C conversations route to the PATH-INDEPENDENT
+  /// [getC2CUnreadCount] (persistence + lastView barrier) so the hybrid
+  /// under-count is fixed for the product too — the in-memory `_unreadByPeer`
+  /// counter is only bumped by FfiChatService's own inbound path, so when the
+  /// binary-replacement hook persists an inbound C2C message first (and the
+  /// poll path dedups it out before the bump) the counter under-counts.
+  ///
+  /// GROUPS stay on the in-memory counter (`incrementGroupUnread`): native
+  /// group inbound increments `_unreadByPeer[gid]` directly and there is no
+  /// equivalent persisted read-barrier reconciliation for groups, so deriving
+  /// group unread from persistence would regress group badges (codex). Group
+  /// ids are detected via the authoritative in-memory `_knownGroups` /
+  /// `_quitGroups` sets (a quit group still isn't a C2C peer).
+  int getUnreadOf(String peerId) {
+    final norm = ConversationIdUtils.normalize(peerId);
+    if (_knownGroups.contains(norm) || _quitGroups.contains(norm)) {
+      // codex: read the NORMALIZED id (callers may pass a raw/prefixed gid),
+      // falling back to the raw key for any pre-normalization writer.
+      return _unreadByPeer[norm] ?? _unreadByPeer[peerId] ?? 0;
+    }
+    return getC2CUnreadCount(peerId);
+  }
+
+  /// Path-independent C2C unread count, read from persisted history + the
+  /// lastView barrier ([MessageHistoryPersistence.getUnreadCount]) — the single
+  /// store BOTH hybrid paths feed — rather than the in-memory `_unreadByPeer`
+  /// counter, which only FfiChatService's own inbound path bumps. When the
+  /// binary-replacement hook persists an inbound message first (and the poll
+  /// path then dedups it out before the increment runs), the in-memory counter
+  /// UNDER-counts; this reads the deduped ground truth instead.
+  ///
+  /// C2C-SCOPED ON PURPOSE: [getUnreadOf] (the product sidebar/conversation-list
+  /// path) is intentionally left on the in-memory counter so native GROUP
+  /// unread (`incrementGroupUnread`) is not regressed — codex flagged that
+  /// switching the product path wholesale would drop group badges. Fixing the
+  /// product C2C under-count without regressing groups is a separate tracked
+  /// follow-up. This helper is used by the L3 debug/test surface (`l3_dump_state`
+  /// / `l3_mark_read`), which is C2C-only.
+  ///
+  /// The active conversation reads 0 (mirrors [setActivePeer]'s synchronous
+  /// zero) so an open/`l3_mark_read` reflects read immediately without waiting
+  /// on the unawaited barrier-save round-trip.
+  int getC2CUnreadCount(String peerId) {
+    final normalizedId = ConversationIdUtils.normalize(peerId);
+    if (_activePeerId == normalizedId) return 0;
+    return _messageHistoryPersistence.getUnreadCount(normalizedId);
+  }
 
   /// Refresh the in-memory last-message cache for a conversation from persisted history.
   /// This is used when a message is written through a native/UI path that bypasses
@@ -1244,6 +1407,9 @@ class FfiChatService {
       _selfId = buf.cast<pkgffi.Utf8>().toDartString();
     }
     pkgffi.malloc.free(buf);
+    // S29: hydrate the blocked-user cache now that selfId is known (the
+    // blacklist key is account-scoped by full Tox ID). Best-effort.
+    await refreshBlockedUsers();
     // Connection status will be updated via OnConnectSuccess/OnConnectFailed events
     final currentStatus = _ffi.getSelfConnectionStatus();
     if (currentStatus != 0) {
@@ -1266,17 +1432,103 @@ class FfiChatService {
     }
   }
 
-  /// Sends a friend request. Returns true if the request was submitted successfully.
-  Future<bool> addFriend(String serverId, {String? requestMessage}) async {
+  // Pending addFriend completers, keyed by the user_id the caller passed in
+  // (C++ echoes it back via the `friendAddResult` callback's `user_id` field).
+  // Using a List per key so concurrent retries with the same ID don't lose
+  // the older Completer. A 30s safety timeout cleans up stale entries if the
+  // native callback is ever dropped — the Future then resolves with
+  // dispatched=true + resultCode=-2 + "timed out".
+  final Map<String, List<Completer<AddFriendResult>>> _pendingAddFriend = {};
+
+  /// Sends a friend request and returns when the V2TIM async result is in.
+  ///
+  /// Resolves with [AddFriendResult]; the Future never throws (failures are
+  /// represented by [AddFriendResult.isSuccess] == false). Callers should
+  /// check [AddFriendResult.isSuccess] before treating the request as sent.
+  Future<AddFriendResult> addFriend(String serverId,
+      {String? requestMessage}) async {
     final message = (requestMessage != null && requestMessage.trim().isNotEmpty)
         ? requestMessage.trim()
         : 'Hello from Flutter UIKit client';
     final psv = serverId.toNativeUtf8();
     final pword = message.toNativeUtf8();
-    final result = _ffi.addFriend(psv, pword);
-    pkgffi.malloc.free(psv);
-    pkgffi.malloc.free(pword);
-    return result != 0;
+    final completer = Completer<AddFriendResult>();
+    _pendingAddFriend.putIfAbsent(serverId, () => []).add(completer);
+    int result;
+    try {
+      result = _ffi.addFriend(psv, pword);
+    } catch (e) {
+      _pendingAddFriend[serverId]?.remove(completer);
+      if (_pendingAddFriend[serverId]?.isEmpty ?? false) {
+        _pendingAddFriend.remove(serverId);
+      }
+      pkgffi.malloc.free(psv);
+      pkgffi.malloc.free(pword);
+      return AddFriendResult(
+        resultCode: -1,
+        userId: serverId,
+        resultInfo: 'addFriend dispatch threw: $e',
+        dispatched: false,
+      );
+    } finally {
+      pkgffi.malloc.free(psv);
+      pkgffi.malloc.free(pword);
+    }
+    if (result == 0) {
+      // Sync-dispatch failure (SDK not initialized, etc.). C++ also emits a
+      // friendAddResult callback in this case, but don't rely on it — return
+      // immediately. Clean up our completer registration so the (eventual)
+      // callback doesn't double-complete.
+      _pendingAddFriend[serverId]?.remove(completer);
+      if (_pendingAddFriend[serverId]?.isEmpty ?? false) {
+        _pendingAddFriend.remove(serverId);
+      }
+      return AddFriendResult(
+        resultCode: -1,
+        userId: serverId,
+        resultInfo: 'addFriend dispatch returned 0',
+        dispatched: false,
+      );
+    }
+    return completer.future.timeout(const Duration(seconds: 30), onTimeout: () {
+      _pendingAddFriend[serverId]?.remove(completer);
+      if (_pendingAddFriend[serverId]?.isEmpty ?? false) {
+        _pendingAddFriend.remove(serverId);
+      }
+      return AddFriendResult(
+        resultCode: -2,
+        userId: serverId,
+        resultInfo: 'addFriend timed out waiting for native result',
+        dispatched: true,
+      );
+    });
+  }
+
+  /// Called by [Tim2ToxSdkPlatform] when a `friendAddResult` native callback
+  /// arrives. Completes the oldest pending [Completer] for [userId].
+  void handleFriendAddResultCallback({
+    required String userId,
+    required int resultCode,
+    required String resultInfo,
+  }) {
+    final pending = _pendingAddFriend[userId];
+    if (pending == null || pending.isEmpty) {
+      _logger?.log(
+          '[FfiChatService] friendAddResult callback for user_id=$userId with no pending completer (code=$resultCode)');
+      return;
+    }
+    final completer = pending.removeAt(0);
+    if (pending.isEmpty) {
+      _pendingAddFriend.remove(userId);
+    }
+    if (!completer.isCompleted) {
+      completer.complete(AddFriendResult(
+        resultCode: resultCode,
+        userId: userId,
+        resultInfo: resultInfo,
+        dispatched: true,
+      ));
+    }
   }
 
   /// Save tox profile to disk now. Call on app pause/lifecycle or use periodic save.
@@ -1530,18 +1782,30 @@ class FfiChatService {
                     timestamp: DateTime.now(),
                     msgID: msgID,
                   );
-                  _lastByPeer[normalizedFrom] = msg;
-                  if (_activePeerId != normalizedFrom && from != _selfId) {
-                    _unreadByPeer.update(normalizedFrom, (v) => v + 1,
-                        ifAbsent: () => 1);
-                  }
-                  _appendHistory(normalizedFrom, msg);
-                  _messages.add(msg);
-                  // Auto-send received receipt for received messages (not self-sent)
-                  // Note: reaction messages are sent via custom messages and should not trigger receipts
-                  // Regular text messages will trigger receipts here
-                  if (!msg.isSelf && !_isReactionMessage(text)) {
-                    unawaited(_sendReceipt(from, msgID, 'received'));
+                  // S29: drop an inbound C2C message from a BLOCKED sender
+                  // before ANY side-effect — not just persistence, but the
+                  // unread bump, last-message preview, the `_messages` UI stream,
+                  // and the delivery receipt (which would leak activity to a
+                  // blocked peer). The _appendHistory guard is defense-in-depth;
+                  // this call-site guard is the real suppression point.
+                  if (from != _selfId && isBlocked(normalizedFrom)) {
+                    _logger?.log(
+                        '[FfiChatService] c2c: dropping blocked sender '
+                        '${normalizedFrom.substring(0, normalizedFrom.length.clamp(0, 8))}..');
+                  } else {
+                    _lastByPeer[normalizedFrom] = msg;
+                    if (_activePeerId != normalizedFrom && from != _selfId) {
+                      _unreadByPeer.update(normalizedFrom, (v) => v + 1,
+                          ifAbsent: () => 1);
+                    }
+                    _appendHistory(normalizedFrom, msg);
+                    _messages.add(msg);
+                    // Auto-send received receipt for received messages (not self-sent)
+                    // Note: reaction messages are sent via custom messages and should not trigger receipts
+                    // Regular text messages will trigger receipts here
+                    if (!msg.isSelf && !_isReactionMessage(text)) {
+                      unawaited(_sendReceipt(from, msgID, 'received'));
+                    }
                   }
                 }
               } else if (s.startsWith('gtext:')) {
@@ -2020,9 +2284,13 @@ class FfiChatService {
                   final isAvatarTransfer = fileKind == 1 ||
                       FfiChatService.isAvatarSyncFilePath(fileName);
 
+                  // S29: a BLOCKED sender's non-avatar file is dropped entirely
+                  // — skipping this whole block means no pending message, no
+                  // transfer-tracking maps, and no auto-accept/disk-write.
+                  final senderBlocked = uid != _selfId && isBlocked(uid);
                   // For non-avatar files, create a pending message immediately to show "receiving" status.
                   // Avatar sync files must never appear in chat history.
-                  if (!isAvatarTransfer) {
+                  if (!isAvatarTransfer && !senderBlocked) {
                     // Normalize friend ID to ensure consistent storage and retrieval
                     final normalizedUid =
                         uid.length > 64 ? _normalizeFriendId(uid) : uid;
@@ -3037,6 +3305,17 @@ class FfiChatService {
                 _logger?.log(
                     '[FfiChatService] _handleFileDone: Using pending message (filename match): msgID=$existingMsgID');
               } else if (completedMsgID != null) {
+                // KNOWN-ACCEPTED last-resort heuristic (codex #24, assessed
+                // 2026-05-30 — intentionally NOT tightened). Reached ONLY after
+                // the precise resolutions above miss: exact fileNumber-handle
+                // and filename+pending matches. Unlike the offline-drain
+                // matchers, `file_done` carries no original-send timestamp, so
+                // the #23 exact-ms/msgID discriminator can't apply here — the
+                // time window is the only available tiebreak. Narrow failure
+                // mode (two same-name files completing in-window with BOTH
+                // precise matches missing); the log line below is the agreed
+                // instrumentation. Do NOT swap in exact-ms: no exact id exists
+                // in this receive path.
                 existingMsgID = completedMsgID;
                 _logger?.log(
                     '[FfiChatService] _handleFileDone: No pending message found, using most recent completed message within time window: msgID=$existingMsgID, timestamp=$mostRecentCompletedTimestamp');
@@ -3549,7 +3828,19 @@ class FfiChatService {
     }
   }
 
-  Future<void> sendText(String peerId, String text) async {
+  /// Sends a C2C text. [cloudCustomData] (optional) is the structured V2TIM
+  /// metadata the UIKit composer builds for a REPLY
+  /// (`{"messageReply":{messageID,messageAbstract,...}}`); it is persisted on the
+  /// sender-side ChatMessage so the quote survives a reload (previously the quote
+  /// lived only on the in-memory message and was lost on cold start).
+  ///
+  /// SCOPE (deliberate, documented): it is NOT sent over Tox (`_ffi.sendText`
+  /// carries plain text only — the peer never sees the quote) and it is NOT
+  /// carried through the OFFLINE queue (a reply sent while the peer is offline
+  /// persists as plain text). Both are out of scope for this sender-side
+  /// persistence fix and are tracked follow-ups.
+  Future<void> sendText(String peerId, String text,
+      {String? cloudCustomData}) async {
     // Normalize friend ID to 64 characters (public key length)
     final normalizedPeerId = _normalizeFriendId(peerId);
     // Check if friend is online
@@ -3564,12 +3855,19 @@ class FfiChatService {
     final isOnline = friend.online;
 
     if (!isOnline) {
-      await _queueOfflineText(normalizedPeerId, text);
+      await _queueOfflineText(normalizedPeerId, text,
+          cloudCustomData: cloudCustomData);
       return;
     }
 
-    // Friend is online - send immediately
-    final msgID = '${DateTime.now().millisecondsSinceEpoch}_$_selfId';
+    // Friend is online - send immediately.
+    // P1-1 (text-send): include the monotonic `_msgIDSequence` like the inbound
+    // and file-send paths, so two C2C texts sent in the same millisecond don't
+    // produce an identical `${ms}_$_selfId` msgID — the history-dedup path
+    // treats msgID as primary identity and would silently drop the second send.
+    // Mirrors the file-send fix below and the inbound format `${ms}_${seq}_x`.
+    final msgID =
+        '${DateTime.now().millisecondsSinceEpoch}_${_msgIDSequence++}_$_selfId';
     final pto = normalizedPeerId.toNativeUtf8();
     final pmsg = text.toNativeUtf8();
     _ffi.sendText(pto, pmsg);
@@ -3583,6 +3881,8 @@ class FfiChatService {
       groupId: null,
       isPending: false,
       msgID: msgID,
+      // Reply quote (sender-side persistence). Null for a plain send.
+      cloudCustomData: cloudCustomData,
     );
     _lastByPeer[normalizedPeerId] = msg;
     _appendHistory(normalizedPeerId, msg);
@@ -3592,18 +3892,29 @@ class FfiChatService {
   // Enqueue a text send for a friend that is offline (or that flipped offline
   // between the pre-check and the FFI call). The UI sees a pending bubble
   // immediately; drain on the next online transition resends and clears it.
-  Future<void> _queueOfflineText(String normalizedPeerId, String text) async {
+  Future<void> _queueOfflineText(String normalizedPeerId, String text,
+      {String? cloudCustomData}) async {
+    // INVARIANT (drain depends on this): the queue item's `timestamp` and the
+    // pending ChatMessage's `timestamp` MUST be the same instant. `_drainTextItem`
+    // identifies this item's pending row by EXACT-ms timestamp equality
+    // (item.timestamp == row.timestamp), so both are built from one `now` below.
+    // If you ever split these into separate DateTime.now() calls, the drain
+    // matcher will silently stop finding the row — keep them identical.
     final now = DateTime.now();
+    // Compute the pending row's msgID BEFORE enqueuing so the queue item can
+    // carry it (durable identity — the drain matchers prefer it over the
+    // exact-ms timestamp fallback).
+    final timestamp = now.millisecondsSinceEpoch;
+    final sequence = _msgIDSequence++;
+    final msgID = '${timestamp}_${sequence}_$_selfId';
     _addToOfflineQueue(normalizedPeerId, (
       kind: 'text',
       text: text,
       filePath: null,
       fileName: null,
       timestamp: now,
+      msgID: msgID,
     ));
-    final timestamp = now.millisecondsSinceEpoch;
-    final sequence = _msgIDSequence++;
-    final msgID = '${timestamp}_${sequence}_$_selfId';
     final msg = ChatMessage(
       text: text,
       fromUserId: _selfId,
@@ -3612,6 +3923,12 @@ class FfiChatService {
       groupId: null,
       isPending: true,
       msgID: msgID,
+      // Reply/forward quote (sender-side persistence). Carried even while the
+      // peer is offline so the local quote bubble survives reload; copyWith on
+      // drain (`_drainTextItem`) preserves it. The offline queue item — which
+      // drives the wire-resend — intentionally omits it (the quote is not sent
+      // over Tox; documented S18 limitation).
+      cloudCustomData: cloudCustomData,
     );
     _lastByPeer[normalizedPeerId] = msg;
     _appendHistory(normalizedPeerId, msg);
@@ -3623,18 +3940,23 @@ class FfiChatService {
   // mid-send). Surfaces a pending file bubble; drain replays via sendFile().
   Future<void> _queueOfflineFile(
       String normalizedPeerId, String filePath) async {
+    // INVARIANT (drain depends on this): the queue item and the pending row
+    // MUST share this one `now` — `_drainFileItem` / `_markPendingItemFailed`
+    // identify this item's row by EXACT-ms timestamp equality. Don't split.
     final now = DateTime.now();
     final fileName = p.basename(filePath);
+    // Compute msgID before enqueuing so the queue item carries the durable id.
+    final timestamp = now.millisecondsSinceEpoch;
+    final sequence = _msgIDSequence++;
+    final msgID = '${timestamp}_${sequence}_$_selfId';
     _addToOfflineQueue(normalizedPeerId, (
       kind: 'file',
       text: '',
       filePath: filePath,
       fileName: fileName,
       timestamp: now,
+      msgID: msgID,
     ));
-    final timestamp = now.millisecondsSinceEpoch;
-    final sequence = _msgIDSequence++;
-    final msgID = '${timestamp}_${sequence}_$_selfId';
     final kind = _detectKind(filePath);
     final msg = ChatMessage(
       text: '',
@@ -4061,19 +4383,33 @@ class FfiChatService {
         groupId: null,
         msgID: msgID,
       );
-      _lastByPeer[sender] = msg;
-      if (_activePeerId != sender && sender != _selfId) {
-        _unreadByPeer.update(sender, (v) => v + 1, ifAbsent: () => 1);
-      }
-      _appendHistory(sender, msg);
-      _messages.add(msg);
-      // Auto-send received receipt for received messages (not self-sent)
-      // Note: reaction messages are sent via custom messages and should not trigger receipts
-      // Regular text messages will trigger receipts here
-      if (!msg.isSelf && !_isReactionMessage(data)) {
-        unawaited(_sendReceipt(sender, msgID, 'received'));
+      // S29: drop an inbound C2C text from a BLOCKED sender before any
+      // side-effect (unread / preview / `_messages` UI stream / receipt).
+      if (sender != _selfId && isBlocked(sender)) {
+        _logger?.log(
+            '[FfiChatService] _onNativeEvent(0): dropping blocked sender');
+      } else {
+        _lastByPeer[sender] = msg;
+        if (_activePeerId != sender && sender != _selfId) {
+          _unreadByPeer.update(sender, (v) => v + 1, ifAbsent: () => 1);
+        }
+        _appendHistory(sender, msg);
+        _messages.add(msg);
+        // Auto-send received receipt for received messages (not self-sent)
+        // Note: reaction messages are sent via custom messages and should not trigger receipts
+        // Regular text messages will trigger receipts here
+        if (!msg.isSelf && !_isReactionMessage(data)) {
+          unawaited(_sendReceipt(sender, msgID, 'received'));
+        }
       }
     } else if (type == 20) {
+      // S29: drop an inbound file from a BLOCKED sender entirely (incl. avatar
+      // sync) before any processing / auto-accept / disk-write.
+      if (sender != _selfId && isBlocked(sender)) {
+        _logger?.log(
+            '[FfiChatService] _onNativeEvent(20): dropping blocked file sender');
+        return;
+      }
       // file received; sender=userID, data=local path
       // NOTE: This event may be redundant if file_done already handled the message
       // Check if we already have a message for this file path to avoid duplicates
@@ -4205,49 +4541,62 @@ class FfiChatService {
       // sender format: "g|<groupID>|<senderID>"
       final parts = sender.split('|');
       if (parts.length >= 3) {
-        final gid = parts[1];
-        final from = parts[2];
-        // Check if this group was quit - if so, don't add it back
-        if (!_quitGroups.contains(gid)) {
-          // Deduplicate: same message can be delivered twice (conference + group callback in C++)
-          if (_isDuplicateGroupTextMessage(gid, from, data)) {
-            _logger?.log(
-                '[FfiChatService] _onNativeEvent(10): Skipping duplicate group message: gid=$gid, from=$from');
-          } else {
-            final added = _knownGroups.add(gid);
-            if (added) {
-              unawaited(
-                  _persistKnownGroups()); // This will call _syncKnownGroupsToNative()
-            }
-            final timestamp = DateTime.now().millisecondsSinceEpoch;
-            final sequence = _msgIDSequence++;
-            final msgID = '${timestamp}_${sequence}_${from}_$gid';
-            final msg = ChatMessage(
-              text: data,
-              fromUserId: from,
-              isSelf: from == _selfId,
-              timestamp: DateTime.now(),
-              groupId: gid,
-              msgID: msgID,
-            );
-            _lastByPeer[gid] = msg; // reuse for group last message
-            if (_activePeerId == gid) {
-              _unreadByPeer[gid] = 0;
-            } else {
-              _unreadByPeer.update(gid, (v) => v + 1, ifAbsent: () => 1);
-            }
-            _appendHistory(gid, msg);
-            _messages.add(msg);
-            // Auto-send received receipt for received group messages (not self-sent)
-            // Note: reaction messages are sent via custom messages and should not trigger receipts
-            if (!msg.isSelf && !_isReactionMessage(data)) {
-              unawaited(_sendReceipt(from, msgID, 'received', groupID: gid));
-            }
-          }
-        }
-        // If group was quit, ignore this message
+        ingestInboundGroupText(gid: parts[1], from: parts[2], text: data);
       }
     }
+  }
+
+  /// Materialize one inbound group text message — the SINGLE ingestion seam
+  /// shared by the native type==10 event (real NGC delivery) and the L3
+  /// test harness (`l3_inject_group_text`), which uses it to seed
+  /// deterministic multi-sender group views: same-host NGC peer links are
+  /// not reliably establishable (NAT-hairpin announces), while this seam
+  /// drives the exact dedup → history → unread → stream pipeline real
+  /// traffic drives, so persistence and rendering are indistinguishable.
+  /// Returns true when the message was ingested (false: quit group / dup).
+  bool ingestInboundGroupText({
+    required String gid,
+    required String from,
+    required String text,
+  }) {
+    // Check if this group was quit - if so, don't add it back
+    if (_quitGroups.contains(gid)) return false;
+    // Deduplicate: same message can be delivered twice (conference + group callback in C++)
+    if (_isDuplicateGroupTextMessage(gid, from, text)) {
+      _logger?.log(
+          '[FfiChatService] ingestInboundGroupText: Skipping duplicate group message: gid=$gid, from=$from');
+      return false;
+    }
+    final added = _knownGroups.add(gid);
+    if (added) {
+      unawaited(
+          _persistKnownGroups()); // This will call _syncKnownGroupsToNative()
+    }
+    final timestamp = DateTime.now().millisecondsSinceEpoch;
+    final sequence = _msgIDSequence++;
+    final msgID = '${timestamp}_${sequence}_${from}_$gid';
+    final msg = ChatMessage(
+      text: text,
+      fromUserId: from,
+      isSelf: from == _selfId,
+      timestamp: DateTime.now(),
+      groupId: gid,
+      msgID: msgID,
+    );
+    _lastByPeer[gid] = msg; // reuse for group last message
+    if (_activePeerId == gid) {
+      _unreadByPeer[gid] = 0;
+    } else {
+      _unreadByPeer.update(gid, (v) => v + 1, ifAbsent: () => 1);
+    }
+    _appendHistory(gid, msg);
+    _messages.add(msg);
+    // Auto-send received receipt for received group messages (not self-sent)
+    // Note: reaction messages are sent via custom messages and should not trigger receipts
+    if (!msg.isSelf && !_isReactionMessage(text)) {
+      unawaited(_sendReceipt(from, msgID, 'received', groupID: gid));
+    }
+    return true;
   }
 
   /// Returns true if we already have a recent group message with the same (gid, from, text).
@@ -4286,6 +4635,18 @@ class FfiChatService {
   }
 
   void _appendHistory(String id, ChatMessage msg) {
+    // S29 block enforcement: drop an inbound C2C message from a blocked sender
+    // BEFORE it reaches persistence/lastByPeer — a local receive-side hide.
+    // This is the single FfiChatService chokepoint for every inbound text/file
+    // path (poll `c2c:` + `_onNativeEvent` type 0/20), so one guard covers them
+    // all. Self-sends (isSelf) and groups (groupId != null) are never blocked;
+    // the binary-replacement hook is guarded separately (it persists directly).
+    if (!msg.isSelf && msg.groupId == null && isBlocked(msg.fromUserId)) {
+      _logger?.log(
+          '[FfiChatService] _appendHistory: dropping blocked sender '
+          '${msg.fromUserId.substring(0, msg.fromUserId.length.clamp(0, 8))}..');
+      return;
+    }
     // Persistence is the single owner of the in-memory list; it also applies
     // the 1000-message memory cap and dedup-by-msgID inside `appendHistory`.
     // Fire-and-forget by design: callers of _appendHistory expect a
@@ -4960,6 +5321,25 @@ class FfiChatService {
     }
   }
 
+  /// Register a self-join the Dart layer did NOT initiate (called from C++ via
+  /// the groupJoinNotification FFI callback — e.g. auto-accepting a group
+  /// invite). The Dart-initiated joinGroup path adds to _knownGroups itself; an
+  /// invite auto-join happens entirely in C++ (tox_group_invite_accept +
+  /// HandleGroupSelfJoin), so without this the group never surfaces in
+  /// _knownGroups. Mirrors joinGroup's LOCAL bookkeeping without the C++ call;
+  /// idempotent (no-op if already known).
+  Future<void> registerJoinedGroupState(String groupId) async {
+    if (_knownGroups.contains(groupId)) return;
+    print(
+        '[FfiChatService] registerJoinedGroupState: adding $groupId to _knownGroups');
+    _knownGroups.add(groupId);
+    _syncKnownGroupsToNative();
+    await _persistKnownGroups();
+    // A (re)join clears any prior quit so it is not filtered back out.
+    _quitGroups.remove(groupId);
+    await _prefs?.removeQuitGroup(groupId);
+  }
+
   /// Cleanup group state after quit (called from C++ layer via FFI notification)
   /// This method performs the same cleanup as quitGroup but without calling C++ layer
   /// It's used when quitGroup is called directly from C++ layer (bypassing Dart layer)
@@ -5187,8 +5567,6 @@ class FfiChatService {
   // Note: reaction messages should not trigger receipts
   Future<void> _sendReceipt(String peerId, String msgID, String receiptType,
       {String? groupID}) async {
-    // TODO: 暂时屏蔽发送已读回执
-    return;
     try {
       final json = {
         'type': 'receipt',
@@ -5379,18 +5757,23 @@ class FfiChatService {
   }
 
   Future<void> _queueOfflineGroupText(String groupId, String text) async {
+    // INVARIANT (drain depends on this): the queue item and the pending row
+    // MUST share this one `now` — `_sendPendingGroupMessages` identifies this
+    // item's row by EXACT-ms timestamp equality. Don't split into two calls.
     final now = DateTime.now();
     final storageKey = _groupOfflineQueueKey(groupId);
+    // Compute msgID before enqueuing so the queue item carries the durable id.
+    final timestamp = now.millisecondsSinceEpoch;
+    final sequence = _msgIDSequence++;
+    final msgID = '${timestamp}_${sequence}_${_selfId}_$groupId';
     _addToOfflineQueue(storageKey, (
       kind: 'text',
       text: text,
       filePath: null,
       fileName: null,
       timestamp: now,
+      msgID: msgID,
     ));
-    final timestamp = now.millisecondsSinceEpoch;
-    final sequence = _msgIDSequence++;
-    final msgID = '${timestamp}_${sequence}_${_selfId}_$groupId';
     final msg = ChatMessage(
       text: text,
       fromUserId: _selfId,
@@ -5431,6 +5814,7 @@ class FfiChatService {
             '[FfiChatService] _sendPendingGroupMessages: lost connection mid-drain for $groupId; ${pending.length - pending.indexOf(item)} item(s) kept in queue');
         break;
       }
+      var dispatched = false;
       try {
         final pg = groupId.toNativeUtf8();
         final pt = item.text.toNativeUtf8();
@@ -5440,16 +5824,29 @@ class FfiChatService {
           pkgffi.malloc.free(pg);
           pkgffi.malloc.free(pt);
         }
-        // Flip the matching pending bubble to delivered.
+        // #25 Option B: durably clear the queue entry NOW (after send, before
+        // the history reconcile) so a crash can't make the next drain re-send.
+        // Same reorder as the C2C drain paths.
+        await _offlineQueuePersistence.removeItem(storageKey, item);
+        // #28 / #25 Property 5 (group): the send succeeded AND the queue entry
+        // is durably gone. Any throw past here is a post-dispatch reconcile
+        // failure, NOT a send failure — the catch must not mark it failed or
+        // re-remove. (A removeItem throw above leaves dispatched=false, which is
+        // treated as not-yet-dispatched, matching the C2C drain.)
+        dispatched = true;
+        // Flip the matching pending bubble to delivered. Identity via
+        // _offlineRowMatchesItem (msgID-first, exact-ms fallback) — not a ±10s
+        // window, which could cross two identical group texts queued close
+        // together. (Same Bug-F-class fix as the C2C drain matchers.)
         if (history != null) {
+          final itemMs = item.timestamp.millisecondsSinceEpoch;
           for (int i = history.length - 1; i >= 0; i--) {
             final msg = history[i];
             if (msg.isSelf &&
                 msg.isPending &&
                 msg.filePath == null &&
                 msg.text == item.text &&
-                (msg.timestamp.difference(item.timestamp).abs().inSeconds <=
-                    10)) {
+                _offlineRowMatchesItem(msg, item, itemMs)) {
               history[i] = msg.copyWith(isPending: false);
               _lastByPeer[groupId] = history[i];
               try {
@@ -5459,14 +5856,32 @@ class FfiChatService {
             }
           }
         }
-        await _offlineQueuePersistence.removeItem(storageKey, item);
         await Future.delayed(const Duration(milliseconds: 100));
       } catch (e, stackTrace) {
+        if (dispatched) {
+          // #25 Property 5 (group): the message WAS sent and the queue entry
+          // removed; only the post-dispatch history reconcile threw. Do NOT mark
+          // it failed (it was delivered) and do NOT re-remove — the pending row
+          // self-heals to delivered on the next reload.
+          _logger?.logError(
+              '[FfiChatService] _sendPendingGroupMessages: post-dispatch '
+              'reconcile failed for an already-sent group text (delivered; row '
+              'self-heals on reload)',
+              e,
+              stackTrace);
+          continue;
+        }
+        // #28: a genuine pre-dispatch send failure. Mirror the C2C drain —
+        // surface a failed bubble (flip the pending row non-pending) instead of
+        // silently dropping the message, then clear the queue entry (one drain
+        // attempt per online transition, matching C2C semantics). Previously this
+        // catch only removed the item, leaving the bubble stuck pending forever
+        // and the message lost with no UI signal.
         _logger?.logError(
             '[FfiChatService] _sendPendingGroupMessages: drain failed for group $groupId',
             e,
             stackTrace);
-        // One drain attempt per online transition, matching C2C semantics.
+        _markPendingItemFailed(groupId, history, item, isFile: false);
         await _offlineQueuePersistence.removeItem(storageKey, item);
       }
     }
@@ -6475,14 +6890,33 @@ class FfiChatService {
     for (final item in messagesToSend) {
       final isFile = item.kind == 'file' ||
           (item.filePath != null && item.filePath!.isNotEmpty);
+      // #25 Option B: `dispatched` flips true the instant the FFI send has
+      // succeeded and the queue entry has been durably removed (inside the
+      // drain, via onDispatched), BEFORE the history reconcile. codex Property
+      // 5: the reconcile can still throw AFTER dispatch — without this flag the
+      // catch below would `_markPendingItemFailed` an already-DELIVERED message
+      // (false "failed" UX) and double-remove. Guard on it so the failure path
+      // only runs for a genuine pre-dispatch send failure.
+      var dispatched = false;
       try {
-        if (isFile) {
-          await _drainFileItem(normalizedPeerId, history, item);
-        } else if (item.text.isNotEmpty) {
-          await _drainTextItem(normalizedPeerId, history, item);
+        // The queue entry is removed INSIDE the drain, right after the FFI send
+        // succeeds and before the history reconcile (via onDispatched) —
+        // shrinking the dup-send-on-crash window.
+        Future<void> remover() async {
+          await _offlineQueuePersistence.removeItem(storageKey, item);
+          dispatched = true;
         }
-        // Success: remove this item from disk + cache before the next send.
-        await _offlineQueuePersistence.removeItem(storageKey, item);
+        if (isFile) {
+          await _drainFileItem(normalizedPeerId, history, item,
+              onDispatched: remover);
+        } else if (item.text.isNotEmpty) {
+          await _drainTextItem(normalizedPeerId, history, item,
+              onDispatched: remover);
+        } else {
+          // Degenerate empty item (no text, no file): nothing to send — just
+          // clear it so it doesn't linger in the queue forever.
+          await remover();
+        }
         await Future.delayed(const Duration(milliseconds: 100));
       } on _OfflineDuringDrain {
         // Friend disconnected again before/during this item's send. Leave
@@ -6493,6 +6927,19 @@ class FfiChatService {
             '[FfiChatService] _sendPendingMessages: friend $normalizedPeerId went offline mid-drain; ${messagesToSend.length - messagesToSend.indexOf(item)} item(s) kept in queue');
         break;
       } catch (e, stackTrace) {
+        if (dispatched) {
+          // codex Property 5: the message WAS sent + the queue entry removed;
+          // only the post-dispatch history reconcile threw. Do NOT mark it
+          // failed (it was delivered) and do NOT re-remove. Log and move on —
+          // the pending row self-heals to delivered on the next reload.
+          _logger?.logError(
+              '[FfiChatService] _sendPendingMessages: post-dispatch reconcile '
+              'failed for an already-sent ${isFile ? "file" : "text"} item '
+              '(message delivered; row will self-heal on reload)',
+              e,
+              stackTrace);
+          continue;
+        }
         _logger?.logError(
             '[FfiChatService] _sendPendingMessages: drain failed for ${isFile ? "file" : "text"} item',
             e,
@@ -6509,8 +6956,18 @@ class FfiChatService {
   // Replay a queued text item: locate the matching pending history record
   // (preserving its original timestamp + msgID) and flip it to delivered
   // after the FFI accepts the send.
+  //
+  // [onDispatched] (#25 Option B) is awaited immediately AFTER the FFI send
+  // succeeds and BEFORE the history reconcile — the caller uses it to durably
+  // remove this item from the offline queue. This shrinks the
+  // duplicate-send-on-crash window to the irreducible `FFI send → one durable
+  // persist` gap: a crash after send but before [onDispatched] re-sends on the
+  // next drain (dup); a crash after [onDispatched] but before reconcile leaves
+  // the queue clear (no resend) and the history row pending (self-heals to
+  // delivered on reload). No message-loss mode.
   Future<void> _drainTextItem(String normalizedPeerId,
-      List<ChatMessage>? history, OfflineMessageItem item) async {
+      List<ChatMessage>? history, OfflineMessageItem item,
+      {Future<void> Function()? onDispatched}) async {
     // The drain trigger was an offline→online transition, but the friend
     // can flip back to offline before we reach this item. Pre-check the
     // cached online status (refreshed by the same getFriendList poll that
@@ -6523,13 +6980,23 @@ class FfiChatService {
     ChatMessage? pendingMsg;
     int? pendingMsgIndex;
     if (history != null) {
+      // codex (Bug F follow-up): match THIS item's pending row via
+      // _offlineRowMatchesItem — msgID-first (durable; the queue item now
+      // carries the pending row's msgID), with EXACT-ms timestamp as the
+      // backward-compat fallback for legacy no-msgID queue files. NOT a ±10s
+      // window: a window matcher that took the most-recent row could, with two
+      // identical offline texts queued within 10s, reconcile the WRONG (newer)
+      // pending row; and since reload clears `isPending` on history rows
+      // (message_history_persistence.dart, "mark all historical messages as
+      // not pending"), that mis-ownership becomes sticky across a crash.
+      final itemMs = item.timestamp.millisecondsSinceEpoch;
       for (int i = history.length - 1; i >= 0; i--) {
         final msg = history[i];
         if (msg.isSelf &&
             msg.isPending &&
             msg.filePath == null &&
             msg.text == item.text &&
-            (msg.timestamp.difference(item.timestamp).abs().inSeconds <= 10)) {
+            _offlineRowMatchesItem(msg, item, itemMs)) {
           pendingMsg = msg;
           pendingMsgIndex = i;
           break;
@@ -6543,6 +7010,10 @@ class FfiChatService {
     pkgffi.malloc.free(pto);
     pkgffi.malloc.free(pmsg);
 
+    // #25 Option B: durably clear the queue entry NOW (after send, before the
+    // history reconcile) so a crash can't make the next drain re-send.
+    if (onDispatched != null) await onDispatched();
+
     if (pendingMsg != null && pendingMsgIndex != null && history != null) {
       final updatedMsg = pendingMsg.copyWith(isPending: false);
       history[pendingMsgIndex] = updatedMsg;
@@ -6554,32 +7025,90 @@ class FfiChatService {
         _messages.add(updatedMsg);
       } catch (_) {}
     } else {
-      // Fallback: history record was lost across restart; create a fresh
-      // delivered message but keep the original composition timestamp.
-      final sequence = _msgIDSequence++;
-      final msgID =
-          '${item.timestamp.millisecondsSinceEpoch}_${sequence}_$_selfId';
-      final msg = ChatMessage(
-        text: item.text,
-        fromUserId: _selfId,
-        isSelf: true,
-        timestamp: item.timestamp,
-        groupId: null,
-        isPending: false,
-        msgID: msgID,
-      );
-      _lastByPeer[normalizedPeerId] = msg;
-      _appendHistory(normalizedPeerId, msg);
-      _messages.add(msg);
-      await _saveHistory(normalizedPeerId);
+      // Fallback: no matching *pending* row in the in-memory history (lost
+      // across restart, trimmed, or composition→item timestamp drift > 10s).
+      //
+      // Bug F fix: appendHistory's content-dedup no longer covers self-sends,
+      // so this fallback must guarantee its OWN idempotency or a re-drain could
+      // append a duplicate of an already-delivered self row. Re-scan for THIS
+      // item's own row (pending OR already-delivered) via _offlineRowMatchesItem
+      // (msgID-first, exact-ms fallback) and reconcile it in place instead of
+      // appending. NOT a window: a 10s window was too broad — it could match a
+      // DIFFERENT identical-text message that merely happens to be nearby, and
+      // wrongly suppress this send, re-creating Bug F in the fallback path.
+      ChatMessage? existing;
+      int? existingIndex;
+      if (history != null) {
+        final itemMs = item.timestamp.millisecondsSinceEpoch;
+        for (int i = history.length - 1; i >= 0; i--) {
+          final msg = history[i];
+          if (msg.isSelf &&
+              msg.filePath == null &&
+              msg.text == item.text &&
+              _offlineRowMatchesItem(msg, item, itemMs)) {
+            existing = msg;
+            existingIndex = i;
+            break;
+          }
+        }
+      }
+      if (existing != null && existingIndex != null && history != null) {
+        // Already present (e.g. a prior drain delivered it): ensure it reads as
+        // delivered, but do NOT append a second row and do NOT re-emit on the
+        // message stream — the row was streamed when first created.
+        final updatedMsg =
+            existing.isPending ? existing.copyWith(isPending: false) : existing;
+        history[existingIndex] = updatedMsg;
+        _lastByPeer[normalizedPeerId] = updatedMsg;
+        try {
+          await _saveHistory(normalizedPeerId);
+        } catch (_) {}
+      } else {
+        // Genuinely absent: create a fresh delivered message but keep the
+        // original composition timestamp.
+        //
+        // codex: REUSE the queue item's durable msgID (the id of the original
+        // pending row) instead of minting a new one. Otherwise, if this branch
+        // saves history and the process dies before the queue item is removed,
+        // the surviving item carries the old id while history has a new id — the
+        // next drain can't correlate them and may resend/duplicate. Only
+        // synthesize a fresh id for legacy items that predate the queue-item
+        // msgID field (item.msgID == null).
+        final itemMsgID = item.msgID;
+        final String msgID;
+        if (itemMsgID != null && itemMsgID.isNotEmpty) {
+          msgID = itemMsgID;
+        } else {
+          final sequence = _msgIDSequence++;
+          msgID = '${item.timestamp.millisecondsSinceEpoch}_${sequence}_$_selfId';
+        }
+        final msg = ChatMessage(
+          text: item.text,
+          fromUserId: _selfId,
+          isSelf: true,
+          timestamp: item.timestamp,
+          groupId: null,
+          isPending: false,
+          msgID: msgID,
+        );
+        _lastByPeer[normalizedPeerId] = msg;
+        _appendHistory(normalizedPeerId, msg);
+        _messages.add(msg);
+        await _saveHistory(normalizedPeerId);
+      }
     }
   }
 
   // Replay a queued file item via sendFile(addToChatHistory: false): the
   // pending bubble already exists from when it was queued, so we just
   // flip it to delivered after the FFI accepts the transfer.
+  //
+  // [onDispatched] (#25 Option B): same contract as _drainTextItem — awaited
+  // after the FFI transfer is accepted and before the history reconcile, to
+  // durably clear the queue entry and minimize the dup-send-on-crash window.
   Future<void> _drainFileItem(String normalizedPeerId,
-      List<ChatMessage>? history, OfflineMessageItem item) async {
+      List<ChatMessage>? history, OfflineMessageItem item,
+      {Future<void> Function()? onDispatched}) async {
     final filePath = item.filePath;
     if (filePath == null || filePath.isEmpty) return;
     if (!await File(filePath).exists()) {
@@ -6588,12 +7117,17 @@ class FfiChatService {
     ChatMessage? pendingMsg;
     int? pendingMsgIndex;
     if (history != null) {
+      // Identity via _offlineRowMatchesItem (msgID-first, exact-ms fallback) —
+      // not a ±10s window. filePath is also matched, but two queued sends of
+      // the SAME file would still need msgID/timestamp to disambiguate; a
+      // window matcher could flip the wrong one.
+      final itemMs = item.timestamp.millisecondsSinceEpoch;
       for (int i = history.length - 1; i >= 0; i--) {
         final msg = history[i];
         if (msg.isSelf &&
             msg.isPending &&
             msg.filePath == filePath &&
-            (msg.timestamp.difference(item.timestamp).abs().inSeconds <= 10)) {
+            _offlineRowMatchesItem(msg, item, itemMs)) {
           pendingMsg = msg;
           pendingMsgIndex = i;
           break;
@@ -6602,6 +7136,9 @@ class FfiChatService {
     }
     await sendFile(normalizedPeerId, filePath,
         addToChatHistory: false, throwIfOffline: true);
+    // #25 Option B: durably clear the queue entry after the transfer is
+    // accepted, before the history reconcile (see _drainTextItem).
+    if (onDispatched != null) await onDispatched();
     if (pendingMsg != null && pendingMsgIndex != null && history != null) {
       final updatedMsg = pendingMsg.copyWith(isPending: false);
       history[pendingMsgIndex] = updatedMsg;
@@ -6622,15 +7159,19 @@ class FfiChatService {
       List<ChatMessage>? history, OfflineMessageItem item,
       {required bool isFile}) {
     if (history == null) return;
+    // Identity via _offlineRowMatchesItem (msgID-first, exact-ms fallback) —
+    // not a ±10s window, which could flip the WRONG pending row to failed when
+    // two identical texts/files were queued close together.
+    final itemMs = item.timestamp.millisecondsSinceEpoch;
     for (int i = history.length - 1; i >= 0; i--) {
       final msg = history[i];
       if (!msg.isSelf || !msg.isPending) continue;
       final matches = isFile
           ? (msg.filePath == item.filePath &&
-              (msg.timestamp.difference(item.timestamp).abs().inSeconds <= 10))
+              _offlineRowMatchesItem(msg, item, itemMs))
           : (msg.filePath == null &&
               msg.text == item.text &&
-              (msg.timestamp.difference(item.timestamp).abs().inSeconds <= 10));
+              _offlineRowMatchesItem(msg, item, itemMs));
       if (matches) {
         final updated = msg.copyWith(isPending: false);
         history[i] = updated;
@@ -7039,6 +7580,7 @@ class FfiChatService {
     _unreadByPeer.clear();
     _knownGroups.clear();
     _quitGroups.clear();
+    _blockedUsers.clear();
     _lastByPeer.clear();
     _typingUntil.clear();
     _processingFileDone.clear();

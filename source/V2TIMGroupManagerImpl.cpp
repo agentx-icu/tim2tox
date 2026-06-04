@@ -525,11 +525,18 @@ void V2TIMGroupManagerImpl::GetGroupsInfo(const V2TIMStringVector& groupIDList,
                                             oss << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(chat_id[i]);
                                         }
                                         std::string chat_id_hex = oss.str();
-                                        
-                                        // Store the chat_id for this groupID (via FFI)
-                                        // Function is already declared with extern "C" at file scope
-                                        manager_impl_->SetGroupChatIdInStorage(groupID, chat_id_hex);
-                                        
+
+                                        // TODO(fallback2-misbind, codex 2026-06-04 P2): only auto-bind when
+                                        // EXACTLY ONE unmapped candidate exists; first-unmapped-wins can
+                                        // persist a wrong chat_id/group mapping when 2+ groups are unmapped.
+                                        // Store the chat_id for this groupID. MUST be the
+                                        // TODO(fallback2-misbind, codex 2026-06-04 P2): only auto-bind when
+                        // EXACTLY ONE unmapped candidate exists (see GetGroupsInfo site).
+                        // *Locked variant: this scope holds mutex_ (lock_guard
+                                        // above) and the plain variant re-locks mutex_ —
+                                        // a non-recursive self-deadlock (2026-06-03 .hang).
+                                        manager_impl_->SetGroupChatIdInStorageLocked(groupID, chat_id_hex);
+
                                         // Rebuild the mapping
                                         manager_impl_->group_id_to_group_number_[V2TIMString(groupID.c_str())] = group_num;
                                         manager_impl_->group_number_to_group_id_[group_num] = V2TIMString(groupID.c_str());
@@ -721,9 +728,11 @@ void V2TIMGroupManagerImpl::QuitGroup(const V2TIMString& groupID, V2TIMCallback*
                                     }
                                     std::string chat_id_hex = oss.str();
                                     
-                                    // Store chat_id for future use
-                                    // Function is already declared with extern "C" at file scope
-                                    manager_impl_->SetGroupChatIdInStorage(groupID_str, chat_id_hex);
+                                    // Store chat_id for future use. *Locked variant:
+                                    // this scope holds mutex_ (the map reads/writes
+                                    // above are bare), so the plain variant would
+                                    // self-deadlock (non-recursive mutex_).
+                                    manager_impl_->SetGroupChatIdInStorageLocked(groupID_str, chat_id_hex);
                                     V2TIM_LOG(kInfo, "V2TIMGroupManagerImpl::QuitGroup: Stored chat_id={}… for groupID={} for future use",
                                               chat_id_hex.substr(0, 8), groupID_str);
                                 }
@@ -1647,7 +1656,13 @@ void V2TIMGroupManagerImpl::GetGroupMemberList(
                         V2TIM_LOG(kInfo, "[GetGroupMemberList] Fallback 2: Found unmapped group_number={} with chat_id={}…, assigning to groupID={}",
                                   group_num, chat_id_hex.substr(0, 8), groupID_str);
 
-                        target_manager_impl->SetGroupChatIdInStorage(groupID_str, chat_id_hex);
+                        // TODO(fallback2-misbind, codex 2026-06-04 P2): only auto-bind when
+                        // EXACTLY ONE unmapped candidate exists (see GetGroupsInfo site).
+                        // *Locked variant: this scope holds lookup_impl->mutex_
+                        // (lock_guard above); the plain variant re-locks the same
+                        // mutex_ and self-deadlocks the main thread — this exact
+                        // call is the stack in the 2026-06-03 Toxee .hang report.
+                        target_manager_impl->SetGroupChatIdInStorageLocked(groupID_str, chat_id_hex);
 
                         lookup_impl->group_id_to_group_number_[V2TIMString(groupID_str.c_str())] = group_num;
                         lookup_impl->group_number_to_group_id_[group_num] = V2TIMString(groupID_str.c_str());
@@ -2713,7 +2728,9 @@ void V2TIMGroupManagerImpl::InviteUserToGroup(
                         std::string chat_id_hex = oss.str();
 
                         V2TIM_LOG(kInfo, "[InviteUserToGroup] Fallback 2: Found unmapped group_number={} chat_id={}… assigning to groupID={}", group_num, chat_id_hex.substr(0, 8), group_id_str);
-                        manager_impl_->SetGroupChatIdInStorage(group_id_str, chat_id_hex);
+                        // *Locked variant: this scope holds mutex_ (lock_guard
+                        // above); the plain variant re-locks and self-deadlocks.
+                        manager_impl_->SetGroupChatIdInStorageLocked(group_id_str, chat_id_hex);
                         manager_impl_->group_id_to_group_number_[V2TIMString(group_id_str.c_str())] = group_num;
                         manager_impl_->group_number_to_group_id_[group_num] = V2TIMString(group_id_str.c_str());
                         matched_group_number = group_num;
@@ -2960,16 +2977,36 @@ void V2TIMGroupManagerImpl::KickGroupMember(
             continue;
         }
         
-        // Find peer_id by public key
+        // Find peer_id by public key. PRIMARY source is the callback-populated
+        // group_peer_id_cache_ (the SAME map GetGroupMemberList uses): the
+        // founder learns a joiner's (pubkey -> peer_id) only via the
+        // HandleGroupPeerJoin callback that fires as the Tox loop iterates.
+        // Sequential 0..N probing is an unreliable fallback. (S37 fix.)
         Tox_Group_Peer_Number target_peer_id = UINT32_MAX;
-        for (Tox_Group_Peer_Number peer_id = 0; peer_id < 1000; ++peer_id) {
-            uint8_t peer_pubkey[TOX_PUBLIC_KEY_SIZE];
-            Tox_Err_Group_Peer_Query err_key;
-            if (GetToxManagerFromImpl(manager_impl_)->getGroupPeerPublicKey(group_number, peer_id, peer_pubkey, &err_key) &&
-                err_key == TOX_ERR_GROUP_PEER_QUERY_OK) {
-                if (memcmp(peer_pubkey, target_pubkey, TOX_PUBLIC_KEY_SIZE) == 0) {
-                    target_peer_id = peer_id;
-                    break;
+        {
+            std::string key_lower = user_id_str;
+            std::transform(key_lower.begin(), key_lower.end(), key_lower.begin(),
+                           [](unsigned char c) { return std::tolower(c); });
+            std::lock_guard<std::mutex> lock(manager_impl_->mutex_);
+            auto cache_it = manager_impl_->group_peer_id_cache_.find(group_number);
+            if (cache_it != manager_impl_->group_peer_id_cache_.end()) {
+                auto peer_it = cache_it->second.find(key_lower);
+                if (peer_it != cache_it->second.end()) {
+                    target_peer_id = peer_it->second;
+                    V2TIM_LOG(kInfo, "KickGroupMember: resolved peer_id={} from cache for userID {}", target_peer_id, user_id_str);
+                }
+            }
+        }
+        if (target_peer_id == UINT32_MAX) {
+            for (Tox_Group_Peer_Number peer_id = 0; peer_id < 1000; ++peer_id) {
+                uint8_t peer_pubkey[TOX_PUBLIC_KEY_SIZE];
+                Tox_Err_Group_Peer_Query err_key;
+                if (GetToxManagerFromImpl(manager_impl_)->getGroupPeerPublicKey(group_number, peer_id, peer_pubkey, &err_key) &&
+                    err_key == TOX_ERR_GROUP_PEER_QUERY_OK) {
+                    if (memcmp(peer_pubkey, target_pubkey, TOX_PUBLIC_KEY_SIZE) == 0) {
+                        target_peer_id = peer_id;
+                        break;
+                    }
                 }
             }
         }

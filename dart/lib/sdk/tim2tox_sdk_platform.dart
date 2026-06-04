@@ -18,6 +18,7 @@ import 'dart:io';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/painting.dart';
 import 'package:tencent_cloud_chat_sdk/tencent_cloud_chat_sdk_platform_interface.dart';
+import 'package:tencent_cloud_chat_sdk/native_im/adapter/tim_group_manager.dart';
 import 'package:tencent_cloud_chat_sdk/enum/V2TimSDKListener.dart';
 import 'package:tencent_cloud_chat_sdk/enum/V2TimUIKitListener.dart';
 import 'package:tencent_cloud_chat_sdk/enum/V2TimAdvancedMsgListener.dart';
@@ -168,6 +169,14 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
   /// The app should increment unread for [groupId] and refresh unread total so
   /// sidebar and conversation list show the new unread count.
   void Function(String? groupId)? onGroupMessageReceivedForUnread;
+
+  /// Called after a conversation is marked read via
+  /// [cleanConversationUnreadMessageCount] (the "mark as read" action that
+  /// does not open the conversation). The host should refresh the conversation
+  /// list + unread total so the sidebar badge clears. Mirrors
+  /// [onGroupMessageReceivedForUnread]; left null in headless/test contexts
+  /// that read unread directly from [FfiChatService].
+  void Function(String conversationID)? onConversationUnreadCleared;
 
   /// Prefer the parsed chat-message group id, but fall back to the V2 message group id.
   /// Conference messages can arrive with only the latter populated.
@@ -454,6 +463,22 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
           }
         }
         break;
+      case "groupJoinNotification":
+        // Inverse of groupQuitNotification: a self-join the Dart layer did NOT
+        // initiate via joinGroup (e.g. auto-accepting an invite). Register the
+        // group in local state so it surfaces in knownGroups.
+        final String? groupId = data["group_id"];
+        if (groupId != null) {
+          try {
+            await ffiService.registerJoinedGroupState(groupId);
+          } catch (e, st) {
+            ffiService.logger?.logError(
+                '[Tim2ToxSdkPlatform] _handleCustomCallback groupJoinNotification failed for groupId=$groupId',
+                e,
+                st);
+          }
+        }
+        break;
       case "groupChatIdStored":
         final String? groupId = data["group_id"];
         final String? chatId = data["chat_id"];
@@ -474,6 +499,32 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
                 e,
                 st);
           }
+        }
+        break;
+      case "friendAddResult":
+        // Emitted by tim2tox_ffi_add_friend's V2TIMValueCallback. Resolves
+        // the Completer registered in FfiChatService.addFriend so the UI
+        // sees the real V2TIMFriendOperationResult (resultCode 0=success,
+        // non-zero=failure such as 6770 "Friend add requires full Tox
+        // address"). Without this routing the dialog only sees the sync
+        // dispatch result and silently closes on any async failure.
+        final String? userId = data["user_id"] as String?;
+        final dynamic rawCode = data["result_code"];
+        final int resultCode = rawCode is int
+            ? rawCode
+            : (rawCode is num
+                ? rawCode.toInt()
+                : int.tryParse(rawCode?.toString() ?? '') ?? -1);
+        final String resultInfo = (data["result_info"] as String?) ?? '';
+        if (userId != null) {
+          ffiService.handleFriendAddResultCallback(
+            userId: userId,
+            resultCode: resultCode,
+            resultInfo: resultInfo,
+          );
+        } else {
+          ffiService.logger?.log(
+              '[Tim2ToxSdkPlatform] friendAddResult callback missing user_id (code=$resultCode)');
         }
         break;
     }
@@ -1634,15 +1685,31 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
                 if (v2Msg.msgID != null && msg.id == v2Msg.msgID) return true;
                 if (v2Msg.id != null && msg.msgID == v2Msg.id) return true;
 
-                // Only treat as duplicate by content when incoming message has no ID or temp ID (same message from two paths).
-                // When v2Msg has a real msgID, distinct messages with same content must not be merged.
-                if (v2Msg.msgID != null && !v2Msg.msgID!.startsWith('m'))
-                  return false;
-                // Content-based matching: same sender, same content, close timestamp
+                // Bug C fix (codex-designed 2026-05-30): the upstream guard was
+                // `if (v2Msg.msgID != null && !startsWith('m')) return false`,
+                // i.e. "only content-dedup temp/optimistic ids". That assumption
+                // is structurally wrong for toxee: the SAME inbound message
+                // double-delivers through BOTH hybrid paths, each with a
+                // DIFFERENT *real* id (binary-replacement `msg_<n>_<nanos>_<seq>`
+                // vs poll `<millis>_<n>_<toxId>`) — neither is the `^m\d+-\d+$`
+                // temp form, so the old guard skipped content-dedup and the 2nd
+                // copy rendered as a live double-bubble (Bug C). The correct
+                // invariant is DIRECTION, not id-format: only INBOUND messages
+                // double-deliver. This whole block is already gated on
+                // `!chatMsg.isSelf` above, so the id-format guard is removed
+                // entirely — content dedup applies to all inbound copies here.
+                // (Self/optimistic adoption is handled on the isSelf path and is
+                // untouched.)
+                //
+                // Content-based matching: same sender, same content, close
+                // timestamp. Window TIGHTENED 10s → 2s (codex): timestamps are
+                // SECONDS (converters do `~/ 1000`); cross-path copies arrive
+                // ms apart, so 2s is ample while a 10s window risked swallowing
+                // two genuinely-distinct identical inbound messages.
                 if (msg.sender == v2Msg.sender) {
                   final timeDiff =
                       ((v2Msg.timestamp ?? 0) - (msg.timestamp ?? 0)).abs();
-                  if (timeDiff <= 10) {
+                  if (timeDiff <= 2) {
                     // Text message matching
                     final v2Text = v2Msg.textElem?.text ?? '';
                     final msgText = msg.textElem?.text ?? '';
@@ -4044,15 +4111,30 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
     required String conversationID,
   }) async {
     try {
-      // Delete conversation
+      // 1) Notify listeners that the conversation was deleted. The host's
+      //    conversation provider records this id in its "SDK-deleted" set, so
+      //    the friend-driven list refresh (which re-emits every friend/known
+      //    group every poll) SUPPRESSES the row until a new message arrives —
+      //    the standard "delete conversation" behaviour. This MUST run before
+      //    the manager's refresh below, or that refresh would immediately
+      //    re-add the row. (The conversation list reappears on the next
+      //    inbound message, which clears the suppression.)
+      _notifyConversationListeners((listener) {
+        listener.onConversationDeleted?.call([conversationID]);
+      });
+
+      // 2) Clear the underlying C2C/group history + remove any pin via the host
+      //    conversation manager. The previous code here did ONLY step 1 (a
+      //    stale comment claimed the manager had no deleteConversation method —
+      //    it does, via [ConversationManagerProvider.deleteConversation]), so a
+      //    "deleted" conversation kept its history (a later inbound resurrected
+      //    the old messages) and its pin lingered. The sibling
+      //    [deleteConversationList] already clears history; this brings the
+      //    single-delete path (the conversation-row context-menu "Delete") in
+      //    line while preserving the row-suppression from step 1.
       final conversationManager = conversationManagerProvider;
       if (conversationManager != null) {
-        // Note: FakeConversationManager doesn't have deleteConversation method
-        // We'll need to clear messages and update conversation list
-        // For now, just notify listeners
-        _notifyConversationListeners((listener) {
-          listener.onConversationDeleted?.call([conversationID]);
-        });
+        await conversationManager.deleteConversation(conversationID);
       }
 
       return V2TimCallback(
@@ -4212,14 +4294,28 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
     required int cleanTimestamp,
     required int cleanSequence,
   }) async {
-    // For Tim2Tox implementation, unread count is managed by the conversation system
-    // This is a simple implementation that just returns success
-    // The actual unread count clearing is handled by the conversation manager
-    // when messages are marked as read through other mechanisms
-    return V2TimCallback(
-      code: 0,
-      desc: 'success',
-    );
+    // Mark the conversation read on the Dart side — the single read-state
+    // store both hybrid paths feed. [FfiChatService.markConversationRead]
+    // advances the persisted read barrier + flags the current non-self
+    // messages `isRead` (so the read state survives restart) and zeroes the
+    // in-memory group counter, WITHOUT making the conversation active (the
+    // user marked it read without opening it). The host hook then refreshes
+    // the conversation list + unread badge.
+    //
+    // `cleanTimestamp`/`cleanSequence` are a V2TIM server message-sequence
+    // concept with no Tox analogue. Every caller passes 0/0 ("mark everything
+    // currently in the conversation read"), which is exactly what
+    // markConversationViewed does — so they are intentionally not forwarded.
+    try {
+      await ffiService.markConversationRead(conversationID);
+      onConversationUnreadCleared?.call(conversationID);
+      return V2TimCallback(code: 0, desc: 'success');
+    } catch (e) {
+      return V2TimCallback(
+        code: -1,
+        desc: 'cleanConversationUnreadMessageCount failed: $e',
+      );
+    }
   }
 
   // ============================================================================
@@ -7395,17 +7491,25 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
     required int addType,
   }) async {
     try {
-      final success = await ffiService.addFriend(
+      final result = await ffiService.addFriend(
         userID,
         requestMessage:
             addWording?.trim().isNotEmpty == true ? addWording : null,
       );
+      // V2TimValueCallback.code is the SDK-level dispatch code; resultCode is
+      // the friend-operation code (0 = success, e.g. 6770 = bad address).
+      // Mirror both so existing V2TIM-style callers see the real failure
+      // detail and can branch on either.
       return V2TimValueCallback<V2TimFriendOperationResult>(
-        code: success ? 0 : -1,
-        desc: success ? 'success' : 'addFriend failed',
+        code: result.isSuccess ? 0 : -1,
+        desc: result.isSuccess
+            ? 'success'
+            : (result.resultInfo.isNotEmpty
+                ? result.resultInfo
+                : 'addFriend failed'),
         data: V2TimFriendOperationResult(
           userID: userID,
-          resultCode: success ? 0 : -1,
+          resultCode: result.resultCode,
         ),
       );
     } catch (e) {
@@ -7781,6 +7885,9 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
         'at the network layer.',
       );
       await prefs.addToBlackList(userIDList, currentUserToxId);
+      // S29: refresh the FfiChatService block cache so inbound filtering takes
+      // effect immediately (not only after the next login).
+      await ffiService.refreshBlockedUsers();
 
       final results = userIDList
           .map((userID) => V2TimFriendOperationResult(
@@ -7842,6 +7949,8 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
         );
       }
       await prefs.removeFromBlackList(userIDList, currentUserToxId);
+      // S29: refresh the FfiChatService block cache (unblock takes effect now).
+      await ffiService.refreshBlockedUsers();
 
       final results = userIDList
           .map((userID) => V2TimFriendOperationResult(
@@ -8744,6 +8853,14 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
     required String groupID,
     required List<String> userList,
   }) async {
+    // FIX (S47/S81): delegate to the native_im binary-replacement path
+    // (DartInviteUserToGroup → C++ V2TIMGroupManagerImpl::InviteUserToGroup →
+    // tox_group_invite_friend). The block below was a no-op stub that returned
+    // success WITHOUT actually inviting (the invite never reached C++), so a
+    // peer never received it. TIMGroupManager goes straight to the FFI bindings.
+    return TIMGroupManager.instance
+        .inviteUserToGroup(groupID: groupID, userList: userList);
+    // ignore: dead_code
     try {
       // Call C++ implementation via FFI
       // The C++ layer (V2TIMGroupManagerImpl::InviteUserToGroup) will:
@@ -8837,6 +8954,17 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
     String? reason,
     int? duration,
   }) async {
+    // FIX (S37): delegate to the native_im binary-replacement path
+    // (DartKickGroupMember → C++ V2TIMGroupManagerImpl::KickGroupMember →
+    // tox_group_kick_peer). The block below was a no-op stub that returned
+    // success WITHOUT actually kicking (the kick never reached C++).
+    return TIMGroupManager.instance.kickGroupMember(
+      groupID: groupID,
+      memberList: memberList,
+      reason: reason,
+      duration: duration,
+    );
+    // ignore: dead_code
     try {
       // Call C++ implementation via FFI
       // The C++ layer (V2TIMGroupManagerImpl::KickGroupMember) will:

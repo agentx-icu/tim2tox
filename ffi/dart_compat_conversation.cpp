@@ -384,48 +384,47 @@ extern "C" {
     }
     
     // DartSetConversationDraft: Set conversation draft
-    // Signature: int DartSetConversationDraft(Pointer<Char> conv_id, TIMConvType conv_type, Pointer<Char> draft_text, Pointer<Void> user_data)
-    int DartSetConversationDraft(const char* conv_id, unsigned int conv_type, const char* draft_text, void* user_data) {
+    // Signature: int DartSetConversationDraft(Pointer<Char> conv_id, TIMConvType conv_type, Pointer<Char> json_draft_param)
+    // ABI note: the Dart binding (native_imsdk_bindings_generated.dart) declares NO
+    // user_data argument, so this call is SYNCHRONOUS from Dart's point of view. The
+    // previous 4-arg signature (with a trailing void* user_data) drifted from the ABI
+    // and would read garbage in the user_data slot. We therefore do NOT send an async
+    // api callback; we pass a no-op V2TIMCallback to the underlying V2TIM method and
+    // return the int result directly. `json_draft_param` is the draft text (may be a
+    // plain string or a JSON wrapper); we pass it through to SetConversationDraft as
+    // the draft text, matching the previous behavior of `draft_text`.
+    int DartSetConversationDraft(const char* conv_id, unsigned int conv_type, const char* json_draft_param) {
         V2TIM_LOG(kInfo, "[dart_compat] DartSetConversationDraft: conv_id={}, conv_type={}",
                   conv_id ? conv_id : "null", conv_type);
-        
-        if (!conv_id || !user_data) {
-            SendApiCallbackResult(user_data, ERR_INVALID_PARAMETERS, "Invalid parameters");
+
+        if (!conv_id) {
             return 1; // Error
         }
-        
+
         // Build full conversationID with prefix
         std::string full_conv_id = BuildFullConversationID(conv_id, conv_type);
         V2TIMString conv_id_str(full_conv_id.c_str());
-        V2TIMString draft_text_str(draft_text ? draft_text : "");
-        
-        // Call V2TIM SetConversationDraft (async)
-        // Note: SetConversationDraft only takes conversationID and draftText, not conversation_type
+        V2TIMString draft_text_str(json_draft_param ? json_draft_param : "");
+
+        // Call V2TIM SetConversationDraft.
+        // Note: SetConversationDraft only takes conversationID and draftText, not conversation_type.
+        // Synchronous from Dart's perspective (no user_data). Pass nullptr for the callback:
+        // V2TIMConversationManagerImpl::SetConversationDraft null-guards it (`if (callback)`),
+        // so a heap `new DartCallback(...)` here would only leak (nothing deletes it).
         SafeGetV2TIMManager()->GetConversationManager()->SetConversationDraft(
             conv_id_str,
             draft_text_str,
-            new DartCallback(
-                user_data,
-                [user_data]() {
-                    // OnSuccess
-                    SendApiCallbackResult(user_data, 0, "");
-                },
-                [user_data](int error_code, const V2TIMString& error_message) {
-                    // OnError
-                    std::string error_msg = error_message.CString();
-                    SendApiCallbackResult(user_data, error_code, error_msg);
-                }
-            )
+            nullptr
         );
-        
+
         return 0; // TIM_SUCC (request accepted)
     }
-    
+
     // DartCancelConversationDraft: Cancel conversation draft
-    // Signature: int DartCancelConversationDraft(Pointer<Char> conv_id, TIMConvType conv_type, Pointer<Void> user_data)
-    int DartCancelConversationDraft(const char* conv_id, unsigned int conv_type, void* user_data) {
+    // Signature: int DartCancelConversationDraft(Pointer<Char> conv_id, TIMConvType conv_type)
+    int DartCancelConversationDraft(const char* conv_id, unsigned int conv_type) {
         // Cancel draft is same as setting draft to empty
-        return DartSetConversationDraft(conv_id, conv_type, "", user_data);
+        return DartSetConversationDraft(conv_id, conv_type, "");
     }
     
     // DartPinConversation: Pin conversation
@@ -471,26 +470,39 @@ extern "C" {
     }
     
     // DartMarkConversation: Mark conversation
-    // Signature: int DartMarkConversation(Pointer<Char> conv_id, TIMConvType conv_type, int mark_type, int enable_mark, Pointer<Void> user_data)
-    int DartMarkConversation(const char* conv_id, unsigned int conv_type, int mark_type, int enable_mark, void* user_data) {
-        V2TIM_LOG(kInfo, "[dart_compat] DartMarkConversation: conv_id={}, conv_type={}, mark_type={}, enable_mark={}",
-                  conv_id ? conv_id : "null", conv_type, mark_type, enable_mark);
-        
-        if (!conv_id || !user_data) {
+    // Signature: int DartMarkConversation(Pointer<Char> conversation_id_array, Uint64 mark_type, bool enable_mark, Pointer<Void> user_data)
+    // ABI note: arg1 is a JSON ARRAY of FULL (already-prefixed) conversation IDs, not a
+    // single base id + conv_type. The previous 5-arg signature drifted from the ABI
+    // (an extra conv_type slot shifted mark_type/enable_mark/user_data). Parse the JSON
+    // array into the V2TIMStringVector instead of building one id from conv_id+conv_type.
+    // mark_type is Uint64 in the binding (matches V2TIM markType uint64_t); a 32-bit int
+    // here truncates the value on ARM64 (mobile) — keep it uint64_t.
+    int DartMarkConversation(const char* conversation_id_array, uint64_t mark_type, bool enable_mark, void* user_data) {
+        V2TIM_LOG(kInfo, "[dart_compat] DartMarkConversation: conversation_id_array={}, mark_type={}, enable_mark={}",
+                  conversation_id_array ? conversation_id_array : "null", mark_type, enable_mark);
+
+        if (!conversation_id_array || !user_data) {
             SendApiCallbackResult(user_data, ERR_INVALID_PARAMETERS, "Invalid parameters");
             return 1; // Error
         }
-        
-        // Build full conversationID with prefix
-        std::string full_conv_id = BuildFullConversationID(conv_id, conv_type);
-        V2TIMString conv_id_str(full_conv_id.c_str());
-        bool enable_mark_bool = (enable_mark != 0);
-        
+
+        // Parse the JSON array of full conversation IDs into a V2TIMStringVector.
+        std::vector<std::string> conversation_ids = ParseJsonStringArray(conversation_id_array);
+        if (conversation_ids.empty()) {
+            V2TIM_LOG(kError, "[dart_compat] DartMarkConversation: conversation id list is empty");
+            SendApiCallbackResult(user_data, ERR_INVALID_PARAMETERS, "conversation id list is empty");
+            return 1; // Error
+        }
+
+        bool enable_mark_bool = enable_mark;
+
         // Call V2TIM MarkConversation (async)
         // Note: MarkConversation takes conversationIDList (vector), markType, and enableMark
         V2TIMStringVector conv_id_vector;
-        conv_id_vector.PushBack(conv_id_str);
-        
+        for (const auto& conv_id : conversation_ids) {
+            conv_id_vector.PushBack(V2TIMString(conv_id.c_str()));
+        }
+
         // Helper class for V2TIMValueCallback<V2TIMConversationOperationResultVector>
         class DartConversationOperationResultVectorCallback : public V2TIMValueCallback<V2TIMConversationOperationResultVector> {
         private:

@@ -1051,28 +1051,85 @@ int tim2tox_ffi_login_async(int64_t instance_id, const char* user_id, const char
     return 1;
 }
 
+// Emits a `friendAddResult` callback to Dart via SendCallbackToDart. This
+// surfaces the async V2TIMFriendOperationResult (resultCode + resultInfo) so
+// the UI can distinguish "dispatched" from "actually succeeded" — without
+// this, callers only see the synchronous 1/0 return and any non-zero async
+// failure (e.g. result_code=6770 "Friend add requires full Tox address") is
+// silently dropped. Routed on the Dart side by NativeLibraryManager's
+// customCallbackHandler dispatch (callback name not in
+// {globalCallback, apiCallback} → custom handler).
+static void EmitFriendAddResultCallback(const std::string& user_id,
+                                         int result_code,
+                                         const std::string& result_info) {
+    std::ostringstream json;
+    json << "{";
+    json << "\"callback\":\"friendAddResult\",";
+    json << "\"user_id\":\"" << EscapeJsonString(user_id) << "\",";
+    json << "\"result_code\":" << result_code << ",";
+    json << "\"result_info\":\"" << EscapeJsonString(result_info) << "\"";
+    json << "}";
+    try {
+        SendCallbackToDart("friendAddResult", json.str(), nullptr);
+    } catch (...) {
+        V2TIM_LOG(kError, "[ffi] EmitFriendAddResultCallback: EXCEPTION in SendCallbackToDart");
+    }
+}
+
 int tim2tox_ffi_add_friend(const char* user_id, const char* wording) {
     V2TIM_LOG(kInfo, "[ffi] tim2tox_ffi_add_friend: ENTRY - user_id={}, wording={}, inited={}", user_id ? user_id : "(null)", wording ? wording : "(null)", IsCurrentInstanceInited());
 
     if (!IsCurrentInstanceInited() || !user_id) {
         V2TIM_LOG(kError, "[ffi] tim2tox_ffi_add_friend: ERROR - inited={}, user_id={}, returning 0", IsCurrentInstanceInited(), (void*)user_id);
+        // Emit a synthetic failure so the Dart-side Completer doesn't hang on
+        // a sync-dispatch failure. user_id may be null here.
+        EmitFriendAddResultCallback(user_id ? user_id : "",
+                                    /*result_code=*/-1,
+                                    "SDK not initialized or user_id null");
         return 0;
     }
 
     V2TIMFriendAddApplication app;
     app.userID = user_id;
     if (wording) app.addWording = wording;
+    // Heap-allocated callback that emits a friendAddResult Dart callback then
+    // self-deletes. Was previously a stack object, which only worked because
+    // V2TIMFriendshipManagerImpl::AddFriend currently invokes the callback
+    // synchronously — switching to `new`+`delete this` makes the lifecycle
+    // explicit and matches the LoginCb pattern above.
     struct AddCb : public V2TIMValueCallback<V2TIMFriendOperationResult> {
+        std::string requested_user_id;
+        explicit AddCb(std::string uid) : requested_user_id(std::move(uid)) {}
         void OnSuccess(const V2TIMFriendOperationResult& r) override {
-            V2TIM_LOG(kInfo, "[ffi] tim2tox_ffi_add_friend: OnSuccess - result_code={}", r.resultCode);
+            // V2TIM routes all AddFriend results through OnSuccess(result) and
+            // distinguishes success/failure via resultCode. A non-zero
+            // resultCode is a failure even though the callback is named
+            // OnSuccess — log accordingly so the log line doesn't mislead
+            // readers (e.g. result_code=6770 = ERR_INVALID_PARAMETERS).
+            if (r.resultCode == 0) {
+                V2TIM_LOG(kInfo, "[ffi] tim2tox_ffi_add_friend: OnSuccess - result_code={}, result_info={}", r.resultCode, r.resultInfo.CString());
+            } else {
+                V2TIM_LOG(kError, "[ffi] tim2tox_ffi_add_friend: OnFailure - result_code={}, result_info={}", r.resultCode, r.resultInfo.CString());
+            }
+            // Prefer the requested user_id (full Tox address as the caller
+            // typed it) over r.userID (which the manager normalizes to the
+            // 64-char public key) so Dart can match the Completer it
+            // registered against the same key the caller used.
+            EmitFriendAddResultCallback(requested_user_id, r.resultCode,
+                                        r.resultInfo.CString() ? r.resultInfo.CString() : "");
+            delete this;
         }
         void OnError(int code, const V2TIMString& msg) override {
             V2TIM_LOG(kError, "[ffi] tim2tox_ffi_add_friend: OnError - code={}, msg={}", code, msg.CString());
             V2TIM_LOG(kError, "[ffi] AddFriend error {}: {}", code, msg.CString());
+            EmitFriendAddResultCallback(requested_user_id, code,
+                                        msg.CString() ? msg.CString() : "");
+            delete this;
         }
-    } addcb;
+    };
+    auto* addcb = new AddCb(std::string(user_id));
     V2TIMManagerImpl* manager_impl = GetCurrentInstance();
-    manager_impl->GetFriendshipManager()->AddFriend(app, &addcb);
+    manager_impl->GetFriendshipManager()->AddFriend(app, addcb);
     return 1;
 }
 

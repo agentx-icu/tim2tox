@@ -1323,14 +1323,19 @@ extern "C" {
     }
     
     // DartSetLocalCustomData: Set local custom data
-    // Signature: int DartSetLocalCustomData(Pointer<Char> conv_id, TIMConvType conv_type, Pointer<Char> json_msg_param, Pointer<Void> user_data)
-    int DartSetLocalCustomData(const char* conv_id, unsigned int conv_type, const char* json_msg_param, void* user_data) {
+    // Signature: int DartSetLocalCustomData(Pointer<Char> json_msg_param, Pointer<Void> user_data)
+    // ABI note: the Dart binding declares only (json_msg_param, user_data). The previous
+    // signature drifted with extra leading (conv_id, conv_type) args, which shifted
+    // json_msg_param/user_data and corrupted the call. The message identity (msgID) and
+    // the local custom data are both parsed out of json_msg_param, so the dropped
+    // conv_id/conv_type were never needed.
+    int DartSetLocalCustomData(const char* json_msg_param, void* user_data) {
 
-        if (!conv_id || !json_msg_param || !user_data) {
+        if (!json_msg_param || !user_data) {
             SendApiCallbackResult(user_data, ERR_INVALID_PARAMETERS, "Invalid parameters");
             return 1; // Error
         }
-        
+
         // Parse JSON message parameter
         std::string json_str = json_msg_param;
         std::string msg_id = ExtractJsonValue(json_str, "message_msg_id");

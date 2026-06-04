@@ -15,12 +15,20 @@ import 'package:path_provider/path_provider.dart';
 /// `kind` discriminates between text and file replays. Files carry both
 /// `filePath` (used to re-send) and `fileName` (preserved so the UI keeps
 /// the original display name when the on-disk path was sanitised).
+/// `msgID` (added 2026-05-29) is the durable identity of the optimistic pending
+/// history row this queue item corresponds to. The drain/fail matchers prefer
+/// it over the legacy exact-millisecond-timestamp heuristic, which removes the
+/// last ambiguity (two identical messages queued in the same millisecond).
+/// Nullable for backward compatibility: queue files written before this field
+/// existed deserialize with `msgID == null`, and the matchers fall back to the
+/// timestamp heuristic for those.
 typedef OfflineMessageItem = ({
   String kind,
   String text,
   String? filePath,
   String? fileName,
   DateTime timestamp,
+  String? msgID,
 });
 
 /// Offline message queue persistence service
@@ -63,6 +71,7 @@ class OfflineMessageQueuePersistence {
           'filePath': item.filePath,
           'fileName': item.fileName,
           'timestamp': item.timestamp.toIso8601String(),
+          'msgID': item.msgID,
         }).toList();
       }
 
@@ -118,6 +127,9 @@ class OfflineMessageQueuePersistence {
             filePath: filePath,
             fileName: map['fileName'] as String?,
             timestamp: DateTime.parse(map['timestamp'] as String),
+            // Backward-compat: pre-2026-05-29 entries lack `msgID` → null, and
+            // the drain matchers fall back to exact-ms timestamp for those.
+            msgID: map['msgID'] as String?,
           );
         }).toList();
         queue[peerId] = items;
@@ -197,6 +209,7 @@ class OfflineMessageQueuePersistence {
               'filePath': item.filePath,
               'fileName': item.fileName,
               'timestamp': item.timestamp.toIso8601String(),
+              'msgID': item.msgID,
             }).toList();
       }
       await file.writeAsString(jsonEncode(jsonMap));

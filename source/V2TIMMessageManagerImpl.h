@@ -61,6 +61,13 @@ public:
     // --- Receiving Options (Placeholders for now) ---
     void SetC2CReceiveMessageOpt(const V2TIMStringVector& userIDList, V2TIMReceiveMessageOpt opt, V2TIMCallback* callback) override;
     void GetC2CReceiveMessageOpt(const V2TIMStringVector& userIDList, V2TIMValueCallback<V2TIMReceiveMessageOptInfoVector>* callback) override;
+    // Synchronous read of the per-peer C2C receive option (mute/DND) from the
+    // authoritative in-memory map. Used by the conversation manager so EVERY
+    // C2C conversation emit/materialization carries the current opt — a
+    // hardcoded/stale 0 in any emit is treated by the Dart projection cache as
+    // an un-mute (the recvOpt "clobber" bug). Short mutex read; never invokes
+    // callbacks/listeners while holding receive_opt_mutex_.
+    int GetC2CReceiveOptSync(const std::string& userID);
     void SetGroupReceiveMessageOpt(const V2TIMString& groupID, V2TIMReceiveMessageOpt opt, V2TIMCallback* callback) override;
     void SetAllReceiveMessageOpt(V2TIMReceiveMessageOpt opt, int32_t startHour, int32_t startMinute, int32_t startSecond, uint32_t duration, V2TIMCallback* callback) override;
     void SetAllReceiveMessageOpt(V2TIMReceiveMessageOpt opt, uint32_t startTimeStamp, uint32_t duration, V2TIMCallback* callback) override;

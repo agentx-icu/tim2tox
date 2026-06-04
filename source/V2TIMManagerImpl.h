@@ -139,7 +139,15 @@ public:
     std::vector<std::string> GetKnownGroupIDs();
     void SetKnownGroupIDs(const std::vector<std::string>& group_ids);
     bool GetGroupChatIdFromStorage(const std::string& group_id, char* out_chat_id_hex, int out_len);
+    // LOCKING CONTRACT: SetGroupChatIdInStorage acquires mutex_ internally and
+    // MUST NOT be called while mutex_ is held — std::mutex is non-recursive, so
+    // a re-lock self-deadlocks the calling thread forever (proven by the
+    // 2026-06-03 Toxee .hang report: main thread stuck in
+    // GetGroupMemberList -> SetGroupChatIdInStorage -> mutex_.lock()).
+    // Inside a scope that already holds mutex_, call the *Locked variant.
     void SetGroupChatIdInStorage(const std::string& group_id, const std::string& chat_id_hex);
+    // Same write, no locking: caller must already hold mutex_.
+    void SetGroupChatIdInStorageLocked(const std::string& group_id, const std::string& chat_id_hex);
     bool GetGroupTypeFromStorage(const std::string& group_id, char* out_type, int out_len);
     void SetGroupTypeInStorage(const std::string& group_id, const std::string& group_type);
     bool GetAutoAcceptGroupInvites();
@@ -384,6 +392,11 @@ private:
     void HandleGroupPeerJoin(Tox_Group_Number group_number, Tox_Group_Peer_Number peer_id);
     void HandleGroupPeerExit(Tox_Group_Number group_number, Tox_Group_Peer_Number peer_id, Tox_Group_Exit_Type exit_type, const uint8_t* name, size_t name_length);
     void HandleGroupModeration(Tox_Group_Number group_number, Tox_Group_Peer_Number source_peer_id, Tox_Group_Peer_Number target_peer_id, Tox_Group_Mod_Event mod_type);
+    // Erase all NON-Tox local state for a group (group_number/chat-id maps + the
+    // peer-id cache). Mirrors the inline cleanup in QuitGroup; used when this
+    // client is removed from a group WITHOUT a local QuitGroup call (e.g. being
+    // kicked). Acquires mutex_ internally — callers must NOT hold it.
+    void EraseGroupLocalState(const V2TIMString& groupID);
     void HandleGroupSelfJoin(Tox_Group_Number group_number);
     void HandleGroupJoinFail(Tox_Group_Number group_number, Tox_Group_Join_Fail fail_type);
     void HandleGroupPrivacyState(Tox_Group_Number group_number, Tox_Group_Privacy_State privacy_state);

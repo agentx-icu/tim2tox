@@ -528,22 +528,24 @@ extern "C" {
     }
     
     // DartSetC2CReceiveMessageOpt: Set C2C receive message option
-    // Signature: int DartSetC2CReceiveMessageOpt(Pointer<Char> json_opt_param, Pointer<Void> user_data)
-    int DartSetC2CReceiveMessageOpt(const char* json_opt_param, void* user_data) {
+    // Signature: int DartSetC2CReceiveMessageOpt(Pointer<Char> json_identifier_array, UnsignedInt opt, Pointer<Void> user_data)
+    int DartSetC2CReceiveMessageOpt(const char* json_identifier_array, unsigned int opt, void* user_data) {
         V2TIM_LOG(kInfo, "[dart_compat] DartSetC2CReceiveMessageOpt");
-        
-        if (!json_opt_param || !user_data) {
+
+        if (!json_identifier_array || !user_data) {
             SendApiCallbackResult(user_data, ERR_INVALID_PARAMETERS, "Invalid parameters");
             return 1; // Error
         }
-        
-        // Parse JSON opt parameter
-        std::string json_str = json_opt_param;
-        std::string user_id_list_str = ExtractJsonValue(json_str, "opt_param_identifier_array");
-        int opt = ExtractJsonInt(json_str, "opt_param_opt", 0);
-        
-        // Parse user ID list
-        std::vector<std::string> user_ids = ParseJsonStringArray(user_id_list_str);
+
+        // ABI: the Dart binding (native_imsdk_bindings_generated.dart) calls this
+        // with THREE args — (Pointer<Char> json_identifier_array, UnsignedInt opt,
+        // Pointer<Void> user_data). The previous 2-arg signature drifted from that
+        // ABI: `opt` (an int) was read in the `user_data` slot and dereferenced as
+        // a pointer (SIGSEGV in SendApiCallbackResult -> UserDataToString), and the
+        // userID-array JSON was parsed as a nested object so the list was always
+        // empty. `json_identifier_array` is a plain string array ["userid1",...];
+        // `opt` arrives directly as the second argument.
+        std::vector<std::string> user_ids = ParseJsonStringArray(json_identifier_array);
         
         if (user_ids.empty()) {
             V2TIM_LOG(kError, "[dart_compat] DartSetC2CReceiveMessageOpt: user_id list is empty");
@@ -557,17 +559,27 @@ extern "C" {
             user_id_vector.PushBack(V2TIMString(user_id.c_str()));
         }
         
+        // Capture user_data as a STRING now, while the pointer is still valid.
+        // The callback may fire after Dart has freed the user_data pointer, and
+        // dereferencing the raw pointer then (SendApiCallbackResult ->
+        // UserDataToString -> str[0]) is a use-after-free that SIGSEGVs the
+        // callback bridge (the volatile-read in UserDataToString cannot catch a
+        // SEGV). Mirror the safe pattern used by DartCallback /
+        // DartMessageVectorCallback: copy the string up front and pass it via
+        // SendApiCallbackResultWithString instead of the raw pointer.
+        const std::string user_data_str = UserDataToString(user_data);
+
         // Call V2TIM SetC2CReceiveMessageOpt (async)
         SafeGetV2TIMManager()->GetMessageManager()->SetC2CReceiveMessageOpt(
             user_id_vector,
             static_cast<V2TIMReceiveMessageOpt>(opt),
             new DartCallback(
                 user_data,
-                [user_data]() {
+                [user_data_str]() {
                     // OnSuccess
-                    SendApiCallbackResult(user_data, 0, "");
+                    SendApiCallbackResultWithString(user_data_str, 0, "");
                 },
-                [user_data](int error_code, const V2TIMString& error_message) {
+                [user_data_str](int error_code, const V2TIMString& error_message) {
                     // OnError
                     // Get CString() (has built-in protection)
                     const char* error_msg_cstr = nullptr;
@@ -577,7 +589,7 @@ extern "C" {
                         error_msg_cstr = nullptr;
                     }
                     std::string error_msg = error_msg_cstr ? std::string(error_msg_cstr) : "";
-                    SendApiCallbackResult(user_data, error_code, error_msg);
+                    SendApiCallbackResultWithString(user_data_str, error_code, error_msg);
                 }
             )
         );
@@ -595,13 +607,19 @@ extern "C" {
             return 1; // Error
         }
         
-        // Parse JSON opt parameter
+        // ABI: the Dart binding passes a FLAT JSON string array ["userid1",...] as
+        // json_opt_param (the same shape DartSetC2CReceiveMessageOpt receives), NOT
+        // a nested {"opt_param_identifier_array":[...]} object. Parse it directly;
+        // the previous ExtractJsonValue("opt_param_identifier_array") always returned
+        // empty, so this getter never resolved any user and always failed. Keep a
+        // fallback to the legacy nested shape for backward compatibility.
         std::string json_str = json_opt_param;
-        std::string user_id_list_str = ExtractJsonValue(json_str, "opt_param_identifier_array");
-        
-        // Parse user ID list
-        std::vector<std::string> user_ids = ParseJsonStringArray(user_id_list_str);
-        
+        std::vector<std::string> user_ids = ParseJsonStringArray(json_str);
+        if (user_ids.empty()) {
+            std::string nested = ExtractJsonValue(json_str, "opt_param_identifier_array");
+            user_ids = ParseJsonStringArray(nested);
+        }
+
         if (user_ids.empty()) {
             V2TIM_LOG(kError, "[dart_compat] DartGetC2CReceiveMessageOpt: user_id list is empty");
             SendApiCallbackResult(user_data, ERR_INVALID_PARAMETERS, "user_id list is empty");
@@ -669,27 +687,39 @@ extern "C" {
     }
     
     // DartSetAllReceiveMessageOpt: Set all receive message option
-    // Signature: int DartSetAllReceiveMessageOpt(int opt, Pointer<Void> user_data)
-    int DartSetAllReceiveMessageOpt(int opt, void* user_data) {
-        V2TIM_LOG(kInfo, "[dart_compat] DartSetAllReceiveMessageOpt: opt={}", opt);
-        
+    // Signature: int DartSetAllReceiveMessageOpt(unsigned int opt, int start_hour, int start_minute, int start_second, unsigned int duration, Pointer<Void> user_data)
+    // ABI note: the Dart binding declares the do-not-disturb time window as
+    // (UnsignedInt opt, Int32 startHour, Int32 startMinute, Int32 startSecond, Uint32 duration, user_data).
+    // duration is Uint32 in the binding (and uint32 in V2TIM) — keep it unsigned here so the
+    // declared ABI matches. The previous 2-arg signature drifted from the ABI (the 4 time ints
+    // were ignored / read as garbage). Pass the time-window args through to the matching V2TIM overload
+    //   SetAllReceiveMessageOpt(opt, int32 startHour, int32 startMinute, int32 startSecond, uint32 duration, callback).
+    int DartSetAllReceiveMessageOpt(unsigned int opt, int start_hour, int start_minute, int start_second, unsigned int duration, void* user_data) {
+        V2TIM_LOG(kInfo, "[dart_compat] DartSetAllReceiveMessageOpt: opt={}, start_hour={}, start_minute={}, start_second={}, duration={}",
+                  opt, start_hour, start_minute, start_second, duration);
+
         if (!user_data) {
             return 1; // Error
         }
-        
-        // Call V2TIM SetAllReceiveMessageOpt (async)
-        // Note: SetAllReceiveMessageOpt requires startTimeStamp and duration parameters
+
+        // Capture user_data as a STRING now, while the pointer is still valid, to avoid a
+        // use-after-free if the async callback fires after Dart has freed the pointer.
+        const std::string user_data_str = UserDataToString(user_data);
+
+        // Call V2TIM SetAllReceiveMessageOpt (async) with the do-not-disturb time window.
         SafeGetV2TIMManager()->GetMessageManager()->SetAllReceiveMessageOpt(
             static_cast<V2TIMReceiveMessageOpt>(opt),
-            0,  // startTimeStamp (0 means no do-not-disturb time)
-            0,  // duration (0 means no duration limit)
+            static_cast<int32_t>(start_hour),
+            static_cast<int32_t>(start_minute),
+            static_cast<int32_t>(start_second),
+            static_cast<uint32_t>(duration),
             new DartCallback(
                 user_data,
-                [user_data]() {
+                [user_data_str]() {
                     // OnSuccess
-                    SendApiCallbackResult(user_data, 0, "");
+                    SendApiCallbackResultWithString(user_data_str, 0, "");
                 },
-                [user_data](int error_code, const V2TIMString& error_message) {
+                [user_data_str](int error_code, const V2TIMString& error_message) {
                     // OnError
                     // Get CString() (has built-in protection)
                     const char* error_msg_cstr = nullptr;
@@ -699,14 +729,58 @@ extern "C" {
                         error_msg_cstr = nullptr;
                     }
                     std::string error_msg = error_msg_cstr ? std::string(error_msg_cstr) : "";
-                    SendApiCallbackResult(user_data, error_code, error_msg);
+                    SendApiCallbackResultWithString(user_data_str, error_code, error_msg);
                 }
             )
         );
-        
+
         return 0; // TIM_SUCC (request accepted)
     }
-    
+
+    // DartSetAllReceiveMessageOpt2: set all-receive-message DND by absolute window.
+    // Signature: int DartSetAllReceiveMessageOpt2(unsigned int opt, uint32_t start_time_stamp, uint32_t duration, Pointer<Void> user_data)
+    // ABI: the Dart binding (native_imsdk_bindings_generated.dart) declares this symbol
+    // (UnsignedInt, Uint32, Uint32, Pointer<Void>) and the SDK resolves it via dlsym; it
+    // was previously NOT exported by the native layer, so a lookup/call would fail (a
+    // latent crash in the same class as the other ABI drifts). Forward to the matching
+    // V2TIM overload SetAllReceiveMessageOpt(opt, uint32 startTimeStamp, uint32 duration, cb).
+    int DartSetAllReceiveMessageOpt2(unsigned int opt, uint32_t start_time_stamp, uint32_t duration, void* user_data) {
+        V2TIM_LOG(kInfo, "[dart_compat] DartSetAllReceiveMessageOpt2: opt={}, start_time_stamp={}, duration={}",
+                  opt, start_time_stamp, duration);
+
+        if (!user_data) {
+            return 1; // Error
+        }
+
+        // Capture user_data as a STRING now (avoid use-after-free if the async
+        // callback fires after Dart frees the pointer) — same pattern as the siblings.
+        const std::string user_data_str = UserDataToString(user_data);
+
+        SafeGetV2TIMManager()->GetMessageManager()->SetAllReceiveMessageOpt(
+            static_cast<V2TIMReceiveMessageOpt>(opt),
+            static_cast<uint32_t>(start_time_stamp),
+            static_cast<uint32_t>(duration),
+            new DartCallback(
+                user_data,
+                [user_data_str]() {
+                    SendApiCallbackResultWithString(user_data_str, 0, "");
+                },
+                [user_data_str](int error_code, const V2TIMString& error_message) {
+                    const char* error_msg_cstr = nullptr;
+                    try {
+                        error_msg_cstr = error_message.CString();
+                    } catch (...) {
+                        error_msg_cstr = nullptr;
+                    }
+                    std::string error_msg = error_msg_cstr ? std::string(error_msg_cstr) : "";
+                    SendApiCallbackResultWithString(user_data_str, error_code, error_msg);
+                }
+            )
+        );
+
+        return 0; // TIM_SUCC (request accepted)
+    }
+
     // DartGetAllReceiveMessageOpt: Get all receive message option
     // Signature: int DartGetAllReceiveMessageOpt(Pointer<Void> user_data)
     int DartGetAllReceiveMessageOpt(void* user_data) {

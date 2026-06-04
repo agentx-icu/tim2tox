@@ -31,6 +31,18 @@ static std::atomic<uint64_t> g_next_group_id_global{0};
 // Forward declaration for GetTestInstanceOptions (defined in tim2tox_ffi.cpp with extern "C" linkage)
 extern "C" bool GetTestInstanceOptions(int64_t instance_id, int* out_local_discovery, int* out_ipv6);
 
+// Forward declaration for DartNotifyGroupQuit (defined in ffi/dart_compat_group.cpp
+// with extern "C" linkage). Posts a "groupQuitNotification" callback that the
+// Platform path maps to FfiChatService.cleanupGroupState (removes the group from
+// _knownGroups). The voluntary-quit path already uses it; the self-kick path
+// (HandleGroupModeration) reuses it so a kicked member drops the group too.
+extern "C" void DartNotifyGroupQuit(const char* group_id);
+// Inverse of the above: posts "groupJoinNotification" → FfiChatService
+// .registerJoinedGroupState (ADDS the group to _knownGroups). Used from
+// HandleGroupSelfJoin so an invite auto-join (which the Dart layer did not
+// initiate via joinGroup) still surfaces in B's knownGroups.
+extern "C" void DartNotifyGroupJoin(const char* group_id);
+
 // Forward declaration for the process-global virtual-clock callback
 // (defined in tim2tox_ffi.cpp). Used when test_mode_ is enabled to make
 // mono_time read from the auto_tests harness's virtual clock instead of
@@ -4637,6 +4649,18 @@ bool V2TIMManagerImpl::GetGroupChatIdFromStorage(const std::string& group_id, ch
 }
 
 void V2TIMManagerImpl::SetGroupChatIdInStorage(const std::string& group_id, const std::string& chat_id_hex) {
+    // See the LOCKING CONTRACT note in the header: this variant takes mutex_;
+    // never call it from a scope that already holds mutex_ (self-deadlock).
+    if (chat_id_hex.length() != TOX_GROUP_CHAT_ID_SIZE * 2) return;
+    std::lock_guard<std::mutex> lock(mutex_);
+    SetGroupChatIdInStorageLocked(group_id, chat_id_hex);
+}
+
+void V2TIMManagerImpl::SetGroupChatIdInStorageLocked(const std::string& group_id, const std::string& chat_id_hex) {
+    // Caller must hold mutex_. Length validation is repeated here so the
+    // Locked variant can be called directly. (Note: like the original code,
+    // strtoul-based parsing does not reject non-hex characters — pre-existing
+    // behavior, kept byte-identical on purpose.)
     if (chat_id_hex.length() != TOX_GROUP_CHAT_ID_SIZE * 2) return;
     std::vector<uint8_t> bin(TOX_GROUP_CHAT_ID_SIZE);
     for (size_t i = 0; i < TOX_GROUP_CHAT_ID_SIZE; ++i) {
@@ -4644,7 +4668,6 @@ void V2TIMManagerImpl::SetGroupChatIdInStorage(const std::string& group_id, cons
         if (byte_val > 255) return;
         bin[i] = (uint8_t)byte_val;
     }
-    std::lock_guard<std::mutex> lock(mutex_);
     group_id_to_chat_id_[V2TIMString(group_id.c_str())] = std::move(bin);
 }
 
@@ -6859,6 +6882,34 @@ void V2TIMManagerImpl::HandleGroupPeerExit(Tox_Group_Number group_number, Tox_Gr
     }
 }
 
+void V2TIMManagerImpl::EraseGroupLocalState(const V2TIMString& groupID) {
+    // Mirrors the inline map cleanup in QuitGroup (group_id_to_group_number_ /
+    // group_number_to_group_id_ / chat-id maps) and additionally prunes the
+    // peer-id cache GetGroupMemberList reads. Non-Tox state only — the caller
+    // (e.g. a self-kick) has already lost the Tox group connection, so there is
+    // no tox_group_leave to make.
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = group_id_to_group_number_.find(groupID);
+    if (it != group_id_to_group_number_.end()) {
+        const Tox_Group_Number gnum = it->second;
+        group_id_to_group_number_.erase(it);
+        group_number_to_group_id_.erase(gnum);
+        group_peer_id_cache_.erase(gnum);
+        V2TIM_LOG(kInfo, "EraseGroupLocalState: removed group_number={} maps + peer cache for group {}", gnum, groupID.CString());
+    }
+    auto chat_it = group_id_to_chat_id_.find(groupID);
+    if (chat_it != group_id_to_chat_id_.end()) {
+        std::ostringstream oss;
+        for (size_t i = 0; i < TOX_GROUP_CHAT_ID_SIZE; ++i) {
+            oss << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(chat_it->second[i]);
+        }
+        const std::string chat_id_hex = oss.str();
+        group_id_to_chat_id_.erase(chat_it);
+        chat_id_to_group_id_.erase(chat_id_hex);
+        V2TIM_LOG(kInfo, "EraseGroupLocalState: removed chat_id maps (chat_id_hex={}) for group {}", chat_id_hex, groupID.CString());
+    }
+}
+
 void V2TIMManagerImpl::HandleGroupModeration(Tox_Group_Number group_number, Tox_Group_Peer_Number source_peer_id, Tox_Group_Peer_Number target_peer_id, Tox_Group_Mod_Event mod_type) {
     V2TIM_LOG(kInfo, "[HandleGroupModeration] ENTRY instance_id={} group_number={} source_peer={} target_peer={} mod_type={}",
               (long long)GetInstanceIdFromManager(this), group_number, source_peer_id, target_peer_id, static_cast<int>(mod_type));
@@ -6923,7 +6974,11 @@ void V2TIMManagerImpl::HandleGroupModeration(Tox_Group_Number group_number, Tox_
 
     // When this client is the target of the moderation (e.g. role changed by someone else),
     // notify listeners with OnMemberInfoChanged so the app sees "my role changed".
-    if (self_is_target && !listeners_copy.empty()) {
+    // EXCLUDE KICK: being kicked is a removal, not an info change — firing
+    // OnMemberInfoChanged for a self-kick would spuriously look like "my role
+    // changed" an instant before the group is removed (the KICK case below
+    // handles self-removal).
+    if (self_is_target && mod_type != TOX_GROUP_MOD_EVENT_KICK && !listeners_copy.empty()) {
         V2TIMGroupMemberChangeInfo changeInfo;
         changeInfo.userID = V2TIMString(target_userID.c_str());
         changeInfo.muteTime = 0;
@@ -6941,7 +6996,23 @@ void V2TIMManagerImpl::HandleGroupModeration(Tox_Group_Number group_number, Tox_
     
     switch (mod_type) {
         case TOX_GROUP_MOD_EVENT_KICK:
-            // Already handled by HandleGroupPeerExit
+            if (self_is_target) {
+                // WE were kicked. Tox does NOT fire group_peer_exit for our own
+                // removal (that callback is documented for peers OTHER than self),
+                // and the Platform path owns knownGroups — so nothing would drop
+                // the group otherwise (S37 A3). (1) Erase native local group state
+                // so stale lookups (GetGroupMemberList, chat-id maps) don't persist
+                // until restart, then (2) drive the SAME Dart cleanup the
+                // voluntary-quit path uses: DartNotifyGroupQuit ->
+                // "groupQuitNotification" -> Tim2ToxSdkPlatform ->
+                // FfiChatService.cleanupGroupState (removes from _knownGroups, adds
+                // to _quitGroups, clears history). groupID is a local copy, so
+                // erasing the maps does not invalidate it.
+                V2TIM_LOG(kInfo, "HandleGroupModeration: SELF was kicked from group {}; erasing local state + notifying Dart cleanup", groupID.CString());
+                EraseGroupLocalState(groupID);
+                DartNotifyGroupQuit(groupID.CString());
+            }
+            // Other-peer kicks are handled by HandleGroupPeerExit.
             break;
         case TOX_GROUP_MOD_EVENT_MODERATOR:
             // Grant administrator
@@ -7237,6 +7308,15 @@ void V2TIMManagerImpl::HandleGroupSelfJoin(Tox_Group_Number group_number) {
         }
     }
     
+    // Surface this self-join to the Dart layer so an invite auto-join (which the
+    // Dart layer did NOT initiate via joinGroup) lands in _knownGroups. groupID
+    // is resolved above (existing mapping or rebuilt from the stored chat_id);
+    // skip if still empty. Idempotent on the Dart side for the create/normal-join
+    // paths that already track the group.
+    if (!groupID.Empty()) {
+        DartNotifyGroupJoin(groupID.CString());
+    }
+
     fprintf(stdout, "[HandleGroupSelfJoin] ========== EXIT ==========\n");
     fflush(stdout);
 }

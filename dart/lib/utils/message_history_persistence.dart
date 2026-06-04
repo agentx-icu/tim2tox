@@ -478,25 +478,13 @@ class MessageHistoryPersistence {
       // This prevents old pending messages from being resent on startup
       final updatedMessages = messages.map((msg) {
         if (msg.isPending) {
-          // Create a new message with isPending=false to mark it as failed
-          return ChatMessage(
-            text: msg.text,
-            fromUserId: msg.fromUserId,
-            isSelf: msg.isSelf,
-            timestamp: msg.timestamp,
-            groupId: msg.groupId,
-            filePath: msg.filePath,
-            fileName: msg.fileName,
-            mediaKind: msg.mediaKind,
-            isPending: false, // Mark as not pending (failed to send in previous session)
-            isReceived: msg.isReceived,
-            isRead: msg.isRead,
-            msgID: msg.msgID,
-            version: msg.version,
-            fileSize: msg.fileSize,
-            mimeType: msg.mimeType,
-            fileHash: msg.fileHash,
-          );
+          // Mark as not pending (failed to send in a previous session) while
+          // preserving EVERY other field. copyWith (not a hand-listed
+          // ChatMessage(...)) keeps cloudCustomData (S17/S18 reply/forward
+          // quote) and altMsgIds (cross-path aliases) — a manual reconstruction
+          // silently dropped both, so a quoted reply lost its messageReply
+          // metadata across an app restart.
+          return msg.copyWith(isPending: false);
         }
         return msg;
       }).toList();
@@ -795,12 +783,13 @@ class MessageHistoryPersistence {
   /// Deduplication, in priority order:
   ///   1. msgID match → merge via [_mergeMessages] (handles file_request /
   ///      file_done multi-event sequences for the same message).
-  ///   2. Content fallback when msgID is null → match on
-  ///      (fromUserId, text, isSelf, timestamp within 2s). The sender check
-  ///      is critical: in a group chat, two members sending identical short
-  ///      text within the window would otherwise be collapsed into one. The
-  ///      2s window is narrow enough that a real user can't legitimately
-  ///      send two identical messages inside it.
+  ///   2. Content fallback, INCOMING messages only (`!isSelf`), when the msgID
+  ///      matched nothing → match on (fromUserId, text, timestamp within 2s).
+  ///      This collapses the inbound hybrid double-delivery (same received
+  ///      message via both paths with different ids). It is deliberately NOT
+  ///      applied to self-sends: those never double-deliver, so collapsing
+  ///      them would silently drop a legitimate repeated message ("Bug F").
+  ///      See the inline comment at the fallback for the full rationale.
   ///
   /// [conversationId] - Will be normalized before use.
   Future<void> appendHistory(String conversationId, ChatMessage message) {
@@ -808,8 +797,11 @@ class MessageHistoryPersistence {
     final list = _historyById.putIfAbsent(normalizedId, () => <ChatMessage>[]);
 
     if (message.msgID != null) {
+      // Match on the primary id OR an absorbed cross-path alias, so a
+      // re-delivery carrying a previously-dropped id merges into the row that
+      // absorbed it instead of appending a third copy.
       final existingIndex =
-          list.indexWhere((msg) => msg.msgID == message.msgID);
+          list.indexWhere((msg) => _idMatches(msg, message.msgID!));
       if (existingIndex >= 0) {
         final existing = list[existingIndex];
         list[existingIndex] = _mergeMessages(existing, message);
@@ -818,12 +810,43 @@ class MessageHistoryPersistence {
         // of file_request / file_done updates for the same msgID coalesces.
         return _scheduleDebouncedSave(normalizedId);
       }
-    } else if (message.text.isNotEmpty) {
+      // Fall through to the content-based dedup below — do NOT return here.
+      // A non-null msgID that matched nothing is NOT proof the message is new:
+      // toxee's hybrid runtime delivers the SAME inbound message through BOTH
+      // paths with DIFFERENT ids (binary-replacement V2TimAdvancedMsgListener
+      // `msg_<n>_<nanos>_<seq>` vs FfiChatService poll `<millis>_<n>_<toxId>`).
+      // The two ids never match, so an early `list.add` here persists the echo
+      // twice. _mergeMessages preserves the dropped id in altMsgIds so it stays
+      // resolvable. Mirrors BinaryReplacementHistoryHook's "msgID OR content".
+    }
+
+    // Content-based dedup fallback. Runs when the message has no msgID OR has
+    // an msgID that matched nothing above (the cross-path duplicate case).
+    // Same heuristic as the binary-replacement hook: (text, fromUserId) within
+    // a 2s window.
+    //
+    // INCOMING ONLY (`!message.isSelf`). The reason this fallback exists is the
+    // INBOUND hybrid double-delivery: the same received message arrives via
+    // both the binary-replacement path (`msg_<n>_<nanos>_<seq>`) and the poll
+    // path (`<millis>_<n>_<toxId>`) with different ids ms apart, and only
+    // content can collapse them. Outbound (self) messages do NOT double-deliver
+    // — Tox does not loop a sender's own message back, so the hook never writes
+    // self-sends; `FfiChatService.sendText` appends each self row exactly once
+    // with a unique sequenced msgID, and the offline pending→delivered drain
+    // reconciles in place by reusing the pending row's msgID (it does not
+    // re-append). Running content-dedup on self-sends was therefore over-reach:
+    // it silently DROPPED a legitimate second identical self message sent
+    // inside 2s (e.g. double-tap send, or "ok" then "ok") — "Bug F". Gating on
+    // `!message.isSelf` fixes that while leaving the inbound merge (the only
+    // case that needs it) untouched. The drain crash-recovery fallback that
+    // *does* re-append a self row does its own content existence check
+    // (`_drainTextItem`), so it no longer relies on this branch.
+    if (message.text.isNotEmpty && !message.isSelf) {
       const dedupWindow = Duration(seconds: 2);
       final contentMatch = list.indexWhere((msg) =>
           msg.text == message.text &&
           msg.fromUserId == message.fromUserId &&
-          msg.isSelf == message.isSelf &&
+          !msg.isSelf &&
           msg.timestamp.difference(message.timestamp).abs() <= dedupWindow);
       if (contentMatch >= 0) {
         list[contentMatch] = _mergeMessages(list[contentMatch], message);
@@ -954,27 +977,55 @@ class MessageHistoryPersistence {
     _appendDebouncePending.clear();
   }
   
-  /// Intelligently merge two messages with the same msgID
-  /// 
-  /// Prefers final file paths over temporary paths, and preserves the best state.
+  /// Whether [msg] is identified by [id] — either its current primary
+  /// [ChatMessage.msgID] or a cross-path duplicate id it absorbed during
+  /// content dedup ([ChatMessage.altMsgIds]). Every exact-id lookup in this
+  /// class routes through here so a dropped hybrid-path id stays resolvable.
+  bool _idMatches(ChatMessage msg, String id) =>
+      msg.msgID == id || msg.altMsgIds.contains(id);
+
+  /// Intelligently merge two messages that resolve to the same logical message
+  /// (matched by msgID, an absorbed alias, or the content-dedup heuristic).
+  ///
+  /// Prefers final file paths over temporary paths, and preserves the best
+  /// state. CRITICAL: the result keeps `updated.msgID ?? existing.msgID` as its
+  /// primary id, and records EVERY other id the two copies carried (the other
+  /// primary + both altMsgIds sets) in [ChatMessage.altMsgIds]. This is what
+  /// keeps a cross-path duplicate's dropped id resolvable: whichever id loses
+  /// the primary slot is retained as an alias, even across a later merge that
+  /// flips the primary. The alias set lives on the row, so it persists and
+  /// reloads with the message (no external map to desync after a restart).
   ChatMessage _mergeMessages(ChatMessage existing, ChatMessage updated) {
     // Prefer final path over temp path
     final filePath = updated.isTempPath && !existing.isTempPath
       ? existing.filePath
       : (!updated.isTempPath ? updated.filePath : existing.filePath);
-    
+
     // Merge file metadata
     final fileSize = updated.fileSize ?? existing.fileSize;
     final mimeType = updated.mimeType ?? existing.mimeType;
     final fileHash = updated.fileHash ?? existing.fileHash;
-    
+
     // Merge states: both must be pending for result to be pending
     final isPending = updated.isPending && existing.isPending;
     // Either received means received
     final isReceived = updated.isReceived || existing.isReceived;
     // Either read means read
     final isRead = updated.isRead || existing.isRead;
-    
+
+    final mergedMsgID = updated.msgID ?? existing.msgID;
+    // Union every id either copy carried, minus the one that becomes primary,
+    // minus nulls. Sorted for deterministic on-disk output. When both copies
+    // share the same id (the common file_request/file_done merge) this stays
+    // empty — only genuine cross-path duplicates accumulate aliases.
+    final aliasIds = <String>{
+      ...existing.altMsgIds,
+      ...updated.altMsgIds,
+      if (existing.msgID != null) existing.msgID!,
+      if (updated.msgID != null) updated.msgID!,
+    }..removeWhere((id) => id == mergedMsgID);
+    final altMsgIds = aliasIds.toList()..sort();
+
     return ChatMessage(
       text: updated.text.isNotEmpty ? updated.text : existing.text,
       fromUserId: updated.fromUserId,
@@ -987,11 +1038,20 @@ class MessageHistoryPersistence {
       isPending: isPending,
       isReceived: isReceived,
       isRead: isRead,
-      msgID: updated.msgID ?? existing.msgID,
+      msgID: mergedMsgID,
       version: updated.version,
       fileSize: fileSize,
       mimeType: mimeType,
       fileHash: fileHash,
+      altMsgIds: altMsgIds,
+      // S17/S18 reply/forward quote. toxee's hybrid runtime double-writes an
+      // outbound send through both paths with different msgIDs, which merge
+      // here — and only ONE copy carries the sender-side cloudCustomData
+      // (FfiChatService.sendText sets it; the binary-replacement copy does
+      // not). Preferring whichever copy has it keeps the quote from being
+      // erased by the merge. Without this, the persisted reply loses its
+      // messageReply metadata even though sendText set it (L3-reply-text).
+      cloudCustomData: updated.cloudCustomData ?? existing.cloudCustomData,
     );
   }
   
@@ -1164,9 +1224,9 @@ class MessageHistoryPersistence {
     final list = _historyById[normalizedId];
     if (list == null) return false;
     
-    final index = list.indexWhere((msg) => msg.msgID == msgID);
+    final index = list.indexWhere((msg) => _idMatches(msg, msgID));
     if (index == -1) return false;
-    
+
     // Merge intelligently instead of direct replacement
     final existing = list[index];
     final merged = _mergeMessages(existing, updatedMessage);
@@ -1204,9 +1264,9 @@ class MessageHistoryPersistence {
     final list = _historyById[normalizedId];
     if (list == null) return false;
     
-    final index = list.indexWhere((msg) => msg.msgID == msgID);
+    final index = list.indexWhere((msg) => _idMatches(msg, msgID));
     if (index == -1) return false;
-    
+
     final existing = list[index];
     final oldFilePath = existing.filePath;
     
@@ -1284,8 +1344,8 @@ class MessageHistoryPersistence {
     if (list == null) return false;
     
     final initialLength = list.length;
-    list.removeWhere((msg) => msg.msgID == msgID);
-    
+    list.removeWhere((msg) => _idMatches(msg, msgID));
+
     if (list.length < initialLength) {
       await saveHistory(normalizedId, list);
       return true;

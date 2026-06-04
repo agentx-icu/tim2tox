@@ -1,9 +1,11 @@
-/// Binary replacement scheme history persistence hook
-///
-/// This hook provides message persistence for binary replacement scheme by:
-/// 1. Wrapping V2TimAdvancedMsgListener to automatically save received messages
-/// 2. Intercepting history message queries to load from persistence service
+// Binary replacement scheme history persistence hook
+//
+// This hook provides message persistence for binary replacement scheme by:
+// 1. Wrapping V2TimAdvancedMsgListener to automatically save received messages
+// 2. Intercepting history message queries to load from persistence service
+import 'dart:convert';
 import 'dart:io';
+import 'package:flutter/foundation.dart' show visibleForTesting;
 import 'package:tencent_cloud_chat_sdk/models/v2_tim_message.dart';
 import 'package:tencent_cloud_chat_sdk/enum/V2TimAdvancedMsgListener.dart';
 import 'package:tencent_cloud_chat_sdk/native_im/adapter/tim_message_manager.dart';
@@ -18,6 +20,14 @@ class BinaryReplacementHistoryHook {
   static MessageHistoryPersistence? _persistence;
   static String? _selfId;
   static LoggerService? _logger;
+
+  /// S29 block enforcement: a predicate (set by the host — toxee's
+  /// SessionRuntimeCoordinator — at install time from `FfiChatService.isBlocked`)
+  /// used to drop an inbound C2C message from a blocked sender on THIS
+  /// (binary-replacement) path, which persists DIRECTLY and would otherwise
+  /// re-introduce a message the FfiChatService `_appendHistory` guard dropped.
+  /// Null when no session is wired → nothing is blocked.
+  static bool Function(String fromUserId)? isBlockedPredicate;
 
   /// Rate-limit the "empty selfId" warning to once per generation so we don't
   /// flood logs on every message during the M6 deferred-selfId window.
@@ -127,6 +137,9 @@ class BinaryReplacementHistoryHook {
     _persistence = null;
     _selfId = null;
     _logger = null;
+    // S29: clear the block predicate so it can't reference the torn-down
+    // session's FfiChatService across a logout→login (stale block list).
+    isBlockedPredicate = null;
     _pendingSelfIdBuffer.clear();
     _warnedEmptySelfIdThisGeneration = false;
     // Bump generation last so a concurrent saveMessage that already captured
@@ -168,6 +181,20 @@ class BinaryReplacementHistoryHook {
     // duplicates history.
     final msgID = v2Msg.msgID ?? v2Msg.id ?? '';
     if (msgID.startsWith('m') && RegExp(r'^m\d+-\d+$').hasMatch(msgID)) {
+      return;
+    }
+
+    // Internal-protocol custom payloads (tim2tox's own receipt / reaction
+    // packets) are TRANSPORT, not chat content: the Platform path consumes
+    // them (poll → _handleReceipt / reaction stream), while the C++ binary
+    // path ALSO wraps every tox custom packet as a V2TIM custom message and
+    // notifies listeners — without this guard the hook persisted those
+    // wrappers as displayable history, so chats and conversation previews
+    // rendered raw `{"type":"receipt"...}` JSON bubbles (found via the
+    // product-screenshot pipeline). Matched by exact payload signature so a
+    // peer app's legitimate custom message is never dropped (see
+    // [_isInternalProtocolCustom]).
+    if (_isInternalProtocolCustom(v2Msg)) {
       return;
     }
 
@@ -249,6 +276,17 @@ class BinaryReplacementHistoryHook {
       // bucket instead of the new account's history.
       if (_generation != capturedGeneration) return;
 
+      // S29: drop an inbound C2C message from a blocked sender. This path
+      // persists DIRECTLY (bypassing FfiChatService._appendHistory, where the
+      // same guard lives), so without this it would re-introduce a message the
+      // FfiChatService path dropped. Self + group are never blocked.
+      final isGroupMsg = (v2Msg.groupID ?? '').isNotEmpty;
+      if (!isGroupMsg &&
+          !chatMsg.isSelf &&
+          (isBlockedPredicate?.call(chatMsg.fromUserId) ?? false)) {
+        return;
+      }
+
       // Save to persistence only if message doesn't exist. Await the on-disk
       // save inside the try block so disk-quota / permission failures land in
       // the catch path instead of becoming silent uncaught Future errors.
@@ -256,6 +294,52 @@ class BinaryReplacementHistoryHook {
     } catch (e, st) {
       _logFallback(
           'BinaryReplacementHistoryHook.saveMessage failed: $e\n$st');
+    }
+  }
+
+  /// True when [m] is one of tim2tox's OWN internal-protocol custom messages
+  /// (a delivery/read receipt or a reaction-sync packet) that must never be
+  /// persisted or rendered as chat history.
+  ///
+  /// The match is by the EXACT payload signature `FfiChatService` emits, not
+  /// merely a `type` string — generic peer custom messages are a supported
+  /// user-visible `[Custom Message]` path (`Tim2ToxSdkPlatform` round-trips
+  /// arbitrary `customElem.data`), and codex flagged that a loose
+  /// `type == 'reaction'` check would silently drop a peer app's legitimate
+  /// `{"type":"reaction", ...}` content. So:
+  ///   - receipt  → `_sendReceipt`:  type=receipt  + receiptType + msgID
+  ///   - reaction → `sendReaction`:  type=reaction + reactionID + action + msgID
+  /// Typing is sent natively via `setTyping` (NOT a JSON custom), so there is
+  /// no typing payload to filter here. `av_call` customs are deliberately
+  /// NOT filtered — they are the persistent call-record rows the chat renders.
+  /// Conservative: anything unparseable, or missing a companion field, is
+  /// treated as content.
+  static bool _isInternalProtocolCustom(V2TimMessage m) =>
+      isInternalProtocolCustomData(m.customElem?.data);
+
+  /// Pure classifier behind [_isInternalProtocolCustom], exposed for testing.
+  /// Returns true only for tim2tox's own receipt / reaction packets matched
+  /// by their full emitted signature (see [_isInternalProtocolCustom] doc).
+  @visibleForTesting
+  static bool isInternalProtocolCustomData(String? data) {
+    if (data == null || data.isEmpty) return false;
+    final trimmed = data.trimLeft();
+    if (!trimmed.startsWith('{')) return false;
+    try {
+      final j = jsonDecode(trimmed);
+      if (j is! Map) return false;
+      final type = j['type']?.toString();
+      if (type == 'receipt') {
+        return j['receiptType'] is String && j['msgID'] is String;
+      }
+      if (type == 'reaction') {
+        return j['reactionID'] is String &&
+            j['action'] is String &&
+            j['msgID'] is String;
+      }
+      return false;
+    } catch (_) {
+      return false;
     }
   }
 

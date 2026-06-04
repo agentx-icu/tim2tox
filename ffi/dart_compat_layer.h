@@ -55,6 +55,7 @@ void DartSetGroupCounterChangedCallback(void* user_data);
 
 // Group notification functions
 void DartNotifyGroupQuit(const char* group_id);
+void DartNotifyGroupJoin(const char* group_id);
 
 // Friendship callbacks
 void DartSetOnAddFriendCallback(void* user_data);
