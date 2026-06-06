@@ -85,6 +85,8 @@ class CallBridgeService {
   void _setupSignalingListener() {
     _signalingListener = V2TimSignalingListener(
       onReceiveNewInvitation: (inviteID, inviter, groupID, inviteeList, data) {
+        _logger?.log(
+            '[CallBridge] onReceiveNewInvitation inviteID=$inviteID inviter=$inviter groupID=$groupID invitees=${inviteeList.join(",")} data=$data');
         // New invitation received
         final callInfo = CallInfo(
           inviteID: inviteID,
@@ -106,9 +108,13 @@ class CallBridgeService {
         }
 
         _activeCalls[inviteID] = callInfo;
+        _logger?.log(
+            '[CallBridge] invitation mapped inviteID=$inviteID friendNumber=${callInfo.friendNumber} state=${callInfo.state}');
         onCallStateChanged?.call(inviteID, CallState.ringing);
       },
       onInvitationCancelled: (inviteID, inviter, data) {
+        _logger?.log(
+            '[CallBridge] onInvitationCancelled inviteID=$inviteID inviter=$inviter data=$data');
         // Caller cancelled the invitation before it was answered.
         final callInfo = _activeCalls[inviteID];
         if (callInfo != null) {
@@ -121,6 +127,8 @@ class CallBridgeService {
         }
       },
       onInviteeAccepted: (inviteID, invitee, data) {
+        _logger?.log(
+            '[CallBridge] onInviteeAccepted inviteID=$inviteID invitee=$invitee data=$data');
         // Invitee accepted - this callback is for the inviter (caller)
         // The inviter already started the ToxAV leg after the signaling invite
         // succeeded (see TUICallKitAdapter._handleCall). Do not call
@@ -137,6 +145,8 @@ class CallBridgeService {
         }
       },
       onInviteeRejected: (inviteID, invitee, data) {
+        _logger?.log(
+            '[CallBridge] onInviteeRejected inviteID=$inviteID invitee=$invitee data=$data');
         // Invitee rejected the invitation.
         final callInfo = _activeCalls[inviteID];
         if (callInfo != null) {
@@ -148,6 +158,8 @@ class CallBridgeService {
         }
       },
       onInvitationTimeout: (inviteID, inviteeList) {
+        _logger?.log(
+            '[CallBridge] onInvitationTimeout inviteID=$inviteID invitees=${inviteeList.join(",")}');
         // Invitation rang out without an answer.
         final callInfo = _activeCalls[inviteID];
         if (callInfo != null) {
@@ -191,6 +203,8 @@ class CallBridgeService {
     int? friendNumber,
     String? groupID,
   }) {
+    _logger?.log(
+        '[CallBridge] registerOutgoingCall inviteID=$inviteID inviter=$inviter invitee=$invitee friendNumber=$friendNumber groupID=$groupID data=$data');
     _activeCalls[inviteID] = CallInfo(
       inviteID: inviteID,
       inviter: inviter,
@@ -209,6 +223,7 @@ class CallBridgeService {
   /// (cancel/reject/timeout/endCall) know there is a real media leg to stop.
   /// No-op if the invite is already gone (e.g. a fast cancel removed it).
   void markAvLegStarted(String inviteID) {
+    _logger?.log('[CallBridge] markAvLegStarted inviteID=$inviteID');
     _activeCalls[inviteID]?.avLegStarted = true;
   }
 

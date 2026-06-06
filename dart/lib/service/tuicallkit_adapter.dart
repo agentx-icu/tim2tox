@@ -125,6 +125,8 @@ class TUICallKitAdapter {
         userID,
         type ?? TYPE_AUDIO,
       );
+      _logger?.log(
+          '[TUICallKitAdapter] preflight result allowed=$allowed userID=$userID type=$type');
       if (!allowed) {
         throw Exception('Outgoing call preflight denied');
       }
@@ -144,6 +146,8 @@ class TUICallKitAdapter {
       onlineUserOnly: false,
       timeout: 30,
     );
+    _logger?.log(
+        '[TUICallKitAdapter] invite result code=${result.code} data=${result.data} userID=$userID type=$type');
 
     if (result.code != 0 || result.data == null) {
       throw Exception('Signaling invite failed: code=${result.code}');
@@ -160,6 +164,8 @@ class TUICallKitAdapter {
     // queried `getCallInfo(inviteID).friendNumber`) saw `null`.
     final resolvedFriendNumber = _avService.getFriendNumberByUserId(userID);
     final hasFriend = resolvedFriendNumber != 0xFFFFFFFF;
+    _logger?.log(
+        '[TUICallKitAdapter] resolvedFriendNumber=$resolvedFriendNumber hasFriend=$hasFriend userID=$userID inviteID=$inviteID');
 
     _callBridge.registerOutgoingCall(
       inviteID: inviteID,
@@ -171,10 +177,10 @@ class TUICallKitAdapter {
     );
 
     // Notify listeners about the outgoing call so UI can show ringing overlay
-    _logger?.logDebug(
-        '[TUICallKitAdapter] _handleCall firing onOutgoingCallInitiated: '
-        'inviteID=$inviteID userID=$userID type=$type '
-        'cb=${onOutgoingCallInitiated != null ? "SET" : "NULL"}');
+    _logger
+        ?.log('[TUICallKitAdapter] _handleCall firing onOutgoingCallInitiated: '
+            'inviteID=$inviteID userID=$userID type=$type '
+            'cb=${onOutgoingCallInitiated != null ? "SET" : "NULL"}');
     onOutgoingCallInitiated?.call(inviteID, userID, type ?? TYPE_AUDIO);
 
     if (!hasFriend) {

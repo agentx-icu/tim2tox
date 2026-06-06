@@ -3183,53 +3183,14 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
           if (addedUserIDs.isEmpty) break;
           if (_debugLog)
             print('[Tim2ToxSdkPlatform] AddFriend: addedUserIDs=$addedUserIDs');
-          final capturedInstanceId = instanceId;
-          unawaited((() async {
-            try {
-              final friends = await ffiService.getFriendList();
-              final addedSet = addedUserIDs.toSet();
-              final friendInfoList = <V2TimFriendInfo>[];
-              for (final friend in friends) {
-                final normalized = friend.userId.length > 64
-                    ? friend.userId.substring(0, 64)
-                    : friend.userId;
-                if (addedSet.contains(friend.userId) ||
-                    addedSet.contains(normalized)) {
-                  final fakeUser = FakeUser(
-                    userID: friend.userId,
-                    nickName: friend.nickName,
-                    online: friend.online,
-                  );
-                  friendInfoList.add(await fakeUserToV2TimFriendInfo(fakeUser));
-                }
-              }
-              if (friendInfoList.isEmpty) {
-                for (final uid in addedUserIDs) {
-                  friendInfoList.add(await fakeUserToV2TimFriendInfo(
-                    FakeUser(userID: uid, nickName: '', online: false),
-                  ));
-                }
-              }
-              final allListeners = <V2TimFriendshipListener>{
-                ...(_instanceFriendshipListeners[capturedInstanceId] ?? []),
-                ..._friendshipListeners,
-              };
-              for (final l in allListeners) {
-                try {
-                  l.onFriendListAdded?.call(friendInfoList);
-                } catch (e, st) {
-                  _logListenerError(
-                      'V2TimFriendshipListener.onFriendListAdded', e, st);
-                }
-              }
-              // Send our avatar to all friends (including new ones) so they see our avatar soon
-              await ffiService.sendAvatarToAllFriends();
-            } catch (e) {
-              if (_debugLog)
-                print(
-                    '[Tim2ToxSdkPlatform] AddFriend: failed to build list or notify: $e');
-            }
-          })());
+          // Outgoing Tox friend requests allocate a provisional friend entry
+          // before the peer accepts. Surfacing that as `onFriendListAdded`
+          // makes the sender-side UIKit believe the peer is already a friend
+          // and immediately collapses no-friend flows into friend flows.
+          //
+          // Real friendship-add notifications are emitted later by the
+          // authoritative accept/sync paths once the relationship is truly
+          // established, so suppress the eager callback here.
         }
         break;
       case GlobalCallbackType.DeleteFriend:
