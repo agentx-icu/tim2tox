@@ -39,6 +39,8 @@ import 'package:tencent_cloud_chat_sdk/models/v2_tim_conversation_operation_resu
 import 'package:tencent_cloud_chat_sdk/models/v2_tim_friend_info.dart';
 import 'package:tencent_cloud_chat_sdk/models/v2_tim_friend_info_result.dart';
 import 'package:tencent_cloud_chat_sdk/models/v2_tim_friend_application.dart';
+import 'package:tencent_cloud_chat_sdk/models/v2_tim_friend_application_delete_param.dart';
+import 'package:tencent_cloud_chat_sdk/models/v2_tim_friend_application_handle_param.dart';
 import 'package:tencent_cloud_chat_sdk/models/v2_tim_friend_application_result.dart';
 import 'package:tencent_cloud_chat_sdk/models/v2_tim_friend_operation_result.dart';
 import 'package:tencent_cloud_chat_sdk/models/v2_tim_friend_check_result.dart';
@@ -85,6 +87,11 @@ import '../service/ffi_chat_service.dart';
 import '../models/chat_message.dart';
 import '../utils/message_converter.dart';
 import '../utils/tim2tox_failed_message_persistence.dart';
+import '../utils/conversation_id_utils.dart';
+import 'message_search.dart';
+import 'package:tencent_cloud_chat_sdk/models/v2_tim_message_search_param.dart';
+import 'package:tencent_cloud_chat_sdk/models/v2_tim_message_search_result.dart';
+import 'package:tencent_cloud_chat_sdk/models/v2_tim_message_search_result_item.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import '../ffi/tim2tox_ffi.dart' as ffi_lib;
 import 'dart:ffi' as ffi;
@@ -101,11 +108,13 @@ import 'package:tencent_cloud_chat_common/utils/tencent_cloud_chat_code_info.dar
 import 'tim2tox_sdk_platform_callbacks.dart' as callbacks;
 import 'tim2tox_sdk_platform_converters.dart';
 import 'package:tencent_cloud_chat_sdk/native_im/adapter/tim_conversation_manager.dart';
+import 'package:tencent_cloud_chat_sdk/native_im/adapter/tim_c_enum.dart';
 import 'package:tencent_cloud_chat_sdk/native_im/adapter/tim_message_manager.dart';
+import 'package:tencent_cloud_chat_sdk/native_im/adapter/tim_manager.dart';
 import 'package:tencent_cloud_chat_sdk/native_im/adapter/tim_friendship_manager.dart';
 import 'package:tencent_cloud_chat_sdk/native_im/bindings/native_library_manager.dart';
 import 'package:tencent_cloud_chat_sdk/native_im/bindings/native_imsdk_bindings_generated.dart'
-    show GlobalCallbackType;
+    show GlobalCallbackType, TIMResult, TIMErrCode;
 import 'package:tencent_cloud_chat_sdk/native_im/tools.dart';
 import 'package:tim2tox_dart/service/toxav_service.dart';
 
@@ -5904,6 +5913,146 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
     }
   }
 
+  /// Local message search over the DART-side history (S93). The binary-
+  /// replacement C++ `SearchLocalMessages` is an intentional empty stub
+  /// (V2TIMMessageManagerImpl.cpp — "messages are stored in the Flutter layer"),
+  /// so without this override the in-conversation search returns nothing. We
+  /// search `FfiChatService` history: keyword substring on owned payload fields
+  /// (`chatMessageMatchesKeywords` — text + fileName, OR/AND per `type`,
+  /// control-signals excluded), honouring `messageTypeList` + the time window,
+  /// scoped to `conversationID` if given (else every conversation with history).
+  /// Per the V2TIM contract, `totalCount` is the MESSAGE count for a single-
+  /// conversation search and the CONVERSATION count for an all-conversation
+  /// search (codex). Matched messages are converted with conversation context so
+  /// self-sent C2C results carry the right userID.
+  @override
+  Future<V2TimValueCallback<V2TimMessageSearchResult>> searchLocalMessages({
+    required V2TimMessageSearchParam searchParam,
+  }) async {
+    try {
+      // Memory safety net: searchLocalMessages pagination (pageIndex/pageSize)
+      // is handled CLIENT-side by the search window, so we don't page here, but
+      // we DO cap total matches so an all-conversation scan over huge history
+      // can't balloon (codex perf trap).
+      const maxResults = 500;
+
+      final matchAll = searchParam.type == 1; // 0 = OR (default), 1 = AND
+      final convFilter = searchParam.conversationID;
+      final singleConv = convFilter != null && convFilter.isNotEmpty;
+      final effKeywords =
+          effectiveKeywords(searchParam.keywordList ?? const <String>[]);
+      final userIdFilter = <String>{
+        for (final u in searchParam.userIDList ?? const <String>[])
+          if (u.trim().isNotEmpty) ConversationIdUtils.normalize(u),
+      };
+      final timePeriod = searchParam.searchTimePeriod ?? 0; // secs; 0 = no bound
+      final hasTimeFilter = timePeriod > 0;
+      // searchTimePosition == 0 means "from now" (NOT unset), so the window is
+      // [end - period, end] only when a period is given (codex).
+      final timeEndSecs = (searchParam.searchTimePosition ?? 0) > 0
+          ? searchParam.searchTimePosition!
+          : (DateTime.now().millisecondsSinceEpoch ~/ 1000);
+      final selfId = ffiService.selfId;
+
+      // No criteria at all (no keyword, no sender, no time window) → return empty
+      // rather than dumping every message in history. NOTE: `messageTypeList` is
+      // intentionally NOT honoured — the param rewrites elem-type ids to the C
+      // `CElemType` scheme (text→0), which doesn't match our Dart ids, so any
+      // filter on it would false-negative; we return all matching types instead.
+      if (effKeywords.isEmpty && userIdFilter.isEmpty && !hasTimeFilter) {
+        return V2TimValueCallback<V2TimMessageSearchResult>(
+          code: 0,
+          desc: 'success',
+          data: V2TimMessageSearchResult(
+            totalCount: 0,
+            messageSearchResultItems: <V2TimMessageSearchResultItem>[],
+          ),
+        );
+      }
+
+      final bareIds = singleConv
+          ? <String>[ConversationIdUtils.extractBaseId(convFilter)]
+          : ffiService.getConversationIds().toList();
+
+      final items = <V2TimMessageSearchResultItem>[];
+      var totalMessageMatches = 0;
+      for (final bareId in bareIds) {
+        if (totalMessageMatches >= maxResults) break;
+        // Single-conv: echo the caller's exact conversationID back (the base-ID
+        // reconstruction only exists on the native bridge — codex). All-conv:
+        // rebuild from knownGroups membership.
+        final prefixedConvId = singleConv
+            ? convFilter
+            : ConversationIdUtils.buildFullId(
+                bareId,
+                isGroup: ffiService.knownGroups.contains(bareId),
+              );
+        final isGroup = prefixedConvId.startsWith('group_');
+        final matches = <V2TimMessage>[];
+        for (final msg in ffiService.getHistory(bareId)) {
+          // Keyword path filters control-signals + keywords together; the
+          // sender/time-only path (empty keyword) still excludes control signals.
+          if (effKeywords.isNotEmpty) {
+            if (!chatMessageMatchesKeywords(
+              msg,
+              keywords: effKeywords,
+              matchAll: matchAll,
+            )) {
+              continue;
+            }
+          } else if (!isSearchableMessage(msg)) {
+            continue;
+          }
+          // Sender filter (userIDList) on the message's sender.
+          if (userIdFilter.isNotEmpty &&
+              !userIdFilter.contains(
+                  ConversationIdUtils.normalize(msg.fromUserId))) {
+            continue;
+          }
+          // Time window: [end - period, end] when a period was given.
+          if (hasTimeFilter) {
+            final tsSecs = msg.timestamp.millisecondsSinceEpoch ~/ 1000;
+            if (tsSecs < timeEndSecs - timePeriod || tsSecs > timeEndSecs) {
+              continue;
+            }
+          }
+          matches.add(chatMessageToV2TimMessage(
+            msg,
+            selfId,
+            forwardTargetUserID: isGroup ? null : bareId,
+            forwardTargetGroupID: isGroup ? bareId : null,
+          ));
+          if (++totalMessageMatches >= maxResults) break;
+        }
+        if (matches.isNotEmpty) {
+          items.add(V2TimMessageSearchResultItem(
+            conversationID: prefixedConvId,
+            messageCount: matches.length,
+            messageList: matches,
+          ));
+        }
+      }
+
+      return V2TimValueCallback<V2TimMessageSearchResult>(
+        code: 0,
+        desc: 'success',
+        data: V2TimMessageSearchResult(
+          totalCount: singleConv ? totalMessageMatches : items.length,
+          messageSearchResultItems: items,
+        ),
+      );
+    } catch (e) {
+      return V2TimValueCallback<V2TimMessageSearchResult>(
+        code: -1,
+        desc: 'searchLocalMessages failed: $e',
+        data: V2TimMessageSearchResult(
+          totalCount: 0,
+          messageSearchResultItems: <V2TimMessageSearchResultItem>[],
+        ),
+      );
+    }
+  }
+
   @override
   Future<V2TimValueCallback<V2TimMessage>> reSendMessage({
     required String msgID,
@@ -7561,6 +7710,125 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
     }
   }
 
+  Future<V2TimValueCallback<V2TimFriendOperationResult>>
+      _nativeRefuseFriendApplication({
+    required String userID,
+  }) async {
+    if (!TIMManager.instance.isInitSDK()) {
+      _log(
+        '[Tim2ToxSdkPlatform] native refuseFriendApplication skipped: '
+        'sdk not init for $userID',
+      );
+      return V2TimValueCallback<V2TimFriendOperationResult>(
+        code: 0,
+        desc: 'success',
+        data: V2TimFriendOperationResult(userID: userID, resultCode: 0),
+      );
+    }
+
+    NativeLibraryManager.registerPort();
+    final userData = Tools.generateUserData('refuseFriendApplication');
+    final completer =
+        Completer<V2TimValueCallback<V2TimFriendOperationResult>>();
+    NativeLibraryManager.addTimValueCallback2Map<V2TimFriendOperationResult>(
+      userData,
+      completer,
+    );
+
+    final param = V2TimFriendApplicationHandleParam(
+      userID: userID,
+      responseType: CFriendResponseAction.responseActionReject,
+    );
+    final pJsonParam = Tools.string2PointerChar(json.encode(param.toJson()));
+    final pUserData = Tools.string2PointerVoid(userData);
+    final result = NativeLibraryManager.bindings.DartHandleFriendAddRequest(
+      pJsonParam,
+      pUserData,
+    );
+    if (result != TIMResult.TIM_SUCC.value) {
+      NativeLibraryManager.removeTimCallbackFromMap(userData);
+      Tools.freePointers([pJsonParam, pUserData]);
+      return V2TimValueCallback<V2TimFriendOperationResult>(
+        code: TIMErrCode.ERR_INVALID_PARAMETERS.value,
+        desc: 'invalid parameter',
+        data: V2TimFriendOperationResult(userID: userID, resultCode: -1),
+      );
+    }
+
+    return completer.future.then((value) {
+      NativeLibraryManager.removeTimCallbackFromMap(userData);
+      Tools.freePointers([pJsonParam, pUserData]);
+      return value;
+    });
+  }
+
+  Future<V2TimCallback> _nativeDeleteFriendApplication({
+    required String userID,
+    required FriendApplicationTypeEnum type,
+  }) async {
+    if (!TIMManager.instance.isInitSDK()) {
+      _log(
+        '[Tim2ToxSdkPlatform] native deleteFriendApplication skipped: '
+        'sdk not init for $userID',
+      );
+      return V2TimCallback(code: 0, desc: 'success');
+    }
+
+    NativeLibraryManager.registerPort();
+    final userData = Tools.generateUserData('deleteFriendApplication');
+    final completer = Completer<V2TimCallback>();
+    NativeLibraryManager.addTimCallback2Map(userData, completer);
+
+    final param = V2TimFriendApplicationDeleteParam(
+      userIDList: [userID],
+      applicationType: type,
+    );
+    final pJsonParam = Tools.string2PointerChar(json.encode(param.toJson()));
+    final pUserData = Tools.string2PointerVoid(userData);
+    final result = NativeLibraryManager.bindings.DartDeleteFriendApplication(
+      pJsonParam,
+      pUserData,
+    );
+    if (result != TIMResult.TIM_SUCC.value) {
+      NativeLibraryManager.removeTimCallbackFromMap(userData);
+      Tools.freePointers([pJsonParam, pUserData]);
+      return V2TimCallback(
+        code: TIMErrCode.ERR_INVALID_PARAMETERS.value,
+        desc: 'invalid parameter',
+      );
+    }
+
+    return completer.future.then((value) {
+      NativeLibraryManager.removeTimCallbackFromMap(userData);
+      Tools.freePointers([pJsonParam, pUserData]);
+      return value;
+    });
+  }
+
+  Future<V2TimCallback> _nativeSetFriendApplicationRead() async {
+    if (!TIMManager.instance.isInitSDK()) {
+      _log(
+        '[Tim2ToxSdkPlatform] native setFriendApplicationRead skipped: '
+        'sdk not init',
+      );
+      return V2TimCallback(code: 0, desc: 'success');
+    }
+
+    NativeLibraryManager.registerPort();
+    final userData = Tools.generateUserData('setFriendApplicationRead');
+    final completer = Completer<V2TimCallback>();
+    NativeLibraryManager.addTimCallback2Map(userData, completer);
+
+    final pUserData = Tools.string2PointerVoid(userData);
+    NativeLibraryManager.bindings.DartSetFriendApplicationRead(0, pUserData);
+
+    return completer.future.then((value) {
+      NativeLibraryManager.removeTimCallbackFromMap(userData);
+      Tools.freePointer(pUserData);
+      return value;
+    });
+  }
+
   @override
   Future<V2TimValueCallback<V2TimFriendOperationResult>>
       acceptFriendApplication({
@@ -7619,16 +7887,12 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
     required int type,
   }) async {
     try {
-      // Tox has no native "refuse" RPC; persist the dismissal locally so the
-      // entry stops reappearing on every 5s poll and across restarts.
+      // Persist the wording-aware dismissal first, then clear the native
+      // pending queue entry so a same-process re-request from the same peer
+      // can surface again.
       await ffiService.refuseFriendApplication(userID);
-      return V2TimValueCallback<V2TimFriendOperationResult>(
-        code: 0,
-        desc: 'success',
-        data: V2TimFriendOperationResult(
-          userID: userID,
-          resultCode: 0,
-        ),
+      return await _nativeRefuseFriendApplication(
+        userID: userID,
       );
     } catch (e) {
       return V2TimValueCallback<V2TimFriendOperationResult>(
@@ -7772,12 +8036,12 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
     required String userID,
   }) async {
     try {
-      // Same path as refuse — the V2TIM API distinguishes the two for IM
-      // analytics, but for Tox both mean "drop it from the local queue".
       await ffiService.deleteFriendApplication(userID);
-      return V2TimCallback(
-        code: 0,
-        desc: 'success',
+      return await _nativeDeleteFriendApplication(
+        userID: userID,
+        type: type >= 0 && type < FriendApplicationTypeEnum.values.length
+            ? FriendApplicationTypeEnum.values[type]
+            : FriendApplicationTypeEnum.V2TIM_FRIEND_APPLICATION_COME_IN,
       );
     } catch (e) {
       return V2TimCallback(
@@ -7790,13 +8054,7 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
   @override
   Future<V2TimCallback> setFriendApplicationRead() async {
     try {
-      // Mark all friend applications as read
-      // In Tox, we don't have a separate read status
-      // For now, just return success
-      return V2TimCallback(
-        code: 0,
-        desc: 'success',
-      );
+      return await _nativeSetFriendApplicationRead();
     } catch (e) {
       return V2TimCallback(
         code: -1,

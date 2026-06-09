@@ -1820,41 +1820,13 @@ class FfiChatService {
                     final from = header.substring(sep + 1);
                     // Check if this group was quit - if so, don't add it back
                     if (!_quitGroups.contains(gid)) {
-                      // Deduplicate: same message can be delivered twice (conference + group callback in C++)
-                      if (_isDuplicateGroupTextMessage(gid, from, text)) {
-                        _logger?.log(
-                            '[FfiChatService] Skipping duplicate group message: gid=$gid, from=$from');
-                        // If group was quit, ignore this message
-                      } else {
-                        _knownGroups.add(gid);
+                      final ingested = ingestInboundGroupText(
+                        gid: gid,
+                        from: from,
+                        text: text,
+                      );
+                      if (ingested && !_quitGroups.contains(gid)) {
                         _syncKnownGroupsToNative(); // Sync to C++ layer
-                        // Generate msgID for receipt tracking
-                        final timestamp = DateTime.now().millisecondsSinceEpoch;
-                        final sequence = _msgIDSequence++;
-                        final msgID = '${timestamp}_${sequence}_${from}_$gid';
-                        final msg = ChatMessage(
-                          text: text,
-                          fromUserId: from,
-                          isSelf: from == _selfId,
-                          timestamp: DateTime.now(),
-                          groupId: gid,
-                          msgID: msgID,
-                        );
-                        _lastByPeer[gid] = msg;
-                        if (_activePeerId == gid) {
-                          _unreadByPeer[gid] = 0;
-                        } else {
-                          _unreadByPeer.update(gid, (v) => v + 1,
-                              ifAbsent: () => 1);
-                        }
-                        _appendHistory(gid, msg);
-                        _messages.add(msg);
-                        // Auto-send received receipt for received group messages (not self-sent)
-                        // Note: reaction messages are sent via custom messages and should not trigger receipts
-                        if (!msg.isSelf && !_isReactionMessage(text)) {
-                          unawaited(_sendReceipt(from, msgID, 'received',
-                              groupID: gid));
-                        }
                       }
                     }
                     // If group was quit, ignore this message
@@ -4203,7 +4175,16 @@ class FfiChatService {
     // this, the C++ application queue keeps returning the same entries every
     // 5s poll because there is no native "dismiss" call.
     final dismissed = await _getDismissedFriendApplications();
-    return filterDismissedApplications(raw, dismissed);
+    final filtered = filterDismissedApplications(raw, dismissed);
+    if (raw.isNotEmpty || dismissed.isNotEmpty) {
+      _logger?.log(
+        '[FfiChatService] getFriendApplications '
+        'raw=${raw.map((a) => '${_normalizeApplicationUserId(a.userId)}:${a.wording}').toList()} '
+        'dismissed=${dismissed.toList()} '
+        'filtered=${filtered.map((a) => '${_normalizeApplicationUserId(a.userId)}:${a.wording}').toList()}',
+      );
+    }
+    return filtered;
   }
 
   /// Mark all currently-pending friend applications from [userID] as dismissed
@@ -4562,10 +4543,26 @@ class FfiChatService {
     // Check if this group was quit - if so, don't add it back
     if (_quitGroups.contains(gid)) return false;
     // Deduplicate: same message can be delivered twice (conference + group callback in C++)
-    if (_isDuplicateGroupTextMessage(gid, from, text)) {
+    final duplicate = _findRecentGroupHistoryMessage(gid, from, text);
+    if (duplicate != null) {
+      final last = _lastByPeer[gid];
+      final alreadyReflected = last != null &&
+          last.fromUserId == duplicate.fromUserId &&
+          last.text == duplicate.text &&
+          last.groupId == gid;
+      if (!alreadyReflected) {
+        _knownGroups.add(gid);
+        _lastByPeer[gid] = duplicate;
+        if (_activePeerId == gid) {
+          _unreadByPeer[gid] = 0;
+        } else {
+          _unreadByPeer.update(gid, (v) => v + 1, ifAbsent: () => 1);
+        }
+        _messages.add(duplicate);
+      }
       _logger?.log(
           '[FfiChatService] ingestInboundGroupText: Skipping duplicate group message: gid=$gid, from=$from');
-      return false;
+      return !alreadyReflected;
     }
     final added = _knownGroups.add(gid);
     if (added) {
@@ -4599,6 +4596,22 @@ class FfiChatService {
     return true;
   }
 
+  ChatMessage? _findRecentGroupHistoryMessage(String gid, String from, String text) {
+    final nowMs = DateTime.now().millisecondsSinceEpoch;
+    const windowMs = 5000;
+    final list = _messageHistoryPersistence.getCachedList(gid);
+    if (list == null || list.isEmpty) return null;
+    for (var i = list.length - 1; i >= 0 && i >= list.length - 20; i--) {
+      final m = list[i];
+      if (m.fromUserId == from &&
+          m.text == text &&
+          (m.timestamp.millisecondsSinceEpoch - nowMs).abs() < windowMs) {
+        return m;
+      }
+    }
+    return null;
+  }
+
   /// Returns true if we already have a recent group message with the same (gid, from, text).
   /// Used to deduplicate when both conference and group callbacks fire for the same message (tox_conf_*).
   bool _isDuplicateGroupTextMessage(String gid, String from, String text) {
@@ -4621,16 +4634,12 @@ class FfiChatService {
       }
     }
 
-    // Fallback for the cold-cache window: _lastByPeer is updated on every
-    // append even before loadHistory has run, so it catches the second copy
-    // of a duplicate-delivered first message of the session.
-    final last = _lastByPeer[gid];
-    if (last != null &&
-        last.fromUserId == from &&
-        last.text == text &&
-        (last.timestamp.millisecondsSinceEpoch - nowMs).abs() < windowMs) {
-      return true;
-    }
+    // Do NOT use _lastByPeer alone as a duplicate signal for groups. In the
+    // real NGC path the native advanced-listener and the polled `gtext:` path
+    // can race each other: one path may update `_lastByPeer` before the other
+    // path materializes history, which would make the very first real inbound
+    // group message of the session look like a duplicate and get dropped. The
+    // authoritative duplicate check is the cached history tail above.
     return false;
   }
 
@@ -4664,6 +4673,14 @@ class FfiChatService {
     // history pipeline so they survive app restart.
     _appendHistory(key, msg);
   }
+
+  /// All conversation ids (bare, normalized) that currently have persisted
+  /// history. Public so the SDK platform's local message search
+  /// (`searchLocalMessages`) can enumerate every conversation when no specific
+  /// `conversationID` is given — the C++ `SearchLocalMessages` is an empty stub
+  /// (history lives here, not in C++), so the search must run Dart-side.
+  Set<String> getConversationIds() =>
+      _messageHistoryPersistence.getConversationIds();
 
   List<ChatMessage> getHistory(String id) {
     // Normalize friend ID to 64 characters if it's a C2C conversation (not a group)
