@@ -497,6 +497,7 @@ PHASE13_BINARY_REPLACEMENT=(
   "test/scenarios_binary/scenario_library_loading_test.dart"
   "test/scenarios_binary/scenario_native_callback_dispatch_test.dart"
   "test/scenarios_binary/scenario_custom_callback_handler_test.dart"
+  "test/scenarios_binary/scenario_binary_friend_refuse_test.dart"
 )
 
 PHASE14_UNIT=(

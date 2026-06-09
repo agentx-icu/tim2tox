@@ -659,11 +659,30 @@ extern "C" {
             SendApiCallbackResult(user_data, ERR_INVALID_PARAMETERS, "user_id is required");
             return 1; // Error
         }
-        
+
         // Create V2TIMFriendApplication
         V2TIMFriendApplication application;
         application.userID = V2TIMString(user_id.c_str());
-        
+
+        // friend_response_action mirrors the Dart SDK's CFriendResponseAction:
+        //   0 = agree, 1 = agreeAndAdd, 2 = REJECT.
+        // refuseFriendApplication() funnels through THIS same unified handle
+        // binding with action=2, so a reject MUST route to RefuseFriendApplication.
+        // The previous code cast the action straight to V2TIMFriendAcceptType and
+        // unconditionally called AcceptFriendApplication, so DECLINING a friend
+        // request silently added the friend (tox_friend_add_norequest) — the
+        // request was accepted instead of refused.
+        constexpr int kFriendResponseActionReject = 2;
+        if (response_type == kFriendResponseActionReject) {
+            V2TIM_LOG(kInfo, "[dart_compat] DartHandleFriendAddRequest: response_type=2 (reject) -> RefuseFriendApplication");
+            fflush(stdout);
+            SafeGetV2TIMManager()->GetFriendshipManager()->RefuseFriendApplication(
+                application,
+                new DartFriendOperationResultCallback(user_data)
+            );
+            return 0; // TIM_SUCC (request refused)
+        }
+
         // Parse accept type (0 = single, 1 = both)
         V2TIMFriendAcceptType accept_type = static_cast<V2TIMFriendAcceptType>(response_type);
         V2TIMString remark_str(remark.c_str());

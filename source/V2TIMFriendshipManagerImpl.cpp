@@ -124,7 +124,7 @@ void V2TIMFriendshipManagerImpl::NotifyFriendApplicationListDeleted(const V2TIMS
                 if (pending_applications_[j].userID == uid) {
                     V2TIM_LOG(kInfo, "[NotifyFriendApplicationListDeleted] Removing application: userID={}", uid.CString());
                     pending_applications_.Erase(j);
-                    break;
+                    continue;
                 }
                 ++j;
             }
@@ -1146,12 +1146,26 @@ void V2TIMFriendshipManagerImpl::RefuseFriendApplication(const V2TIMFriendApplic
     result.userID = V2TIMString(refuse_uid.c_str());
     
     V2TIM_LOG(kWarning, "RefuseFriendApplication: Tox doesn't support actively rejecting friend requests.");
+    // Client-side dismissal still needs to clear the local pending queue so a
+    // later request from the same peer can surface again. Without this the old
+    // application stays in pending_applications_ forever, and higher layers may
+    // keep filtering or reusing the stale entry instead of the fresh request.
+    if (!application.userID.Empty()) {
+        V2TIMStringVector deleted_ids;
+        deleted_ids.PushBack(application.userID);
+        NotifyFriendApplicationListDeleted(deleted_ids);
+    }
     if (callback) callback->OnSuccess(result);
 }
 void V2TIMFriendshipManagerImpl::DeleteFriendApplication(const V2TIMFriendApplication& application, V2TIMCallback* callback) {
     V2TIM_LOG(kInfo, "DeleteFriendApplication called");
     
     V2TIM_LOG(kWarning, "DeleteFriendApplication: Friend application deletion is a client-side concept.");
+    if (!application.userID.Empty()) {
+        V2TIMStringVector deleted_ids;
+        deleted_ids.PushBack(application.userID);
+        NotifyFriendApplicationListDeleted(deleted_ids);
+    }
     if (callback) callback->OnSuccess();
 }
 void V2TIMFriendshipManagerImpl::SetFriendApplicationRead(V2TIMCallback* callback) { 
