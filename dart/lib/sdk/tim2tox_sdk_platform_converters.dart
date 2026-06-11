@@ -246,6 +246,8 @@ extension Tim2ToxSdkPlatformConverters on Tim2ToxSdkPlatform {
       elemType = MessageElemType.V2TIM_ELEM_TYPE_SOUND;
     } else if (chatMsg.mediaKind == 'file') {
       elemType = MessageElemType.V2TIM_ELEM_TYPE_FILE;
+    } else if (chatMsg.mediaKind == 'custom') {
+      elemType = MessageElemType.V2TIM_ELEM_TYPE_CUSTOM;
     }
 
     final msg = V2TimMessage(elemType: elemType);
@@ -321,7 +323,7 @@ extension Tim2ToxSdkPlatformConverters on Tim2ToxSdkPlatform {
         } catch (e) {
           // Ignore file size errors
         }
-        
+
         // Create image list with both thumb and origin images
         // UIKit may request either THUMB (1) or ORIGIN (0), so we need both
         // This is required for downloadMessage to work properly
@@ -341,7 +343,7 @@ extension Tim2ToxSdkPlatformConverters on Tim2ToxSdkPlatform {
             localUrl: chatMsg.filePath,
           ),
         ];
-        
+
         msg.imageElem = V2TimImageElem(
           path: chatMsg.filePath,
           imageList: imageList,
@@ -381,7 +383,7 @@ extension Tim2ToxSdkPlatformConverters on Tim2ToxSdkPlatform {
         } catch (e) {
           // Ignore file size errors
         }
-        
+
         msg.fileElem = V2TimFileElem(
           path: chatMsg.filePath,
           fileName: chatMsg.fileName,
@@ -395,6 +397,14 @@ extension Tim2ToxSdkPlatformConverters on Tim2ToxSdkPlatform {
       }
     } else if (chatMsg.mediaKind == 'call_record') {
       // Call record: text contains CallingMessage-compatible JSON
+      msg.elemType = MessageElemType.V2TIM_ELEM_TYPE_CUSTOM;
+      msg.customElem = V2TimCustomElem(
+        data: chatMsg.text,
+        desc: '',
+        extension: '',
+      );
+      msg.elemList.add(msg.customElem!);
+    } else if (chatMsg.mediaKind == 'custom') {
       msg.elemType = MessageElemType.V2TIM_ELEM_TYPE_CUSTOM;
       msg.customElem = V2TimCustomElem(
         data: chatMsg.text,
@@ -443,9 +453,8 @@ extension Tim2ToxSdkPlatformConverters on Tim2ToxSdkPlatform {
     // isn't routed through this prefs key shape).
     if (!fakeConv.isGroup) {
       final prefs = preferencesService ?? ffiService.preferencesService;
-      conv.recvOpt = await prefs?.getC2CReceiveMessageOpt(
-              peerId, ffiService.selfId) ??
-          0;
+      conv.recvOpt =
+          await prefs?.getC2CReceiveMessageOpt(peerId, ffiService.selfId) ?? 0;
     } else {
       conv.recvOpt = 0;
     }
@@ -459,7 +468,8 @@ extension Tim2ToxSdkPlatformConverters on Tim2ToxSdkPlatform {
     }
 
     // Fallback showName from prefs when not set so conversation list/header show correct nickname
-    if (!fakeConv.isGroup && (conv.showName == null || conv.showName!.isEmpty)) {
+    if (!fakeConv.isGroup &&
+        (conv.showName == null || conv.showName!.isEmpty)) {
       final prefs = preferencesService ?? ffiService.preferencesService;
       final nick = await prefs?.getFriendNickname(peerId);
       if (nick != null && nick.isNotEmpty) {

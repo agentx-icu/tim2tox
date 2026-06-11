@@ -586,6 +586,7 @@ class FfiChatService {
       pkgffi.malloc.free(buf);
     }
   }
+
   Stream<ChatMessage> get messages => _messages.stream;
   Stream<bool> get connectionStatusStream => _connectionStatus.stream;
   bool _isConnected = false;
@@ -631,6 +632,7 @@ class FfiChatService {
     _logger?.log(
         '[FfiChatService] refreshBlockedUsers: ${_blockedUsers.length} blocked');
   }
+
   String?
       _lastCustomSender; // Track last custom message sender for reaction parsing
   String?
@@ -799,8 +801,8 @@ class FfiChatService {
   /// `_queueOffline*` sites), so [itemMs] (== item.timestamp in ms) pins the
   /// row. The remaining same-exact-ms ambiguity only affects those legacy
   /// no-msgID items; new items match by msgID and have no ambiguity.
-  bool _offlineRowMatchesItem(ChatMessage row, OfflineMessageItem item,
-      int itemMs) {
+  bool _offlineRowMatchesItem(
+      ChatMessage row, OfflineMessageItem item, int itemMs) {
     final id = item.msgID;
     if (id != null && id.isNotEmpty) return row.msgID == id;
     return row.timestamp.millisecondsSinceEpoch == itemMs;
@@ -4596,7 +4598,45 @@ class FfiChatService {
     return true;
   }
 
-  ChatMessage? _findRecentGroupHistoryMessage(String gid, String from, String text) {
+  /// Materialize one inbound C2C custom message through the same local
+  /// history, unread, preview, and UI-stream pipeline as native C2C delivery.
+  /// This is intentionally radio-free and test-harness friendly: the sender's
+  /// customElem.data is stored as [ChatMessage.text] with mediaKind=custom so
+  /// SDK conversion produces a real V2TIM custom elem for UIKit menus.
+  /// Returns true when the message was ingested (false: blocked sender).
+  bool ingestInboundC2cCustom({
+    required String from,
+    required String data,
+  }) {
+    final normalizedFrom = from.length > 64 ? _normalizeFriendId(from) : from;
+    if (from != _selfId && isBlocked(normalizedFrom)) {
+      _logger?.log(
+          '[FfiChatService] ingestInboundC2cCustom: dropping blocked sender');
+      return false;
+    }
+
+    final timestamp = DateTime.now().millisecondsSinceEpoch;
+    final sequence = _msgIDSequence++;
+    final msgID = '${timestamp}_${sequence}_$from';
+    final msg = ChatMessage(
+      text: data,
+      fromUserId: from,
+      isSelf: from == _selfId,
+      timestamp: DateTime.now(),
+      msgID: msgID,
+      mediaKind: 'custom',
+    );
+    _lastByPeer[normalizedFrom] = msg;
+    if (_activePeerId != normalizedFrom && from != _selfId) {
+      _unreadByPeer.update(normalizedFrom, (v) => v + 1, ifAbsent: () => 1);
+    }
+    _appendHistory(normalizedFrom, msg);
+    _messages.add(msg);
+    return true;
+  }
+
+  ChatMessage? _findRecentGroupHistoryMessage(
+      String gid, String from, String text) {
     final nowMs = DateTime.now().millisecondsSinceEpoch;
     const windowMs = 5000;
     final list = _messageHistoryPersistence.getCachedList(gid);
@@ -4651,8 +4691,7 @@ class FfiChatService {
     // all. Self-sends (isSelf) and groups (groupId != null) are never blocked;
     // the binary-replacement hook is guarded separately (it persists directly).
     if (!msg.isSelf && msg.groupId == null && isBlocked(msg.fromUserId)) {
-      _logger?.log(
-          '[FfiChatService] _appendHistory: dropping blocked sender '
+      _logger?.log('[FfiChatService] _appendHistory: dropping blocked sender '
           '${msg.fromUserId.substring(0, msg.fromUserId.length.clamp(0, 8))}..');
       return;
     }
@@ -6925,6 +6964,7 @@ class FfiChatService {
           await _offlineQueuePersistence.removeItem(storageKey, item);
           dispatched = true;
         }
+
         if (isFile) {
           await _drainFileItem(normalizedPeerId, history, item,
               onDispatched: remover);
@@ -7099,7 +7139,8 @@ class FfiChatService {
           msgID = itemMsgID;
         } else {
           final sequence = _msgIDSequence++;
-          msgID = '${item.timestamp.millisecondsSinceEpoch}_${sequence}_$_selfId';
+          msgID =
+              '${item.timestamp.millisecondsSinceEpoch}_${sequence}_$_selfId';
         }
         final msg = ChatMessage(
           text: item.text,
