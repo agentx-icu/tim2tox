@@ -774,6 +774,17 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
               }
             }
           }
+          // Refresh the conversation preview off the now-reaped control signal
+          // so an inbound `__revoke__:` doesn't strand as the sidebar's last
+          // message on the receive side. The signal (and, for revoke, the
+          // referenced message) were deleted above; re-notify so UIKit re-reads
+          // the corrected preview. Sender-side is handled in revokeMessage; this
+          // covers the receive path. C2C only (no group notify helper yet).
+          if (!chatMsg.isSelf &&
+              (chatMsg.groupId == null || chatMsg.groupId!.isEmpty) &&
+              chatMsg.fromUserId.isNotEmpty) {
+            await _refreshConversationPreviewC2C(chatMsg.fromUserId);
+          }
           if (_debugLog) {
             print(
                 '[Tim2ToxSdkPlatform] _setupMessageListener: swallowed control signal (isSelf=${chatMsg.isSelf}, text="${chatMsg.text}")');
@@ -3852,6 +3863,31 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
     _notifyConversationListeners((listener) {
       listener.onConversationChanged?.call([convToNotify]);
     });
+  }
+
+  /// Force the C2C conversation PREVIEW to refresh from the current
+  /// `_lastByPeer` — e.g. after a recall / control-signal swallow deleted the
+  /// last message. Unlike [notifyConversationChangedForC2C], which emits a
+  /// SPARSE conversation (the UIKit merge then KEEPS the existing lastMessage,
+  /// preserving the stale recalled text — codex P1), this fetches the FULL
+  /// conversation with the corrected lastMessage so the sidebar re-renders the
+  /// real new last message.
+  Future<void> _refreshConversationPreviewC2C(String receiver) async {
+    if (receiver.isEmpty) return;
+    final c2cKey = receiver.length >= 64 ? receiver.substring(0, 64) : receiver;
+    try {
+      final res = await getConversation(conversationID: 'c2c_$c2cKey');
+      final conv = res.data;
+      if (conv != null) {
+        _notifyConversationListeners((listener) {
+          listener.onConversationChanged?.call([conv]);
+        });
+      }
+    } catch (e) {
+      if (_debugLog) {
+        print('[Tim2ToxSdkPlatform] _refreshConversationPreviewC2C: $e');
+      }
+    }
   }
 
   @override
@@ -6946,20 +6982,44 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
       try {
         final String? peerUserID = message.userID;
         final String? peerGroupID = message.groupID;
-        // H-G: include the sender-side timestamp (ms) so the receiver
-        // can locate the matching history entry by sender + timestamp
-        // window when our msgID doesn't survive the wire trip.
+        // H-G: include the sender-side timestamp (ms) so the receiver can
+        // locate the matching history entry when our msgID doesn't survive the
+        // wire trip. PLUS a CONTENT key (text prefix + full length): the
+        // timestamp window matches the SENDER's send-time against the
+        // RECEIVER's receive-time, which drift apart on a slow/marginal DHT (and
+        // a nearby message then matches closer) — so the receiver could delete
+        // the wrong message or none (observed live as bGone=false). The content
+        // key is latency-independent and disambiguates nearby messages. Capped
+        // at 200 chars so the signal always fits a Tox message; the receiver
+        // matches prefix+length, falling back to the timestamp window.
         final senderTimestampMs = (message.timestamp ?? 0) * 1000;
-        final payload = '__revoke__:${json.encode({
+        final recalledText = message.textElem?.text ?? '';
+        // Byte-budget the content prefix so the full __revoke__ payload fits a
+        // Tox message (1372 bytes) with margin, accounting for JSON escaping +
+        // UTF-8 (codex P2). The receiver matches by full length + this prefix
+        // via startsWith, so a shorter prefix still disambiguates.
+        String revokePayload(String prefix) => '__revoke__:${json.encode({
               'msgID': msgID,
               'senderTimestampMs': senderTimestampMs,
               'fromUserId': ffiService.selfId,
+              'textPrefix': prefix,
+              'textLen': recalledText.length,
             })}';
+        var textPrefix = recalledText;
+        while (textPrefix.isNotEmpty &&
+            utf8.encode(revokePayload(textPrefix)).length > 1100) {
+          textPrefix = textPrefix.substring(0, (textPrefix.length * 3) ~/ 4);
+        }
+        final payload = revokePayload(textPrefix);
         if (peerUserID != null && peerUserID.isNotEmpty) {
-          await ffiService.sendText(peerUserID, payload);
+          // Send via the non-polluting control path so `__revoke__:{json}`
+          // never lands in our own history / conversation preview (the recall
+          // conv-preview leak fix). `sendText` would persist it + set
+          // `_lastByPeer`, stranding the JSON as the sidebar's last-message.
+          await ffiService.sendControlSignal(peerUserID, payload);
         } else if (peerGroupID != null && peerGroupID.isNotEmpty) {
-          // Group revoke: FfiChatService exposes sendGroupText.
-          await ffiService.sendGroupText(peerGroupID, payload);
+          await ffiService.sendControlSignal(peerGroupID, payload,
+              isGroup: true);
         }
       } catch (e) {
         // Wire-side failure should not fail the local revoke.
@@ -6967,6 +7027,16 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
           print(
               '[Tim2ToxSdkPlatform] revokeMessage: signal send failed (peer will keep its copy): $e');
         }
+      }
+
+      // Refresh the sender's conversation preview. The local delete above
+      // dropped the recalled message, so the sidebar must re-render off the
+      // newest remaining message rather than stranding the recalled text.
+      // (Group conversations have no dedicated notify helper yet; the group
+      // recall preview refresh is a documented residual.)
+      final String? notifyC2C = message.userID;
+      if (notifyC2C != null && notifyC2C.isNotEmpty) {
+        await _refreshConversationPreviewC2C(notifyC2C);
       }
 
       return V2TimCallback(
@@ -7049,13 +7119,15 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
           final senderTimestampMs = parsed['senderTimestampMs'] is int
               ? parsed['senderTimestampMs'] as int
               : null;
+          final revokedTextPrefix = parsed['textPrefix'] as String?;
+          final revokedTextLen =
+              parsed['textLen'] is int ? parsed['textLen'] as int : null;
 
           String? targetMsgID = revokedID;
-          // H-G: sender's msgID rarely matches the receiver's history
-          // msgID. Use sender + timestamp window to locate the actual
-          // entry in our history. Skipped for self-sent revoke signals
-          // (revokeMessage already deleted the sender's own copy).
-          if (!chatMsg.isSelf && senderTimestampMs != null) {
+          // The sender's msgID rarely matches the receiver's history msgID, so
+          // locate the actual entry in our history. Skipped for self-sent
+          // revoke signals (revokeMessage already deleted the sender's copy).
+          if (!chatMsg.isSelf) {
             final senderUid = chatMsg.fromUserId;
             final convId = chatMsg.groupId ?? senderUid;
             try {
@@ -7065,25 +7137,74 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
               // Best-effort: continue with whatever is in memory.
             }
             final history = ffiService.getHistory(convId);
-            // Walk the most recent 50 entries from this sender; pick the
-            // closest match within 5 s.
+            final recent = history.reversed.take(100).toList();
             ChatMessage? best;
-            int bestDelta = 5000;
-            final recent = history.reversed.take(50);
-            for (final m in recent) {
-              if (m.fromUserId != senderUid) continue;
-              if (m.text.isEmpty) continue;
-              if (m.text.startsWith('__')) continue; // skip control msgs
-              final delta =
-                  (m.timestamp.millisecondsSinceEpoch - senderTimestampMs)
-                      .abs();
-              if (delta <= bestDelta && m.msgID != null) {
-                best = m;
-                bestDelta = delta;
+            final hasContentKey =
+                revokedTextPrefix != null && revokedTextLen != null;
+            if (hasContentKey) {
+              // CONTENT match (latency-independent, codex P1). Collect ALL
+              // entries from this sender whose text matches by full length +
+              // 200-char prefix, then delete only when the match is
+              // UNAMBIGUOUS. With a v2 content key we do NOT fall back to the
+              // timestamp window — that window matches the sender's send-time
+              // against the receiver's receive-time and would re-introduce the
+              // wrong-delete it was meant to fix (and for a non-text recall,
+              // textLen==0 matches nothing here → we must NOT delete a nearby
+              // text row by timestamp).
+              final matches = <ChatMessage>[];
+              for (final m in recent) {
+                if (m.fromUserId != senderUid) continue;
+                if (m.msgID == null) continue;
+                if (m.text.isEmpty || m.text.startsWith('__')) continue;
+                if (m.text.length != revokedTextLen) continue;
+                if (!m.text.startsWith(revokedTextPrefix)) continue;
+                matches.add(m);
+              }
+              if (matches.length == 1) {
+                best = matches.first;
+              } else if (matches.length > 1 && senderTimestampMs != null) {
+                // Duplicate text: disambiguate ONLY within the matched set by
+                // the closest send-time, and only when one is clearly closest
+                // (<2s); otherwise leave best null (swallow without deleting the
+                // wrong copy — better a lingering copy than a wrong delete).
+                int bestDelta = 2000;
+                for (final m in matches) {
+                  final delta =
+                      (m.timestamp.millisecondsSinceEpoch - senderTimestampMs)
+                          .abs();
+                  if (delta < bestDelta) {
+                    best = m;
+                    bestDelta = delta;
+                  }
+                }
+              }
+              // matches.isEmpty → best stays null → no delete (the recalled
+              // message may not have arrived yet; a later reload won't show it
+              // since the local copy survives — acceptable vs a wrong delete).
+            } else if (senderTimestampMs != null) {
+              // LEGACY sender (no content key): sender + timestamp window
+              // (closest within 5 s).
+              int bestDelta = 5000;
+              for (final m in recent) {
+                if (m.fromUserId != senderUid) continue;
+                if (m.text.isEmpty) continue;
+                if (m.text.startsWith('__')) continue; // skip control msgs
+                final delta =
+                    (m.timestamp.millisecondsSinceEpoch - senderTimestampMs)
+                        .abs();
+                if (delta <= bestDelta && m.msgID != null) {
+                  best = m;
+                  bestDelta = delta;
+                }
               }
             }
             if (best != null) {
               targetMsgID = best.msgID;
+            } else if (hasContentKey) {
+              // No unambiguous content match: do NOT delete by the sender's
+              // (non-matching) msgID either — clear the target so we swallow
+              // the signal without deleting a wrong/uncertain row.
+              targetMsgID = null;
             }
           }
 

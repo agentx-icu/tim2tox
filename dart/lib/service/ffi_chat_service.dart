@@ -3874,6 +3874,61 @@ class FfiChatService {
     _messages.add(msg);
   }
 
+  /// Sends a raw control-signal text (e.g. the `__revoke__:` recall envelope)
+  /// over the wire WITHOUT touching local history, the conversation-preview
+  /// cache (`_lastByPeer`), or the message stream. Control signals are protocol
+  /// plumbing — they must never surface as a chat bubble OR as a conversation's
+  /// last-message preview on the sender side. (The receive side already swallows
+  /// them in `Tim2ToxSdkPlatform._setupMessageListener`.)
+  ///
+  /// Using the normal [sendText]/[sendGroupText] here was the root cause of the
+  /// recall conv-preview leak: those persist the outbound text and set
+  /// `_lastByPeer`, so `__revoke__:{json}` briefly (or, when the peer was
+  /// offline, durably as a pending row) became the sidebar preview before the
+  /// self-echo reap could undo it.
+  ///
+  /// Best-effort + fire-and-forget: the signal is sent immediately and NOT
+  /// queued (a queued control signal would create a visible pending bubble).
+  ///
+  /// KNOWN LIMITATION (deferred, codex P2): unlike the prior `sendText` path,
+  /// there is no offline queue, so a control signal to a genuinely-offline peer
+  /// is lost (a recall would not reach a peer that is offline at recall time).
+  /// A non-rendering `kind:'control'` offline queue (drain on reconnect without
+  /// `_appendHistory`/`_lastByPeer`/`_messages`) would restore eventual
+  /// delivery while keeping the preview clean; tracked as a follow-up. (We do
+  /// NOT gate on the cached online flag — see the always-send rationale below.)
+  Future<void> sendControlSignal(String peerId, String payload,
+      {bool isGroup = false}) async {
+    if (payload.isEmpty) return;
+    // ALWAYS attempt the raw send — do NOT gate on the cached online/connected
+    // flag. That flag can be a transient false-negative (e.g. a marginal
+    // same-host DHT where the peer is reachable but the status lags), and a
+    // dropped control signal then silently fails the action (a recall would
+    // leave the peer's copy undeleted — observed live as bGone=false). Tox's
+    // send is itself best-effort: if the peer really is unreachable the FFI
+    // call just fails harmlessly (FRIEND_NOT_CONNECTED), no crash, no queue.
+    if (isGroup) {
+      final pg = peerId.toNativeUtf8();
+      final pt = payload.toNativeUtf8();
+      try {
+        _ffi.sendGroupText(pg, pt);
+      } finally {
+        pkgffi.malloc.free(pg);
+        pkgffi.malloc.free(pt);
+      }
+      return;
+    }
+    final normalizedPeerId = _normalizeFriendId(peerId);
+    final pto = normalizedPeerId.toNativeUtf8();
+    final pmsg = payload.toNativeUtf8();
+    try {
+      _ffi.sendText(pto, pmsg);
+    } finally {
+      pkgffi.malloc.free(pto);
+      pkgffi.malloc.free(pmsg);
+    }
+  }
+
   // Enqueue a text send for a friend that is offline (or that flipped offline
   // between the pre-check and the FFI call). The UI sees a pending bubble
   // immediately; drain on the next online transition resends and clears it.
