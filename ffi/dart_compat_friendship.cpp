@@ -445,11 +445,40 @@ extern "C" {
             return 1; // Error
         }
         
-        // Parse JSON modify friend info parameter
+        // Parse JSON modify friend info parameter.
+        //
+        // The Dart side (tim_friendship_manager.setFriendInfo ->
+        // V2TimFriendInfo.toModifyJsonParam) actually emits:
+        //   { "friendship_modify_friend_profile_param_identifier": "<userID>",
+        //     "friendship_modify_friend_profile_param_item": {
+        //         "friend_profile_item_remark": "<remark>", ... } }
+        // i.e. the identifier is under friendship_modify_friend_profile_param_*
+        // and the REMARK is NESTED inside the *_item sub-object under
+        // friend_profile_item_remark. The previous code looked for the wrong flat
+        // keys (modify_friend_info_param_identifier /
+        // modify_friend_info_param_friend_remark), so neither matched and the
+        // remark was never applied (root cause of "remark edit does not persist").
+        // Parse the real keys first, fall back to the legacy flat keys for
+        // defensiveness (matching the DartAddFriend multi-key pattern).
         std::string json_str = json_modify_friend_info_param;
-        std::string user_id = ExtractJsonValue(json_str, "modify_friend_info_param_identifier");
-        std::string friend_remark = ExtractJsonValue(json_str, "modify_friend_info_param_friend_remark");
-        
+        std::string user_id =
+            ExtractJsonValue(json_str, "friendship_modify_friend_profile_param_identifier");
+        if (user_id.empty()) {
+            user_id = ExtractJsonValue(json_str, "modify_friend_info_param_identifier");
+        }
+        // The remark lives inside the *_item sub-object; ExtractJsonValue returns
+        // a nested object as its JSON dump, which we then re-parse for the remark.
+        std::string friend_remark;
+        std::string item_json =
+            ExtractJsonValue(json_str, "friendship_modify_friend_profile_param_item");
+        if (!item_json.empty()) {
+            friend_remark = ExtractJsonValue(item_json, "friend_profile_item_remark");
+        }
+        if (friend_remark.empty()) {
+            // Legacy flat fallback.
+            friend_remark = ExtractJsonValue(json_str, "modify_friend_info_param_friend_remark");
+        }
+
         if (user_id.empty()) {
             V2TIM_LOG(kError, "[dart_compat] DartSetFriendInfo: user_id is required");
             fflush(stderr);
