@@ -561,6 +561,30 @@ class FfiChatService {
   String _selfId = '';
   String get selfId => _selfId;
 
+  /// One-shot cloudCustomData (the V2TIM reply-quote / forward metadata) for the
+  /// NEXT [sendText]/[sendGroupText]. The desktop reply flow builds the
+  /// `{"messageReply":{...}}` payload and routes the send through
+  /// `ChatMessageProvider.sendText(userID, groupID, text)`, whose interface
+  /// carries no cloudCustomData — so the quote was dropped and the sent bubble
+  /// had empty cloudCustomData. The platform `sendMessage` ARMS this immediately
+  /// before that provider call; [sendText]/[sendGroupText] consume + clear it
+  /// (their explicit `cloudCustomData` arg, when given, still wins). Sequential
+  /// (single-isolate) so there is no cross-send race.
+  String? _armedSendCloudCustomData;
+  void armNextSendCloudCustomData(String? data) {
+    _armedSendCloudCustomData = (data != null && data.isNotEmpty) ? data : null;
+  }
+
+  String? _consumeArmedCloudCustomData(String? explicit) {
+    if (explicit != null && explicit.isNotEmpty) {
+      _armedSendCloudCustomData = null;
+      return explicit;
+    }
+    final armed = _armedSendCloudCustomData;
+    _armedSendCloudCustomData = null;
+    return armed;
+  }
+
   /// Returns the 76-hex-char Tox address (self public key + nospam + checksum)
   /// for this account, or `null` when the underlying Tox instance has no
   /// identity yet (before [login] has resolved) or the FFI call fails.
@@ -3826,6 +3850,9 @@ class FfiChatService {
   /// persistence fix and are tracked follow-ups.
   Future<void> sendText(String peerId, String text,
       {String? cloudCustomData}) async {
+    // Consume any armed reply-quote/forward cloudCustomData (the composer reply
+    // flow routes through the provider interface, which can't pass it directly).
+    cloudCustomData = _consumeArmedCloudCustomData(cloudCustomData);
     // Normalize friend ID to 64 characters (public key length)
     final normalizedPeerId = _normalizeFriendId(peerId);
     // Check if friend is online
@@ -4696,11 +4723,20 @@ class FfiChatService {
 
     final timestamp = DateTime.now().millisecondsSinceEpoch;
     final sequence = _msgIDSequence++;
-    final msgID = '${timestamp}_${sequence}_$from';
+    // Use the NORMALIZED (64-char public key) sender for fromUserId + msgID, the
+    // same form a REAL inbound C2C message carries (the native callback passes
+    // the bare friend pubkey). A caller that hands us a 76-char Tox ID (the
+    // l3_inject_c2c_custom seam passes the peer's full Tox id) would otherwise
+    // tag the message with a 76-char userID, so it lands in the UIKit
+    // messageData under the 76-char key while the OPEN chat reads the 64-char
+    // key — the bubble never renders in the live list (only after a cold reload
+    // reconciles the key). Normalizing here makes the injected message route +
+    // store identically to a real inbound one, so it renders immediately.
+    final msgID = '${timestamp}_${sequence}_$normalizedFrom';
     final msg = ChatMessage(
       text: data,
-      fromUserId: from,
-      isSelf: from == _selfId,
+      fromUserId: normalizedFrom,
+      isSelf: normalizedFrom == _selfId,
       timestamp: DateTime.now(),
       msgID: msgID,
       mediaKind: 'custom',
@@ -5861,6 +5897,11 @@ class FfiChatService {
   String _groupOfflineQueueKey(String groupId) => 'group:$groupId';
 
   Future<void> sendGroupText(String groupId, String text) async {
+    // Consume any armed reply-quote cloudCustomData (the composer reply flow
+    // routes group sends through the same provider.sendText, which can't pass
+    // it). Always consume — even on the offline branch — so an armed value can
+    // never leak into a later send.
+    final cloudCustomData = _consumeArmedCloudCustomData(null);
     // P0-C1: parallel of the C2C offline-queue behavior. Group messages
     // used to be sent fire-and-forget even when we had no DHT connection
     // — Tox would silently drop them with no path for recovery, and the
@@ -5886,6 +5927,7 @@ class FfiChatService {
       timestamp: DateTime.now(),
       groupId: groupId,
       msgID: msgID,
+      cloudCustomData: cloudCustomData,
     );
     _lastByPeer[groupId] = out;
     _unreadByPeer[groupId] = 0;

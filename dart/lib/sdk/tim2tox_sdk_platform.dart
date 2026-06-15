@@ -5225,6 +5225,18 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
           final text = messageToSend.textElem!.text ?? '';
           if (_debugLog)
             print('[Tim2ToxSdkPlatform] Sending text message: "$text"');
+          // ChatMessageProvider.sendText's interface carries no cloudCustomData,
+          // so a reply-quote / forward built by the composer would be lost. Arm
+          // it on the FfiChatService for the next send (sendText/sendGroupText
+          // consume + clear it) so the sent bubble persists the messageReply.
+          // Prefer the explicit `cloudCustomData` arg (data_tools passes the
+          // reply JSON through sendMessageFinalPhase); fall back to the looked-up
+          // optimistic message's field.
+          ffiService.armNextSendCloudCustomData(
+            (cloudCustomData != null && cloudCustomData.isNotEmpty)
+                ? cloudCustomData
+                : messageToSend.cloudCustomData,
+          );
           await provider.sendText(
             userID: userID,
             groupID: groupID.isNotEmpty ? groupID : null,
@@ -5267,6 +5279,12 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
               '[Tim2ToxSdkPlatform] Sending merger message with compatibleText: "$compatibleText"');
           print(
               '[Tim2ToxSdkPlatform] Merger message cloudCustomData: ${messageToSend.cloudCustomData}');
+          // Defensive: clear any armed reply cloudCustomData so a prior (e.g.
+          // cancelled) reply can never bleed into this merger forward. The
+          // text-elem branch arms before its send and the send consumes it, so
+          // in steady state this is already null; this guards future refactors
+          // that might add an early-return between arm and send.
+          ffiService.armNextSendCloudCustomData(null);
           await provider.sendText(
             userID: userID,
             groupID: groupID.isNotEmpty ? groupID : null,
