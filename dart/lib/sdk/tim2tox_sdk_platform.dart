@@ -8267,9 +8267,18 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
               ))
           .toList();
 
-      // Notify listeners
-      final friendInfoList =
-          userIDList.map((userID) => V2TimFriendInfo(userID: userID)).toList();
+      // Notify listeners. Normalize each id to the 64-char public key (the form
+      // a real inbound / the Prefs blackList use) so the UIKit's
+      // contact.blockList entry and the LATER onBlackListDeleted payload key by
+      // the SAME id. Otherwise the block-time profile id (e.g. opened from a
+      // 76-char contact row) and the unblock-time id (opened from the
+      // blocked-list row) can differ in length, the fork's exact-match
+      // deleteFromBlockList never removes the entry, and an unblocked user
+      // lingers in the Blocked Users list (root-caused live: rowGone=false).
+      final friendInfoList = userIDList
+          .map((userID) =>
+              V2TimFriendInfo(userID: ffiService.normalizeToxId(userID)))
+          .toList();
       _notifyFriendshipListeners((listener) {
         listener.onBlackListAdd?.call(friendInfoList);
       });
@@ -8330,9 +8339,15 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
               ))
           .toList();
 
-      // Notify listeners
+      // Notify listeners. Normalize to the 64-char public key so this matches
+      // the (also-normalized) contact.blockList entry the UIKit built on
+      // addToBlackList — see the matching comment there. Without this the fork's
+      // exact-match removal (`ele.userID == element`) misses on a length
+      // difference and the unblocked user stays in the Blocked Users list.
+      final normalizedDeleted =
+          userIDList.map(ffiService.normalizeToxId).toList();
       _notifyFriendshipListeners((listener) {
-        listener.onBlackListDeleted?.call(userIDList);
+        listener.onBlackListDeleted?.call(normalizedDeleted);
       });
 
       return V2TimValueCallback<List<V2TimFriendOperationResult>>(
