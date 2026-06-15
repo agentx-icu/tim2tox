@@ -3844,13 +3844,14 @@ class FfiChatService {
   /// lived only on the in-memory message and was lost on cold start).
   ///
   /// SCOPE (deliberate, documented): it is NOT sent over Tox (`_ffi.sendText`
-  /// carries plain text only — the peer never sees the quote). The C2C offline
-  /// queue DOES persist it (`_queueOfflineText` threads `cloudCustomData`
-  /// through, so a reply sent while the peer is offline keeps its quote on
-  /// reconnect/reload); only the GROUP offline queue drops it
-  /// (`_queueOfflineGroupText` is text-only) and the over-the-wire delivery
-  /// remain out of scope for this sender-side persistence fix (tracked
-  /// follow-ups).
+  /// carries plain text only — the peer never sees the quote). Both the C2C and
+  /// GROUP offline paths now persist it on the pending bubble IN-SESSION
+  /// (`_queueOfflineText`/`_queueOfflineGroupText` thread `cloudCustomData` into
+  /// the pending ChatMessage; the drain flips that same row to delivered). The
+  /// durable OfflineMessageItem queue entry is still text-only for both, so a
+  /// restart BEFORE reconnect drains as plain text — a pre-existing offline-
+  /// queue-schema gap (tracked follow-up). The over-the-wire delivery is also
+  /// out of scope for this sender-side persistence fix.
   Future<void> sendText(String peerId, String text,
       {String? cloudCustomData}) async {
     // Consume any armed reply-quote/forward cloudCustomData (the composer reply
@@ -5915,7 +5916,8 @@ class FfiChatService {
     // nowhere. Now: if we're not connected, queue the message and surface
     // it as pending; drain on the next conn:success.
     if (!_isConnected) {
-      await _queueOfflineGroupText(groupId, text);
+      await _queueOfflineGroupText(groupId, text,
+          cloudCustomData: cloudCustomData);
       return;
     }
     final pg = groupId.toNativeUtf8();
@@ -5941,7 +5943,8 @@ class FfiChatService {
     _messages.add(out);
   }
 
-  Future<void> _queueOfflineGroupText(String groupId, String text) async {
+  Future<void> _queueOfflineGroupText(String groupId, String text,
+      {String? cloudCustomData}) async {
     // INVARIANT (drain depends on this): the queue item and the pending row
     // MUST share this one `now` — `_sendPendingGroupMessages` identifies this
     // item's row by EXACT-ms timestamp equality. Don't split into two calls.
@@ -5967,6 +5970,14 @@ class FfiChatService {
       groupId: groupId,
       isPending: true,
       msgID: msgID,
+      // Persist the armed reply/forward metadata on the pending bubble so it
+      // survives in-session (drain flips this same row to delivered, keeping
+      // it). Parity with the C2C offline path. NOTE: the durable queue ITEM
+      // above is still text-only, so a restart BEFORE reconnect drains as plain
+      // text — a pre-existing OfflineMessageItem-schema gap that affects C2C too
+      // (tracked follow-up: add cloudCustomData to OfflineMessageItem + (de)
+      // serialize + preserve on drain).
+      cloudCustomData: cloudCustomData,
     );
     _lastByPeer[groupId] = msg;
     _appendHistory(groupId, msg);

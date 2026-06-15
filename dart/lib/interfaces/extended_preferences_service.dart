@@ -90,5 +90,13 @@ abstract class ExtendedPreferencesService extends PreferencesService {
   Future<int> getC2CReceiveMessageOpt(String userID, [String? userToxId]);
   Future<void> setC2CReceiveMessageOpt(String userID, int opt,
       [String? userToxId]);
+
+  // Group receive-message-opt (do-not-disturb / mute). Tox has no native group
+  // recv-opt, so it is persisted LOCALLY (account-scoped), mirroring the C2C
+  // pair above. 0 = receive, 2 = not-notify (mute). Bound to the current user
+  // Tox ID so two accounts in the same group can have independent DND.
+  Future<int> getGroupReceiveMessageOpt(String groupID, [String? userToxId]);
+  Future<void> setGroupReceiveMessageOpt(String groupID, int opt,
+      [String? userToxId]);
 }
 

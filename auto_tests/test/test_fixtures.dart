@@ -352,6 +352,24 @@ class MockPreferencesService implements ExtendedPreferencesService {
         : 'c2c_recv_opt_$userID';
     await setInt(key, opt);
   }
+
+  @override
+  Future<int> getGroupReceiveMessageOpt(String groupID,
+      [String? userToxId]) async {
+    final key = userToxId != null
+        ? 'group_recv_opt_${userToxId}_$groupID'
+        : 'group_recv_opt_$groupID';
+    return await getInt(key) ?? 0;
+  }
+
+  @override
+  Future<void> setGroupReceiveMessageOpt(String groupID, int opt,
+      [String? userToxId]) async {
+    final key = userToxId != null
+        ? 'group_recv_opt_${userToxId}_$groupID'
+        : 'group_recv_opt_$groupID';
+    await setInt(key, opt);
+  }
 }
 
 /// Mock logger service for testing

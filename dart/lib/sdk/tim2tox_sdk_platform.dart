@@ -5292,17 +5292,30 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
               '[Tim2ToxSdkPlatform] Sending merger message with compatibleText: "$compatibleText"');
           print(
               '[Tim2ToxSdkPlatform] Merger message cloudCustomData: ${messageToSend.cloudCustomData}');
-          // Defensive: clear any armed reply cloudCustomData so a prior (e.g.
-          // cancelled) reply can never bleed into this merger forward. The
-          // text-elem branch arms before its send and the send consumes it, so
-          // in steady state this is already null; this guards future refactors
-          // that might add an early-return between arm and send.
-          ffiService.armNextSendCloudCustomData(null);
-          await provider.sendText(
-            userID: userID,
-            groupID: groupID.isNotEmpty ? groupID : null,
-            text: compatibleText,
+          // Persist the FORWARD's OWN metadata (the merger cloudCustomData the
+          // UIKit built — e.g. {"mergerMessageIDs":[...]}) on the sent message,
+          // mirroring the text-elem reply persistence. Prefer the explicit
+          // cloudCustomData arg, else the merger message's own field. Arming the
+          // merger's value (not a blanket null) also subsumes the prior
+          // defensive clear: it OVERWRITES any stale armed reply (no bleed) AND
+          // carries the forward metadata through the provider interface (which
+          // can't pass it directly). The converter preserves it on cold reload.
+          // The finally clears it so a throw before the consuming send can't
+          // leak it into a later send.
+          ffiService.armNextSendCloudCustomData(
+            (cloudCustomData != null && cloudCustomData.isNotEmpty)
+                ? cloudCustomData
+                : messageToSend.cloudCustomData,
           );
+          try {
+            await provider.sendText(
+              userID: userID,
+              groupID: groupID.isNotEmpty ? groupID : null,
+              text: compatibleText,
+            );
+          } finally {
+            ffiService.armNextSendCloudCustomData(null);
+          }
           if (_debugLog)
             print('[Tim2ToxSdkPlatform] Merger message sent successfully');
         } else if (messageToSend.soundElem != null &&
@@ -7395,12 +7408,49 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
     required int opt,
   }) async {
     try {
-      // Tox doesn't support group message receive options
-      // For now, just return success
-      // The opt parameter can be:
-      // 0: Receive all messages
-      // 1: Receive only @ mentions
-      // 2: Do not receive messages
+      // Tox has no native group receive-opt, so persist it LOCALLY
+      // (account-scoped), mirroring setC2CReceiveMessageOpt. `_mapConv` projects
+      // it into the conversation recvOpt (the notification suppressor reads it)
+      // and `getGroupsInfo` projects it into V2TimGroupInfo.recvOpt (the
+      // group-profile do-not-disturb switch reflects it on reopen). opt:
+      // 0 = receive, 1 = @-only (treated as set), 2 = not-notify (mute).
+      final prefs = _prefs;
+      if (prefs == null) {
+        _log(
+          '[Tim2ToxSdkPlatform] setGroupReceiveMessageOpt: no preferences '
+          'service attached — dropping opt=$opt for groupID=$groupID. Caller '
+          'should inject ExtendedPreferencesService.',
+        );
+        return V2TimCallback(
+          code: -1,
+          desc:
+              'setGroupReceiveMessageOpt: no preferences service available, opt not persisted',
+        );
+      }
+      final currentUserToxId = ffiService.selfId;
+      if (currentUserToxId.isEmpty) {
+        return V2TimCallback(
+          code: -1,
+          desc:
+              'setGroupReceiveMessageOpt failed: user not logged in (no Tox ID)',
+        );
+      }
+      await prefs.setGroupReceiveMessageOpt(groupID, opt, currentUserToxId);
+      // Emit an IMMEDIATE conversation update so the mute takes effect at once —
+      // the conversation cache the notification suppressor (and the conversation
+      // list / profile switch) reads — not only on the next periodic rebuild.
+      // getConversation rebuilds via the converter, which now projects the
+      // persisted group recvOpt. Mirrors _refreshConversationPreviewC2C; closes
+      // the "a group message arrives in the window right after muting" race.
+      try {
+        final convRes = await getConversation(conversationID: 'group_$groupID');
+        final conv = convRes.data;
+        if (conv != null) {
+          _notifyConversationListeners((listener) {
+            listener.onConversationChanged?.call([conv]);
+          });
+        }
+      } catch (_) {}
       return V2TimCallback(
         code: 0,
         desc: 'success',
@@ -8710,6 +8760,13 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
           }
         } catch (_) {}
 
+        // Project the locally-persisted group DND so the group-profile
+        // do-not-disturb switch reflects the saved state on reopen (Tox has no
+        // native group recv-opt; see setGroupReceiveMessageOpt). 0 = receive,
+        // 2 = not-notify (mute).
+        final groupRecvOpt = await _prefs?.getGroupReceiveMessageOpt(
+                groupID, ffiService.selfId) ??
+            0;
         final groupInfo = V2TimGroupInfo(
           groupID: groupID,
           groupType: GroupType.Work,
@@ -8719,6 +8776,7 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
           notification: groupNotification,
           introduction: groupIntroduction,
           owner: groupOwner,
+          recvOpt: groupRecvOpt,
         );
 
         results.add(V2TimGroupInfoResult(

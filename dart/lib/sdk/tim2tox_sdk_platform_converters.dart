@@ -460,17 +460,18 @@ extension Tim2ToxSdkPlatformConverters on Tim2ToxSdkPlatform {
         ? fakeConv.conversationID.replaceFirst('group_', '')
         : fakeConv.conversationID.replaceFirst('c2c_', '');
 
-    // recvOpt is the per-peer DND state (0 = receive, 2 = mute). UIKit reads
-    // it back from V2TimConversation, so a stale 0 here makes the DND toggle
-    // appear to reset on every conversation refresh. Pull from prefs when
-    // available (only C2C currently — group DND has its own pathway and
-    // isn't routed through this prefs key shape).
-    if (!fakeConv.isGroup) {
+    // recvOpt is the per-peer/per-group DND state (0 = receive, 2 = mute). UIKit
+    // reads it back from V2TimConversation, so a stale 0 here makes the DND
+    // toggle appear to reset on every conversation refresh AND defeats the
+    // notification suppressor (which matches this conversation's recvOpt). Pull
+    // from prefs for BOTH C2C and group — Tox has no native group recv-opt, so
+    // group DND is persisted locally under its own key (mirrors C2C).
+    {
       final prefs = preferencesService ?? ffiService.preferencesService;
-      conv.recvOpt =
-          await prefs?.getC2CReceiveMessageOpt(peerId, ffiService.selfId) ?? 0;
-    } else {
-      conv.recvOpt = 0;
+      conv.recvOpt = (fakeConv.isGroup
+              ? await prefs?.getGroupReceiveMessageOpt(peerId, ffiService.selfId)
+              : await prefs?.getC2CReceiveMessageOpt(peerId, ffiService.selfId)) ??
+          0;
     }
 
     // Fallback faceUrl from prefs when not set so conversation list/header show correct avatar
