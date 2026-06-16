@@ -1,0 +1,43 @@
+From defc830f6d1b60e15353cbce23d10b58c08fb8bc Mon Sep 17 00:00:00 2001
+From: tim2tox-bootstrap <bootstrap@local>
+Date: Mon, 15 Jun 2026 20:22:06 -0700
+Subject: [PATCH] ios native-lib loader: resolve embedded FFI by absolute
+ bundle path
+
+On iOS the FFI artifact is embedded in the running app bundle's Frameworks/
+directory. dlopen of a relative path (e.g. 'tim2tox_ffi.framework/tim2tox_ffi')
+is resolved against the process working directory, not the bundle, so it does
+not reliably find an embedded artifact. Resolve an absolute path from
+Platform.resolvedExecutable instead (mirrors the macOS branch).
+---
+ lib/native_im/bindings/native_library_manager.dart | 14 ++++++++++++++
+ 1 file changed, 14 insertions(+)
+
+diff --git a/lib/native_im/bindings/native_library_manager.dart b/lib/native_im/bindings/native_library_manager.dart
+index 6334872..8e42b70 100644
+--- a/lib/native_im/bindings/native_library_manager.dart
++++ b/lib/native_im/bindings/native_library_manager.dart
+@@ -59,6 +59,20 @@ final DynamicLibrary _dylib = () {
+   }
+ 
+   if (Platform.isIOS) {
++    // Resolve an absolute path inside the running app bundle's Frameworks/
++    // directory; a relative dlopen path is resolved against the process working
++    // directory, not the bundle, and would not find the embedded FFI artifact.
++    final exeDir = File(Platform.resolvedExecutable).parent.path;
++    for (final path in [
++      '$exeDir/Frameworks/$libName.framework/$libName',
++      '$exeDir/Frameworks/lib$libName.dylib',
++    ]) {
++      if (File(path).existsSync()) {
++        try {
++          return DynamicLibrary.open(path);
++        } catch (_) {}
++      }
++    }
+     try {
+       return DynamicLibrary.open('$libName.framework/$libName');
+     } catch (e) {
+-- 
+2.50.1 (Apple Git-155)
+

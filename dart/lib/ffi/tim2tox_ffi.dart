@@ -792,18 +792,34 @@ class Tim2ToxFfi {
 
   /// Open library on iOS
   static Tim2ToxFfi _openIOS() {
-    final libName = 'libtim2tox_ffi.dylib';
-    
-    // On iOS, libraries are typically in the app bundle's Frameworks directory
+    // On iOS the FFI artifact is embedded in the running app bundle's
+    // Frameworks/ directory. dlopen of a *relative* path (e.g.
+    // 'tim2tox_ffi.framework/tim2tox_ffi') is resolved against the process
+    // working directory, not the bundle, so it does not reliably find an
+    // embedded artifact. Resolve an absolute path from the executable location
+    // instead — mirrors the macOS/Linux/Windows branches above.
+    final exeDir = File(Platform.resolvedExecutable).parent.path;
+    final candidates = <String>[
+      '$exeDir/Frameworks/tim2tox_ffi.framework/tim2tox_ffi',
+      '$exeDir/Frameworks/libtim2tox_ffi.dylib',
+    ];
+    for (final path in candidates) {
+      if (File(path).existsSync()) {
+        try {
+          return Tim2ToxFfi._(ffi.DynamicLibrary.open(path));
+        } catch (_) {
+          // Try the next candidate.
+        }
+      }
+    }
+
+    // Last-ditch fallbacks: let dyld resolve by partial/leaf name.
     try {
-      // Try framework first (preferred for iOS)
-      final frameworkPath = 'tim2tox_ffi.framework/tim2tox_ffi';
-      try {
-        return Tim2ToxFfi._(ffi.DynamicLibrary.open(frameworkPath));
-      } catch (_) {}
-      
-      // Fallback to dylib
-      return Tim2ToxFfi._(ffi.DynamicLibrary.open(libName));
+      return Tim2ToxFfi._(
+          ffi.DynamicLibrary.open('tim2tox_ffi.framework/tim2tox_ffi'));
+    } catch (_) {}
+    try {
+      return Tim2ToxFfi._(ffi.DynamicLibrary.open('libtim2tox_ffi.dylib'));
     } catch (e) {
       throw Exception('Failed to load tim2tox_ffi on iOS: $e');
     }

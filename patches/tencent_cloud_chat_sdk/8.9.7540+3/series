@@ -26,3 +26,4 @@
 0013-passthrough-update-friend-profile.patch
 0014-instance-tagged-listener-routing.patch
 0015-v2-tim-conversation-recv-opt-null-safety.patch
+0016-ios-native-lib-loader-resolve-embedded-FFI-by-absolu.patch
