@@ -1,0 +1,17 @@
+# Mach-O exported-symbols list for libtim2tox_ffi (macOS + iOS device/sim).
+#
+# Counterpart to tim2tox_ffi_exports.map (ELF/Android). Export ONLY the C FFI
+# ABI and hide the ~2.3k C++ mangled symbols + vendored libsodium/toxcore that
+# otherwise leak into the host Flutter process. Mach-O symbols carry a leading
+# underscore; ld64 supports '*' wildcards here.
+#
+# Exported surface is exactly what the Dart side dlsym's (verified against
+# native_imsdk_bindings_generated.dart + tim2tox_ffi.dart):
+#   _Dart*          the binary-replacement entrypoints + dart_api_dl pointers
+#   _tim2tox_ffi_*  the Platform-path C API
+#
+# NOTE: unlike the Android ELF map, this does NOT hide tox_* — the macOS/Linux
+# native test harness (account_export/tox_profile_factory.dart) dlsym's tox_*.
+_Dart*
+_tim2tox_ffi_*
+_tox_*

@@ -320,10 +320,13 @@ endif()
 
 # Platform-specific linker options
 if(APPLE)
-    # macOS: Use undefined dynamic lookup for Dart API DL functions
-    # These functions are provided by the Dart VM at runtime
+    # macOS / iOS: undefined dynamic lookup for the Dart API DL functions (the
+    # Dart VM provides them at runtime), PLUS an exported-symbols list so only
+    # the C FFI ABI is exported and the ~2.3k C++ mangled symbols + vendored
+    # libsodium symbols stay hidden in the host Flutter process. See
+    # ffi/tim2tox_ffi_exports_macho.txt (Mach-O counterpart of the Android map).
     set_target_properties(tim2tox_ffi PROPERTIES
-        LINK_FLAGS "-undefined dynamic_lookup"
+        LINK_FLAGS "-undefined dynamic_lookup -Wl,-exported_symbols_list,${CMAKE_CURRENT_SOURCE_DIR}/tim2tox_ffi_exports_macho.txt"
     )
 elseif(ANDROID)
     # Android ELF: export ONLY the C FFI ABI (the Dart* binary-replacement
