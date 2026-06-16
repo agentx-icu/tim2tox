@@ -1,0 +1,24 @@
+/*
+ * ELF dynamic-symbol export map for libtim2tox_ffi (Android only — see
+ * ffi/CMakeLists.txt; Linux keeps the full export surface for native tests).
+ *
+ * The shared library is loaded into the host Flutter process. Without this it
+ * also exports ~5k C++ mangled (_Z...) symbols plus the vendored libsodium /
+ * toxcore C symbols, which can collide with or interpose symbols already in the
+ * process. Export ONLY the actual C FFI ABI and hide everything else.
+ *
+ * The exported surface is exactly what the Dart side dlsym's:
+ *   - Dart*           the binary-replacement compat entrypoints (DartInitSDK,
+ *                     DartSet*Callback, DartHandle*, ...) + the dart_api_dl
+ *                     pointers (Dart_*_DL) the callback bridge uses internally;
+ *   - tim2tox_ffi_*   the Platform-path C API (tim2tox_ffi_init, _av_*, ...).
+ * Verified against native_imsdk_bindings_generated.dart and tim2tox_ffi.dart:
+ * the Dart side never looks up any other prefix.
+ */
+{
+  global:
+    Dart*;
+    tim2tox_ffi_*;
+  local:
+    *;
+};

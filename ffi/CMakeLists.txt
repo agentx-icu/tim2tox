@@ -325,6 +325,17 @@ if(APPLE)
     set_target_properties(tim2tox_ffi PROPERTIES
         LINK_FLAGS "-undefined dynamic_lookup"
     )
+elseif(ANDROID)
+    # Android ELF: export ONLY the C FFI ABI (the Dart* binary-replacement
+    # entrypoints + the tim2tox_ffi_* C API) and hide everything else — the ~5k
+    # C++ mangled symbols and the vendored libsodium/toxcore symbols — so the
+    # library can't collide with or interpose symbols in the host Flutter
+    # process. See ffi/tim2tox_ffi_exports.map. Scoped to Android deliberately:
+    # the Linux native test harness (e.g. account_export tox_profile_factory.dart)
+    # dlsym's tox_* directly, so Linux must keep the full export surface.
+    set_target_properties(tim2tox_ffi PROPERTIES
+        LINK_FLAGS "-Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/tim2tox_ffi_exports.map"
+    )
 endif()
 
 # Set library properties

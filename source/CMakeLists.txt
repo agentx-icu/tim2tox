@@ -177,15 +177,19 @@ else()
         -Wall
         -Wextra
         -Werror
-        # uint64_t/int64_t are 'unsigned long'/'long' on LP64 (Android/Linux
-        # arm64) but 'unsigned long long'/'long long' on Apple. The codebase's
-        # %llu/%lld debug-log format strings therefore trip -Wformat on LP64
-        # only — but the values are 64-bit either way, so the mismatch is benign
-        # at runtime. Keep the warning visible; don't fail the cross build on it.
-        -Wno-error=format
         -Wno-unused-parameter
         -fPIC
     )
+    if(NOT APPLE)
+        # uint64_t/int64_t are 'unsigned long'/'long' on LP64 (Android/Linux
+        # arm64), so the codebase's %llu/%lld debug-log format strings trip
+        # -Wformat there only — the values are 64-bit either way, so the mismatch
+        # is benign at runtime. Keep the warning visible but don't fail the
+        # cross build on it. Scoped to non-Apple deliberately: on Apple uint64_t
+        # IS 'unsigned long long', so %llu matches and -Werror=format stays on to
+        # catch genuinely wrong format strings (codex review 2026-06-16).
+        target_compile_options(tim2tox PRIVATE -Wno-error=format)
+    endif()
 endif()
 
 if(APPLE)

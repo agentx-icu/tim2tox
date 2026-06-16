@@ -2519,7 +2519,7 @@ V2TIMString V2TIMManagerImpl::SendGroupPrivateTextMessage(const V2TIMString& gro
     }
     uint64_t ts = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
     char msg_id_buf[80];
-    snprintf(msg_id_buf, sizeof(msg_id_buf), "gp%llu-%llu", ts, (unsigned long long)msg_id);
+    snprintf(msg_id_buf, sizeof(msg_id_buf), "gp%llu-%llu", (unsigned long long)ts, (unsigned long long)msg_id);
     V2TIMString msgID = msg_id_buf;
     if (callback) {
         V2TIMMessage resultMsg;
