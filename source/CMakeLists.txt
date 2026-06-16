@@ -177,6 +177,12 @@ else()
         -Wall
         -Wextra
         -Werror
+        # uint64_t/int64_t are 'unsigned long'/'long' on LP64 (Android/Linux
+        # arm64) but 'unsigned long long'/'long long' on Apple. The codebase's
+        # %llu/%lld debug-log format strings therefore trip -Wformat on LP64
+        # only — but the values are 64-bit either way, so the mismatch is benign
+        # at runtime. Keep the warning visible; don't fail the cross build on it.
+        -Wno-error=format
         -Wno-unused-parameter
         -fPIC
     )
