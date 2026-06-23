@@ -8993,6 +8993,44 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
             await completer.future;
         Tools.freePointers([pJsonParam, pUserData]);
 
+        // De-duplicate by normalized public key. A group member is uniquely
+        // identified by its 32-byte Tox public key, but the NGC peer enumeration
+        // underneath DartGetGroupMemberList is keyed by ephemeral per-session
+        // peer ids: when a peer churns (disconnect/reconnect — common on a
+        // single host running many instances) it can surface under multiple peer
+        // ids that all map to the SAME public key, so the raw list contains
+        // ghost duplicates of one member (member count grows across rapid
+        // create/leave cycles). V2TIM never returns a member twice, so collapse
+        // them here so every SDK consumer (member-list page, role/kick targeting,
+        // member-count gates) sees one entry per member. Keep the entry with the
+        // highest role (Owner > Admin > Member) so a ghost Member copy can't
+        // shadow the real Owner/Admin. Only rewrite when a genuine same-pubkey
+        // duplicate was collapsed (compare against the count of VALID entries,
+        // not the raw length which also counts skipped null/empty-userID
+        // elements) so the no-duplicate path leaves the original list untouched.
+        final rawList = result.data?.memberInfoList;
+        if (rawList != null && rawList.length > 1) {
+          final byPubkey = <String, V2TimGroupMemberFullInfo>{};
+          final order = <String>[];
+          var validCount = 0;
+          for (final m in rawList.whereType<V2TimGroupMemberFullInfo>()) {
+            if (m.userID.isEmpty) continue;
+            validCount++;
+            final pk = ConversationIdUtils.normalize(m.userID);
+            final existing = byPubkey[pk];
+            if (existing == null) {
+              byPubkey[pk] = m;
+              order.add(pk);
+            } else if ((m.role ?? 0) > (existing.role ?? 0)) {
+              byPubkey[pk] = m;
+            }
+          }
+          if (byPubkey.length != validCount) {
+            result.data!.memberInfoList =
+                [for (final pk in order) byPubkey[pk]!];
+          }
+        }
+
         // Fill faceUrl, nickName, and role from prefs
         if (result.data?.memberInfoList != null &&
             result.data!.memberInfoList!.isNotEmpty) {
