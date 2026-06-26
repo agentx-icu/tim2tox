@@ -1035,8 +1035,16 @@ void V2TIMFriendshipManagerImpl::AcceptFriendApplication(const V2TIMFriendApplic
         return;
     }
     
+    // Use the NORMALIZED 64-char public key (accept_norm_uid), not the raw
+    // userID: a full Tox ID is 76 hex chars (32-byte pubkey + nospam + checksum)
+    // and tox_hex_to_bytes into a TOX_PUBLIC_KEY_SIZE (32-byte) buffer requires
+    // exactly 64 hex chars, so passing the raw 76-char ID always failed with
+    // "Invalid UserID format". Real onion accepts happen to pass the 64-char
+    // pubkey (pending applications store it), but any caller accepting by full
+    // Tox ID (e.g. the seed/test path) hit this. Normalizing first makes accept
+    // robust to both forms.
     uint8_t public_key[TOX_PUBLIC_KEY_SIZE];
-    if (!tox_hex_to_bytes(application.userID.CString(), application.userID.Length(), public_key, TOX_PUBLIC_KEY_SIZE)) {
+    if (!tox_hex_to_bytes(accept_norm_uid.c_str(), accept_norm_uid.length(), public_key, TOX_PUBLIC_KEY_SIZE)) {
          V2TIM_LOG(kError, "[AcceptFriendApplication] Invalid UserID format");
          result.resultCode = ERR_INVALID_PARAMETERS;
          result.resultInfo = "Invalid UserID format";
@@ -1073,9 +1081,13 @@ void V2TIMFriendshipManagerImpl::AcceptFriendApplication(const V2TIMFriendApplic
         V2TIMFriendInfoVector friendList;
         friendList.PushBack(friendInfo);
         NotifyFriendListAdded(friendList);
-        // Remove from pending and notify UI so "new application" badge/list is cleared (auto-accept case)
+        // Remove from pending and notify UI so "new application" badge/list is cleared (auto-accept case).
+        // Use the NORMALIZED 64-char pubkey (accept_norm_uid), consistent with the
+        // friendInfo.userID above and the tox_hex_to_bytes accept: a pending
+        // application is keyed by the 64-char pubkey, so a raw 76-char Tox ID here
+        // would fail to match and leave the badge/row uncleared (codex/reviewer).
         V2TIMStringVector deleted_ids;
-        deleted_ids.PushBack(application.userID);
+        deleted_ids.PushBack(V2TIMString(accept_norm_uid.c_str()));
         NotifyFriendApplicationListDeleted(deleted_ids);
         // OPTIMIZATION: Refresh conversation cache asynchronously without blocking
         // The debounce mechanism in RefreshConversationCache will prevent excessive refreshes
