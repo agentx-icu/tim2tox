@@ -12,6 +12,7 @@
 #include <sstream> // For std::ostringstream
 #include <iomanip> // For std::setw, std::setfill
 #include <cstring> // For memcmp
+#include <cstdlib> // For std::getenv, std::strtol (TOX_TCP_RELAY_PORT)
 #include <cstdio> // For std::remove
 #include <cerrno> // For errno, EINTR
 #ifndef _WIN32
@@ -147,6 +148,53 @@ void ToxManager::initialize(const Tox_Options* options,
 
     // Enable Toxcore internal logging (WARNING + ERROR) to capture conference events
     tox_options_set_log_callback(opts, toxcore_log_callback);
+
+    // Optional: run a TCP relay (server) on a fixed port. Disabled by default
+    // (tcp_port=0). When TOX_TCP_RELAY_PORT is set (>0) this node listens for
+    // incoming TCP relay connections, letting peers that cannot reach it over
+    // UDP route through it instead. This is read HERE — the single tox_new
+    // chokepoint — rather than at the V2TIM options level, because the
+    // savedata/restore path (loadFromFile) builds its own Tox_Options and would
+    // otherwise drop the setting, leaving the logged-in account's tox without a
+    // relay. Unblocks a same-host macOS desktop <-> iOS-Simulator pair: the
+    // simulator's UDP loopback to the sandboxed desktop app does not deliver,
+    // but the simulator CAN open a TCP connection to a server on the host's
+    // localhost; the desktop peer sets this and the other peer reaches it via
+    // the tox_add_tcp_relay calls already issued by add_bootstrap_node (which
+    // probes port 3389). Production never sets the env var, so behaviour is
+    // unchanged for real clients and on mobile.
+    if (const char* relay_env = std::getenv("TOX_TCP_RELAY_PORT")) {
+        const long parsed = std::strtol(relay_env, nullptr, 10);
+        if (parsed > 0 && parsed <= 65535) {
+            tox_options_set_tcp_port(opts, static_cast<uint16_t>(parsed));
+            V2TIM_LOG(kInfo, "[ToxManager] initialize: TCP relay server enabled on port {}", parsed);
+        } else {
+            V2TIM_LOG(kWarning, "[ToxManager] initialize: ignoring out-of-range TOX_TCP_RELAY_PORT='{}' (want 1..65535)", relay_env);
+        }
+    }
+
+    // Optional: force TCP-only mode (disable the UDP socket). Read at the same
+    // tox_new chokepoint as TOX_TCP_RELAY_PORT and for the same reason (the
+    // savedata/restore path builds its own Tox_Options and would otherwise drop
+    // it). When TOX_FORCE_TCP_ONLY is set to a truthy value (1/true/yes/on) all
+    // traffic — DHT, friend connections AND NGC group routing — is carried over
+    // TCP relays instead of UDP. This deterministically sidesteps environments
+    // where same-host UDP loopback between two sandboxed processes is silently
+    // dropped (Parallels VM guest, iOS-Simulator-to-host): on those hosts an NGC
+    // peer that has flipped a connection to "direct" UDP would otherwise send
+    // every group message into a black hole (see group_connection.c
+    // gcc_send_packet / gcc_conn_is_direct). Pair this with a reachable TCP relay
+    // (the peer's TOX_TCP_RELAY_PORT server + the tox_add_tcp_relay calls
+    // add_bootstrap_node already issues). Production never sets the env var, so
+    // behaviour is unchanged for real clients and on mobile.
+    if (const char* tcp_only_env = std::getenv("TOX_FORCE_TCP_ONLY")) {
+        const std::string v(tcp_only_env);
+        const bool enable = (v == "1" || v == "true" || v == "TRUE" || v == "yes" || v == "on");
+        if (enable) {
+            tox_options_set_udp_enabled(opts, false);
+            V2TIM_LOG(kInfo, "[ToxManager] initialize: TCP-only mode enabled (UDP disabled) via TOX_FORCE_TCP_ONLY");
+        }
+    }
 
     V2TIM_LOG(kDebug, "[ToxManager] initialize: About to call tox_new with options");
     TOX_ERR_NEW err_new;

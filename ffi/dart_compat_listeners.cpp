@@ -989,7 +989,11 @@ public:
         json << "]";
         
         std::map<std::string, std::string> fields;
-        fields["json_identifier_array"] = json.str();
+        // Key MUST match what NativeLibraryManager._dispatchGlobalCallback reads
+        // for AddFriend ("friend_info_array"); a generic key delivers '' to Dart
+        // and json.decode('') throws FormatException (callback JSON shape is an
+        // ABI). Strings here are user IDs → Dart's getFriendsInfo fallback path.
+        fields["friend_info_array"] = json.str();
         std::string user_data = UserDataToString(GetCallbackUserData(instance_id, "AddFriend"));
         std::string json_msg = BuildGlobalCallbackJson(GlobalCallbackType::AddFriend, fields, user_data, instance_id);
         SendCallbackToDart("globalCallback", json_msg, GetCallbackUserData(instance_id, "AddFriend"));
@@ -1010,7 +1014,9 @@ public:
         json << "]";
         
         std::map<std::string, std::string> fields;
-        fields["json_identifier_array"] = json.str();
+        // Key MUST match the Dart DeleteFriend dispatch ("friend_id_array"); see
+        // the AddFriend note above on the callback-JSON-shape ABI.
+        fields["friend_id_array"] = json.str();
         int64_t instance_id = GetInstanceIdForListener(this);
         if (instance_id == 0) instance_id = GetCurrentInstanceId();
         std::string user_data = UserDataToString(GetCallbackUserData(instance_id, "DeleteFriend"));
@@ -1108,7 +1114,10 @@ public:
         json << "]";
         
         std::map<std::string, std::string> fields;
-        fields["json_identifier_array"] = json.str();
+        // Key MUST match the Dart FriendApplicationListDeleted dispatch
+        // ("json_user_id_array"); see the AddFriend note above on the
+        // callback-JSON-shape ABI. This is the friend-accept crash path.
+        fields["json_user_id_array"] = json.str();
         int64_t instance_id = GetInstanceIdForListener(this);
         if (instance_id == 0) instance_id = GetCurrentInstanceId();
         std::string user_data = UserDataToString(GetCallbackUserData(instance_id, "FriendApplicationListDeleted"));
@@ -1129,7 +1138,13 @@ public:
         int64_t instance_id = GetInstanceIdForListener(this);
         if (instance_id == 0) instance_id = GetCurrentInstanceId();
         
-        // Convert V2TIMFriendInfoVector to JSON array
+        // Emit an array of friend-info OBJECTS (not bare strings): the Dart
+        // FriendBlackListAdded dispatch does `whereType<Map>().map(V2TimFriendInfo
+        // .fromJson)`, so a string array would yield an empty list (the blocked
+        // userID would be silently dropped). userID is the only metadata Tox has
+        // at block time. `friendGroups:[]` is REQUIRED — V2TimFriendInfo.fromJson
+        // does `json['friendGroups'].cast<String>()` with no null guard, so a
+        // missing key would throw inside fromJson.
         // Note: userID should be 64-character public key (TOX_PUBLIC_KEY_SIZE * 2)
         std::ostringstream json;
         json << "[";
@@ -1139,12 +1154,16 @@ public:
             }
             const V2TIMFriendInfo& friendInfo = infoList[i];
             std::string user_id = friendInfo.userID.CString();
-            json << "\"" << EscapeJsonString(user_id) << "\"";
+            json << "{\"userID\":\"" << EscapeJsonString(user_id)
+                 << "\",\"friendGroups\":[]}";
         }
         json << "]";
-        
+
         std::map<std::string, std::string> fields;
-        fields["json_identifier_array"] = json.str();
+        // Key MUST match the Dart FriendBlackListAdded dispatch
+        // ("json_friend_info_array"); see the AddFriend note above on the
+        // callback-JSON-shape ABI.
+        fields["json_friend_info_array"] = json.str();
         std::string user_data = UserDataToString(GetCallbackUserData(instance_id, "FriendBlackListAdded"));
         std::string json_msg = BuildGlobalCallbackJson(GlobalCallbackType::FriendBlackListAdded, fields, user_data, instance_id);
         SendCallbackToDart("globalCallback", json_msg, GetCallbackUserData(instance_id, "FriendBlackListAdded"));
@@ -1168,7 +1187,10 @@ public:
         json << "]";
         
         std::map<std::string, std::string> fields;
-        fields["json_identifier_array"] = json.str();
+        // Key MUST match the Dart FriendBlackListDeleted dispatch
+        // ("json_user_id_array"); see the AddFriend note above on the
+        // callback-JSON-shape ABI.
+        fields["json_user_id_array"] = json.str();
         std::string user_data = UserDataToString(GetCallbackUserData(instance_id, "FriendBlackListDeleted"));
         std::string json_msg = BuildGlobalCallbackJson(GlobalCallbackType::FriendBlackListDeleted, fields, user_data, instance_id);
         SendCallbackToDart("globalCallback", json_msg, GetCallbackUserData(instance_id, "FriendBlackListDeleted"));

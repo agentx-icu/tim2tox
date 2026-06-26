@@ -1,0 +1,35 @@
+From 534a7f5b1d99c9f389b1c26f16de5d269b6a7708 Mon Sep 17 00:00:00 2001
+From: tim2tox-bootstrap <bootstrap@local>
+Date: Thu, 25 Jun 2026 02:31:12 -0700
+Subject: [PATCH] 0017-global-callback-dispatch-crash-safety: catch+log
+ malformed native callback payloads so a field-key mismatch (json.decode(''))
+ cannot crash the app
+
+---
+ lib/native_im/bindings/native_library_manager.dart | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+diff --git a/lib/native_im/bindings/native_library_manager.dart b/lib/native_im/bindings/native_library_manager.dart
+index 8e42b70..ea929fe 100644
+--- a/lib/native_im/bindings/native_library_manager.dart
++++ b/lib/native_im/bindings/native_library_manager.dart
+@@ -461,6 +461,16 @@ class NativeLibraryManager {
+     currentDispatchInstanceId = instanceId;
+     try {
+       _dispatchGlobalCallback(globalCallbackType, dataFromNativeMap);
++    } catch (e, st) {
++      // Defense-in-depth: a malformed or empty native callback payload (e.g. an
++      // upstream field-key mismatch delivering '' → json.decode('') →
++      // FormatException) must NEVER crash the whole app from the native
++      // callback pump. Log and continue so the offending event stays
++      // diagnosable while the app survives. The correct fix for any such case
++      // is to repair the field name at its origin (the tim2tox FFI callback
++      // bridge, ffi/dart_compat_listeners.cpp); this catch is only a backstop.
++      print(
++          'TIM_SDK: _dispatchGlobalCallback($globalCallbackType) threw $e\n$st');
+     } finally {
+       currentDispatchInstanceId = prevDispatchInstanceId;
+     }
+-- 
+2.50.1 (Apple Git-155)
+
