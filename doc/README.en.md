@@ -46,4 +46,4 @@
 ## Example client
 
 - [Main README](../README.en.md)
-- A client that uses Tim2Tox is [toxee](https://github.com/anonymoussoft/toxee). For its documentation and account/session details, see the [toxee repository](https://github.com/anonymoussoft/toxee); when Tim2Tox is used as a submodule, the parent repo’s `doc/` may also apply.
+- A client that uses Tim2Tox is [toxee](https://github.com/agentx-icu/toxee). For its documentation and account/session details, see the [toxee repository](https://github.com/agentx-icu/toxee); when Tim2Tox is used as a submodule, the parent repo’s `doc/` may also apply.

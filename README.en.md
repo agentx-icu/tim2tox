@@ -128,7 +128,7 @@ The stack is split into four layers from bottom to top. **Two call entry points*
 
 Tim2Tox supports **binary replacement** (minimal code change, swap library only) and **Platform / FfiChatService** (history, polling, Bootstrap, calls implemented on the Dart side). You can use one or both (hybrid). For path comparison, choice guide, and **five integration steps**, see [doc/integration/INTEGRATION_OVERVIEW.en.md](doc/integration/INTEGRATION_OVERVIEW.en.md).
 
-**Clients using Tim2Tox**: An example client that uses this repo is [toxee](https://github.com/anonymoussoft/toxee) (a Flutter chat client based on Tox; hybrid setup, interface implementations, Bootstrap, history are documented there).
+**Clients using Tim2Tox**: An example client that uses this repo is [toxee](https://github.com/agentx-icu/toxee) (a Flutter chat client based on Tox; hybrid setup, interface implementations, Bootstrap, history are documented there).
 
 ---
 

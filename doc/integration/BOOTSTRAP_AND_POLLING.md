@@ -114,4 +114,4 @@ Tim2Tox 侧仅依赖接口：
 
 - [ARCHITECTURE.md](../architecture/ARCHITECTURE.md)
 - [API 参考](../api/API_REFERENCE.md)
-- 示例客户端的启动、Bootstrap 与账号会话说明见该客户端项目文档，例如 [toxee](https://github.com/anonymoussoft/toxee)（当 Tim2Tox 作为 submodule 被使用时，常见于上层仓库的 doc）。
+- 示例客户端的启动、Bootstrap 与账号会话说明见该客户端项目文档，例如 [toxee](https://github.com/agentx-icu/toxee)（当 Tim2Tox 作为 submodule 被使用时，常见于上层仓库的 doc）。

@@ -46,4 +46,4 @@
 ## 示例客户端
 
 - [主 README](../README.md)
-- 使用 Tim2Tox 的客户端包括 [toxee](https://github.com/anonymoussoft/toxee)。其文档与账号/会话说明见 [toxee 仓库](https://github.com/anonymoussoft/toxee)；当 Tim2Tox 作为 submodule 被使用时，也可在上层仓库的 `doc/` 中查看。
+- 使用 Tim2Tox 的客户端包括 [toxee](https://github.com/agentx-icu/toxee)。其文档与账号/会话说明见 [toxee 仓库](https://github.com/agentx-icu/toxee)；当 Tim2Tox 作为 submodule 被使用时，也可在上层仓库的 `doc/` 中查看。

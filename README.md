@@ -128,7 +128,7 @@
 
 Tim2Tox 支持**二进制替换**（最少改业务、仅换库）与 **Platform / FfiChatService**（历史、轮询、Bootstrap、通话等由 Dart 实现）两种接入方式，可择一或混合使用。路径对比、选择建议与**集成五步**见 [doc/integration/INTEGRATION_OVERVIEW.md](doc/integration/INTEGRATION_OVERVIEW.md)。
 
-**使用 Tim2Tox 的客户端**：当前采用本仓库的示例客户端包括 [toxee](https://github.com/anonymoussoft/toxee)（基于 Tox 的 Flutter 聊天客户端，混合架构、接口实现、Bootstrap 与历史等见其项目文档）。
+**使用 Tim2Tox 的客户端**：当前采用本仓库的示例客户端包括 [toxee](https://github.com/agentx-icu/toxee)（基于 Tox 的 Flutter 聊天客户端，混合架构、接口实现、Bootstrap 与历史等见其项目文档）。
 
 ---
 

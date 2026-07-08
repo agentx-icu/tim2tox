@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 **Tim2Tox** is a reusable **compatibility layer / framework** that lets a V2TIM-style caller (Tencent Cloud Chat UIKit, or any client built against `tencent_cloud_chat_sdk`) run against the **Tox P2P network** instead of Tencent Cloud IM. It is *not* a finished client and *not* a thin Tox protocol wrapper — it implements V2TIM semantics (login, messages, friends, groups, conversations, signaling) on top of `c-toxcore` and preserves the native SDK's callback JSON contract so existing listeners and UI code keep working.
 
-The canonical integrating client is [`toxee`](https://github.com/anonymoussoft/toxee), which vendors this repo at `third_party/tim2tox`. **Tim2Tox does not depend on toxee.** Anything client-specific (account model, UI, FakeUIKit, persistence wiring) belongs in toxee, not here.
+The canonical integrating client is [`toxee`](https://github.com/agentx-icu/toxee), which vendors this repo at `third_party/tim2tox`. **Tim2Tox does not depend on toxee.** Anything client-specific (account model, UI, FakeUIKit, persistence wiring) belongs in toxee, not here.
 
 Authoritative architecture deep-dive: `doc/architecture/ARCHITECTURE.en.md`. FFI/binary-replacement boundary: `doc/architecture/FFI_COMPAT_LAYER.en.md` and `doc/architecture/BINARY_REPLACEMENT.en.md`. Build doc: `README_BUILD.md`.
 

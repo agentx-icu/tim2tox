@@ -31,7 +31,7 @@
 4. **Platform (if used)**: `TencentCloudChatSdkPlatform.instance = Tim2ToxSdkPlatform(ffiService: ffiService, ...)`.
 5. **UIKit**: Use Tencent Cloud Chat UIKit as usual; login, send message, conversation list, etc. will go through Tim2Tox to Tox.
 
-**Reference implementation**: A client that uses Tim2Tox is [toxee](https://github.com/anonymoussoft/toxee); for hybrid setup, interface implementations, Bootstrap, history, see [toxee’s documentation](https://github.com/anonymoussoft/toxee).
+**Reference implementation**: A client that uses Tim2Tox is [toxee](https://github.com/agentx-icu/toxee); for hybrid setup, interface implementations, Bootstrap, history, see [toxee’s documentation](https://github.com/agentx-icu/toxee).
 
 ---
 

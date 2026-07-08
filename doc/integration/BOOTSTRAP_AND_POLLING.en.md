@@ -114,4 +114,4 @@ For concrete implementation and maintenance order, see each client repo’s docu
 
 - [ARCHITECTURE.en.md](../architecture/ARCHITECTURE.en.md)
 - [API Reference](../api/API_REFERENCE.en.md)
-- For an example client’s startup, Bootstrap, and account/session docs, see that client’s project, e.g. [toxee](https://github.com/anonymoussoft/toxee) (when Tim2Tox is used as a submodule, the parent repo’s doc).
+- For an example client’s startup, Bootstrap, and account/session docs, see that client’s project, e.g. [toxee](https://github.com/agentx-icu/toxee) (when Tim2Tox is used as a submodule, the parent repo’s doc).

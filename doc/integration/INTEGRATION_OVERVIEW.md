@@ -31,7 +31,7 @@
 4. **Platform（若用）**：`TencentCloudChatSdkPlatform.instance = Tim2ToxSdkPlatform(ffiService: ffiService, ...)`。
 5. **UIKit**：按原有方式使用 Tencent Cloud Chat UIKit，登录、发消息、会话列表等会经 Tim2Tox 落到 Tox。
 
-**参考实现**：使用 Tim2Tox 的客户端包括 [toxee](https://github.com/anonymoussoft/toxee)；混合架构、接口实现、Bootstrap 与历史等见 [toxee 文档](https://github.com/anonymoussoft/toxee)。
+**参考实现**：使用 Tim2Tox 的客户端包括 [toxee](https://github.com/agentx-icu/toxee)；混合架构、接口实现、Bootstrap 与历史等见 [toxee 文档](https://github.com/agentx-icu/toxee)。
 
 ---
 

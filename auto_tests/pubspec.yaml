@@ -35,7 +35,7 @@ dependency_overrides:
     # `-8.7.7201` suffix that no longer exists post-bootstrap.
     path: ../../tencent_cloud_chat_sdk
   # tim2tox/dart imports tencent_cloud_chat_common/external/chat_message_provider.dart,
-  # which only exists in the anonymoussoft/chat-uikit-flutter fork. Without
+  # which only exists in the agentx-icu/chat-uikit-flutter fork. Without
   # this override `flutter test` resolves the public pub.dev package and
   # fails to compile tim2tox_sdk_platform.dart. Mirror toxee's overrides
   # at toxee/pubspec_overrides.yaml.
