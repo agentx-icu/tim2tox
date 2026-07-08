@@ -4,6 +4,7 @@
 #include "IrcClientManager.h"
 #include "V2TIMLog.h"
 #include <cstdio>
+#include <mutex>
 
 namespace {
     irc_message_callback_t g_irc_callback = nullptr;
@@ -16,6 +17,7 @@ namespace {
     void* g_user_list_user_data = nullptr;
     irc_user_join_part_callback_t g_user_join_part_callback = nullptr;
     void* g_user_join_part_user_data = nullptr;
+    std::mutex g_callback_mutex;
 }
 
 extern "C" {
@@ -23,58 +25,86 @@ extern "C" {
 int irc_client_init(void) {
     // Set up callbacks
     IrcClientManager::getInstance().setToxMessageCallback([](const std::string& group_id, const std::string& sender_nick, const std::string& message) {
-        if (g_irc_callback) {
-            g_irc_callback(group_id.c_str(), sender_nick.c_str(), message.c_str(), g_irc_user_data);
+        irc_message_callback_t callback = nullptr;
+        void* user_data = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(g_callback_mutex);
+            callback = g_irc_callback;
+            user_data = g_irc_user_data;
+        }
+        if (callback) {
+            callback(group_id.c_str(), sender_nick.c_str(), message.c_str(), user_data);
         }
     });
     
     // Set up connection status callback
     IrcClientManager::getInstance().setConnectionStatusCallback([](const std::string& channel, IrcClientManager::ConnectionStatus status, const std::string& message) {
-        if (g_connection_status_callback) {
-            irc_connection_status_t c_status;
-            switch (status) {
-                case IrcClientManager::ConnectionStatus::Disconnected:
-                    c_status = IRC_CONNECTION_DISCONNECTED;
-                    break;
-                case IrcClientManager::ConnectionStatus::Connecting:
-                    c_status = IRC_CONNECTION_CONNECTING;
-                    break;
-                case IrcClientManager::ConnectionStatus::Connected:
-                    c_status = IRC_CONNECTION_CONNECTED;
-                    break;
-                case IrcClientManager::ConnectionStatus::Authenticating:
-                    c_status = IRC_CONNECTION_AUTHENTICATING;
-                    break;
-                case IrcClientManager::ConnectionStatus::Reconnecting:
-                    c_status = IRC_CONNECTION_RECONNECTING;
-                    break;
-                case IrcClientManager::ConnectionStatus::Error:
-                    c_status = IRC_CONNECTION_ERROR;
-                    break;
-                default:
-                    c_status = IRC_CONNECTION_DISCONNECTED;
-                    break;
-            }
-            g_connection_status_callback(channel.c_str(), c_status, message.empty() ? nullptr : message.c_str(), g_connection_status_user_data);
+        irc_connection_status_t c_status;
+        switch (status) {
+            case IrcClientManager::ConnectionStatus::Disconnected:
+                c_status = IRC_CONNECTION_DISCONNECTED;
+                break;
+            case IrcClientManager::ConnectionStatus::Connecting:
+                c_status = IRC_CONNECTION_CONNECTING;
+                break;
+            case IrcClientManager::ConnectionStatus::Connected:
+                c_status = IRC_CONNECTION_CONNECTED;
+                break;
+            case IrcClientManager::ConnectionStatus::Authenticating:
+                c_status = IRC_CONNECTION_AUTHENTICATING;
+                break;
+            case IrcClientManager::ConnectionStatus::Reconnecting:
+                c_status = IRC_CONNECTION_RECONNECTING;
+                break;
+            case IrcClientManager::ConnectionStatus::Error:
+                c_status = IRC_CONNECTION_ERROR;
+                break;
+            default:
+                c_status = IRC_CONNECTION_DISCONNECTED;
+                break;
+        }
+        irc_connection_status_callback_t callback = nullptr;
+        void* user_data = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(g_callback_mutex);
+            callback = g_connection_status_callback;
+            user_data = g_connection_status_user_data;
+        }
+        if (callback) {
+            callback(channel.c_str(), c_status, message.empty() ? nullptr : message.c_str(), user_data);
         }
     });
     
     // Set up user list callback
     IrcClientManager::getInstance().setUserListCallback([](const std::string& channel, const std::vector<std::string>& users) {
-        if (g_user_list_callback) {
-            std::string users_str;
-            for (size_t i = 0; i < users.size(); ++i) {
-                if (i > 0) users_str += ",";
-                users_str += users[i];
-            }
-            g_user_list_callback(channel.c_str(), users_str.empty() ? nullptr : users_str.c_str(), g_user_list_user_data);
+        std::string users_str;
+        for (size_t i = 0; i < users.size(); ++i) {
+            if (i > 0) users_str += ",";
+            users_str += users[i];
+        }
+        irc_user_list_callback_t callback = nullptr;
+        void* user_data = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(g_callback_mutex);
+            callback = g_user_list_callback;
+            user_data = g_user_list_user_data;
+        }
+        if (callback) {
+            callback(channel.c_str(), users_str.empty() ? nullptr : users_str.c_str(), user_data);
         }
     });
     
     // Set up user join/part callback
     IrcClientManager::getInstance().setUserJoinPartCallback([](const std::string& channel, const std::string& nickname, bool joined) {
-        if (g_user_join_part_callback) {
-            g_user_join_part_callback(channel.c_str(), nickname.c_str(), joined ? 1 : 0, g_user_join_part_user_data);
+        irc_user_join_part_callback_t callback = nullptr;
+        void* user_data = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(g_callback_mutex);
+            callback = g_user_join_part_callback;
+            user_data = g_user_join_part_user_data;
+        }
+        if (callback) {
+            callback(channel.c_str(), nickname.c_str(), joined ? 1 : 0, user_data);
         }
     });
     
@@ -156,11 +186,13 @@ int irc_client_is_connected(const char* channel) {
 }
 
 void irc_client_set_message_callback(irc_message_callback_t callback, void* user_data) {
+    std::lock_guard<std::mutex> lock(g_callback_mutex);
     g_irc_callback = callback;
     g_irc_user_data = user_data;
 }
 
 void irc_client_set_tox_message_callback(tox_group_message_callback_t callback, void* user_data) {
+    std::lock_guard<std::mutex> lock(g_callback_mutex);
     g_tox_callback = callback;
     g_tox_user_data = user_data;
     
@@ -181,19 +213,21 @@ int irc_client_forward_tox_message(const char* group_id, const char* sender, con
 }
 
 void irc_client_set_connection_status_callback(irc_connection_status_callback_t callback, void* user_data) {
+    std::lock_guard<std::mutex> lock(g_callback_mutex);
     g_connection_status_callback = callback;
     g_connection_status_user_data = user_data;
 }
 
 void irc_client_set_user_list_callback(irc_user_list_callback_t callback, void* user_data) {
+    std::lock_guard<std::mutex> lock(g_callback_mutex);
     g_user_list_callback = callback;
     g_user_list_user_data = user_data;
 }
 
 void irc_client_set_user_join_part_callback(irc_user_join_part_callback_t callback, void* user_data) {
+    std::lock_guard<std::mutex> lock(g_callback_mutex);
     g_user_join_part_callback = callback;
     g_user_join_part_user_data = user_data;
 }
 
 } // extern "C"
-

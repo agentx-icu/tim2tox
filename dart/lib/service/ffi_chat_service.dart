@@ -165,8 +165,9 @@ const bool _avatarBroadcastAsChatFileEnabled = true;
 // loop, NOT on Tox's background event_thread. Because of the async hop, the
 // C-side allocates heap copies of the hex public_key and IP strings via
 // strdup() and transfers ownership here; we must free() them after reading.
-// userData is cast to int64_t (instance_id) for routing to the correct service
-// instance.
+// userData encodes the instance_id directly in the pointer address. Do not
+// dereference it: listener callbacks may be queued after unregister, so a
+// heap-owned pointer would be vulnerable to use-after-free.
 @pragma('vm:entry-point')
 void _dhtNodesResponseTrampoline(ffi.Pointer<pkgffi.Utf8> publicKeyPtr,
     ffi.Pointer<pkgffi.Utf8> ipPtr, int port, ffi.Pointer<ffi.Void> userData) {
@@ -183,14 +184,7 @@ void _dhtNodesResponseTrampoline(ffi.Pointer<pkgffi.Utf8> publicKeyPtr,
       return;
     }
 
-    // Extract instance ID from userData (cast void* to int64_t).
-    int instanceId = 0;
-    if (userData.address != 0) {
-      // userData points to an int64_t value (instance_id) allocated by Dart in
-      // setDhtNodesResponseCallback; this pointer is heap-stable for the
-      // lifetime of the callback registration.
-      instanceId = userData.cast<ffi.Int64>().value;
-    }
+    final instanceId = userData.address;
 
     // Route to the correct service instance based on instance ID.
     FfiChatService? targetService;
@@ -245,39 +239,96 @@ final _nativeCbPtr =
 @pragma('vm:entry-point')
 void _ircConnectionStatusTrampoline(ffi.Pointer<pkgffi.Utf8> channel,
     int status, ffi.Pointer<pkgffi.Utf8> message, ffi.Pointer<ffi.Void> user) {
-  final ch = channel.cast<pkgffi.Utf8>().toDartString();
-  final msg =
-      message.address != 0 ? message.cast<pkgffi.Utf8>().toDartString() : null;
-  _globalService?._onIrcConnectionStatus(ch, status, msg);
+  try {
+    final ch =
+        channel.address != 0 ? channel.cast<pkgffi.Utf8>().toDartString() : '';
+    final msg = message.address != 0
+        ? message.cast<pkgffi.Utf8>().toDartString()
+        : null;
+    _ircCallbacksOwner?._onIrcConnectionStatus(ch, status, msg);
+  } finally {
+    if (channel.address != 0) {
+      pkgffi.calloc.free(channel);
+    }
+    if (message.address != 0) {
+      pkgffi.calloc.free(message);
+    }
+  }
 }
 
 @pragma('vm:entry-point')
 void _ircUserListTrampoline(ffi.Pointer<pkgffi.Utf8> channel,
     ffi.Pointer<pkgffi.Utf8> users, ffi.Pointer<ffi.Void> user) {
-  final ch = channel.cast<pkgffi.Utf8>().toDartString();
-  final usersStr =
-      users.address != 0 ? users.cast<pkgffi.Utf8>().toDartString() : '';
-  final usersList = usersStr.isEmpty ? <String>[] : usersStr.split(',');
-  _globalService?._onIrcUserList(ch, usersList);
+  try {
+    final ch =
+        channel.address != 0 ? channel.cast<pkgffi.Utf8>().toDartString() : '';
+    final usersStr =
+        users.address != 0 ? users.cast<pkgffi.Utf8>().toDartString() : '';
+    final usersList = usersStr.isEmpty ? <String>[] : usersStr.split(',');
+    _ircCallbacksOwner?._onIrcUserList(ch, usersList);
+  } finally {
+    if (channel.address != 0) {
+      pkgffi.calloc.free(channel);
+    }
+    if (users.address != 0) {
+      pkgffi.calloc.free(users);
+    }
+  }
 }
 
 @pragma('vm:entry-point')
 void _ircUserJoinPartTrampoline(ffi.Pointer<pkgffi.Utf8> channel,
     ffi.Pointer<pkgffi.Utf8> nickname, int joined, ffi.Pointer<ffi.Void> user) {
-  final ch = channel.cast<pkgffi.Utf8>().toDartString();
-  final nick = nickname.cast<pkgffi.Utf8>().toDartString();
-  _globalService?._onIrcUserJoinPart(ch, nick, joined != 0);
+  try {
+    final ch =
+        channel.address != 0 ? channel.cast<pkgffi.Utf8>().toDartString() : '';
+    final nick = nickname.address != 0
+        ? nickname.cast<pkgffi.Utf8>().toDartString()
+        : '';
+    _ircCallbacksOwner?._onIrcUserJoinPart(ch, nick, joined != 0);
+  } finally {
+    if (channel.address != 0) {
+      pkgffi.calloc.free(channel);
+    }
+    if (nickname.address != 0) {
+      pkgffi.calloc.free(nickname);
+    }
+  }
 }
 
-final _ircConnectionStatusCbPtr =
-    ffi.Pointer.fromFunction<_irc_connection_status_callback_native>(
-        _ircConnectionStatusTrampoline);
-final _ircUserListCbPtr =
-    ffi.Pointer.fromFunction<_irc_user_list_callback_native>(
-        _ircUserListTrampoline);
-final _ircUserJoinPartCbPtr =
-    ffi.Pointer.fromFunction<_irc_user_join_part_callback_native>(
-        _ircUserJoinPartTrampoline);
+ffi.NativeCallable<_irc_connection_status_callback_native>?
+    _ircConnectionStatusCallable;
+ffi.NativeCallable<_irc_user_list_callback_native>? _ircUserListCallable;
+ffi.NativeCallable<_irc_user_join_part_callback_native>?
+    _ircUserJoinPartCallable;
+FfiChatService? _ircCallbacksOwner;
+
+ffi.Pointer<ffi.NativeFunction<_irc_connection_status_callback_native>>
+    _ircConnectionStatusNativeFunction() {
+  _ircConnectionStatusCallable ??=
+      ffi.NativeCallable<_irc_connection_status_callback_native>.listener(
+    _ircConnectionStatusTrampoline,
+  );
+  return _ircConnectionStatusCallable!.nativeFunction;
+}
+
+ffi.Pointer<ffi.NativeFunction<_irc_user_list_callback_native>>
+    _ircUserListNativeFunction() {
+  _ircUserListCallable ??=
+      ffi.NativeCallable<_irc_user_list_callback_native>.listener(
+    _ircUserListTrampoline,
+  );
+  return _ircUserListCallable!.nativeFunction;
+}
+
+ffi.Pointer<ffi.NativeFunction<_irc_user_join_part_callback_native>>
+    _ircUserJoinPartNativeFunction() {
+  _ircUserJoinPartCallable ??=
+      ffi.NativeCallable<_irc_user_join_part_callback_native>.listener(
+    _ircUserJoinPartTrampoline,
+  );
+  return _ircUserJoinPartCallable!.nativeFunction;
+}
 
 /// Resolves on-disk paths for [FfiChatService] without coupling tim2tox to
 /// any particular client (toxee, examples, auto_tests). When an integrator
@@ -498,6 +549,7 @@ class FfiChatService {
   /// R-08: Async login: completer completed when native login callback fires.
   Completer<({int success, int code, String message})>? _pendingLoginCompleter;
   ffi.NativeCallable<_login_callback_native>? _loginNativeCallable;
+  int? _dhtNodesResponseRegisteredInstanceId;
 
   /// Get the preferences service (for use by SDK Platform)
   ExtendedPreferencesService? get preferencesService => _prefs;
@@ -1305,12 +1357,7 @@ class FfiChatService {
 
     // Register IRC callbacks if library is loaded
     if (_ffi.ircIsLibraryLoaded() == 1) {
-      _ffi.ircSetConnectionStatusCallback(
-          _ircConnectionStatusCbPtr, ffi.Pointer.fromAddress(0));
-      _ffi.ircSetUserListCallback(
-          _ircUserListCbPtr, ffi.Pointer.fromAddress(0));
-      _ffi.ircSetUserJoinPartCallback(
-          _ircUserJoinPartCbPtr, ffi.Pointer.fromAddress(0));
+      _registerIrcCallbacks();
     }
     final savedGroups = await _prefs?.getGroups() ?? <String>{};
     final quitGroups = await _prefs?.getQuitGroups() ?? <String>{};
@@ -4281,9 +4328,8 @@ class FfiChatService {
     String? nickName,
   }) {
     final norm = _normalizeApplicationUserId(userId);
-    final already = _seededApplications
-        .any((a) => _normalizeApplicationUserId(a.userId) == norm
-            && a.wording == wording);
+    final already = _seededApplications.any((a) =>
+        _normalizeApplicationUserId(a.userId) == norm && a.wording == wording);
     if (!already) {
       _seededApplications.add((userId: norm, wording: wording));
     }
@@ -4371,8 +4417,8 @@ class FfiChatService {
     final normalized = _normalizeApplicationUserId(userID);
     // Drop any locally-seeded application for this user first — it has no C++
     // backing entry, so the dismissed-fingerprint path below cannot filter it.
-    _seededApplications
-        .removeWhere((a) => _normalizeApplicationUserId(a.userId) == normalized);
+    _seededApplications.removeWhere(
+        (a) => _normalizeApplicationUserId(a.userId) == normalized);
     _seededApplicationNicknames.remove(normalized);
     final apps = await _getFriendApplicationsUnfiltered();
     final liveWordings = apps
@@ -4853,7 +4899,8 @@ class FfiChatService {
     }
     final ms = epochMs ?? DateTime.now().millisecondsSinceEpoch;
     final sequence = _msgIDSequence++;
-    final fromUserId = isSelf ? (_selfId.isNotEmpty ? _selfId : convKey) : convKey;
+    final fromUserId =
+        isSelf ? (_selfId.isNotEmpty ? _selfId : convKey) : convKey;
     final msgID = '${ms}_${sequence}_$convKey';
     final msg = ChatMessage(
       text: text,
@@ -5803,12 +5850,7 @@ class FfiChatService {
       final result = _ffi.ircLoadLibrary(plibPath);
       if (result == 1) {
         // Register IRC callbacks after library is loaded
-        _ffi.ircSetConnectionStatusCallback(
-            _ircConnectionStatusCbPtr, ffi.Pointer.fromAddress(0));
-        _ffi.ircSetUserListCallback(
-            _ircUserListCbPtr, ffi.Pointer.fromAddress(0));
-        _ffi.ircSetUserJoinPartCallback(
-            _ircUserJoinPartCbPtr, ffi.Pointer.fromAddress(0));
+        _registerIrcCallbacks();
       }
       return result == 1;
     } finally {
@@ -6630,6 +6672,16 @@ class FfiChatService {
     _dhtNodesResponseCallback?.call(publicKey, ip, port);
   }
 
+  void _registerIrcCallbacks() {
+    _ffi.ircSetConnectionStatusCallback(
+        _ircConnectionStatusNativeFunction(), ffi.Pointer.fromAddress(0));
+    _ffi.ircSetUserListCallback(
+        _ircUserListNativeFunction(), ffi.Pointer.fromAddress(0));
+    _ffi.ircSetUserJoinPartCallback(
+        _ircUserJoinPartNativeFunction(), ffi.Pointer.fromAddress(0));
+    _ircCallbacksOwner = this;
+  }
+
   /// Set DHT nodes response callback
   /// callback: callback function (publicKey, ip, port) -> void
   /// Note: This callback may be called from Tox's background thread
@@ -6637,6 +6689,7 @@ class FfiChatService {
   void setDhtNodesResponseCallback(
       void Function(String publicKey, String ip, int port) callback) {
     _dhtNodesResponseCallback = callback;
+    _clearDhtNodesResponseRegistration();
 
     // Get current instance ID for routing
     // Note: This requires that setCurrentInstance has been called before setting the callback
@@ -6659,26 +6712,20 @@ class FfiChatService {
         _knownInstanceIds.add(currentInstanceId!);
       });
 
-      // Create user_data pointer containing the instance ID. Heap-allocated
-      // so it remains valid across thread hops when the listener posts the
-      // call to the isolate.
-      final instanceIdPtr = pkgffi.malloc<ffi.Int64>();
-      instanceIdPtr.value = currentInstanceId;
-
       // Bind via NativeCallable.listener so the trampoline is invoked on this
       // isolate's event loop instead of Tox's background event_thread. The
       // shared listener routes by instance_id (userData) to the right service.
-      _ffi.setDhtNodesResponseCallbackNative(currentInstanceId!,
-          _dhtNodesResponseNativeFunction(), instanceIdPtr.cast());
-
-      // Note: We don't free instanceIdPtr here because it needs to persist
-      // for the callback lifetime. It will be freed when the callback is
-      // unregistered or the service is disposed.
+      _ffi.setDhtNodesResponseCallbackNative(
+          currentInstanceId!,
+          _dhtNodesResponseNativeFunction(),
+          ffi.Pointer<ffi.Void>.fromAddress(currentInstanceId!));
+      _dhtNodesResponseRegisteredInstanceId = currentInstanceId;
     } else {
       // Fallback to global service for default instance (backward compatibility)
       _globalService = this;
       _ffi.setDhtNodesResponseCallbackNative(
           0, _dhtNodesResponseNativeFunction(), ffi.nullptr);
+      _dhtNodesResponseRegisteredInstanceId = 0;
     }
   }
 
@@ -6693,6 +6740,39 @@ class FfiChatService {
       // If FFI call fails, return null (default instance)
       return null;
     }
+  }
+
+  void _clearDhtNodesResponseRegistration() {
+    final registeredInstanceId = _dhtNodesResponseRegisteredInstanceId;
+    if (registeredInstanceId != null) {
+      try {
+        _ffi.setDhtNodesResponseCallbackNative(
+            registeredInstanceId, ffi.nullptr, ffi.nullptr);
+      } catch (_) {}
+      if (registeredInstanceId != 0) {
+        synchronized(_instanceServicesLock, () {
+          _instanceServices.remove(registeredInstanceId);
+          _knownInstanceIds.remove(registeredInstanceId);
+        });
+      }
+      _dhtNodesResponseRegisteredInstanceId = null;
+    }
+  }
+
+  void _clearIrcCallbacks() {
+    if (_ircCallbacksOwner != this) {
+      return;
+    }
+    if (_ffi.ircIsLibraryLoaded() != 1) {
+      _ircCallbacksOwner = null;
+      return;
+    }
+    try {
+      _ffi.ircSetConnectionStatusCallback(ffi.nullptr, ffi.nullptr);
+      _ffi.ircSetUserListCallback(ffi.nullptr, ffi.nullptr);
+      _ffi.ircSetUserJoinPartCallback(ffi.nullptr, ffi.nullptr);
+    } catch (_) {}
+    _ircCallbacksOwner = null;
   }
 
   String? getDhtId() {
@@ -7844,6 +7924,8 @@ class FfiChatService {
     if (_globalService == this) {
       _globalService = null;
     }
+    _clearIrcCallbacks();
+    _clearDhtNodesResponseRegistration();
     _lastSentPathByPeer.clear();
 
     if (_instanceId != null && _instanceId! != 0) {

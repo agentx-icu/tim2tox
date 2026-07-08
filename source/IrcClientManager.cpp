@@ -9,6 +9,7 @@
   typedef int socklen_t;
   typedef long long ssize_t;
   #define IRC_CLOSE_SOCKET(s) closesocket(s)
+  #define IRC_SHUTDOWN_SOCKET(s) ::shutdown((s), SD_BOTH)
   #define IRC_ERRNO WSAGetLastError()
   #define IRC_EINPROGRESS WSAEWOULDBLOCK
   static void irc_set_nonblocking(int sock, bool nonblocking) {
@@ -24,6 +25,7 @@
   #include <fcntl.h>
   #include <sys/ioctl.h>
   #define IRC_CLOSE_SOCKET(s) close(s)
+  #define IRC_SHUTDOWN_SOCKET(s) ::shutdown((s), SHUT_RDWR)
   #define IRC_ERRNO errno
   #define IRC_EINPROGRESS EINPROGRESS
   static void irc_set_nonblocking(int sock, bool nonblocking) {
@@ -40,6 +42,7 @@
 #include <cstdio>
 #include <sstream>
 #include <algorithm>
+#include <cctype>
 #include <vector>
 #include <chrono>
 #include <thread>
@@ -63,6 +66,93 @@
 #if defined(__MACH__) && !defined(MSG_NOSIGNAL)
 #define MSG_NOSIGNAL 0
 #endif
+
+namespace {
+
+struct ParsedIrcMessage {
+    std::string prefix;
+    std::string command;
+    std::vector<std::string> params;
+    std::string trailing;
+    bool has_trailing = false;
+};
+
+std::string trim_copy(std::string value) {
+    const auto first = value.find_first_not_of(" \t\r\n");
+    if (first == std::string::npos) return "";
+    const auto last = value.find_last_not_of(" \t\r\n");
+    return value.substr(first, last - first + 1);
+}
+
+std::string upper_copy(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(),
+                   [](unsigned char c) {
+                       return static_cast<char>(std::toupper(c));
+                   });
+    return value;
+}
+
+ParsedIrcMessage parse_irc_message(const std::string& raw_line) {
+    ParsedIrcMessage parsed;
+    std::string rest = trim_copy(raw_line);
+    if (rest.empty()) return parsed;
+
+    if (rest[0] == ':') {
+        const auto space = rest.find(' ');
+        if (space == std::string::npos) {
+            parsed.prefix = rest.substr(1);
+            return parsed;
+        }
+        parsed.prefix = rest.substr(1, space - 1);
+        rest = trim_copy(rest.substr(space + 1));
+    }
+
+    const auto command_end = rest.find(' ');
+    if (command_end == std::string::npos) {
+        parsed.command = upper_copy(rest);
+        return parsed;
+    }
+
+    parsed.command = upper_copy(rest.substr(0, command_end));
+    rest = trim_copy(rest.substr(command_end + 1));
+
+    while (!rest.empty()) {
+        if (rest[0] == ':') {
+            parsed.has_trailing = true;
+            parsed.trailing = rest.substr(1);
+            break;
+        }
+
+        const auto space = rest.find(' ');
+        if (space == std::string::npos) {
+            parsed.params.push_back(rest);
+            break;
+        }
+
+        parsed.params.push_back(rest.substr(0, space));
+        rest = trim_copy(rest.substr(space + 1));
+    }
+
+    return parsed;
+}
+
+std::string nickname_from_prefix(const std::string& prefix) {
+    const auto bang = prefix.find('!');
+    if (bang != std::string::npos) return prefix.substr(0, bang);
+    const auto at = prefix.find('@');
+    if (at != std::string::npos) return prefix.substr(0, at);
+    return prefix;
+}
+
+bool params_contain_channel(const ParsedIrcMessage& message,
+                            const std::string& channel) {
+    if (message.has_trailing && message.trailing == channel) return true;
+    return std::any_of(message.params.begin(), message.params.end(),
+                       [&](const std::string& param) {
+                           return param == channel;
+                       });
+}
+}  // namespace
 
 IrcClientManager& IrcClientManager::getInstance() {
     static IrcClientManager instance;
@@ -163,7 +253,9 @@ bool IrcClientManager::sendIrcCommand(int sock, const std::string& command) {
 
 // Send IRC command (with SSL support)
 bool IrcClientManager::sendIrcCommand(IrcChannel* channel, const std::string& command) {
-    if (channel->sock_fd < 0) {
+    std::lock_guard<std::mutex> io_lock(channel->io_mutex);
+    const int sock_fd = channel->sock_fd.load();
+    if (sock_fd < 0) {
         return false;
     }
     
@@ -176,7 +268,7 @@ bool IrcClientManager::sendIrcCommand(IrcChannel* channel, const std::string& co
     if (channel->use_ssl && channel->ssl) {
         sent = sslSend((SSL*)channel->ssl, cmd.c_str(), cmd.length());
     } else {
-        sent = send(channel->sock_fd, cmd.c_str(), cmd.length(), MSG_NOSIGNAL);
+        sent = send(sock_fd, cmd.c_str(), cmd.length(), MSG_NOSIGNAL);
     }
     
     if (sent < 0) {
@@ -196,53 +288,36 @@ void IrcClientManager::handlePing(IrcChannel* channel, const std::string& line) 
     }
 }
 
-void IrcClientManager::handlePrivmsg(IrcChannel* channel, const std::string& line) {
-    // Parse PRIVMSG: :nick!user@host PRIVMSG #channel :message
-    size_t colon1 = line.find(':');
-    if (colon1 == std::string::npos) return;
-    
-    size_t space1 = line.find(' ', colon1 + 1);
-    if (space1 == std::string::npos) return;
-    
-    size_t exclamation = line.find('!', colon1 + 1);
-    std::string sender_nick;
-    if (exclamation != std::string::npos && exclamation < space1) {
-        sender_nick = line.substr(colon1 + 1, exclamation - colon1 - 1);
-    } else {
-        sender_nick = line.substr(colon1 + 1, space1 - colon1 - 1);
+bool IrcClientManager::sendJoinIfNeeded(IrcChannel* channel) {
+    if (channel->join_sent) return true;
+    std::string join_cmd = "JOIN " + channel->channel;
+    if (!channel->password.empty()) {
+        join_cmd += " " + channel->password;
     }
-    
-    // Find PRIVMSG
-    size_t privmsg_pos = line.find("PRIVMSG", space1);
-    if (privmsg_pos == std::string::npos) return;
-    
-    // Find channel name
-    size_t channel_start = line.find(' ', privmsg_pos + 7) + 1;
-    if (channel_start == std::string::npos || channel_start >= line.length()) return;
-    
-    size_t colon2 = line.find(':', channel_start);
-    if (colon2 == std::string::npos) return;
-    
-    std::string msg_channel = line.substr(channel_start, colon2 - channel_start);
-    // Remove leading/trailing spaces
-    msg_channel.erase(0, msg_channel.find_first_not_of(" \t"));
-    msg_channel.erase(msg_channel.find_last_not_of(" \t") + 1);
-    
-    // Check if this message is for our channel
-    if (msg_channel != channel->channel) {
+    channel->join_sent = true;
+    return sendIrcCommand(channel, join_cmd);
+}
+
+void IrcClientManager::handlePrivmsg(IrcChannel* channel, const std::string& line) {
+    const auto parsed = parse_irc_message(line);
+    if (parsed.command != "PRIVMSG" || parsed.params.empty() ||
+        !parsed.has_trailing) {
         return;
     }
+
+    const std::string sender_nick = nickname_from_prefix(parsed.prefix);
+    const std::string& msg_channel = parsed.params[0];
+
+    if (msg_channel != channel->channel) return;
+    const std::string message = parsed.trailing;
     
-    // Extract message
-    std::string message = line.substr(colon2 + 1);
-    // Remove trailing \r\n
-    while (!message.empty() && (message.back() == '\n' || message.back() == '\r')) {
-        message.pop_back();
+    std::function<void(const std::string&, const std::string&, const std::string&)> tox_message_callback;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        tox_message_callback = tox_message_callback_;
     }
-    
-    // Call callback to send to Tox
-    if (tox_message_callback_) {
-        tox_message_callback_(channel->group_id, sender_nick, message);
+    if (tox_message_callback) {
+        tox_message_callback(channel->group_id, sender_nick, message);
     }
     
     V2TIM_LOG(kInfo, "[IRC] PRIVMSG from {} in {}: {}", sender_nick, channel->channel, message);
@@ -250,54 +325,51 @@ void IrcClientManager::handlePrivmsg(IrcChannel* channel, const std::string& lin
 
 void IrcClientManager::processIrcMessage(IrcChannel* channel, const std::string& line) {
     if (line.empty()) return;
+    const auto parsed = parse_irc_message(line);
+    if (parsed.command.empty()) return;
     
     // Handle PING
-    if (line.length() >= 4 && line.substr(0, 4) == "PING") {
+    if (parsed.command == "PING") {
         handlePing(channel, line);
         return;
     }
     
     // Handle PRIVMSG
-    if (line.find("PRIVMSG") != std::string::npos) {
+    if (parsed.command == "PRIVMSG") {
         handlePrivmsg(channel, line);
         return;
     }
     
     // Handle JOIN confirmation
-    if (line.find("JOIN") != std::string::npos) {
-        // Check if it's our own JOIN or another user's JOIN
-        if (line.find(channel->channel) != std::string::npos) {
-            // Check if it's our own JOIN (no : prefix before JOIN)
-            size_t join_pos = line.find("JOIN");
-            if (join_pos > 0 && line[join_pos - 1] == ' ') {
-                // This is our own JOIN
-                V2TIM_LOG(kInfo, "[IRC] Successfully joined {}", channel->channel);
-                channel->connected = true;
-                updateConnectionStatus(channel, ConnectionStatus::Connected, "Connected to channel");
-                // Request user list
-                sendIrcCommand(channel, "NAMES " + channel->channel);
-            } else {
-                // Another user joined
-                handleJoinPart(channel, line, true);
-            }
+    if (parsed.command == "JOIN" && params_contain_channel(parsed, channel->channel)) {
+        const auto nick = nickname_from_prefix(parsed.prefix);
+        const auto current_nick = generateNickname(channel);
+        if (!nick.empty() && nick == current_nick) {
+            V2TIM_LOG(kInfo, "[IRC] Successfully joined {}", channel->channel);
+            channel->connected = true;
+            updateConnectionStatus(channel, ConnectionStatus::Connected, "Connected to channel");
+            sendIrcCommand(channel, "NAMES " + channel->channel);
+        } else {
+            handleJoinPart(channel, line, true);
         }
         return;
     }
     
     // Handle PART
-    if (line.find("PART") != std::string::npos && line.find(channel->channel) != std::string::npos) {
+    if ((parsed.command == "PART" || parsed.command == "QUIT") &&
+        (parsed.command == "QUIT" || params_contain_channel(parsed, channel->channel))) {
         handleJoinPart(channel, line, false);
         return;
     }
     
     // Handle NAMES response (353 RPL_NAMREPLY)
-    if (line.length() >= 3 && line.substr(0, 3) == "353") {
+    if (parsed.command == "353") {
         handleNamesResponse(channel, line);
         return;
     }
     
     // Handle end of NAMES list (366 RPL_ENDOFNAMES)
-    if (line.length() >= 3 && line.substr(0, 3) == "366") {
+    if (parsed.command == "366") {
         // NAMES list complete
         return;
     }
@@ -318,22 +390,19 @@ void IrcClientManager::processIrcMessage(IrcChannel* channel, const std::string&
     }
     
     // Handle AUTHENTICATE responses
-    if (line.find("AUTHENTICATE") != std::string::npos) {
+    if (parsed.command == "AUTHENTICATE") {
         handleSaslAuth(channel, line);
         return;
     }
     
     // Handle numeric responses (001 = welcome, etc.)
-    if (line.length() >= 3 && line[0] >= '0' && line[0] <= '9') {
-        std::string code = line.substr(0, 3);
+    if (parsed.command.length() == 3 &&
+        parsed.command[0] >= '0' && parsed.command[0] <= '9') {
+        const std::string& code = parsed.command;
         if (code == "001" || code == "002" || code == "003") {
             // Server welcome, but only join channel if SASL is done (or not using SASL)
             if (!channel->use_sasl || channel->sasl_authenticated) {
-                std::string join_cmd = "JOIN " + channel->channel;
-                if (!channel->password.empty()) {
-                    join_cmd += " " + channel->password;
-                }
-                sendIrcCommand(channel, join_cmd);
+                sendJoinIfNeeded(channel);
             }
         } else if (code == "900" || code == "903") {
             // SASL authentication successful
@@ -342,11 +411,7 @@ void IrcClientManager::processIrcMessage(IrcChannel* channel, const std::string&
             // End CAP negotiation
             sendIrcCommand(channel, "CAP END");
             // Now join channel
-            std::string join_cmd = "JOIN " + channel->channel;
-            if (!channel->password.empty()) {
-                join_cmd += " " + channel->password;
-            }
-            sendIrcCommand(channel->sock_fd, join_cmd);
+            sendJoinIfNeeded(channel);
         } else if (code == "904" || code == "905") {
             // SASL authentication failed
             V2TIM_LOG(kError, "[IRC] SASL authentication failed: {}", line);
@@ -355,9 +420,6 @@ void IrcClientManager::processIrcMessage(IrcChannel* channel, const std::string&
         } else if (code == "433") {
             // ERR_NICKNAMEINUSE - Nickname already in use
             handleNickConflict(channel);
-        } else if (code == "001" || code == "002" || code == "003") {
-            // Server welcome messages
-            updateConnectionStatus(channel, ConnectionStatus::Connected, "Connected to server");
         } else if (code == "004" || code == "005") {
             // Server capabilities/info
             // Continue
@@ -380,14 +442,15 @@ void IrcClientManager::channelThread(IrcChannel* channel) {
     
     // Connect to server (with retry logic)
     while (!channel->should_stop) {
-        channel->sock_fd = connectToServer(channel->server, channel->port, channel->use_ssl);
-        if (channel->sock_fd >= 0) {
+        const int connected_sock = connectToServer(channel->server, channel->port, channel->use_ssl);
+        channel->sock_fd.store(connected_sock);
+        if (connected_sock >= 0) {
             // Perform SSL handshake if needed
             if (channel->use_ssl) {
                 if (!performSslHandshake(channel)) {
                     V2TIM_LOG(kError, "[IRC] SSL handshake failed");
-                    IRC_CLOSE_SOCKET(channel->sock_fd);
-                    channel->sock_fd = -1;
+                    IRC_CLOSE_SOCKET(channel->sock_fd.load());
+                    channel->sock_fd.store(-1);
                     // Try to reconnect
                     attemptReconnect(channel);
                     if (channel->should_stop) {
@@ -399,6 +462,7 @@ void IrcClientManager::channelThread(IrcChannel* channel) {
             }
             
             channel->reconnect_attempts = 0; // Reset on successful connection
+            channel->join_sent = false;
             break;
         }
         
@@ -412,7 +476,7 @@ void IrcClientManager::channelThread(IrcChannel* channel) {
         std::this_thread::sleep_for(std::chrono::seconds(IrcChannel::reconnect_delay_seconds));
     }
     
-    if (channel->sock_fd < 0) {
+    if (channel->sock_fd.load() < 0) {
         updateConnectionStatus(channel, ConnectionStatus::Error, "Failed to connect to server");
         return;
     }
@@ -435,15 +499,19 @@ void IrcClientManager::channelThread(IrcChannel* channel) {
     std::string line_buffer;
     
     while (!channel->should_stop) {
+        const int sock_fd = channel->sock_fd.load();
+        if (sock_fd < 0) {
+            break;
+        }
         fd_set read_fds;
         FD_ZERO(&read_fds);
-        FD_SET(channel->sock_fd, &read_fds);
+        FD_SET(sock_fd, &read_fds);
         
         struct timeval timeout;
         timeout.tv_sec = 1;
         timeout.tv_usec = 0;
         
-        int ret = select(channel->sock_fd + 1, &read_fds, nullptr, nullptr, &timeout);
+        int ret = select(sock_fd + 1, &read_fds, nullptr, nullptr, &timeout);
         if (ret < 0) {
 #ifdef _WIN32
             break;
@@ -458,12 +526,18 @@ void IrcClientManager::channelThread(IrcChannel* channel) {
             continue;
         }
         
-        if (FD_ISSET(channel->sock_fd, &read_fds)) {
+        if (FD_ISSET(sock_fd, &read_fds)) {
             ssize_t n;
-            if (channel->use_ssl && channel->ssl) {
-                n = sslRecv((SSL*)channel->ssl, buffer, sizeof(buffer) - 1);
-            } else {
-                n = recv(channel->sock_fd, buffer, sizeof(buffer) - 1, 0);
+            {
+                std::lock_guard<std::mutex> io_lock(channel->io_mutex);
+                if (sock_fd != channel->sock_fd.load()) {
+                    continue;
+                }
+                if (channel->use_ssl && channel->ssl) {
+                    n = sslRecv((SSL*)channel->ssl, buffer, sizeof(buffer) - 1);
+                } else {
+                    n = recv(sock_fd, buffer, sizeof(buffer) - 1, 0);
+                }
             }
             if (n <= 0) {
                 if (n == 0) {
@@ -478,7 +552,7 @@ void IrcClientManager::channelThread(IrcChannel* channel) {
                 // Try to reconnect if not explicitly stopped
                 if (!channel->should_stop) {
                     attemptReconnect(channel);
-                    if (channel->sock_fd < 0) {
+                    if (channel->sock_fd.load() < 0) {
                         // Reconnect failed, wait and retry in next iteration
                         std::this_thread::sleep_for(std::chrono::seconds(IrcChannel::reconnect_delay_seconds));
                         continue;
@@ -508,9 +582,22 @@ void IrcClientManager::channelThread(IrcChannel* channel) {
     }
     
     // Cleanup
-    if (channel->sock_fd >= 0) {
-        IRC_CLOSE_SOCKET(channel->sock_fd);
-        channel->sock_fd = -1;
+    {
+        std::lock_guard<std::mutex> io_lock(channel->io_mutex);
+        if (channel->ssl) {
+            SSL_shutdown((SSL*)channel->ssl);
+            SSL_free((SSL*)channel->ssl);
+            channel->ssl = nullptr;
+        }
+        if (channel->ssl_ctx) {
+            SSL_CTX_free((SSL_CTX*)channel->ssl_ctx);
+            channel->ssl_ctx = nullptr;
+        }
+        const int sock_fd = channel->sock_fd.load();
+        if (sock_fd >= 0) {
+            IRC_CLOSE_SOCKET(sock_fd);
+            channel->sock_fd.store(-1);
+        }
     }
     channel->connected = false;
     updateConnectionStatus(channel, ConnectionStatus::Disconnected, "Thread ended");
@@ -526,6 +613,11 @@ bool IrcClientManager::connectChannel(const std::string& server, int port,
                                       bool use_ssl,
                                       const std::string& custom_nickname) {
     std::lock_guard<std::mutex> lock(mutex_);
+
+    if (shutting_down_) {
+        V2TIM_LOG(kError, "[IRC] Refusing channel {} while shutdown is in progress", channel);
+        return false;
+    }
     
     // Check if channel already exists
     if (channels_.find(channel) != channels_.end()) {
@@ -533,7 +625,7 @@ bool IrcClientManager::connectChannel(const std::string& server, int port,
         return false;
     }
     
-    auto irc_channel = std::make_unique<IrcChannel>();
+    auto irc_channel = std::make_shared<IrcChannel>();
     irc_channel->server = server;
     irc_channel->port = port;
     irc_channel->channel = channel;
@@ -563,7 +655,7 @@ bool IrcClientManager::connectChannel(const std::string& server, int port,
     // Start thread
     irc_channel->thread = std::make_unique<std::thread>(&IrcClientManager::channelThread, this, irc_channel.get());
     
-    channels_[channel] = std::move(irc_channel);
+    channels_[channel] = irc_channel;
     
     V2TIM_LOG(kInfo, "[IRC] Connecting to {}:{}, channel {}{}{}", server, port, channel,
               use_sasl ? " (with SASL)" : "",
@@ -572,40 +664,40 @@ bool IrcClientManager::connectChannel(const std::string& server, int port,
 }
 
 bool IrcClientManager::disconnectChannel(const std::string& channel) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    
-    auto it = channels_.find(channel);
-    if (it == channels_.end()) {
-        return false;
+    std::shared_ptr<IrcChannel> channel_to_disconnect;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto it = channels_.find(channel);
+        if (it == channels_.end()) {
+            return false;
+        }
+
+        IrcChannel* irc_channel = it->second.get();
+        irc_channel->should_stop = true;
+        irc_channel->connected = false;
+        const int sock_fd = irc_channel->sock_fd.load();
+        if (sock_fd >= 0) {
+            IRC_SHUTDOWN_SOCKET(sock_fd);
+        }
+
+        channel_to_disconnect = it->second;
     }
-    
-    IrcChannel* irc_channel = it->second.get();
-    irc_channel->should_stop = true;
-    
-    // Cleanup SSL
-    if (irc_channel->ssl) {
-        SSL_shutdown((SSL*)irc_channel->ssl);
-        SSL_free((SSL*)irc_channel->ssl);
-        irc_channel->ssl = nullptr;
+
+    if (channel_to_disconnect) {
+        std::lock_guard<std::mutex> lifecycle_lock(channel_to_disconnect->lifecycle_mutex);
+        if (channel_to_disconnect->thread && channel_to_disconnect->thread->joinable()) {
+            channel_to_disconnect->thread->join();
+        }
     }
-    if (irc_channel->ssl_ctx) {
-        SSL_CTX_free((SSL_CTX*)irc_channel->ssl_ctx);
-        irc_channel->ssl_ctx = nullptr;
+
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto it = channels_.find(channel);
+        if (it != channels_.end() && it->second == channel_to_disconnect) {
+            channels_.erase(it);
+        }
     }
-    
-    // Close socket to wake up thread
-    if (irc_channel->sock_fd >= 0) {
-        IRC_CLOSE_SOCKET(irc_channel->sock_fd);
-        irc_channel->sock_fd = -1;
-    }
-    
-    // Wait for thread
-    if (irc_channel->thread && irc_channel->thread->joinable()) {
-        irc_channel->thread->join();
-    }
-    
-    channels_.erase(it);
-    
+
     V2TIM_LOG(kInfo, "[IRC] Disconnected channel {}", channel);
     return true;
 }
@@ -652,8 +744,13 @@ void IrcClientManager::setToxGroupMessageCallback(std::function<void(const std::
 
 void IrcClientManager::onToxGroupMessage(const std::string& group_id, const std::string& sender, const std::string& message) {
     // Call external callback if set (for dynamic library)
-    if (tox_group_message_callback_) {
-        tox_group_message_callback_(group_id, sender, message);
+    std::function<void(const std::string&, const std::string&, const std::string&)> callback;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        callback = tox_group_message_callback_;
+    }
+    if (callback) {
+        callback(group_id, sender, message);
         return;
     }
     
@@ -672,23 +769,34 @@ void IrcClientManager::onToxGroupMessage(const std::string& group_id, const std:
 }
 
 void IrcClientManager::shutdown() {
-    std::lock_guard<std::mutex> lock(mutex_);
-    
-    for (auto& pair : channels_) {
-        pair.second->should_stop = true;
-        if (pair.second->sock_fd >= 0) {
-            IRC_CLOSE_SOCKET(pair.second->sock_fd);
-            pair.second->sock_fd = -1;
+    std::vector<std::shared_ptr<IrcChannel>> channels_to_disconnect;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        shutting_down_ = true;
+
+        for (auto& pair : channels_) {
+            pair.second->should_stop = true;
+            pair.second->connected = false;
+            const int sock_fd = pair.second->sock_fd.load();
+            if (sock_fd >= 0) {
+                IRC_SHUTDOWN_SOCKET(sock_fd);
+            }
+            channels_to_disconnect.push_back(pair.second);
         }
     }
-    
-    for (auto& pair : channels_) {
-        if (pair.second->thread && pair.second->thread->joinable()) {
-            pair.second->thread->join();
+
+    for (auto& irc_channel : channels_to_disconnect) {
+        std::lock_guard<std::mutex> lifecycle_lock(irc_channel->lifecycle_mutex);
+        if (irc_channel->thread && irc_channel->thread->joinable()) {
+            irc_channel->thread->join();
         }
     }
-    
-    channels_.clear();
+
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        channels_.clear();
+        shutting_down_ = false;
+    }
 }
 
 void IrcClientManager::handleSaslAuth(IrcChannel* channel, const std::string& line) {
@@ -732,8 +840,13 @@ std::string IrcClientManager::base64Encode(const std::string& data) {
 // 更新连接状态
 void IrcClientManager::updateConnectionStatus(IrcChannel* channel, ConnectionStatus status, const std::string& message) {
     channel->status = status;
-    if (connection_status_callback_) {
-        connection_status_callback_(channel->channel, status, message);
+    ConnectionStatusCallback callback;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        callback = connection_status_callback_;
+    }
+    if (callback) {
+        callback(channel->channel, status, message);
     }
 }
 
@@ -780,14 +893,29 @@ void IrcClientManager::attemptReconnect(IrcChannel* channel) {
                           "Reconnecting (attempt " + std::to_string(channel->reconnect_attempts) + ")");
     
     // Close old socket
-    if (channel->sock_fd >= 0) {
-        IRC_CLOSE_SOCKET(channel->sock_fd);
-        channel->sock_fd = -1;
+    channel->connected = false;
+    {
+        std::lock_guard<std::mutex> io_lock(channel->io_mutex);
+        if (channel->ssl) {
+            SSL_shutdown((SSL*)channel->ssl);
+            SSL_free((SSL*)channel->ssl);
+            channel->ssl = nullptr;
+        }
+        if (channel->ssl_ctx) {
+            SSL_CTX_free((SSL_CTX*)channel->ssl_ctx);
+            channel->ssl_ctx = nullptr;
+        }
+        const int sock_fd = channel->sock_fd.load();
+        if (sock_fd >= 0) {
+            IRC_CLOSE_SOCKET(sock_fd);
+            channel->sock_fd.store(-1);
+        }
     }
     
     // Try to reconnect
-    channel->sock_fd = connectToServer(channel->server, channel->port, channel->use_ssl);
-    if (channel->sock_fd < 0) {
+    const int connected_sock = connectToServer(channel->server, channel->port, channel->use_ssl);
+    channel->sock_fd.store(connected_sock);
+    if (connected_sock < 0) {
         V2TIM_LOG(kError, "[IRC] Reconnect attempt {} failed for {}",
                   channel->reconnect_attempts, channel->channel);
         return;
@@ -797,8 +925,8 @@ void IrcClientManager::attemptReconnect(IrcChannel* channel) {
     if (channel->use_ssl) {
         if (!performSslHandshake(channel)) {
             V2TIM_LOG(kError, "[IRC] SSL handshake failed on reconnect");
-            IRC_CLOSE_SOCKET(channel->sock_fd);
-            channel->sock_fd = -1;
+            IRC_CLOSE_SOCKET(channel->sock_fd.load());
+            channel->sock_fd.store(-1);
             return;
         }
     }
@@ -806,6 +934,7 @@ void IrcClientManager::attemptReconnect(IrcChannel* channel) {
     // Reset reconnect attempts on successful connection
     channel->reconnect_attempts = 0;
     channel->sasl_authenticated = false;
+    channel->join_sent = false;
     
     // Re-send NICK and USER
     std::string nick = generateNickname(channel);
@@ -822,27 +951,37 @@ void IrcClientManager::attemptReconnect(IrcChannel* channel) {
 void IrcClientManager::handleNamesResponse(IrcChannel* channel, const std::string& line) {
     // Format: :server 353 nickname = #channel :nick1 nick2 nick3
     // Or: :server 353 nickname @ #channel :@op1 +voice1 nick2
-    size_t colon_pos = line.find_last_of(':');
-    if (colon_pos == std::string::npos) return;
+    const auto parsed = parse_irc_message(line);
+    if (parsed.command != "353" || !parsed.has_trailing) return;
+    if (!params_contain_channel(parsed, channel->channel)) return;
+
+    const std::string& names_str = parsed.trailing;
+    std::vector<std::string> users;
+    {
+        std::lock_guard<std::mutex> lock(channel->user_list_mutex);
+        channel->user_list.clear();
     
-    std::string names_str = line.substr(colon_pos + 1);
-    std::lock_guard<std::mutex> lock(channel->user_list_mutex);
-    channel->user_list.clear();
-    
-    std::istringstream iss(names_str);
-    std::string name;
-    while (iss >> name) {
-        // Remove mode prefixes (@, +, etc.)
-        while (!name.empty() && (name[0] == '@' || name[0] == '+' || name[0] == '%' || name[0] == '&' || name[0] == '~')) {
-            name = name.substr(1);
+        std::istringstream iss(names_str);
+        std::string name;
+        while (iss >> name) {
+            // Remove mode prefixes (@, +, etc.)
+            while (!name.empty() && (name[0] == '@' || name[0] == '+' || name[0] == '%' || name[0] == '&' || name[0] == '~')) {
+                name = name.substr(1);
+            }
+            if (!name.empty()) {
+                channel->user_list.push_back(name);
+            }
         }
-        if (!name.empty()) {
-            channel->user_list.push_back(name);
-        }
+        users = channel->user_list;
     }
-    
-    if (user_list_callback_) {
-        user_list_callback_(channel->channel, channel->user_list);
+
+    UserListCallback callback;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        callback = user_list_callback_;
+    }
+    if (callback) {
+        callback(channel->channel, users);
     }
 }
 
@@ -850,36 +989,51 @@ void IrcClientManager::handleNamesResponse(IrcChannel* channel, const std::strin
 void IrcClientManager::handleJoinPart(IrcChannel* channel, const std::string& line, bool is_join) {
     // Format: :nick!user@host JOIN #channel
     // Format: :nick!user@host PART #channel :reason
-    size_t colon_pos = line.find(':');
-    if (colon_pos == std::string::npos) return;
+    const auto parsed = parse_irc_message(line);
+    if ((parsed.command == "JOIN" || parsed.command == "PART") &&
+        !params_contain_channel(parsed, channel->channel)) {
+        return;
+    }
+
+    const std::string nickname = nickname_from_prefix(parsed.prefix);
+    if (nickname.empty()) return;
     
-    size_t exclamation = line.find('!', colon_pos);
-    if (exclamation == std::string::npos) return;
-    
-    std::string nickname = line.substr(colon_pos + 1, exclamation - colon_pos - 1);
-    
-    if (user_join_part_callback_) {
-        user_join_part_callback_(channel->channel, nickname, is_join);
+    UserJoinPartCallback join_part_callback;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        join_part_callback = user_join_part_callback_;
+    }
+    if (join_part_callback) {
+        join_part_callback(channel->channel, nickname, is_join);
     }
     
     // Update user list
-    std::lock_guard<std::mutex> lock(channel->user_list_mutex);
-    if (is_join) {
-        // Add user if not already in list
-        auto it = std::find(channel->user_list.begin(), channel->user_list.end(), nickname);
-        if (it == channel->user_list.end()) {
-            channel->user_list.push_back(nickname);
+    std::vector<std::string> users;
+    {
+        std::lock_guard<std::mutex> lock(channel->user_list_mutex);
+        if (is_join) {
+            // Add user if not already in list
+            auto it = std::find(channel->user_list.begin(), channel->user_list.end(), nickname);
+            if (it == channel->user_list.end()) {
+                channel->user_list.push_back(nickname);
+            }
+        } else {
+            // Remove user from list
+            channel->user_list.erase(
+                std::remove(channel->user_list.begin(), channel->user_list.end(), nickname),
+                channel->user_list.end()
+            );
         }
-    } else {
-        // Remove user from list
-        channel->user_list.erase(
-            std::remove(channel->user_list.begin(), channel->user_list.end(), nickname),
-            channel->user_list.end()
-        );
+        users = channel->user_list;
     }
-    
-    if (user_list_callback_) {
-        user_list_callback_(channel->channel, channel->user_list);
+
+    UserListCallback list_callback;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        list_callback = user_list_callback_;
+    }
+    if (list_callback) {
+        list_callback(channel->channel, users);
     }
 }
 
@@ -913,7 +1067,7 @@ bool IrcClientManager::performSslHandshake(IrcChannel* channel) {
     }
     
     // Set socket
-    if (SSL_set_fd(ssl, channel->sock_fd) != 1) {
+    if (SSL_set_fd(ssl, channel->sock_fd.load()) != 1) {
         V2TIM_LOG(kError, "[IRC] Failed to set SSL file descriptor");
         SSL_free(ssl);
         SSL_CTX_free(ctx);
@@ -989,4 +1143,3 @@ std::vector<std::string> IrcClientManager::getUserList(const std::string& channe
     }
     return {};
 }
-

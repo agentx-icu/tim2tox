@@ -165,25 +165,6 @@ void* g_irc_lib_handle = nullptr;
 bool g_irc_lib_loaded = false;
 std::mutex g_irc_lib_mutex;
 
-// Forward declare callback types (matching irc_client_api.h)
-typedef void (*irc_message_callback_t)(const char* group_id, const char* sender_nick, const char* message, void* user_data);
-typedef void (*tox_group_message_callback_t)(const char* group_id, const char* sender, const char* message, void* user_data);
-
-// Connection status enumeration
-typedef enum {
-    IRC_CONNECTION_DISCONNECTED = 0,
-    IRC_CONNECTION_CONNECTING = 1,
-    IRC_CONNECTION_CONNECTED = 2,
-    IRC_CONNECTION_AUTHENTICATING = 3,
-    IRC_CONNECTION_RECONNECTING = 4,
-    IRC_CONNECTION_ERROR = 5
-} irc_connection_status_t;
-
-// New callback types
-typedef void (*irc_connection_status_callback_t)(const char* channel, irc_connection_status_t status, const char* message, void* user_data);
-typedef void (*irc_user_list_callback_t)(const char* channel, const char* users, void* user_data);
-typedef void (*irc_user_join_part_callback_t)(const char* channel, const char* nickname, int joined, void* user_data);
-
 // IRC API function pointers
 typedef int (*irc_init_t)(void);
 typedef void (*irc_shutdown_t)(void);
@@ -210,6 +191,82 @@ irc_forward_tox_message_t g_irc_forward_tox_message = nullptr;
 irc_set_connection_status_callback_t g_irc_set_connection_status_callback = nullptr;
 irc_set_user_list_callback_t g_irc_set_user_list_callback = nullptr;
 irc_set_user_join_part_callback_t g_irc_set_user_join_part_callback = nullptr;
+
+std::mutex g_tim2tox_irc_callback_mutex;
+tim2tox_irc_connection_status_callback_t g_tim2tox_irc_connection_status_callback = nullptr;
+tim2tox_irc_user_list_callback_t g_tim2tox_irc_user_list_callback = nullptr;
+tim2tox_irc_user_join_part_callback_t g_tim2tox_irc_user_join_part_callback = nullptr;
+void* g_tim2tox_irc_connection_status_user_data = nullptr;
+void* g_tim2tox_irc_user_list_user_data = nullptr;
+void* g_tim2tox_irc_user_join_part_user_data = nullptr;
+
+char* duplicate_irc_callback_string(const char* value) {
+    if (!value) return nullptr;
+    const size_t length = std::strlen(value);
+    char* copy = static_cast<char*>(std::malloc(length + 1));
+    if (!copy) return nullptr;
+    std::memcpy(copy, value, length);
+    copy[length] = '\0';
+    return copy;
+}
+
+void tim2tox_irc_connection_status_callback_bridge(
+    const char* channel,
+    irc_connection_status_t status,
+    const char* message,
+    void*) {
+    tim2tox_irc_connection_status_callback_t callback = nullptr;
+    void* user_data = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_tim2tox_irc_callback_mutex);
+        callback = g_tim2tox_irc_connection_status_callback;
+        user_data = g_tim2tox_irc_connection_status_user_data;
+    }
+    if (!callback) return;
+    callback(
+        duplicate_irc_callback_string(channel),
+        static_cast<tim2tox_irc_connection_status_t>(status),
+        duplicate_irc_callback_string(message),
+        user_data);
+}
+
+void tim2tox_irc_user_list_callback_bridge(
+    const char* channel,
+    const char* users,
+    void*) {
+    tim2tox_irc_user_list_callback_t callback = nullptr;
+    void* user_data = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_tim2tox_irc_callback_mutex);
+        callback = g_tim2tox_irc_user_list_callback;
+        user_data = g_tim2tox_irc_user_list_user_data;
+    }
+    if (!callback) return;
+    callback(
+        duplicate_irc_callback_string(channel),
+        duplicate_irc_callback_string(users),
+        user_data);
+}
+
+void tim2tox_irc_user_join_part_callback_bridge(
+    const char* channel,
+    const char* nickname,
+    int joined,
+    void*) {
+    tim2tox_irc_user_join_part_callback_t callback = nullptr;
+    void* user_data = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_tim2tox_irc_callback_mutex);
+        callback = g_tim2tox_irc_user_join_part_callback;
+        user_data = g_tim2tox_irc_user_join_part_user_data;
+    }
+    if (!callback) return;
+    callback(
+        duplicate_irc_callback_string(channel),
+        duplicate_irc_callback_string(nickname),
+        joined,
+        user_data);
+}
 
 } // namespace
 
@@ -2358,6 +2415,9 @@ int tim2tox_ffi_irc_load_library(const char* library_path) {
     g_irc_set_message_callback = (irc_set_message_callback_t)dlsym(handle, "irc_client_set_message_callback");
     g_irc_set_tox_message_callback = (irc_set_tox_message_callback_t)dlsym(handle, "irc_client_set_tox_message_callback");
     g_irc_forward_tox_message = (irc_forward_tox_message_t)dlsym(handle, "irc_client_forward_tox_message");
+    g_irc_set_connection_status_callback = (irc_set_connection_status_callback_t)dlsym(handle, "irc_client_set_connection_status_callback");
+    g_irc_set_user_list_callback = (irc_set_user_list_callback_t)dlsym(handle, "irc_client_set_user_list_callback");
+    g_irc_set_user_join_part_callback = (irc_set_user_join_part_callback_t)dlsym(handle, "irc_client_set_user_join_part_callback");
     
     // Check required symbols (new callbacks are optional)
     if (!g_irc_init || !g_irc_shutdown || !g_irc_connect_channel || !g_irc_disconnect_channel || 
@@ -2367,7 +2427,10 @@ int tim2tox_ffi_irc_load_library(const char* library_path) {
         return 0;
     }
     
-    // New callbacks are optional - log warning if not found but continue
+    if (!g_irc_set_connection_status_callback || !g_irc_set_user_list_callback ||
+        !g_irc_set_user_join_part_callback) {
+        V2TIM_LOG(kWarning, "[ffi] IRC status/user callbacks are unavailable in this libirc_client build");
+    }
     
     g_irc_lib_handle = handle;
     
@@ -2448,6 +2511,54 @@ int tim2tox_ffi_irc_unload_library(void) {
 int tim2tox_ffi_irc_is_library_loaded(void) {
     std::lock_guard<std::mutex> lock(g_irc_lib_mutex);
     return g_irc_lib_loaded ? 1 : 0;
+}
+
+void tim2tox_ffi_irc_set_connection_status_callback(tim2tox_irc_connection_status_callback_t callback, void* user_data) {
+    std::lock_guard<std::mutex> lock(g_irc_lib_mutex);
+    if (!g_irc_lib_loaded || !g_irc_set_connection_status_callback) {
+        V2TIM_LOG(kWarning, "[ffi] IRC connection status callback setter unavailable");
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> callback_lock(g_tim2tox_irc_callback_mutex);
+        g_tim2tox_irc_connection_status_callback = callback;
+        g_tim2tox_irc_connection_status_user_data = user_data;
+    }
+    g_irc_set_connection_status_callback(
+        callback ? tim2tox_irc_connection_status_callback_bridge : nullptr,
+        nullptr);
+}
+
+void tim2tox_ffi_irc_set_user_list_callback(tim2tox_irc_user_list_callback_t callback, void* user_data) {
+    std::lock_guard<std::mutex> lock(g_irc_lib_mutex);
+    if (!g_irc_lib_loaded || !g_irc_set_user_list_callback) {
+        V2TIM_LOG(kWarning, "[ffi] IRC user list callback setter unavailable");
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> callback_lock(g_tim2tox_irc_callback_mutex);
+        g_tim2tox_irc_user_list_callback = callback;
+        g_tim2tox_irc_user_list_user_data = user_data;
+    }
+    g_irc_set_user_list_callback(
+        callback ? tim2tox_irc_user_list_callback_bridge : nullptr,
+        nullptr);
+}
+
+void tim2tox_ffi_irc_set_user_join_part_callback(tim2tox_irc_user_join_part_callback_t callback, void* user_data) {
+    std::lock_guard<std::mutex> lock(g_irc_lib_mutex);
+    if (!g_irc_lib_loaded || !g_irc_set_user_join_part_callback) {
+        V2TIM_LOG(kWarning, "[ffi] IRC user join/part callback setter unavailable");
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> callback_lock(g_tim2tox_irc_callback_mutex);
+        g_tim2tox_irc_user_join_part_callback = callback;
+        g_tim2tox_irc_user_join_part_user_data = user_data;
+    }
+    g_irc_set_user_join_part_callback(
+        callback ? tim2tox_irc_user_join_part_callback_bridge : nullptr,
+        nullptr);
 }
 
 // IRC Channel Management Functions (delegate to dynamic library)
@@ -3611,8 +3722,6 @@ int tim2tox_ffi_dht_send_nodes_request(const char* public_key, const char* ip, u
 }
 
 void tim2tox_ffi_set_dht_nodes_response_callback(int64_t instance_id, tim2tox_dht_nodes_response_callback_t callback, void* user_data) {
-    if (instance_id == 0) instance_id = GetCurrentInstanceId();
-    
     if (instance_id != 0) {
         // Register per-instance callback
         {
@@ -3640,7 +3749,7 @@ void tim2tox_ffi_set_dht_nodes_response_callback(int64_t instance_id, tim2tox_dh
     }
     
     // Register/unregister internal callback with Tox for this instance
-    V2TIMManagerImpl* manager = GetInstanceFromId(instance_id);
+    V2TIMManagerImpl* manager = instance_id == 0 ? V2TIMManagerImpl::GetInstance() : GetInstanceFromId(instance_id);
     if (manager) {
         ToxManager* tox_manager = manager->GetToxManager();
         if (tox_manager) {

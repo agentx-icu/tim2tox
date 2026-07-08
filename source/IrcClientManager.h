@@ -124,9 +124,12 @@ private:
         bool use_sasl;
         bool use_ssl;
         bool sasl_authenticated;
-        int sock_fd;
+        bool join_sent;
+        std::atomic<int> sock_fd;
         void* ssl_ctx;  // SSL_CTX* for SSL connections
         void* ssl;      // SSL* for SSL connections
+        mutable std::mutex io_mutex;
+        mutable std::mutex lifecycle_mutex;
         std::atomic<bool> connected;
         std::atomic<bool> should_stop;
         std::atomic<ConnectionStatus> status;
@@ -146,10 +149,11 @@ private:
         std::string base_nickname;
         int nickname_suffix;
         
-        IrcChannel() : port(6667), sock_fd(-1), ssl_ctx(nullptr), ssl(nullptr),
-                      connected(false), should_stop(false), 
-                      use_sasl(false), use_ssl(false), sasl_authenticated(false),
-                      reconnect_attempts(0), status(ConnectionStatus::Disconnected),
+        IrcChannel() : port(6667), use_sasl(false), use_ssl(false),
+                      sasl_authenticated(false), join_sent(false), sock_fd(-1),
+                      ssl_ctx(nullptr), ssl(nullptr), connected(false),
+                      should_stop(false), status(ConnectionStatus::Disconnected),
+                      reconnect_attempts(0),
                       nickname_suffix(0) {}
     };
 
@@ -164,6 +168,9 @@ private:
     
     // 发送IRC命令（重载：使用channel，支持SSL）
     bool sendIrcCommand(IrcChannel* channel, const std::string& command);
+
+    // 发送 JOIN，避免 welcome burst 或 SASL completion 重复加入同一频道
+    bool sendJoinIfNeeded(IrcChannel* channel);
 
     // 执行SSL/TLS握手（如果使用SSL）
     bool performSslHandshake(IrcChannel* channel);
@@ -211,11 +218,11 @@ private:
     std::string generateNickname(IrcChannel* channel);
 
     mutable std::mutex mutex_;
-    std::unordered_map<std::string, std::unique_ptr<IrcChannel>> channels_;
+    std::unordered_map<std::string, std::shared_ptr<IrcChannel>> channels_;
+    bool shutting_down_ = false;
     std::function<void(const std::string&, const std::string&, const std::string&)> tox_message_callback_;
     std::function<void(const std::string&, const std::string&, const std::string&)> tox_group_message_callback_;
     ConnectionStatusCallback connection_status_callback_;
     UserListCallback user_list_callback_;
     UserJoinPartCallback user_join_part_callback_;
 };
-
