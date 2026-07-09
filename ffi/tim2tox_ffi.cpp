@@ -3256,7 +3256,46 @@ int tim2tox_ffi_av_send_video_frame(int64_t instance_id, uint32_t friend_number,
     if (!manager_impl) return 0;
     ToxAVManager* av_mgr = manager_impl->GetToxAVManager();
     if (!av_mgr) return 0;
-    return av_mgr->sendVideoFrame(friend_number, width, height, y, u, v) ? 1 : 0;
+
+    // toxav_video_send_frame expects TIGHTLY PACKED planes with FLOOR chroma
+    // dimensions — Y is width*height, U/V are (width/2)*(height/2) (see
+    // toxav.h + toxav/video.c, both use integer division). This API accepts
+    // arbitrary strides, but ToxAVManager::sendVideoFrame drops them —
+    // passing strided planes through would silently corrupt the encoded
+    // frame. Compact into temporary buffers when any stride differs from the
+    // packed layout. A stride <= 0 means "this plane is already packed" by
+    // convention (the effective stride is the packed row width).
+    const int32_t packed_y = static_cast<int32_t>(width);
+    const int32_t packed_uv = static_cast<int32_t>(width / 2);
+    const uint16_t chroma_h = static_cast<uint16_t>(height / 2);
+    const int32_t eff_y_stride = y_stride <= 0 ? packed_y : y_stride;
+    const int32_t eff_u_stride = u_stride <= 0 ? packed_uv : u_stride;
+    const int32_t eff_v_stride = v_stride <= 0 ? packed_uv : v_stride;
+    if (eff_y_stride == packed_y && eff_u_stride == packed_uv &&
+        eff_v_stride == packed_uv) {
+        return av_mgr->sendVideoFrame(friend_number, width, height, y, u, v) ? 1 : 0;
+    }
+    if (eff_y_stride < packed_y || eff_u_stride < packed_uv ||
+        eff_v_stride < packed_uv) {
+        V2TIM_LOG(kError, "[ffi] av_send_video_frame: stride smaller than plane width (y={} u={} v={}, width={})",
+                  eff_y_stride, eff_u_stride, eff_v_stride, width);
+        return 0;
+    }
+    std::vector<uint8_t> y_buf(static_cast<size_t>(packed_y) * height);
+    std::vector<uint8_t> u_buf(static_cast<size_t>(packed_uv) * chroma_h);
+    std::vector<uint8_t> v_buf(static_cast<size_t>(packed_uv) * chroma_h);
+    for (uint16_t row = 0; row < height; ++row) {
+        memcpy(y_buf.data() + static_cast<size_t>(row) * packed_y,
+               y + static_cast<size_t>(row) * eff_y_stride, packed_y);
+    }
+    for (uint16_t row = 0; row < chroma_h; ++row) {
+        memcpy(u_buf.data() + static_cast<size_t>(row) * packed_uv,
+               u + static_cast<size_t>(row) * eff_u_stride, packed_uv);
+        memcpy(v_buf.data() + static_cast<size_t>(row) * packed_uv,
+               v + static_cast<size_t>(row) * eff_v_stride, packed_uv);
+    }
+    return av_mgr->sendVideoFrame(friend_number, width, height,
+                                  y_buf.data(), u_buf.data(), v_buf.data()) ? 1 : 0;
 }
 
 int tim2tox_ffi_av_set_audio_bit_rate(int64_t instance_id, uint32_t friend_number, uint32_t audio_bit_rate) {
@@ -3510,6 +3549,17 @@ const char* tim2tox_ffi_get_user_id_by_friend_number(uint32_t friend_number) {
 
     V2TIM_LOG(kInfo, "[ffi] get_user_id_by_friend_number: successfully found user_id={} for friend_number={}", result_buf, friend_number);
     return result_buf;
+}
+
+int tim2tox_ffi_get_friend_connection_status(int64_t instance_id, uint32_t friend_number) {
+    if (instance_id == 0) instance_id = GetCurrentInstanceId();
+    V2TIMManagerImpl* manager_impl = GetInstanceFromId(instance_id);
+    if (!manager_impl) return -1;
+    ToxManager* tox_mgr = manager_impl->GetToxManager();
+    if (!tox_mgr) return -1;
+    // ToxManager::getFriendConnectionStatus locks its own mutex; TOX_CONNECTION
+    // maps directly onto the documented 0/1/2 return values.
+    return static_cast<int>(tox_mgr->getFriendConnectionStatus(friend_number));
 }
 
 #ifdef BUILD_TOXAV

@@ -566,6 +566,13 @@ uint32_t tim2tox_ffi_get_friend_number_by_user_id(const char* user_id);
 // Note: returned pointer is valid until the next call from the same thread
 const char* tim2tox_ffi_get_user_id_by_friend_number(uint32_t friend_number);
 
+// Helper: Friend transport connection status. Cheap, thread-safe query used
+// by call reconnect watchdogs (poll it at ~1s cadence during an active call).
+// NOT gated by BUILD_TOXAV — this is core Tox state.
+// Returns: 0 = offline (TOX_CONNECTION_NONE), 1 = TCP, 2 = UDP, -1 = error
+// (instance not found / not initialized).
+int tim2tox_ffi_get_friend_connection_status(int64_t instance_id, uint32_t friend_number);
+
 // ============================================================================
 // DHT Nodes API
 // ============================================================================

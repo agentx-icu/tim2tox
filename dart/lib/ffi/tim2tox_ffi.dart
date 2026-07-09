@@ -199,6 +199,8 @@ typedef _dart_set_signaling_cb_d = void Function(ffi.Pointer<ffi.Void>);
 
 // Audio/Video (ToxAV) types (instance_id first; 0 = use current)
 typedef _av_is_available_c = ffi.Int32 Function();
+typedef _get_friend_connection_status_c = ffi.Int32 Function(
+    ffi.Int64, ffi.Uint32);
 typedef _av_initialize_c = ffi.Int32 Function(ffi.Int64);
 typedef _av_shutdown_c = ffi.Void Function(ffi.Int64);
 typedef _av_iterate_c = ffi.Void Function(ffi.Int64);
@@ -519,6 +521,10 @@ class Tim2ToxFfi {
   late final void Function(int, ffi.Pointer<ffi.NativeFunction<_av_video_bitrate_callback_native>>, ffi.Pointer<ffi.Void>) avSetVideoBitrateCallbackNative = _lib.lookupFunction<_av_set_video_bitrate_callback_c, void Function(int, ffi.Pointer<ffi.NativeFunction<_av_video_bitrate_callback_native>>, ffi.Pointer<ffi.Void>)>('tim2tox_ffi_av_set_video_bitrate_callback');
   late final int Function(ffi.Pointer<pkgffi.Utf8>) getFriendNumberByUserIdNative = _lib.lookupFunction<_get_friend_number_by_user_id_c, int Function(ffi.Pointer<pkgffi.Utf8>)>('tim2tox_ffi_get_friend_number_by_user_id');
   late final ffi.Pointer<pkgffi.Utf8> Function(int) getUserIdByFriendNumberNative = _lib.lookupFunction<_get_user_id_by_friend_number_c, ffi.Pointer<pkgffi.Utf8> Function(int)>('tim2tox_ffi_get_user_id_by_friend_number');
+
+  /// Friend transport connection status: 0 = offline, 1 = TCP, 2 = UDP,
+  /// -1 = error. Cheap, thread-safe; used by call reconnect watchdogs.
+  late final int Function(int, int) getFriendConnectionStatusNative = _lib.lookupFunction<_get_friend_connection_status_c, int Function(int, int)>('tim2tox_ffi_get_friend_connection_status');
   
   // Update known groups list in C++ layer (called when knownGroups changes in Dart)
   late final int Function(int, ffi.Pointer<pkgffi.Utf8>) updateKnownGroupsNative = 

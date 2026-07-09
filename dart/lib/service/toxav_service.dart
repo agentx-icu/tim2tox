@@ -724,4 +724,16 @@ class ToxAVService implements CallAvBackend {
 
   @override
   bool get isAvailable => _ffi.avIsAvailable;
+
+  /// Friend transport connection status: 0 = offline, 1 = TCP, 2 = UDP,
+  /// -1 = unknown (native error, or an older library without the symbol).
+  /// Cheap enough for a ~1s reconnect watchdog during active calls.
+  int getFriendConnectionStatus(int friendNumber) {
+    try {
+      return _ffi.getFriendConnectionStatusNative(
+          _ffi.getCurrentInstanceId(), friendNumber);
+    } on ArgumentError {
+      return -1;
+    }
+  }
 }

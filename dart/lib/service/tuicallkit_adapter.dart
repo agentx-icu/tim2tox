@@ -35,6 +35,46 @@ typedef OutgoingCallCallback = void Function(
 typedef OutgoingCallPreflight = Future<bool> Function(
     String userID, String type);
 
+/// Typed reasons an outgoing call setup can fail. Surfaced via
+/// [TUICallKitAdapter.onCallSetupFailed] so the embedding app can show user
+/// feedback — historically these failures were swallowed (handleCall returned
+/// false and TUICore ignored it), leaving the user with a dead call button.
+enum CallSetupFailureReason {
+  /// The TUICore call request carried no user IDs.
+  noUsers,
+
+  /// More than one invitee — group calls are not implemented yet.
+  groupCallsUnsupported,
+
+  /// The embedder's preflight (permissions / duplicate-ring dedup) declined.
+  /// The embedder already knows about this one — it made the decision — so it
+  /// normally should NOT show an extra notice for it.
+  preflightDenied,
+
+  /// The signaling invite could not be sent.
+  inviteFailed,
+
+  /// Signaling succeeded but the ToxAV media leg could not be started.
+  avStartFailed,
+
+  /// Unexpected error (bug or environmental).
+  internalError,
+}
+
+/// Exception carrying a [CallSetupFailureReason] through [_handleCall]'s
+/// throw-on-failure control flow.
+class CallSetupException implements Exception {
+  final CallSetupFailureReason reason;
+  final String message;
+  CallSetupException(this.reason, this.message);
+
+  @override
+  String toString() => 'CallSetupException($reason): $message';
+}
+
+typedef CallSetupFailedCallback = void Function(
+    CallSetupFailureReason reason, List<String> userids);
+
 /// TUICallKit Adapter Service
 ///
 /// Registers itself as a TUICallKit service in TUICore
@@ -52,6 +92,11 @@ class TUICallKitAdapter {
   /// Fires when an outgoing call is successfully initiated so the UI can show the ringing overlay.
   OutgoingCallCallback? onOutgoingCallInitiated;
   OutgoingCallPreflight? onBeforeOutgoingCall;
+
+  /// Fires when an outgoing call setup fails, with a typed reason — the UI
+  /// should surface this to the user (except [CallSetupFailureReason
+  /// .preflightDenied], which the embedder itself produced).
+  CallSetupFailedCallback? onCallSetupFailed;
 
   /// When set, we only call endCall() before startCall() if this returns false (i.e. there is an active call).
   /// Avoids blocking the UI when native endCall() is invoked with no call in progress (e.g. second call after hangup).
@@ -98,6 +143,17 @@ class TUICallKitAdapter {
       return true;
     } catch (e, st) {
       _logger?.logError('[TUICallKitAdapter] Error handling call', e, st);
+      final reason = e is CallSetupException
+          ? e.reason
+          : CallSetupFailureReason.internalError;
+      try {
+        onCallSetupFailed?.call(reason, List.unmodifiable(userids));
+      } catch (cbError, cbStack) {
+        _logger?.logError(
+            '[TUICallKitAdapter] onCallSetupFailed callback threw',
+            cbError,
+            cbStack);
+      }
       return false;
     }
   }
@@ -109,12 +165,14 @@ class TUICallKitAdapter {
     final groupID = params[PARAM_NAME_GROUPID] as String?;
 
     if (userids == null || userids.isEmpty) {
-      throw Exception('No userids provided');
+      throw CallSetupException(
+          CallSetupFailureReason.noUsers, 'No userids provided');
     }
 
     // For now, only support 1-on-1 calls
     if (userids.length > 1) {
-      throw Exception('Group calls not yet supported');
+      throw CallSetupException(CallSetupFailureReason.groupCallsUnsupported,
+          'Group calls not yet supported');
     }
 
     final userID = userids.first;
@@ -128,7 +186,8 @@ class TUICallKitAdapter {
       _logger?.log(
           '[TUICallKitAdapter] preflight result allowed=$allowed userID=$userID type=$type');
       if (!allowed) {
-        throw Exception('Outgoing call preflight denied');
+        throw CallSetupException(CallSetupFailureReason.preflightDenied,
+            'Outgoing call preflight denied');
       }
     }
 
@@ -150,7 +209,8 @@ class TUICallKitAdapter {
         '[TUICallKitAdapter] invite result code=${result.code} data=${result.data} userID=$userID type=$type');
 
     if (result.code != 0 || result.data == null) {
-      throw Exception('Signaling invite failed: code=${result.code}');
+      throw CallSetupException(CallSetupFailureReason.inviteFailed,
+          'Signaling invite failed: code=${result.code}');
     }
 
     final inviteID = result.data!;
@@ -220,7 +280,7 @@ class TUICallKitAdapter {
     if (!callResult) {
       _userToInviteId.remove(userID);
       await _callBridge.endCall(inviteID);
-      throw Exception(
+      throw CallSetupException(CallSetupFailureReason.avStartFailed,
           'ToxAV startCall failed for friendNumber=$resolvedFriendNumber');
     }
 

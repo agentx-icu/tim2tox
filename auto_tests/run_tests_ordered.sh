@@ -417,6 +417,7 @@ PHASE4_GROUP=(
 
 PHASE5_TOXAV=(
   "test/scenarios/scenario_toxav_basic_test.dart"
+  "test/scenarios/scenario_toxav_media_frames_test.dart"
   "test/scenarios/scenario_toxav_many_test.dart"
   "test/scenarios/scenario_toxav_peer_offline_test.dart"
   "test/scenarios/scenario_toxav_conference_test.dart"
@@ -753,6 +754,12 @@ run_single_test() {
   local test_timeout=180
   case "$test_basekey" in
     scenario_conference|scenario_nospam|scenario_group_create_debug)
+      test_timeout=300 ;;
+    scenario_toxav_media_frames)
+      # Passes in ~20s, but the worst-case FAILURE path (3 call retries ×
+      # 25s + call-state wait + bounded audio/video send-retry loops) can
+      # exceed 180s; give it 300s so a slow failure surfaces as a Dart
+      # assertion/timeout instead of a runner kill.
       test_timeout=300 ;;
     scenario_group_large)
       # 5 nodes + 4 friendships; each invite retry can wait 30s × 3 tries
