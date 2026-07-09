@@ -721,4 +721,7 @@ class ToxAVService implements CallAvBackend {
 
   @override
   bool get isInitialized => _initialized;
+
+  @override
+  bool get isAvailable => _ffi.avIsAvailable;
 }

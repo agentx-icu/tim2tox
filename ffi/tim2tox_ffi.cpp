@@ -2886,6 +2886,25 @@ int tim2tox_ffi_signaling_reject(const char* invite_id, const char* data) {
 // Audio/Video (ToxAV) Implementation
 // ============================================================================
 
+// Availability probe — see tim2tox_ffi.h. Defined outside the BUILD_TOXAV
+// guard so the symbol exists (and answers honestly) in both real and stub
+// builds.
+int tim2tox_ffi_av_is_available(void) {
+#ifdef BUILD_TOXAV
+    return 1;
+#else
+    return 0;
+#endif
+}
+
+#ifdef BUILD_TOXAV
+// Marker symbol exported ONLY when a real ToxAV backend is compiled in.
+// Static packaging checks (nm/llvm-nm on cross-compiled artifacts that cannot
+// be executed on the build host) grep for this symbol to prove the artifact
+// is not a stub build. Runtime callers should use tim2tox_ffi_av_is_available.
+extern "C" int tim2tox_ffi_av_backend_toxav(void) { return 1; }
+#endif
+
 #ifdef BUILD_TOXAV
 
 namespace {

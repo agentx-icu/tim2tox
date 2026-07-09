@@ -1,4 +1,9 @@
 abstract class CallAvBackend {
+  /// Whether a real AV backend is compiled into the loaded native library.
+  /// False means every other method here is a no-op stub (BUILD_TOXAV off)
+  /// and the UI must not offer calling.
+  bool get isAvailable;
+
   bool get isInitialized;
 
   Future<bool> initialize();
