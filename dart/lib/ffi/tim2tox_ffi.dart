@@ -198,6 +198,7 @@ typedef _dart_set_signaling_cb_c = ffi.Void Function(ffi.Pointer<ffi.Void>);
 typedef _dart_set_signaling_cb_d = void Function(ffi.Pointer<ffi.Void>);
 
 // Audio/Video (ToxAV) types (instance_id first; 0 = use current)
+typedef _av_is_available_c = ffi.Int32 Function();
 typedef _av_initialize_c = ffi.Int32 Function(ffi.Int64);
 typedef _av_shutdown_c = ffi.Void Function(ffi.Int64);
 typedef _av_iterate_c = ffi.Void Function(ffi.Int64);
@@ -483,6 +484,21 @@ class Tim2ToxFfi {
   // Audio/Video (ToxAV) FFI Bindings
   // ============================================================================
   
+  late final int Function() avIsAvailableNative = _lib.lookupFunction<_av_is_available_c, int Function()>('tim2tox_ffi_av_is_available');
+
+  /// Whether the loaded native library was compiled with a real ToxAV backend
+  /// (BUILD_TOXAV). Returns false both for stub builds and for older
+  /// libraries that predate the probe symbol — either way calling is not
+  /// trustworthy, so callers get an honest "unavailable".
+  bool get avIsAvailable {
+    try {
+      return avIsAvailableNative() == 1;
+    } on ArgumentError {
+      // Symbol missing: library predates tim2tox_ffi_av_is_available.
+      return false;
+    }
+  }
+
   late final int Function(int) avInitialize = _lib.lookupFunction<_av_initialize_c, int Function(int)>('tim2tox_ffi_av_initialize');
   late final void Function(int) avShutdown = _lib.lookupFunction<_av_shutdown_c, void Function(int)>('tim2tox_ffi_av_shutdown');
   late final void Function(int) avIterate = _lib.lookupFunction<_av_iterate_c, void Function(int)>('tim2tox_ffi_av_iterate');

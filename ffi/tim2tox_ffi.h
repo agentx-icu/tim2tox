@@ -450,6 +450,14 @@ int tim2tox_ffi_signaling_reject(const char* invite_id, const char* data);
 // Audio/Video (ToxAV) APIs
 // ============================================================================
 
+// Compile-time ToxAV availability probe.
+// Returns 1 when the library was built with BUILD_TOXAV (real ToxAV backend),
+// 0 when the tim2tox_ffi_av_* functions below are no-op stubs. Callers (Dart
+// capability gates, packaging assertions) MUST check this instead of inferring
+// availability from av_initialize's return code, so a stubbed build can never
+// masquerade as a functional calling backend.
+int tim2tox_ffi_av_is_available(void);
+
 // Initialize ToxAV (must be called after SDK init and login)
 // Returns: 1 on success, 0 on failure
 int tim2tox_ffi_av_initialize(int64_t instance_id);
