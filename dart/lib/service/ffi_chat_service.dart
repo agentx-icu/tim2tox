@@ -869,6 +869,56 @@ class FfiChatService {
 
   /// Reference to local scheduleNextPoll so [ _scheduleNextPoll] can schedule next poll from async callback.
   void Function()? _scheduleNextPollRef;
+
+  /// True while an AV call is being set up or is active — see
+  /// [setAvSessionActive]. Forces the fast poll cadence so toxav_iterate is
+  /// never starved by the idle heuristics.
+  bool _avSessionActive = false;
+
+  /// AV-session poll boost. toxav_iterate() is piggybacked on this service's
+  /// generic poll loop; the adaptive interval can relax to 1000ms when the
+  /// text/file side is idle, which starves ToxAV mid-call (RTP receive,
+  /// call-state progress, bitrate control all run off iterate) and causes
+  /// audible stutter. Callers flip this on for the whole call lifecycle
+  /// (ringing -> in-call -> ended), not just while media flows — call SETUP
+  /// also progresses via iterate.
+  void setAvSessionActive(bool active) {
+    if (_avSessionActive == active) return;
+    _avSessionActive = active;
+    _logger?.log('[FfiChatService] setAvSessionActive($active)');
+    if (active) {
+      // The currently-armed timer may be up to 1s away; re-arm promptly so
+      // the boost takes effect now, not after the stale interval elapses.
+      triggerPollOnce();
+    }
+  }
+
+  /// Poll-interval policy, extracted as a pure function for unit testing.
+  /// Priority: AV call active (20ms, matches the 20ms audio frame cadence)
+  /// > file transfer / test multi-instance (50ms) > recent activity (200ms)
+  /// > idle (1000ms).
+  static Duration computePollInterval({
+    required bool avSessionActive,
+    required bool hasActiveFileTransfer,
+    required bool hasKnownInstances,
+    required bool isSharedInstance,
+    required Duration timeSinceActivity,
+  }) {
+    if (avSessionActive) {
+      return const Duration(milliseconds: 20);
+    }
+    if (hasActiveFileTransfer) {
+      // Very frequent polling during file transfer
+      return const Duration(milliseconds: 50);
+    }
+    if (hasKnownInstances || isSharedInstance) {
+      // Test/multi-instance: poll very often so file_request is consumed promptly
+      return const Duration(milliseconds: 50);
+    }
+    return timeSinceActivity < const Duration(seconds: 2)
+        ? const Duration(milliseconds: 200)
+        : const Duration(milliseconds: 1000);
+  }
   // Offline message queue - use persistence service cache
   // Helper methods to access offline message queue through persistence service
   List<OfflineMessageItem> _getOfflineQueue(String peerId) {
@@ -1654,16 +1704,13 @@ class FfiChatService {
       final timeSinceActivity = _lastPollActivity != null
           ? DateTime.now().difference(_lastPollActivity!)
           : const Duration(seconds: 10);
-      final pollInterval = hasActiveFileTransfer
-          ? const Duration(
-              milliseconds: 50) // Very frequent polling during file transfer
-          : (hasKnownInstances || _instanceId == null)
-              ? const Duration(
-                  milliseconds:
-                      50) // Test/multi-instance: poll very often so file_request is consumed promptly
-              : (timeSinceActivity < const Duration(seconds: 2)
-                  ? const Duration(milliseconds: 200)
-                  : const Duration(milliseconds: 1000));
+      final pollInterval = computePollInterval(
+        avSessionActive: _avSessionActive,
+        hasActiveFileTransfer: hasActiveFileTransfer,
+        hasKnownInstances: hasKnownInstances,
+        isSharedInstance: _instanceId == null,
+        timeSinceActivity: timeSinceActivity,
+      );
       _pollTimerCallback = () async {
         // P2-19: drop overlapping invocations. See _pollBusy doc.
         if (_pollBusy) {

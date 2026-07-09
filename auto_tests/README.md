@@ -257,12 +257,14 @@ PARALLEL_WORKERS=3 ./run_tests_ordered.sh 4 10
 | `scenario_group_topic_revert_test.dart` | 话题回滚 |
 | `scenario_group_moderation_test.dart` | 群组管理（踢人、禁言等） |
 
-### 音视频测试 (6个)
+### 音视频测试 (8个)
 
 | 测试文件 | 说明 |
 |---------|------|
 | `scenario_toxav_basic_test.dart` | ToxAV 基础功能 |
+| `scenario_toxav_media_frames_test.dart` | 音视频媒体帧发送/接收（PCM + I420） |
 | `scenario_toxav_many_test.dart` | 多节点音视频 |
+| `scenario_toxav_peer_offline_test.dart` | 通话中对端离线 |
 | `scenario_toxav_conference_test.dart` | 音视频会议 |
 | `scenario_toxav_conference_audio_test.dart` | 会议音频 |
 | `scenario_toxav_conference_invite_test.dart` | 会议邀请 |
