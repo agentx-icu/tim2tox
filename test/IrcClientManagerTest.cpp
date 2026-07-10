@@ -115,6 +115,17 @@ public:
             }));
     }
 
+    // Simulate a server-side drop: close the current client socket so the
+    // client's recv() returns and its reconnect path engages. run() then accepts
+    // the reconnection on a fresh socket.
+    void dropClient() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (client_fd_ != kInvalidSocket) {
+            close_socket(client_fd_);
+            client_fd_ = kInvalidSocket;
+        }
+    }
+
 private:
     bool waitForClientLocked(std::unique_lock<std::mutex>& lock) {
         return cv_.wait_for(lock, std::chrono::milliseconds(3000), [&] {
@@ -123,36 +134,47 @@ private:
     }
 
     void run() {
-        sockaddr_in client_addr{};
-        socklen_t client_len = sizeof(client_addr);
-        const auto accepted = accept(listen_fd_,
-                                     reinterpret_cast<sockaddr*>(&client_addr),
-                                     &client_len);
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            client_fd_ = accepted;
-        }
-        cv_.notify_all();
-        if (accepted == kInvalidSocket) return;
-
-        char buffer[1024];
-        std::string pending;
+        // Accept repeatedly so a reconnecting client (server-side drop → client
+        // reconnect) is served on a fresh socket rather than left hanging.
         while (!stopped_) {
-            const int n = recv(accepted, buffer, sizeof(buffer) - 1, 0);
-            if (n <= 0) break;
-            buffer[n] = '\0';
-            pending += buffer;
+            sockaddr_in client_addr{};
+            socklen_t client_len = sizeof(client_addr);
+            const auto accepted = accept(listen_fd_,
+                                         reinterpret_cast<sockaddr*>(&client_addr),
+                                         &client_len);
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                client_fd_ = accepted;
+            }
+            cv_.notify_all();
+            if (accepted == kInvalidSocket) return;
 
-            std::size_t pos;
-            while ((pos = pending.find('\n')) != std::string::npos) {
-                auto line = pending.substr(0, pos);
-                if (!line.empty() && line.back() == '\r') line.pop_back();
-                {
-                    std::lock_guard<std::mutex> lock(mutex_);
-                    commands_.push_back(line);
+            char buffer[1024];
+            std::string pending;
+            while (!stopped_) {
+                const int n = recv(accepted, buffer, sizeof(buffer) - 1, 0);
+                if (n <= 0) break;
+                buffer[n] = '\0';
+                pending += buffer;
+
+                std::size_t pos;
+                while ((pos = pending.find('\n')) != std::string::npos) {
+                    auto line = pending.substr(0, pos);
+                    if (!line.empty() && line.back() == '\r') line.pop_back();
+                    {
+                        std::lock_guard<std::mutex> lock(mutex_);
+                        commands_.push_back(line);
+                    }
+                    cv_.notify_all();
+                    pending.erase(0, pos + 1);
                 }
-                cv_.notify_all();
-                pending.erase(0, pos + 1);
+            }
+            // Client gone. Close it unless dropClient() already did (it nulls
+            // client_fd_ under the lock, so a match here means we own the close).
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (client_fd_ == accepted) {
+                close_socket(accepted);
+                client_fd_ = kInvalidSocket;
             }
         }
     }
@@ -621,6 +643,42 @@ TEST_F(IrcClientManagerTest, JoinsBridgesMessagesAndQuitsIrcSession) {
 
     ASSERT_TRUE(manager.disconnectChannel("#test"));
     EXPECT_TRUE(server.waitForCommandContaining("QUIT :Disconnecting from IRC"));
+}
+
+TEST_F(IrcClientManagerTest, ReconnectsAfterServerDropMidSession) {
+    FakeIrcServer server;
+    auto& manager = IrcClientManager::getInstance();
+
+    ASSERT_TRUE(manager.connectChannel("127.0.0.1", server.port(), "#test", "",
+                                       "group_test", "", "", false,
+                                       "toxee_test"));
+    ASSERT_TRUE(server.waitForCommandContaining("NICK toxee_test"));
+    server.sendLine(":irc.example 001 toxee_test :Welcome to IRC");
+    ASSERT_TRUE(server.waitForCommandContaining("JOIN #test"));
+    server.sendLine(":toxee_test!u@h JOIN #test");
+    ASSERT_TRUE(waitUntil([&] { return manager.isChannelConnected("#test"); }));
+    ASSERT_EQ(server.commandCountContaining("NICK toxee_test"), 1);
+
+    // First drop: the initial reconnect attempt succeeds immediately (the
+    // reconnect throttle hasn't armed yet), so both the fixed and the old code
+    // would re-register here. This alone does NOT exercise the regression.
+    server.dropClient();
+    ASSERT_TRUE(waitUntil(
+        [&] { return server.commandCountContaining("NICK toxee_test") >= 2; },
+        std::chrono::milliseconds(10000)));
+
+    // Second drop, immediately after the first reconnect: attemptReconnect() now
+    // THROTTLES (elapsed < reconnect_delay_seconds), leaving sock_fd < 0 on the
+    // first try. THIS is the regression path — the old code would sleep, then
+    // break out of the read loop on sock_fd < 0 and permanently kill the channel
+    // (NICK count frozen at 2). The fix keeps retrying until the throttle window
+    // clears, so a third registration must eventually reach the server.
+    server.dropClient();
+    EXPECT_TRUE(waitUntil(
+        [&] { return server.commandCountContaining("NICK toxee_test") >= 3; },
+        std::chrono::milliseconds(20000)));
+
+    ASSERT_TRUE(manager.disconnectChannel("#test"));
 }
 
 TEST_F(IrcClientManagerTest, DISABLED_PublicIrcJoinSendReceiveAndQuit) {

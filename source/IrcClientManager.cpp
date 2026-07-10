@@ -47,6 +47,8 @@
 #include <chrono>
 #include <thread>
 #include <mutex>
+#include <memory>
+#include <atomic>
 #include <algorithm>
 
 // OpenSSL includes
@@ -68,6 +70,23 @@
 #endif
 
 namespace {
+
+// Owns the result of one off-thread getaddrinfo() (see connectToServer). The
+// channel thread either takes ownership of `result` (and frees it itself) or
+// abandons the resolve on should_stop; either way the last shared_ptr holder
+// frees any leftover addrinfo here. Safe to outlive the channel thread because
+// libirc_client is never dlclose()d (the FFI unload leaves it mapped).
+struct DnsResolveJob {
+    std::mutex m;
+    bool done = false;
+    int rc = 0;
+    struct addrinfo* result = nullptr;
+    ~DnsResolveJob() {
+        if (result != nullptr) {
+            freeaddrinfo(result);
+        }
+    }
+};
 
 struct ParsedIrcMessage {
     std::string prefix;
@@ -166,23 +185,59 @@ IrcClientManager::~IrcClientManager() {
     shutdown();
 }
 
-int IrcClientManager::connectToServer(const std::string& server, int port, bool use_ssl) {
-    struct addrinfo hints = {};
-    hints.ai_family = AF_INET;
-    hints.ai_socktype = SOCK_STREAM;
-    hints.ai_protocol = IPPROTO_TCP;
+int IrcClientManager::connectToServer(const std::string& server, int port,
+                                      bool use_ssl, IrcChannel* channel) {
+    // --- Interruptible DNS resolution ---
+    // getaddrinfo() is blocking with no per-call timeout; if a disconnect /
+    // shutdown join lands while this channel thread is resolving, the join (on
+    // the Dart isolate) would stall for the OS resolver timeout. Run the resolve
+    // on a detached helper and poll for completion OR should_stop, so teardown
+    // wakes us within ~50ms. The helper owns its result via a shared_ptr that
+    // frees the addrinfo in its destructor, so an abandoned resolve self-cleans
+    // (see DnsResolveJob). The library is never dlclose()d, so a detached
+    // resolver finishing after teardown returns into still-mapped code.
+    auto job = std::make_shared<DnsResolveJob>();
+    const std::string port_str = std::to_string(port);
+    std::thread([job, server, port_str]() {
+        struct addrinfo hints = {};
+        hints.ai_family = AF_INET;
+        hints.ai_socktype = SOCK_STREAM;
+        hints.ai_protocol = IPPROTO_TCP;
+        struct addrinfo* res = nullptr;
+        const int rc = getaddrinfo(server.c_str(), port_str.c_str(), &hints, &res);
+        std::lock_guard<std::mutex> lock(job->m);
+        job->rc = rc;
+        job->result = res; // ownership handed to `job`
+        job->done = true;
+    }).detach();
 
     struct addrinfo* result = nullptr;
-    std::string port_str = std::to_string(port);
-    
-    int ret = getaddrinfo(server.c_str(), port_str.c_str(), &hints, &result);
-    if (ret != 0) {
-        V2TIM_LOG(kError, "[IRC] getaddrinfo failed: {}", gai_strerror(ret));
-        return -1;
+    while (true) {
+        {
+            std::lock_guard<std::mutex> lock(job->m);
+            if (job->done) {
+                if (job->rc != 0) {
+                    V2TIM_LOG(kError, "[IRC] getaddrinfo failed: {}", gai_strerror(job->rc));
+                    return -1;
+                }
+                result = job->result;
+                job->result = nullptr; // ownership transferred to us
+                break;
+            }
+        }
+        if (channel != nullptr && channel->should_stop) {
+            // Abandon the resolve. The detached helper finishes on its own and
+            // self-cleans via DnsResolveJob's destructor.
+            V2TIM_LOG(kInfo, "[IRC] DNS resolve abandoned (stopping) for {}", server);
+            return -1;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
 
+    // --- Connect (bounded + stop-aware) ---
     int sock = -1;
     for (struct addrinfo* rp = result; rp != nullptr; rp = rp->ai_next) {
+        if (channel != nullptr && channel->should_stop) break;
         sock = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
         if (sock < 0) {
             continue;
@@ -195,22 +250,33 @@ int IrcClientManager::connectToServer(const std::string& server, int port, bool 
             break;
         }
 
-        // Check if connection is in progress
+        // Connection in progress: poll for writability in short slices (up to a
+        // 5s budget) so a stop request bails within ~200ms instead of blocking
+        // the whole select timeout.
         if (IRC_ERRNO == IRC_EINPROGRESS) {
-            fd_set write_fds;
-            FD_ZERO(&write_fds);
-            FD_SET(sock, &write_fds);
-            struct timeval timeout;
-            timeout.tv_sec = 5;
-            timeout.tv_usec = 0;
-            
-            if (select(sock + 1, nullptr, &write_fds, nullptr, &timeout) > 0) {
-                int error = 0;
-                socklen_t len = sizeof(error);
-                if (getsockopt(sock, SOL_SOCKET, SO_ERROR, (char*)&error, &len) == 0 && error == 0) {
+            bool connected = false;
+            for (int waited_ms = 0; waited_ms < 5000; waited_ms += 200) {
+                if (channel != nullptr && channel->should_stop) break;
+                fd_set write_fds;
+                FD_ZERO(&write_fds);
+                FD_SET(sock, &write_fds);
+                struct timeval tv;
+                tv.tv_sec = 0;
+                tv.tv_usec = 200000;
+                const int sret = select(sock + 1, nullptr, &write_fds, nullptr, &tv);
+                if (sret > 0) {
+                    int error = 0;
+                    socklen_t len = sizeof(error);
+                    if (getsockopt(sock, SOL_SOCKET, SO_ERROR, (char*)&error, &len) == 0 &&
+                        error == 0) {
+                        connected = true;
+                    }
                     break;
                 }
+                if (sret < 0) break; // select error
+                // sret == 0: still connecting — keep waiting within the budget.
             }
+            if (connected) break;
         }
 
         IRC_CLOSE_SOCKET(sock);
@@ -278,6 +344,65 @@ bool IrcClientManager::sendIrcCommand(IrcChannel* channel, const std::string& co
 
     V2TIM_LOG(kInfo, "[IRC] Sent: {}", cmd);
     return true;
+}
+
+// Best-effort, strictly-bounded graceful QUIT. Called from disconnectChannel()
+// on the Dart isolate — it must never block. We only acquire io_mutex via a
+// short bounded try_lock (skip the QUIT if the channel thread is mid-IO rather
+// than wait on it) and write in non-blocking mode so a stalled peer or a full
+// send buffer can't wedge disconnect. Holding io_mutex here excludes the channel
+// thread's recv/SSL_read, so temporarily toggling the fd to non-blocking for the
+// SSL write is safe.
+void IrcClientManager::sendQuitBestEffort(IrcChannel* channel) {
+    if (!channel->connected || channel->sock_fd.load() < 0) {
+        return;
+    }
+    std::unique_lock<std::mutex> io_lock(channel->io_mutex, std::defer_lock);
+    // Bounded acquisition: at most ~100ms, never unbounded.
+    for (int i = 0; i < 5 && !io_lock.try_lock(); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    if (!io_lock.owns_lock()) {
+        return; // Channel thread busy; skip the courtesy QUIT.
+    }
+    const int fd = channel->sock_fd.load();
+    if (fd < 0) {
+        return;
+    }
+    static const std::string quit = "QUIT :Disconnecting from IRC\r\n";
+    // Non-blocking best-effort for BOTH paths. io_mutex is held so the channel
+    // thread is not in recv/SSL_read; toggling the fd non-blocking for this
+    // single write is safe and portable (avoids the non-portable MSG_DONTWAIT
+    // flag, which Winsock does not define).
+    irc_set_nonblocking(fd, true);
+    if (channel->use_ssl && channel->ssl) {
+        SSL_write((SSL*)channel->ssl, quit.c_str(), static_cast<int>(quit.size()));
+    } else {
+        send(fd, quit.c_str(), quit.size(), MSG_NOSIGNAL);
+    }
+    irc_set_nonblocking(fd, false);
+    V2TIM_LOG(kInfo, "[IRC] Sent: QUIT :Disconnecting from IRC");
+}
+
+// Tear down the channel's SSL objects + socket under io_mutex. Idempotent, so
+// every channelThread exit/reconnect path can route through it without risking
+// a leaked fd or SSL handle.
+void IrcClientManager::cleanupChannelSocket(IrcChannel* channel) {
+    std::lock_guard<std::mutex> io_lock(channel->io_mutex);
+    if (channel->ssl) {
+        SSL_shutdown((SSL*)channel->ssl);
+        SSL_free((SSL*)channel->ssl);
+        channel->ssl = nullptr;
+    }
+    if (channel->ssl_ctx) {
+        SSL_CTX_free((SSL_CTX*)channel->ssl_ctx);
+        channel->ssl_ctx = nullptr;
+    }
+    const int sock_fd = channel->sock_fd.load();
+    if (sock_fd >= 0) {
+        IRC_CLOSE_SOCKET(sock_fd);
+        channel->sock_fd.store(-1);
+    }
 }
 
 void IrcClientManager::handlePing(IrcChannel* channel, const std::string& line) {
@@ -440,47 +565,53 @@ void IrcClientManager::channelThread(IrcChannel* channel) {
     
     updateConnectionStatus(channel, ConnectionStatus::Connecting, "Connecting to server");
     
-    // Connect to server (with retry logic)
+    // Connect to server (with its OWN retry/backoff — see the note below on why
+    // this must not delegate to attemptReconnect()).
     while (!channel->should_stop) {
-        const int connected_sock = connectToServer(channel->server, channel->port, channel->use_ssl);
+        const int connected_sock = connectToServer(channel->server, channel->port, channel->use_ssl, channel);
         channel->sock_fd.store(connected_sock);
         if (connected_sock >= 0) {
             // Perform SSL handshake if needed
-            if (channel->use_ssl) {
-                if (!performSslHandshake(channel)) {
-                    V2TIM_LOG(kError, "[IRC] SSL handshake failed");
-                    IRC_CLOSE_SOCKET(channel->sock_fd.load());
-                    channel->sock_fd.store(-1);
-                    // Try to reconnect
-                    attemptReconnect(channel);
-                    if (channel->should_stop) {
-                        return;
-                    }
-                    std::this_thread::sleep_for(std::chrono::seconds(IrcChannel::reconnect_delay_seconds));
-                    continue;
-                }
+            if (!channel->use_ssl || performSslHandshake(channel)) {
+                channel->reconnect_attempts = 0; // Reset on successful connection
+                channel->join_sent = false;
+                break;
             }
-            
-            channel->reconnect_attempts = 0; // Reset on successful connection
-            channel->join_sent = false;
-            break;
+            V2TIM_LOG(kError, "[IRC] SSL handshake failed");
+            IRC_CLOSE_SOCKET(channel->sock_fd.load());
+            channel->sock_fd.store(-1);
+            // fall through to the retry bookkeeping below
         }
-        
-        // Connection failed, try to reconnect
-        attemptReconnect(channel);
-        if (channel->should_stop) {
+
+        // Connect (or SSL handshake) failed. Count the attempt and back off HERE
+        // rather than calling attemptReconnect(): attemptReconnect() opens a
+        // *second* connection and sends NICK/USER on it, which this loop would
+        // then orphan on the next connectToServer() — leaking the fd and leaving
+        // a ghost registration on the server. attemptReconnect() stays reserved
+        // for the mid-session (post-JOIN) drop path in the read loop below.
+        if (++channel->reconnect_attempts >= IrcChannel::max_reconnect_attempts) {
+            updateConnectionStatus(channel, ConnectionStatus::Error, "Max reconnect attempts reached");
+            channel->should_stop = true;
             return;
         }
-        
-        // Wait before retry
-        std::this_thread::sleep_for(std::chrono::seconds(IrcChannel::reconnect_delay_seconds));
+        updateConnectionStatus(
+            channel, ConnectionStatus::Reconnecting,
+            "Reconnecting (attempt " + std::to_string(channel->reconnect_attempts) + ")");
+        // Wait before retry (waking early if asked to stop)
+        interruptibleSleep(channel, IrcChannel::reconnect_delay_seconds);
     }
-    
-    if (channel->sock_fd.load() < 0) {
-        updateConnectionStatus(channel, ConnectionStatus::Error, "Failed to connect to server");
+
+    if (channel->should_stop || channel->sock_fd.load() < 0) {
+        // A stop (or failed connect) landed after the socket was established but
+        // before the read loop. Tear the socket/SSL down here — the normal
+        // cleanup block at the end of this function is skipped on this early
+        // return, so without this the fd + SSL objects would leak (disconnect
+        // only shutdown()s the fd, it never close()s it).
+        cleanupChannelSocket(channel);
+        channel->connected = false;
         return;
     }
-    
+
     // Generate nickname
     std::string nick = generateNickname(channel);
     
@@ -549,24 +680,40 @@ void IrcClientManager::channelThread(IrcChannel* channel) {
                     updateConnectionStatus(channel, ConnectionStatus::Error, std::string("Recv error: ") + std::to_string(sock_err));
                 }
                 
-                // Try to reconnect if not explicitly stopped
-                if (!channel->should_stop) {
-                    attemptReconnect(channel);
-                    if (channel->sock_fd.load() < 0) {
-                        // Reconnect failed, wait and retry in next iteration
-                        std::this_thread::sleep_for(std::chrono::seconds(IrcChannel::reconnect_delay_seconds));
-                        continue;
-                    }
-                    // Reconnected, continue processing
-                    continue;
-                } else {
+                // Explicit stop wins — exit to the cleanup block.
+                if (channel->should_stop) {
                     break;
                 }
+                // Close the dead socket first. attemptReconnect() may
+                // early-return (still inside the reconnect-delay window) without
+                // touching the fd; a half-closed fd left open would make the
+                // next select() return immediately-readable → recv()==0 in a
+                // tight CPU spin until the delay elapsed.
+                cleanupChannelSocket(channel);
+                // Keep retrying until we reconnect, are asked to stop, or
+                // attemptReconnect() caps out (it sets should_stop at the max
+                // attempt count). We must NOT fall back into the main loop with
+                // sock_fd < 0 — its top would `break` and kill the channel
+                // instead of retrying.
+                while (!channel->should_stop && channel->sock_fd.load() < 0) {
+                    attemptReconnect(channel);
+                    if (channel->sock_fd.load() >= 0) {
+                        break; // reconnected (attemptReconnect re-sent NICK/USER)
+                    }
+                    interruptibleSleep(channel, IrcChannel::reconnect_delay_seconds);
+                }
+                if (channel->should_stop) {
+                    break;
+                }
+                // Reconnected — resume reading in the next iteration.
+                continue;
             }
             
-            buffer[n] = '\0';
-            line_buffer += buffer;
-            
+            // recv() may embed NULs (binary/garbage from a hostile peer); append
+            // exactly n bytes rather than treating the buffer as a C string so a
+            // NUL can't truncate accounting and defeat the size cap below.
+            line_buffer.append(buffer, static_cast<size_t>(n));
+
             // Process complete lines
             size_t pos;
             while ((pos = line_buffer.find('\n')) != std::string::npos) {
@@ -578,27 +725,22 @@ void IrcClientManager::channelThread(IrcChannel* channel) {
                 processIrcMessage(channel, line);
                 line_buffer.erase(0, pos + 1);
             }
+
+            // Bound the unparsed remainder: a peer that never sends a newline
+            // must not be able to grow this accumulator without limit. IRC lines
+            // are <=512 bytes, so anything past the cap is malformed/hostile —
+            // drop the partial line rather than exhaust memory.
+            if (line_buffer.size() > kMaxLineBufferBytes) {
+                V2TIM_LOG(kError,
+                          "[IRC] Oversized line buffer ({} bytes) for {}, dropping",
+                          line_buffer.size(), channel->channel);
+                line_buffer.clear();
+            }
         }
     }
     
     // Cleanup
-    {
-        std::lock_guard<std::mutex> io_lock(channel->io_mutex);
-        if (channel->ssl) {
-            SSL_shutdown((SSL*)channel->ssl);
-            SSL_free((SSL*)channel->ssl);
-            channel->ssl = nullptr;
-        }
-        if (channel->ssl_ctx) {
-            SSL_CTX_free((SSL_CTX*)channel->ssl_ctx);
-            channel->ssl_ctx = nullptr;
-        }
-        const int sock_fd = channel->sock_fd.load();
-        if (sock_fd >= 0) {
-            IRC_CLOSE_SOCKET(sock_fd);
-            channel->sock_fd.store(-1);
-        }
-    }
+    cleanupChannelSocket(channel);
     channel->connected = false;
     updateConnectionStatus(channel, ConnectionStatus::Disconnected, "Thread ended");
     V2TIM_LOG(kInfo, "[IRC] Thread ended for channel {}", channel->channel);
@@ -673,6 +815,12 @@ bool IrcClientManager::disconnectChannel(const std::string& channel) {
         }
 
         IrcChannel* irc_channel = it->second.get();
+        // Send a graceful QUIT before tearing the socket down so the server
+        // drops us cleanly instead of leaving a ghost nick until ping-timeout.
+        // Best-effort and strictly bounded (see sendQuitBestEffort): this runs
+        // on the Dart isolate over FFI, so it must never block on a stalled peer
+        // or a full send buffer.
+        sendQuitBestEffort(irc_channel);
         irc_channel->should_stop = true;
         irc_channel->connected = false;
         const int sock_fd = irc_channel->sock_fd.load();
@@ -797,6 +945,10 @@ void IrcClientManager::shutdown() {
         channels_.clear();
         shutting_down_ = false;
     }
+    // Note: detached DNS resolver threads (see connectToServer) may still be
+    // running here. We do NOT wait for them — the library is never dlclose()d
+    // (the FFI unload leaves it mapped precisely so those threads can finish
+    // safely), so an abandoned resolver simply frees its addrinfo and exits.
 }
 
 void IrcClientManager::handleSaslAuth(IrcChannel* channel, const std::string& line) {
@@ -850,25 +1002,47 @@ void IrcClientManager::updateConnectionStatus(IrcChannel* channel, ConnectionSta
     }
 }
 
-// 生成昵称
+// 生成昵称（获取 mutex_ 后读取昵称字段）
 std::string IrcClientManager::generateNickname(IrcChannel* channel) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return generateNicknameLocked(channel);
+}
+
+// 生成昵称（调用者已持有 mutex_）
+std::string IrcClientManager::generateNicknameLocked(IrcChannel* channel) {
     if (!channel->custom_nickname.empty() && channel->nickname_suffix == 0) {
         return channel->custom_nickname;
     }
-    
+
     if (channel->nickname_suffix == 0) {
         return channel->base_nickname;
     }
-    
+
     return channel->base_nickname + "_" + std::to_string(channel->nickname_suffix);
 }
 
 // 处理昵称冲突
 void IrcClientManager::handleNickConflict(IrcChannel* channel) {
-    channel->nickname_suffix++;
-    std::string new_nick = generateNickname(channel);
+    std::string new_nick;
+    {
+        // custom_nickname/base_nickname/nickname_suffix may be mutated by
+        // setCustomNickname() on the caller thread under mutex_; take the same
+        // lock here so the IRC thread never reads a torn std::string/int.
+        std::lock_guard<std::mutex> lock(mutex_);
+        channel->nickname_suffix++;
+        new_nick = generateNicknameLocked(channel);
+    }
     sendIrcCommand(channel, "NICK " + new_nick);
     V2TIM_LOG(kInfo, "[IRC] Nickname conflict, trying: {}", new_nick);
+}
+
+// Sleep in small steps so a stop request (disconnect/shutdown) wakes us early
+// instead of blocking the joining thread for the whole delay.
+void IrcClientManager::interruptibleSleep(IrcChannel* channel, int seconds) {
+    for (int elapsed_ms = 0; elapsed_ms < seconds * 1000; elapsed_ms += 100) {
+        if (channel->should_stop) return;
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
 }
 
 // 自动重连
@@ -913,7 +1087,7 @@ void IrcClientManager::attemptReconnect(IrcChannel* channel) {
     }
     
     // Try to reconnect
-    const int connected_sock = connectToServer(channel->server, channel->port, channel->use_ssl);
+    const int connected_sock = connectToServer(channel->server, channel->port, channel->use_ssl, channel);
     channel->sock_fd.store(connected_sock);
     if (connected_sock < 0) {
         V2TIM_LOG(kError, "[IRC] Reconnect attempt {} failed for {}",
@@ -1066,24 +1240,65 @@ bool IrcClientManager::performSslHandshake(IrcChannel* channel) {
         return false;
     }
     
+    const int ssl_fd = channel->sock_fd.load();
     // Set socket
-    if (SSL_set_fd(ssl, channel->sock_fd.load()) != 1) {
+    if (SSL_set_fd(ssl, ssl_fd) != 1) {
         V2TIM_LOG(kError, "[IRC] Failed to set SSL file descriptor");
         SSL_free(ssl);
         SSL_CTX_free(ctx);
         return false;
     }
-    
-    // Perform handshake
-    int ret = SSL_connect(ssl);
-    if (ret != 1) {
-        int err = SSL_get_error(ssl, ret);
-        V2TIM_LOG(kError, "[IRC] SSL handshake failed: {}", ERR_error_string(err, nullptr));
+
+    // Perform the handshake non-blocking with a bounded, stop-aware wait. A
+    // blocking SSL_connect() against a peer that completes TCP but stalls TLS
+    // would hang this thread forever, and disconnect()/shutdown() join it on the
+    // Dart isolate — so the whole UI would wedge. Cap the handshake instead.
+    irc_set_nonblocking(ssl_fd, true);
+    bool handshake_ok = false;
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::seconds(kSslHandshakeTimeoutSeconds);
+    while (true) {
+        if (channel->should_stop) {
+            V2TIM_LOG(kInfo, "[IRC] SSL handshake aborted (stopping) for {}", channel->channel);
+            break;
+        }
+        const int ret = SSL_connect(ssl);
+        if (ret == 1) {
+            handshake_ok = true;
+            break;
+        }
+        const int err = SSL_get_error(ssl, ret);
+        if (err != SSL_ERROR_WANT_READ && err != SSL_ERROR_WANT_WRITE) {
+            V2TIM_LOG(kError, "[IRC] SSL handshake failed: {}", ERR_error_string(err, nullptr));
+            break;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= deadline) {
+            V2TIM_LOG(kError, "[IRC] SSL handshake timed out for {}", channel->channel);
+            break;
+        }
+        // Wait for the socket to become ready in the direction OpenSSL wants,
+        // but never longer than 1s so should_stop / the deadline are honored.
+        fd_set fds;
+        FD_ZERO(&fds);
+        FD_SET(ssl_fd, &fds);
+        struct timeval tv;
+        tv.tv_sec = 1;
+        tv.tv_usec = 0;
+        if (err == SSL_ERROR_WANT_READ) {
+            select(ssl_fd + 1, &fds, nullptr, nullptr, &tv);
+        } else {
+            select(ssl_fd + 1, nullptr, &fds, nullptr, &tv);
+        }
+    }
+    if (!handshake_ok) {
         SSL_free(ssl);
         SSL_CTX_free(ctx);
         return false;
     }
-    
+    // Restore blocking mode for the existing sslRecv/sslSend paths.
+    irc_set_nonblocking(ssl_fd, false);
+
     // Store SSL context and connection in channel
     channel->ssl_ctx = ctx;
     channel->ssl = ssl;
