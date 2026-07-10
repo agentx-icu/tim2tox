@@ -22,11 +22,11 @@ struct TIM_API V2TIMOfficialAccountInfo {
     /// 自定义数据
     V2TIMString customData;
     /// 创建公众号的时间，单位：秒
-    uint64_t createTime;
+    uint64_t createTime = 0;
     /// 公众号订阅者数量
-    uint64_t subscriberCount;
+    uint64_t subscriberCount = 0;
     /// 订阅的时间，单位：秒
-    uint64_t subscribeTime;
+    uint64_t subscribeTime = 0;
 
     V2TIMOfficialAccountInfo();
     V2TIMOfficialAccountInfo(const V2TIMOfficialAccountInfo& officialAccountInfo);
@@ -36,7 +36,7 @@ struct TIM_API V2TIMOfficialAccountInfo {
 /// 公众号资料获取结果
 struct TIM_API V2TIMOfficialAccountInfoResult {
     /// 返回码
-    int resultCode;
+    int resultCode = 0;
     /// 返回结果表述
     V2TIMString resultInfo;
     /// 公众号资料

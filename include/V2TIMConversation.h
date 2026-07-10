@@ -58,7 +58,7 @@ enum V2TIMConversationFilterType {
 /// 会话对象
 struct TIM_API V2TIMConversation {
     /// 会话类型
-    V2TIMConversationType type;
+    V2TIMConversationType type = V2TIM_UNKNOWN;
     /// 会话唯一 ID，如果是 C2C 单聊，组成方式为 c2c_userID，如果是群聊，组成方式为 group_groupID
     V2TIMString conversationID;
     /// 如果会话类型为 C2C 单聊，userID 会存储对方的用户ID，否则为空字符串
@@ -72,20 +72,20 @@ struct TIM_API V2TIMConversation {
     /// 会话展示头像（群组：群头像；C2C：对方头像）
     V2TIMString faceUrl;
     /// 会话未读消息数量,直播群（AVChatRoom）不支持未读计数，默认为 0
-    int unreadCount;
+    int unreadCount = 0;
     /// 消息接收选项（接收 | 接收但不提醒 | 不接收）
-    V2TIMReceiveMessageOpt recvOpt;
+    V2TIMReceiveMessageOpt recvOpt = V2TIM_RECEIVE_MESSAGE;
     /// 会话最后一条消息，如果会话没有消息，lastMessage 字段为 NULL
     /// 5.5.892 以前版本，请您使用 lastMessage -> timestamp 对会话做排序，timestamp 越大，会话越靠前
-    V2TIMMessage *lastMessage;
+    V2TIMMessage *lastMessage = nullptr;
     /// 群会话 @ 信息列表，用于展示 “有人@我” 或 “@所有人” 这两种提醒状态
     V2TIMGroupAtInfoVector groupAtInfolist;
     /// 草稿信息，设置草稿信息请调用 SetConversationDraft() 接口
     V2TIMString draftText;
     /// 上次设置草稿时的 UTC 时间戳
-    uint64_t draftTimestamp;
+    uint64_t draftTimestamp = 0;
     /// 是否置顶
-    bool isPinned;
+    bool isPinned = false;
     // 排序字段（5.5.892 及以后版本支持）
     // @note
     // - 排序字段 orderKey
@@ -95,7 +95,7 @@ struct TIM_API V2TIMConversation {
     // - 当您 “清空会话所有消息” 或者 “逐个删除会话的所有消息” 之后，会话的 lastMessage
     // 变为空，但会话的 orderKey
     // 不会改变；如果想保持会话的排序位置不变，可以使用该字段对所有会话进行排序
-    uint64_t orderKey;
+    uint64_t orderKey = 0;
     /// 会话标记列表，取值详见 @V2TIMConversationMarkType（从 6.5 版本开始支持）
     V2TIMUInt64Vector markList;
     /// 会话自定义数据（从 6.5 版本开始支持）
@@ -103,9 +103,9 @@ struct TIM_API V2TIMConversation {
     /// 会话所属分组列表（从 6.5 版本开始支持）
     V2TIMStringVector conversationGroupList;
     /// 最新已读消息的 UTC 时间戳，仅对单聊会话生效（从 7.1 版本开始支持）
-    uint64_t c2cReadTimestamp;
+    uint64_t c2cReadTimestamp = 0;
     /// 已读消息的 sequence，仅对群聊会话生效（从 7.1 版本开始支持）
-    uint64_t groupReadSequence;
+    uint64_t groupReadSequence = 0;
 
     V2TIMConversation();
     V2TIMConversation(const V2TIMConversation& conversation);
@@ -119,26 +119,26 @@ typedef TXV2TIMConversationVector V2TIMConversationVector;
 /// 会话 filter
 struct TIM_API V2TIMConversationListFilter {
     /// C2C 或群会话(填 0 代表不过滤此项)
-    V2TIMConversationType type;
+    V2TIMConversationType type = V2TIM_UNKNOWN;
     /// 会话过滤类型，取值详见 @V2TIMConversationFilterType
     /// 如需会话分组过滤，则设置 filterType |= (uint32_t)V2TIM_CONVERSATION_FILTER_TYPE_CONVERSATION_GROUP
     /// 如需会话标记过滤，则设置 filterType |= (uint32_t)V2TIM_CONVERSATION_FILTER_TYPE_CONVERSATION_MARK
     /// 如需会话未读数过滤，则设置 filterType |= (uint32_t)V2TIM_CONVERSATION_FILTER_TYPE_HAS_UNREAD_COUNT
     /// 如需会话群 @ 信息过滤，则设置 filterType |= (uint32_t)V2TIM_CONVERSATION_FILTER_TYPE_HAS_GROUP_AT_INFO
-    uint32_t filterType;
+    uint32_t filterType = 0;
     /// 会话分组名称
     /// 当 filterType 设置为需要会话分组过滤时，该字段才生效，字段设置为 "" 代表过滤不属于任何分组的会话
     V2TIMString conversationGroup;
     /// 会话标记类型，取值详见 @V2TIMConversationMarkType
     /// 当 filterType 设置为需要会话标记过滤时，该字段才生效，字段设置为 0 代表过滤不含任何标记的会话
-    uint64_t markType;
+    uint64_t markType = 0;
     /// 会话未读数
     /// 当 filterType 设置为需要会话未读数过滤时，该字段才生效，设置为 true 代表过滤含未读数的会话；设置为 false 代表过滤不含未读数的会话
-    bool hasUnreadCount;
+    bool hasUnreadCount = false;
     /// 会话群 @ 信息
     /// 当 filterType 设置为需要会话 @ 信息过滤时，该字段才生效，设置为 true 代表过滤含群 @ 消息的会话；设置为 false 代表过滤不含群 @ 消息的会话
-    bool hasGroupAtInfo;
-    
+    bool hasGroupAtInfo = false;
+
     V2TIMConversationListFilter();
     V2TIMConversationListFilter(const V2TIMConversationListFilter& filter);
     V2TIMConversationListFilter& operator =(const V2TIMConversationListFilter& filter);
@@ -148,9 +148,9 @@ struct TIM_API V2TIMConversationListFilter {
 /// 获取会话列表结果
 struct TIM_API V2TIMConversationResult  {
     /// 获取下一次分页拉取的游标
-    uint64_t nextSeq;
+    uint64_t nextSeq = 0;
     /// 会话列表是否已经拉取完毕
-    bool isFinished;
+    bool isFinished = false;
     /// 获取会话列表
     V2TIMConversationVector conversationList;
 
@@ -165,7 +165,7 @@ struct TIM_API V2TIMConversationOperationResult {
     /// 会话 ID
     V2TIMString conversationID;
     /// 返回码
-    int resultCode;
+    int resultCode = 0;
     /// 返回信息
     V2TIMString resultInfo;
 

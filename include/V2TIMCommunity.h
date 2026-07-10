@@ -116,36 +116,36 @@ struct TIM_API V2TIMTopicInfo : V2TIMBaseObject {
     /// 话题公告，最长 400 字节，使用 UTF-8 编码
     V2TIMString notification;
     /// 话题全员禁言
-    bool isAllMuted;
+    bool isAllMuted = false;
     /// 当前用户在话题中的禁言时间
-    uint32_t selfMuteTime;
+    uint32_t selfMuteTime = 0;
     /// 话题自定义字段
     V2TIMString customString;
     /// 话题消息接收选项，修改话题消息接收选项请调用 setGroupReceiveMessageOpt 接口
-    V2TIMReceiveMessageOpt recvOpt;
+    V2TIMReceiveMessageOpt recvOpt = V2TIM_RECEIVE_MESSAGE;
     /// 话题草稿
     V2TIMString draftText;
     /// 话题消息未读数量
-    uint64_t unreadCount;
+    uint64_t unreadCount = 0;
     /// 话题 lastMessage
-    V2TIMMessage *lastMessage;
+    V2TIMMessage *lastMessage = nullptr;
     /// 话题已读消息的 sequence，从 7.8 版本开始支持
-    uint64_t readSequence;
+    uint64_t readSequence = 0;
     /// 话题 at 信息列表
     V2TIMGroupAtInfoVector groupAtInfoList;
     /// 话题创建时间，单位：秒
-    uint32_t createTime;
+    uint32_t createTime = 0;
     /// 申请加入话题是否需要管理员审批（私密话题有效，默认不需要审批，可以自由加入）（从 8.4 版本开始支持）
-    V2TIMGroupAddOpt topicAddOpt;
+    V2TIMGroupAddOpt topicAddOpt = V2TIM_GROUP_ADD_FORBID;
     /// 邀请加入话题是否需要管理员审批（私密话题有效，默认不需要审批，可以自由加入）（从 8.4 版本开始支持）
-    V2TIMGroupAddOpt topicApproveOpt;
+    V2TIMGroupAddOpt topicApproveOpt = V2TIM_GROUP_ADD_FORBID;
     /// 话题默认群成员（私密话题有效，最大支持 100 个群成员，只能在创建话题的时候设置）（从 8.4 版本开始支持）
     V2TIMCreateGroupMemberInfoVector memberlist;
     /// 话题成员的最大个数（私密话题有效，最大支持 10000，默认 10000，只能在创建话题的时候设置）（从 8.4 版本开始支持）
-    uint32_t memberMaxCount;
+    uint32_t memberMaxCount = 0;
     /// 话题默认权限，7.8 版本开始支持
     /// 群成员在没有加入任何权限组时的默认权限，仅在社群资料 V2TIMGroupInfo 中 enablePermissionGroup = true 打开权限组之后生效
-    uint64_t defaultPermissions;
+    uint64_t defaultPermissions = 0;
     /**
      * 获取登录用户在话题中的消息接收选项是否继承社群。该功能仅增强版 SDK 8.1 及以上版本支持
      */
@@ -162,7 +162,7 @@ struct TIM_API V2TIMTopicInfo : V2TIMBaseObject {
     /// info.topicFaceURL = "new face url";
     /// info.modifyFlag = V2TIM_COMMUNITY_MODIFY_FLAG_TOPIC_NAME |
     /// V2TIM_COMMUNITY_MODIFY_FLAG_TOPIC_FACE_URL;
-    uint32_t modifyFlag;
+    uint32_t modifyFlag = 0;
 
     V2TIMTopicInfo();
     V2TIMTopicInfo(const V2TIMTopicInfo& topicInfo);
@@ -178,7 +178,7 @@ struct TIM_API V2TIMTopicInfo : V2TIMBaseObject {
 
 struct TIM_API V2TIMTopicOperationResult {
     /// 结果 0：成功；非0：失败
-    int32_t errorCode;
+    int32_t errorCode = 0;
     /// 如果删除失败，会返回错误信息
     V2TIMString errorMsg;
     /// 如果删除成功，会返回对应的 topicID
@@ -200,7 +200,7 @@ typedef TXV2TIMTopicOperationResultVector V2TIMTopicOperationResultVector;
 
 struct TIM_API V2TIMTopicInfoResult {
     /// 结果 0：成功；非0：失败
-    int32_t errorCode;
+    int32_t errorCode = 0;
     /// 如果获取失败，会返回错误信息
     V2TIMString errorMsg;
     /// 如果获取成功，会返回对应的 info
@@ -230,16 +230,16 @@ struct TIM_API V2TIMPermissionGroupInfo {
     /// 权限组自定义字段
     V2TIMString customData;
     /// 群权限
-    uint64_t groupPermission;
+    uint64_t groupPermission = 0;
     /// 权限组当前人数
-    uint64_t memberCount;
+    uint64_t memberCount = 0;
     /// 权限组资料修改标记位
     /// 枚举 V2TIMPermissionGroupInfoModifyFlag 列出哪些字段支持修改，如果您修改权限组资料，请设置这个字段值
     /// 如果您同时修改多个字段，多个枚举值按位或 | 组合，例如，同时修改群名称和头像
     /// info.permissionGroupName = "new permission group name";
     /// info.customData = "new custom data";
     /// info.modifyFlag = V2TIM_PERMISSION_MODIFY_FLAG_NAME | V2TIM_PERMISSION_MODIFY_FLAG_CUSTOM_STRING;
-    uint32_t modifyFlag;
+    uint32_t modifyFlag = 0;
 
     V2TIMPermissionGroupInfo();
     V2TIMPermissionGroupInfo(const V2TIMPermissionGroupInfo& info);
@@ -254,7 +254,7 @@ struct TIM_API V2TIMPermissionGroupInfo {
 
 struct TIM_API V2TIMPermissionGroupInfoResult {
     /// 结果 0：成功；非0：失败
-    int resultCode;
+    int resultCode = 0;
     /// 如果获取失败，会返回错误信息
     V2TIMString resultMsg;
     /// 如果获取成功，会返回对应的 info
@@ -276,7 +276,7 @@ typedef TXV2TIMPermissionGroupInfoResultVector V2TIMPermissionGroupInfoResultVec
 
 struct TIM_API V2TIMPermissionGroupOperationResult {
     /// 结果 0：成功；非0：失败
-    int resultCode;
+    int resultCode = 0;
     /// 如果处理失败，会返回错误信息
     V2TIMString resultMsg;
     /// 权限组 ID
@@ -317,7 +317,7 @@ struct TIM_API V2TIMPermissionGroupMemberOperationResult {
     /// 被操作成员
     V2TIMString memberID;
     /// 结果 0：成功；非0：失败
-    int resultCode;
+    int resultCode = 0;
 
     V2TIMPermissionGroupMemberOperationResult();
     V2TIMPermissionGroupMemberOperationResult(
@@ -338,11 +338,11 @@ struct TIM_API V2TIMTopicPermissionResult {
     /// 话题 ID
     V2TIMString topicID;
     /// 结果 0：成功；非0：失败
-    int resultCode;
+    int resultCode = 0;
     /// 如果处理失败，会返回错误信息
     V2TIMString resultMsg;
     /// 话题权限
-    uint64_t topicPermission;
+    uint64_t topicPermission = 0;
     /// 社群 ID
     V2TIMString groupID;
     /// 权限组 ID

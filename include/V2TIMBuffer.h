@@ -24,8 +24,8 @@ public:
     V2TIMBuffer &operator=(const V2TIMBuffer &buffer);
 
 private:
-    uint8_t *buffer_;
-    size_t length_;
+    uint8_t *buffer_ = nullptr;
+    size_t length_ = 0;
 };
 
 #endif /* __V2TIM_BUFFER_H__ */

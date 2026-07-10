@@ -155,15 +155,15 @@ struct TIM_API V2TIMUserFullInfo : public V2TIMUserInfo {
     /// 用户签名
     V2TIMString selfSignature;
     /// 用户性别
-    V2TIMGender gender;
+    V2TIMGender gender = V2TIM_GENDER_UNKNOWN;
     /// 用户角色
-    uint32_t role;
+    uint32_t role = 0;
     /// 用户等级
-    uint32_t level;
+    uint32_t level = 0;
     /// 出生日期
-    uint32_t birthday;
+    uint32_t birthday = 0;
     /// 用户好友验证方式
-    V2TIMFriendAllowType allowType;
+    V2TIMFriendAllowType allowType = V2TIM_FRIEND_ALLOW_ANY;
     /// 用户自定义字段
     /// 首先要在 [控制台](https://console.cloud.tencent.com/im) (功能配置 -> 用户自定义字段)
     /// 配置用户自定义字段，然后再调用该接口进行设置，key 值不需要加 Tag_Profile_Custom_ 前缀。
@@ -174,7 +174,7 @@ struct TIM_API V2TIMUserFullInfo : public V2TIMUserInfo {
     // info.nickName = "new nickname";
     // info.selfSignature = "new self signature";
     // info.modifyFlag = V2TIM_USER_INFO_MODIFY_FLAG_NICK | V2TIM_USER_INFO_MODIFY_FLAG_SELF_SIGNATURE;
-    uint32_t modifyFlag;
+    uint32_t modifyFlag = 0;
 
     V2TIMUserFullInfo();
     V2TIMUserFullInfo(const V2TIMUserFullInfo& userFullInfo);
@@ -190,15 +190,15 @@ struct TIM_API V2TIMUserSearchParam {
     V2TIMStringVector keywordList;
     /// 指定关键字列表匹配类型，可设置为“或”关系搜索或者“与”关系搜索.
     /// 取值分别为 V2TIM_KEYWORD_LIST_MATCH_TYPE_OR 和 V2TIM_KEYWORD_LIST_MATCH_TYPE_AND，默认为“或”关系搜索。
-    V2TIMKeywordListMatchType keywordListMatchType;
+    V2TIMKeywordListMatchType keywordListMatchType = V2TIM_KEYWORD_LIST_MATCH_TYPE_OR;
     /// 用户性别（如果不设置，默认男性和女性都会返回）
-    V2TIMGender gender;
+    V2TIMGender gender = V2TIM_GENDER_UNKNOWN;
     /// 用户最小生日（如果不设置，默认值为 0）
-    uint32_t minBirthday;
+    uint32_t minBirthday = 0;
     /// 用户最大生日（如果不设置，默认 birthday >= minBirthday 的用户都会返回）
-    uint32_t maxBirthday;
+    uint32_t maxBirthday = 0;
     /// 每次云端搜索返回结果的条数（必须大于 0，最大支持 100，默认 20）
-    uint32_t searchCount;
+    uint32_t searchCount = 0;
     /// 每次云端搜索的起始位置。第一次填空字符串，续拉时填写 V2TIMUserSearchResult 中的返回值。
     V2TIMString searchCursor;
 
@@ -210,9 +210,9 @@ struct TIM_API V2TIMUserSearchParam {
 /// 用户搜索结果的参数
 struct TIM_API V2TIMUserSearchResult {
     /// 是否已经返回全部满足搜索条件的用户列表
-    bool isFinished;
+    bool isFinished = false;
     /// 满足搜索条件的用户总数量
-    uint32_t totalCount;
+    uint32_t totalCount = 0;
     /// 下一次云端搜索的起始位置
     V2TIMString nextCursor;
     /// 当前一次云端搜索返回的用户列表
@@ -229,7 +229,7 @@ struct TIM_API V2TIMUserStatus {
     V2TIMString userID;
 
     /// 用户的状态
-    V2TIMUserStatusType statusType;
+    V2TIMUserStatusType statusType = V2TIM_USER_STATUS_UNKNOWN;
 
     /// 用户的自定义状态, 最大 100 字节
     V2TIMString customStatus;
@@ -255,7 +255,7 @@ struct TIM_API V2TIMFriendInfo {
     /// [控制台](https://cloud.tencent.com/document/product/269/1501#.E6.A0.87.E9.85.8D.E5.A5.BD.E5.8F.8B.E5.AD.97.E6.AE.B5)。
     V2TIMString friendRemark;
     /// 添加好友的 UTC 时间戳
-    uint64_t friendAddTime;
+    uint64_t friendAddTime = 0;
     /// 好友自定义字段
     /// 首先要在 [控制台](https://console.cloud.tencent.com/im) (功能配置 -> 好友自定义字段)
     /// 配置好友自定义字段，然后再调用该接口进行设置，key 值不需要加 Tag_SNS_Custom_ 前缀。
@@ -276,7 +276,7 @@ struct TIM_API V2TIMFriendInfo {
     // info.friendRemark = "new friend remark";
     // info.friendCustomInfo = friendCustomInfo;
     // info.modifyFlag = V2TIM_FRIEND_INFO_MODIFY_FLAG_REMARK | V2TIM_FRIEND_INFO_MODIFY_FLAG_CUSTOM;
-    uint32_t modifyFlag;
+    uint32_t modifyFlag = 0;
 
     V2TIMFriendInfo();
     V2TIMFriendInfo(const V2TIMFriendInfo& friendInfo);
@@ -289,11 +289,11 @@ typedef TXV2TIMFriendInfoVector V2TIMFriendInfoVector;
 /// 好友资料获取结果
 struct TIM_API V2TIMFriendInfoResult {
     /// 返回码
-    int resultCode;
+    int resultCode = 0;
     /// 返回结果表述
     V2TIMString resultInfo;
     /// 好友类型
-    V2TIMFriendRelationType relation;
+    V2TIMFriendRelationType relation = V2TIM_FRIEND_RELATION_TYPE_NONE;
     /// 好友个人资料，如果不是好友，除了 userID 字段，其他字段都为空
     V2TIMFriendInfo friendInfo;
 
@@ -318,7 +318,7 @@ struct TIM_API V2TIMFriendAddApplication {
     /// 添加来源
     V2TIMString addSource;
     /// 加好友方式
-    V2TIMFriendType addType;
+    V2TIMFriendType addType = static_cast<V2TIMFriendType>(0);
 
     V2TIMFriendAddApplication();
     V2TIMFriendAddApplication(const V2TIMFriendAddApplication& friendAddApplication);
@@ -334,13 +334,13 @@ struct TIM_API V2TIMFriendApplication {
     /// 用户头像
     V2TIMString faceUrl;
     /// 添加好友的 UTC 时间戳
-    uint64_t addTime;
+    uint64_t addTime = 0;
     /// 来源
     V2TIMString addSource;
     /// 加好友附言
     V2TIMString addWording;
     /// 好友申请类型
-    V2TIMFriendApplicationType type;
+    V2TIMFriendApplicationType type = static_cast<V2TIMFriendApplicationType>(0);
 
     V2TIMFriendApplication();
     V2TIMFriendApplication(const V2TIMFriendApplication& friendApplication);
@@ -353,7 +353,7 @@ typedef TXV2TIMFriendApplicationVector V2TIMFriendApplicationVector;
 /// 好友申请列表
 struct TIM_API V2TIMFriendApplicationResult {
     /// 好友申请未读数量
-    uint64_t unreadCount;
+    uint64_t unreadCount = 0;
     /// 好友申请列表
     V2TIMFriendApplicationVector applicationList;
 
@@ -367,11 +367,11 @@ struct TIM_API V2TIMFriendCheckResult {
     /// 用户id
     V2TIMString userID;
     /// 返回码
-    int32_t resultCode;
+    int32_t resultCode = 0;
     /// 返回信息
     V2TIMString resultInfo;
     /// 检查结果
-    V2TIMFriendRelationType relationType;
+    V2TIMFriendRelationType relationType = V2TIM_FRIEND_RELATION_TYPE_NONE;
 
     V2TIMFriendCheckResult();
     V2TIMFriendCheckResult(const V2TIMFriendCheckResult& friendCheckResult);
@@ -386,7 +386,7 @@ struct TIM_API V2TIMFriendOperationResult {
     /// 用户Id
     V2TIMString userID;
     /// 返回码
-    int32_t resultCode;
+    int32_t resultCode = 0;
     /// 返回信息
     V2TIMString resultInfo;
 
@@ -403,7 +403,7 @@ struct TIM_API V2TIMFriendGroup {
     /// 好友分组名称
     V2TIMString groupName;
     /// 分组成员数量
-    uint64_t userCount;
+    uint64_t userCount = 0;
     /// 分组成员列表
     V2TIMStringVector friendList;
 
@@ -420,11 +420,11 @@ struct TIM_API V2TIMFriendSearchParam {
     /// 搜索的关键字列表，关键字列表最多支持 5 个
     V2TIMStringVector keywordList;
     /// 设置是否搜索 userID
-    bool isSearchUserID;
+    bool isSearchUserID = false;
     /// 是否设置搜索昵称
-    bool isSearchNickName;
+    bool isSearchNickName = false;
     /// 是否设置搜索备注
-    bool isSearchRemark;
+    bool isSearchRemark = false;
 
     V2TIMFriendSearchParam();
     V2TIMFriendSearchParam(const V2TIMFriendSearchParam& friendSearchParam);
@@ -436,7 +436,7 @@ struct TIM_API V2TIMFollowOperationResult {
     /// 用户 ID
     V2TIMString userID;
     /// 返回码
-    int32_t resultCode;
+    int32_t resultCode = 0;
     /// 返回信息
     V2TIMString resultInfo;
 
@@ -463,17 +463,17 @@ struct TIM_API V2TIMUserInfoResult {
 /// 用户关注数量信息获取结果
 struct TIM_API V2TIMFollowInfo {
     /// 返回码
-    int32_t resultCode;
+    int32_t resultCode = 0;
     /// 返回信息
     V2TIMString resultInfo;
     /// 用户 ID
     V2TIMString userID;
     /// 用户的关注数量
-    uint64_t followingCount;
+    uint64_t followingCount = 0;
     /// 用户的粉丝数量
-    uint64_t followersCount;
+    uint64_t followersCount = 0;
     /// 用户的互关数量
-    uint64_t mutualFollowersCount;
+    uint64_t mutualFollowersCount = 0;
 
     V2TIMFollowInfo();
     V2TIMFollowInfo(const V2TIMFollowInfo& followInfo);
@@ -488,11 +488,11 @@ struct TIM_API V2TIMFollowTypeCheckResult {
     /// 用户 ID
     V2TIMString userID;
     /// 返回码
-    int32_t resultCode;
+    int32_t resultCode = 0;
     /// 返回信息
     V2TIMString resultInfo;
     /// 关注类型
-    V2TIMFollowType followType;
+    V2TIMFollowType followType = V2TIM_FOLLOW_TYPE_NONE;
 
     V2TIMFollowTypeCheckResult();
     V2TIMFollowTypeCheckResult(const V2TIMFollowTypeCheckResult& followTypeCheckResult);

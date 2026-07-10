@@ -137,7 +137,7 @@ typedef unsigned int uintptr_t;
         const class_name* end() const { return &operator[](Size()); }         \
                                                                               \
     private:                                                                  \
-        TX##class_name##VectorIMPL* impl_;                                    \
+        TX##class_name##VectorIMPL* impl_ = nullptr;                          \
     };
 
 #define DEFINE_POINT_VECTOR(class_name)                                         \
@@ -170,7 +170,7 @@ typedef unsigned int uintptr_t;
         void Erase(size_t index);                                               \
                                                                                 \
     private:                                                                    \
-        TXP##class_name##VectorIMPL* impl_;                                     \
+        TXP##class_name##VectorIMPL* impl_ = nullptr;                           \
     };
 
 /////////////////////////////////////////////////////////////////////////////////
@@ -208,7 +208,7 @@ typedef unsigned int uintptr_t;
         const class_key##Vector AllKeys() const;                                             \
                                                                                              \
     private:                                                                                 \
-        TX##class_key##To##class_value##MapIMPL* impl_;                                      \
+        TX##class_key##To##class_value##MapIMPL* impl_ = nullptr;                            \
     };
 
 #endif /* __V2TIM_DEFINE_H__ */

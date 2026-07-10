@@ -164,14 +164,14 @@ struct TIM_API V2TIMOfflinePushConfig {
     /// 注册应用到厂商平台时获取的 token。
     V2TIMBuffer token;
     /// IM 控制台证书 ID
-    uint32_t businessID;
+    uint32_t businessID = 0;
 
     /// token 的类型，默认是 V2TIM_OFFLINE_PUSH_TOKEN_TYPE_DEFAULT
     /// @note V2TIM_OFFLINE_PUSH_TOKEN_TYPE_TPNS 字段已废弃
     /// - 如果您之前通过 TPNS 接入离线推送，并且在 TPNS 控制台配置推送信息，可以继续按照该方式接入推送功能；
     /// - 如果您从未接入 TPNS，从未在 TPNS 控制台配置推送信息，IM 将不在支持 TPNS 方式接入离线推送功能, 推荐参照如下方式接入：
     ///  https://cloud.tencent.com/document/product/269/74284
-    V2TIMOfflinePushTokenType token_type;
+    V2TIMOfflinePushTokenType token_type = V2TIM_OFFLINE_PUSH_TOKEN_TYPE_DEFAULT;
 
     V2TIMOfflinePushConfig();
     V2TIMOfflinePushConfig(const V2TIMOfflinePushConfig &);
@@ -195,13 +195,13 @@ struct TIM_API V2TIMOfflinePushInfo {
     /// userInfo 拿到这个字段，用这个字段可以做 UI 跳转逻辑
     V2TIMString ext;
     /// 是否关闭推送（默认开启推送）。
-    bool disablePush;
+    bool disablePush = false;
     /// iOS 离线推送的类型（仅对 iOS 生效）
     /// 默认值是 V2TIM_IOS_OFFLINE_PUSH_TYPE_APNS
-    V2TIMIOSOfflinePushType iOSPushType;
+    V2TIMIOSOfflinePushType iOSPushType = V2TIM_IOS_OFFLINE_PUSH_TYPE_APNS;
     /// 离线推送忽略 badge 计数（仅对 iOS 生效），
     /// 如果设置为 true，在 iOS 接收端，这条消息不会使 APP 的应用图标未读计数增加。
-    bool ignoreIOSBadge;
+    bool ignoreIOSBadge = false;
     /// 离线推送声音设置（仅对 iOS 生效），
     /// 当 iOSSound = kIOSOfflinePushNoSound，表示接收时不会播放声音。
     /// 当 iOSSound = kIOSOfflinePushDefaultSound，表示接收时播放系统声音。
@@ -216,7 +216,7 @@ struct TIM_API V2TIMOfflinePushInfo {
     V2TIMString iOSInterruptionLevel;
     /// 设置 iOS 后台透传消息
     /// 设置打开后，离线接收会唤起应用并透传消息内容 ext
-    bool enableIOSBackgroundNotification;
+    bool enableIOSBackgroundNotification = false;
     /// 离线推送声音设置（仅对 Android 生效, 仅 imsdk 6.1 及以上版本支持）
     /// 只有华为和谷歌手机支持设置铃音提示，小米铃音设置请您参照：https://dev.mi.com/console/doc/detail?pId=1278%23_3_0
     /// 另外，谷歌手机 FCM 推送在 Android 8.0 及以上系统设置声音提示，必须调用 setAndroidFCMChannelID 设置好 channelID，才能生效。
@@ -230,7 +230,7 @@ struct TIM_API V2TIMOfflinePushInfo {
     V2TIMString AndroidXiaoMiChannelID;
     /// 离线推送设置 VIVO 推送消息分类 (待废弃接口，VIVO 推送服务于 2023 年 4 月 3 日优化消息分类规则，推荐使用 AndroidVIVOCategory 设置消息类别)
     /// VIVO 手机离线推送消息分类，0：运营消息，1：系统消息。默认取值为 1 。
-    int AndroidVIVOClassification;
+    int AndroidVIVOClassification = 0;
     /// 离线推送设置 VIVO 推送消息类别，详见：https://dev.vivo.com.cn/documentCenter/doc/359。(VIVO 推送服务于 2023 年 4 月 3 日优化消息分类规则，推荐使用 AndroidVIVOCategory 设置消息类别，不需要再关注和设置 AndroidVIVOClassification)
     V2TIMString AndroidVIVOCategory;
     /// 离线推送设置华为推送消息分类，详见：https://developer.huawei.com/consumer/cn/doc/development/HMSCore-Guides/message-classification-0000001149358835
@@ -240,7 +240,7 @@ struct TIM_API V2TIMOfflinePushInfo {
     V2TIMString AndroidOPPOCategory;
     /// 离线推送设置 OPPO 推送通知栏消息提醒等级，详见：https://open.oppomobile.com/new/developmentDoc/info?id=13189
     /// 使用生效前，需要先设置 AndroidOPPOCategory  指定 category 为 IM 类消息。消息提醒等级有：1，通知栏；2，通知栏 + 锁屏 （默认）；16，通知栏 + 锁屏 + 横幅 + 震动 + 铃声；
-    int AndroidOPPONotifyLevel;
+    int AndroidOPPONotifyLevel = 0;
     /// 离线推送设置 Honor 推送消息分类，详见：https://developer.honor.com/cn/docs/11002/guides/notification-class
     /// Honor 推送消息分类: "NORMAL", 表示消息为服务通讯类; "LOW", 表示消息为资讯营销类
     V2TIMString AndroidHonorImportance;
@@ -267,7 +267,7 @@ struct TIM_API V2TIMOfflinePushInfo {
     V2TIMString HarmonyCategory;
     /// 离线推送忽略 badge 计数（仅对 Harmony 生效），
     /// 如果设置为 YES，在 Harmony 接收端，这条消息不会使 APP 的应用图标未读计数增加。
-    bool ignoreHarmonyBadge;
+    bool ignoreHarmonyBadge = false;
 
     V2TIMOfflinePushInfo();
     V2TIMOfflinePushInfo(const V2TIMOfflinePushInfo &);
@@ -303,7 +303,7 @@ struct TIM_API V2TIMMessage : V2TIMBaseObject {
     /// 消息 ID（消息创建的时候为空，消息发送的时候会生成）
     V2TIMString msgID;
     /// 消息的 UTC 时间戳
-    int64_t timestamp;
+    int64_t timestamp = 0;
     /// 消息发送者
     V2TIMString sender;
     /// 消息发送者昵称
@@ -326,17 +326,17 @@ struct TIM_API V2TIMMessage : V2TIMBaseObject {
     V2TIMString userID;
     /// 群聊中的消息序列号云端生成，在群里是严格递增且唯一的,
     /// 单聊中的序列号是本地生成，不能保证严格递增且唯一。
-    uint64_t seq;
+    uint64_t seq = 0;
     /// 消息随机码
-    uint64_t random;
+    uint64_t random = 0;
     /// 消息发送状态
-    V2TIMMessageStatus status;
+    V2TIMMessageStatus status = static_cast<V2TIMMessageStatus>(0);
     /// 是否支持消息扩展（6.7 及其以上版本支持，需要您购买旗舰版套餐）
     /// 直播群（AVChatRoom）消息不支持该功能。
     /// 您需要先到 IM 控制台配置该功能。
-    bool supportMessageExtension;
+    bool supportMessageExtension = false;
     /// 消息发送者是否是自己
-    bool isSelf;
+    bool isSelf = false;
     /// 消息自己是否已读
     bool IsRead() const;
     /// 消息对方是否已读（只有 C2C 消息有效）
@@ -347,11 +347,11 @@ struct TIM_API V2TIMMessage : V2TIMBaseObject {
     /// <p> 群聊消息 6.1 及以上版本支持该特性，需要您先到 IM 控制台配置支持已读回执的群类型。
     /// <p> 单聊消息 6.2 及以上版本支持该特性。
     /// <p> 群聊消息和单聊消息都需要购买旗舰版套餐包。
-    bool needReadReceipt;
+    bool needReadReceipt = false;
     /// 是否是广播消息，仅直播群支持（6.5 及以上版本支持，需要您购买旗舰版套餐）
-    bool isBroadcastMessage;
+    bool isBroadcastMessage = false;
     /// 消息优先级（只有 onRecvNewMessage 收到的 V2TIMMessage 获取有效）
-    V2TIMMessagePriority priority;
+    V2TIMMessagePriority priority = V2TIM_PRIORITY_DEFAULT;
     /// 群消息中被 @ 的用户 UserID 列表（即该消息都 @ 了哪些人）
     V2TIMStringVector groupAtUserList;
     /// 消息元素列表
@@ -418,14 +418,14 @@ struct TIM_API V2TIMMessage : V2TIMBaseObject {
     /// 消息是否不计入会话未读数：默认为 false，表明需要计入会话未读数，设置为
     /// true，表明不需要计入会话未读数
     /// <p> 5.3.425 及以上版本支持, 会议群（Meeting）默认不支持该字段
-    bool isExcludedFromUnreadCount;
+    bool isExcludedFromUnreadCount = false;
     /// 消息是否不计入会话 lastMsg：默认为 false，表明需要计入会话 lastMsg，设置为
     /// true，表明不需要计入会话 lastMsg
-    bool isExcludedFromLastMessage;
+    bool isExcludedFromLastMessage = false;
     /// 消息是否不过内容审核（【云端审核】）
     /// 只有在开通【云端审核】功能后，isExcludedFromContentModeration 设置才有效，设置为 true，表明不过内容审核，设置为 false：表明过内容审核。
     ///【云端审核】开通流程请参考 [云端审核功能](https://cloud.tencent.com/document/product/269/83795#.E4.BA.91.E7.AB.AF.E5.AE.A1.E6.A0.B8.E5.8A.9F.E8.83.BD)
-    bool isExcludedFromContentModeration;
+    bool isExcludedFromContentModeration = false;
     /// 消息自定义审核配置 ID（从 7.8 版本开始支持）
     /// 在开通【云端审核】功能后，您可以请前往 [控制台](https://console.cloud.tencent.com/im) (云端审核 -> 审核配置 -> 自定义配置 -> 添加自定义配置) 获取配置 ID。
     ///【自定义审核】配置流程请参考 [云端审核功能]（https://cloud.tencent.com/document/product/269/78633#a5efc9e8-a7ec-40e3-9b18-8ed1910f589c）
@@ -435,11 +435,11 @@ struct TIM_API V2TIMMessage : V2TIMBaseObject {
     /// 暂时只支持语音和视频消息。
     /// 只有在开通【云端审核】功能后才生效，【云端审核】开通流程请参考 [云端审核功能](https://cloud.tencent.com/document/product/269/83795#.E4.BA.91.E7.AB.AF.E5.AE.A1.E6.A0.B8.E5.8A.9F.E8.83.BD)。
     /// 如果您发送的语音或视频消息内容不合规，云端异步审核后会触发 SDK 的 onRecvMessageModified 回调，回调里的 message 对象该字段值为 true。
-    bool hasRiskContent;
+    bool hasRiskContent = false;
     /// 是否禁用消息发送前云端回调（从 8.1 版本开始支持）
-    bool disableCloudMessagePreHook;
+    bool disableCloudMessagePreHook = false;
     /// 是否禁用消息发送后云端回调（从 8.1 版本开始支持）
-    bool disableCloudMessagePostHook;
+    bool disableCloudMessagePostHook = false;
 
     /// 消息的离线推送信息
     V2TIMOfflinePushInfo offlinePushInfo;
@@ -472,7 +472,7 @@ typedef TXV2TIMMessageVector V2TIMMessageVector;
 /// 消息元素基类
 struct TIM_API V2TIMElem : V2TIMBaseObject {
     /// 元素类型
-    V2TIMElemType elemType;
+    V2TIMElemType elemType = V2TIM_ELEM_TYPE_NONE;
 
     V2TIMElem();
     V2TIMElem(const V2TIMElem &);
@@ -528,13 +528,13 @@ struct TIM_API V2TIMImage {
     /// 图片 ID，内部标识，可用于外部缓存 key
     V2TIMString uuid;
     /// 图片类型
-    V2TIMImageType type;
+    V2TIMImageType type = static_cast<V2TIMImageType>(0);
     /// 图片大小（type == V2TIM_IMAGE_TYPE_ORIGIN 有效）
-    uint64_t size;
+    uint64_t size = 0;
     /// 图片宽度
-    uint32_t width;
+    uint32_t width = 0;
     /// 图片高度
-    uint32_t height;
+    uint32_t height = 0;
     /// 图片 url
     V2TIMString url;
 
@@ -583,9 +583,9 @@ struct TIM_API V2TIMSoundElem : public V2TIMElem {
     /// 语音消息内部 ID
     V2TIMString uuid;
     /// 语音数据大小
-    uint64_t dataSize;
+    uint64_t dataSize = 0;
     /// 语音长度（秒）
-    uint32_t duration;
+    uint32_t duration = 0;
 
     /// 获取语音的 URL 下载地址
     void GetUrl(V2TIMValueCallback<V2TIMString> *callback);
@@ -631,19 +631,19 @@ struct TIM_API V2TIMVideoElem : public V2TIMElem {
     /// 视频 ID,内部标识，可用于外部缓存 key
     V2TIMString videoUUID;
     /// 视频大小
-    uint64_t videoSize;
+    uint64_t videoSize = 0;
     /// 视频类型
     V2TIMString videoType;
     /// 视频时长
-    uint32_t duration;
+    uint32_t duration = 0;
     /// 截图 ID,内部标识，可用于外部缓存 key
     V2TIMString snapshotUUID;
     /// 截图 size
-    uint64_t snapshotSize;
+    uint64_t snapshotSize = 0;
     /// 截图宽
-    uint32_t snapshotWidth;
+    uint32_t snapshotWidth = 0;
     /// 截图高
-    uint32_t snapshotHeight;
+    uint32_t snapshotHeight = 0;
 
     /// 获取视频的 URL 下载地址
     void GetVideoUrl(V2TIMValueCallback<V2TIMString> *callback);
@@ -692,7 +692,7 @@ struct TIM_API V2TIMFileElem : public V2TIMElem {
     /// 文件显示名称
     V2TIMString filename;
     /// 文件大小
-    uint64_t fileSize;
+    uint64_t fileSize = 0;
 
     /// 获取文件的 URL 下载地址
     void GetUrl(V2TIMValueCallback<V2TIMString> *callback);
@@ -724,9 +724,9 @@ struct TIM_API V2TIMLocationElem : public V2TIMElem {
     /// 地理位置描述信息
     V2TIMString desc;
     /// 经度，发送消息时设置
-    double longitude;
+    double longitude = 0.0;
     /// 纬度，发送消息时设置
-    double latitude;
+    double latitude = 0.0;
 
     V2TIMLocationElem();
     V2TIMLocationElem(const V2TIMLocationElem &);
@@ -749,7 +749,7 @@ struct TIM_API V2TIMFaceElem : public V2TIMElem {
      * key，都由用户自定义，SDK 内部只做透传。
      *  2. index 和 data 只需要传入一个即可，ImSDK 只是透传这两个数据。
      */
-    uint32_t index;
+    uint32_t index = 0;
     /// 额外数据，用户自定义
     V2TIMBuffer data;
 
@@ -770,7 +770,7 @@ struct TIM_API V2TIMMergerElem : public V2TIMElem {
     /// 合并消息里面又包含合并消息我们称之为合并嵌套，合并嵌套层数不能超过 100 层，
     /// 如果超过限制，layersOverLimit 为 true，title 和 abstractList 为空，DownloadMergerMessage
     /// 会返回 ERR_MERGER_MSG_LAYERS_OVER_LIMIT 错误码。
-    bool layersOverLimit;
+    bool layersOverLimit = false;
     /// 合并消息 title
     V2TIMString title;
     /// 合并消息摘要列表
@@ -796,7 +796,7 @@ struct TIM_API V2TIMGroupTipsElem : public V2TIMElem {
     /// 群组 ID
     V2TIMString groupID;
     /// 群Tips类型
-    V2TIMGroupTipsType type;
+    V2TIMGroupTipsType type = V2TIM_GROUP_TIPS_TYPE_NONE;
     /// 操作者群成员资料
     V2TIMGroupMemberInfo opMember;
     /// 被操作人列表
@@ -808,7 +808,7 @@ struct TIM_API V2TIMGroupTipsElem : public V2TIMElem {
     /// 当前群人数（type =
     /// V2TIM_GROUP_TIPS_TYPE_INVITE、TIM_GROUP_TIPS_TYPE_QUIT_GRP、TIM_GROUP_TIPS_TYPE_KICKED
     /// 时有效）
-    uint32_t memberCount;
+    uint32_t memberCount = 0;
 
     V2TIMGroupTipsElem();
     V2TIMGroupTipsElem(const V2TIMGroupTipsElem &);
@@ -829,17 +829,17 @@ struct TIM_API V2TIMMessageReceipt {
     /// C2C 消息接收对象
     V2TIMString userID;
     /// C2C 对端消息是否已读
-    bool isPeerRead;
+    bool isPeerRead = false;
     /// C2C 对端已读的时间
     /// 如果 msgID 为空，该字段表示对端用户标记会话已读的时间
     /// 如果 msgID 不为空，该字段表示对端用户发送消息已读回执的时间（8.1 及以上版本支持）
-    int64_t timestamp;
+    int64_t timestamp = 0;
     /// 群 ID
     V2TIMString groupID;
     /// 群消息已读人数
-    int32_t readCount ;
+    int32_t readCount = 0;
     /// 群消息未读人数
-    int32_t unreadCount ;
+    int32_t unreadCount = 0;
 
     V2TIMMessageReceipt();
     V2TIMMessageReceipt(const V2TIMMessageReceipt &);
@@ -852,9 +852,9 @@ typedef TXV2TIMMessageReceiptVector V2TIMMessageReceiptVector;
 /// Group 消息已读群成员信息
 struct TIM_API V2TIMGroupMessageReadMemberList {
     /// 获取下一次分页拉取的游标
-    uint64_t nextSeq;
+    uint64_t nextSeq = 0;
     /// 会话列表是否已经拉取完毕
-    bool isFinished;
+    bool isFinished = false;
     /// 群消息已读或未读的群成员列表
     V2TIMGroupMemberInfoVector members;
 
@@ -873,22 +873,22 @@ struct TIM_API V2TIMReceiveMessageOptInfo {
     /// 用户 ID
     V2TIMString userID;
     /// 消息接收选项
-    V2TIMReceiveMessageOpt receiveOpt;
+    V2TIMReceiveMessageOpt receiveOpt = V2TIM_RECEIVE_MESSAGE;
     /// 获取消息免打扰开始时间：小时
-    int32_t startHour;
+    int32_t startHour = 0;
     /// 获取消息免打扰开始时间：分钟
-    int32_t startMinute;
+    int32_t startMinute = 0;
     /// 获取消息免打扰开始时间：秒
-    int32_t startSecond;
+    int32_t startSecond = 0;
     /**
      *  获取消息免打扰开始的 UTC 时间戳
      *  @note
      *  - 如果返回的 startTimeStamp 大于 0，您可以直接使用
      *  - 如果返回的 startTimeStamp 等于 0，您需要调用 getStartHour()、getStartMinute()、getStartSecond() 来获取免打扰的相对开始时间
      */
-    uint32_t startTimeStamp;
+    uint32_t startTimeStamp = 0;
     /// 获取免打扰持续时长，单位：秒
-    uint32_t duration;
+    uint32_t duration = 0;
 
     V2TIMReceiveMessageOptInfo();
     V2TIMReceiveMessageOptInfo(const V2TIMReceiveMessageOptInfo &);
@@ -916,7 +916,7 @@ struct TIM_API V2TIMMessageSearchParam {
      * 取值分别为 V2TIM_KEYWORD_LIST_MATCH_TYPE_OR 和
      * V2TIM_KEYWORD_LIST_MATCH_TYPE_AND，默认为“或”关系搜索。
      */
-    V2TIMKeywordListMatchType keywordListMatchType;
+    V2TIMKeywordListMatchType keywordListMatchType = V2TIM_KEYWORD_LIST_MATCH_TYPE_OR;
 
     /**
      * 指定 userID 发送的消息，最多支持5个。
@@ -935,10 +935,10 @@ struct TIM_API V2TIMMessageSearchParam {
     V2TIMString conversationID;
 
     /// 搜索的起始时间点。默认为0即代表从现在开始搜索。UTC 时间戳，单位：秒
-    uint32_t searchTimePosition;
+    uint32_t searchTimePosition = 0;
 
     /// 从起始时间点开始的过去时间范围，单位秒。默认为0即代表不限制时间范围，传24x60x60代表过去一天。
-    uint32_t searchTimePeriod;
+    uint32_t searchTimePeriod = 0;
 
     /**
      * 分页的页号：用于分页展示查找结果，从零开始起步。
@@ -951,19 +951,19 @@ struct TIM_API V2TIMMessageSearchParam {
      *
      * @note 仅对接口 searchLocalMessages 生效
      */
-    uint32_t pageIndex;
+    uint32_t pageIndex = 0;
 
     /**
      * 每页结果数量：用于分页展示查找结果，如不希望分页可将其设置成 0，但如果结果太多，可能会带来性能问题。
      * @note 仅对接口 searchLocalMessages 生效
      */
-    uint32_t pageSize;
+    uint32_t pageSize = 0;
 
     /**
      * 每次云端搜索返回结果的条数。
      * @note 仅对接口 searchCloudMessages 生效
      */
-    uint32_t searchCount;
+    uint32_t searchCount = 0;
 
     /**
      * 每次云端搜索的起始位置。第一次填空字符串，续拉时填写 V2TIMMessageSearchResult 中的返回值。
@@ -981,7 +981,7 @@ struct TIM_API V2TIMMessageSearchResultItem {
     /// 会话ID
     V2TIMString conversationID;
     /// 当前会话一共搜索到了多少条符合要求的消息
-    uint32_t messageCount;
+    uint32_t messageCount = 0;
 
     /**
      * 满足搜索条件的消息列表
@@ -1008,7 +1008,7 @@ struct TIM_API V2TIMMessageSearchResult {
      * 如果您本次搜索【指定会话】，那么返回满足搜索条件的消息总数量；
      * 如果您本次搜索【全部会话】，那么返回满足搜索条件的消息所在的所有会话总数量。
      */
-    uint32_t totalCount;
+    uint32_t totalCount = 0;
 
     /**
      * 如果您本次搜索【指定会话】，那么返回结果列表只包含该会话结果；
@@ -1048,7 +1048,7 @@ struct TIM_API V2TIMMessageListGetOption {
      * - 当起始消息和时间范围都不存在时，结果集可理解成：从当前会话最新的一条消息开始，按照 getType
      * 所指定的方向和拉取方式拉取。
      */
-    V2TIMMessageGetType getType;
+    V2TIMMessageGetType getType = static_cast<V2TIMMessageGetType>(0);
 
     /// 拉取单聊历史消息
     V2TIMString userID;
@@ -1057,7 +1057,7 @@ struct TIM_API V2TIMMessageListGetOption {
     V2TIMString groupID;
 
     /// 拉取消息数量
-    uint32_t count;
+    uint32_t count = 0;
 
     /// 拉取的消息类型集合，getType 为 V2TIM_GET_LOCAL_OLDER_MSG 和 V2TIM_GET_LOCAL_NEWER_MSG 有效，传入空数组表示拉取全部类型消息，取值详见 @V2TIMElemType。
     V2TIMElemTypeVector messageTypeList;
@@ -1077,8 +1077,8 @@ struct TIM_API V2TIMMessageListGetOption {
      * -  如果设置了拉取的时间范围，SDK 会根据 @getTimeBegin 所描述的时间点作为拉取起点；
      * -  如果未设置拉取的时间范围，SDK 默认使用会话的最新消息作为拉取起点。
      */
-    V2TIMMessage *lastMsg;
-    uint64_t lastMsgSeq;
+    V2TIMMessage *lastMsg = nullptr;
+    uint64_t lastMsgSeq = 0;
 
     /**
      * 拉取消息的时间范围
@@ -1093,8 +1093,8 @@ struct TIM_API V2TIMMessageListGetOption {
      * - 如果 getType 指定了朝消息时间更老的方向拉取，则时间范围表示为 [getTimeBegin-getTimePeriod, getTimeBegin]
      * - 如果 getType 指定了朝消息时间更新的方向拉取，则时间范围表示为 [getTimeBegin, getTimeBegin+getTimePeriod]
      */
-    int64_t getTimeBegin;
-    int64_t getTimePeriod;
+    int64_t getTimeBegin = 0;
+    int64_t getTimePeriod = 0;
 
     /**
      * 拉取群组历史消息时，支持按照消息序列号 seq 拉取（从 7.1 版本开始有效）
@@ -1144,7 +1144,7 @@ typedef TXV2TIMMessageExtensionVector V2TIMMessageExtensionVector;
 
 struct TIM_API V2TIMMessageExtensionResult {
     /// 返回码
-    int32_t resultCode;
+    int32_t resultCode = 0;
     /// 返回信息
     V2TIMString resultInfo;
     /// 扩展信息
@@ -1169,11 +1169,11 @@ struct TIM_API V2TIMMessageReaction {
     /// 消息回应 ID
     V2TIMString reactionID;
     /// 使用同一个 reactionID 回应消息的总的用户个数
-    uint32_t totalUserCount;
+    uint32_t totalUserCount = 0;
     /// 使用同一个 reactionID 回应消息的部分用户列表（用户列表数量取决于调用 getMessageReactions 接口时设置的 maxUserCountPerReaction 值）
     V2TIMUserInfoVector partialUserList;
     /// 自己是否使用了该 reaction
-    bool reactedByMyself;
+    bool reactedByMyself = false;
 
     V2TIMMessageReaction();
     V2TIMMessageReaction(const V2TIMMessageReaction &);
@@ -1192,7 +1192,7 @@ typedef TXV2TIMMessageReactionVector V2TIMMessageReactionVector;
 
 struct TIM_API V2TIMMessageReactionResult {
     /// 返回码
-    int32_t resultCode;
+    int32_t resultCode = 0;
     /// 返回信息
     V2TIMString resultInfo;
     /// 消息 ID
@@ -1219,9 +1219,9 @@ struct TIM_API V2TIMMessageReactionUserResult {
     /// 用户列表
     V2TIMUserInfoVector userInfoList;
     /// 下次分页拉取 seq
-    uint32_t nextSeq;
+    uint32_t nextSeq = 0;
     /// 是否全部拉取完毕
-    bool isFinished;
+    bool isFinished = false;
 
     V2TIMMessageReactionUserResult();
     V2TIMMessageReactionUserResult(const V2TIMMessageReactionUserResult &);

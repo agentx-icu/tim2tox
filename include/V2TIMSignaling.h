@@ -45,9 +45,9 @@ struct TIM_API V2TIMSignalingInfo {
     // 信令内容
     V2TIMString data;
     // 信令操作类型
-    V2TIMSignalingActionType actionType;
+    V2TIMSignalingActionType actionType = static_cast<V2TIMSignalingActionType>(0);
     // 信令超时时间
-    int timeout;
+    int timeout = 0;
 
     V2TIMSignalingInfo();
     V2TIMSignalingInfo(const V2TIMSignalingInfo& signalingInfo);

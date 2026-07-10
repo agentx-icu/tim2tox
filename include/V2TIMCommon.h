@@ -86,7 +86,7 @@ typedef TXV2TIMStringTouint64_tMap V2TIMStringToUint64Map;
 class V2TIMLogListener;
 
 struct TIM_API V2TIMBaseObject {
-    void *obj_ptr;
+    void *obj_ptr = nullptr;
 
     V2TIMBaseObject();
     V2TIMBaseObject(const V2TIMBaseObject &object);
@@ -102,10 +102,10 @@ struct TIM_API V2TIMSDKConfig {
     V2TIMString logPath;
 
     /// 本地写 log 文件的等级，默认 DEBUG 等级， IMSDK 的日志默认存储于程序文件的运行目录下
-    V2TIMLogLevel logLevel;
+    V2TIMLogLevel logLevel = V2TIM_LOG_NONE;
 
     /// log 监听回调（回调在主线程，日志回调可能比较频繁，请注意不要在回调里面同步处理太多耗时任务，可能会堵塞主线程）
-    V2TIMLogListener *logListener;
+    V2TIMLogListener *logListener = nullptr;
 
     V2TIMSDKConfig();
     V2TIMSDKConfig(const V2TIMSDKConfig &);
