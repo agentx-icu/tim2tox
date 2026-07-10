@@ -189,8 +189,12 @@ elseif(UNIX AND NOT APPLE)
     endif()
 elseif(WIN32)
     # Windows - support vcpkg and standard paths
+    # Prefer the explicit VCPKG_TARGET_TRIPLET (authoritative when building
+    # through the vcpkg toolchain) over arch sniffing.
     set(_vcpkg_triplet "x64-windows")
-    if(DEFINED CMAKE_VS_PLATFORM_NAME AND (CMAKE_VS_PLATFORM_NAME STREQUAL "ARM64"))
+    if(DEFINED VCPKG_TARGET_TRIPLET)
+        set(_vcpkg_triplet "${VCPKG_TARGET_TRIPLET}")
+    elseif(DEFINED CMAKE_VS_PLATFORM_NAME AND (CMAKE_VS_PLATFORM_NAME STREQUAL "ARM64"))
         set(_vcpkg_triplet "arm64-windows")
     elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "ARM64|aarch64")
         set(_vcpkg_triplet "arm64-windows")
@@ -263,8 +267,12 @@ elseif(UNIX AND NOT APPLE)
     endif()
 elseif(WIN32)
     # Windows - support vcpkg and standard paths
+    # Prefer the explicit VCPKG_TARGET_TRIPLET (authoritative when building
+    # through the vcpkg toolchain) over arch sniffing.
     set(_vcpkg_triplet "x64-windows")
-    if(DEFINED CMAKE_VS_PLATFORM_NAME AND (CMAKE_VS_PLATFORM_NAME STREQUAL "ARM64"))
+    if(DEFINED VCPKG_TARGET_TRIPLET)
+        set(_vcpkg_triplet "${VCPKG_TARGET_TRIPLET}")
+    elseif(DEFINED CMAKE_VS_PLATFORM_NAME AND (CMAKE_VS_PLATFORM_NAME STREQUAL "ARM64"))
         set(_vcpkg_triplet "arm64-windows")
     elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "ARM64|aarch64")
         set(_vcpkg_triplet "arm64-windows")

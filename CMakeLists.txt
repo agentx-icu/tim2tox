@@ -105,15 +105,28 @@ elseif(UNIX AND NOT APPLE)
     # Linux - use pkg-config for dependency management
     find_package(PkgConfig REQUIRED)
 elseif(WIN32)
-    # Windows - support vcpkg
+    # Windows - support vcpkg. The triplet must follow the TARGET arch:
+    # hardcoding x64-windows broke ARM64 builds — the toxav fallback link
+    # entries (bare opus.lib/vpx.lib, see source/CMakeLists.txt) resolve via
+    # these link_directories, and an x64 LIBPATH on an arm64 link fails with
+    # LNK1181. Prefer the explicit VCPKG_TARGET_TRIPLET (set by the vcpkg
+    # toolchain / toxee's build_tim2tox.sh), then fall back to arch sniffing.
+    if(DEFINED VCPKG_TARGET_TRIPLET)
+        set(_tim2tox_vcpkg_triplet "${VCPKG_TARGET_TRIPLET}")
+    elseif((DEFINED CMAKE_VS_PLATFORM_NAME AND CMAKE_VS_PLATFORM_NAME STREQUAL "ARM64")
+           OR CMAKE_SYSTEM_PROCESSOR MATCHES "ARM64|aarch64")
+        set(_tim2tox_vcpkg_triplet "arm64-windows")
+    else()
+        set(_tim2tox_vcpkg_triplet "x64-windows")
+    endif()
     if(DEFINED ENV{VCPKG_ROOT})
-        include_directories($ENV{VCPKG_ROOT}/installed/x64-windows/include)
-        link_directories($ENV{VCPKG_ROOT}/installed/x64-windows/lib)
+        include_directories($ENV{VCPKG_ROOT}/installed/${_tim2tox_vcpkg_triplet}/include)
+        link_directories($ENV{VCPKG_ROOT}/installed/${_tim2tox_vcpkg_triplet}/lib)
     endif()
     # Also check standard Windows paths
-    if(EXISTS "C:/vcpkg/installed/x64-windows/include")
-        include_directories(C:/vcpkg/installed/x64-windows/include)
-        link_directories(C:/vcpkg/installed/x64-windows/lib)
+    if(EXISTS "C:/vcpkg/installed/${_tim2tox_vcpkg_triplet}/include")
+        include_directories(C:/vcpkg/installed/${_tim2tox_vcpkg_triplet}/include)
+        link_directories(C:/vcpkg/installed/${_tim2tox_vcpkg_triplet}/lib)
     endif()
 endif()
 
@@ -130,7 +143,7 @@ if(APPLE OR WIN32)
                 /opt/homebrew/lib
                 /usr/local/lib
                 /usr/lib
-                C:/vcpkg/installed/x64-windows/lib
+                C:/vcpkg/installed/${_tim2tox_vcpkg_triplet}/lib
         )
         if(NOT SODIUM_LIB)
             message(WARNING "libsodium not found, some features may not work")
