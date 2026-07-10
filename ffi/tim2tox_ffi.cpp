@@ -2482,12 +2482,17 @@ int tim2tox_ffi_irc_unload_library(void) {
     if (g_irc_shutdown) {
         g_irc_shutdown();
     }
-    
-    if (g_irc_lib_handle) {
-        dlclose(g_irc_lib_handle);
-        g_irc_lib_handle = nullptr;
-    }
-    
+
+    // Deliberately do NOT dlclose the library. connectToServer() runs DNS
+    // resolution on detached helper threads that can still be executing
+    // libirc_client code (getaddrinfo + the shared_ptr/thread unwind) after
+    // shutdown() returns; unmapping the library out from under such a thread
+    // would crash. Leaving the (small) library mapped is harmless — it is a
+    // logical unload: we drop our handle + function pointers and mark it
+    // unloaded, and a subsequent load re-dlopen()s the still-mapped image
+    // (the loader just re-bumps its refcount) and re-resolves the symbols.
+    g_irc_lib_handle = nullptr;
+
     // Clear function pointers
     g_irc_init = nullptr;
     g_irc_shutdown = nullptr;

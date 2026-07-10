@@ -160,14 +160,25 @@ private:
     // 频道处理线程
     void channelThread(IrcChannel* channel);
 
-    // 连接到IRC服务器
-    int connectToServer(const std::string& server, int port, bool use_ssl = false);
+    // 连接到IRC服务器. [channel] (optional) lets the blocking DNS/connect phases
+    // observe should_stop so a teardown join isn't pinned by getaddrinfo().
+    int connectToServer(const std::string& server, int port, bool use_ssl = false,
+                        IrcChannel* channel = nullptr);
 
     // 发送IRC命令（重载：使用socket）
     bool sendIrcCommand(int sock, const std::string& command);
     
     // 发送IRC命令（重载：使用channel，支持SSL）
     bool sendIrcCommand(IrcChannel* channel, const std::string& command);
+
+    // Best-effort, strictly-bounded graceful QUIT used by disconnectChannel().
+    // Never blocks the caller (the Dart isolate) — see the .cpp for details.
+    void sendQuitBestEffort(IrcChannel* channel);
+
+    // Tear down the channel's SSL objects + socket under io_mutex and mark the
+    // fd closed. Idempotent; used by every channelThread exit/reconnect path so
+    // no early return can leak the fd or SSL handles.
+    void cleanupChannelSocket(IrcChannel* channel);
 
     // 发送 JOIN，避免 welcome burst 或 SASL completion 重复加入同一频道
     bool sendJoinIfNeeded(IrcChannel* channel);
@@ -214,8 +225,25 @@ private:
     // 处理JOIN/PART消息
     void handleJoinPart(IrcChannel* channel, const std::string& line, bool is_join);
 
-    // 生成昵称
+    // 生成昵称（内部加锁后调用，读取 custom/base nickname 字段需持有 mutex_）
     std::string generateNickname(IrcChannel* channel);
+    // Same, but the caller already holds mutex_ (reads the nickname fields).
+    std::string generateNicknameLocked(IrcChannel* channel);
+
+    // Sleep up to `seconds`, waking early (in ~100ms steps) if the channel is
+    // asked to stop. Keeps disconnect()/shutdown() joins from blocking the
+    // caller (the Dart isolate) for a full reconnect delay.
+    void interruptibleSleep(IrcChannel* channel, int seconds);
+
+    // Upper bound on the unparsed receive accumulator. A well-behaved IRC
+    // server terminates every message with CRLF within 512 bytes; a peer that
+    // never sends a newline must not be allowed to grow this without bound.
+    static constexpr size_t kMaxLineBufferBytes = 65536;
+
+    // Upper bound on a single TLS handshake so a peer that stalls mid-handshake
+    // cannot wedge the channel thread (and, transitively, disconnect/shutdown
+    // joins on the Dart isolate).
+    static constexpr int kSslHandshakeTimeoutSeconds = 15;
 
     mutable std::mutex mutex_;
     std::unordered_map<std::string, std::shared_ptr<IrcChannel>> channels_;
