@@ -1702,26 +1702,41 @@ int tim2tox_ffi_get_group_chat_id(int64_t instance_id, const char* group_id, cha
     // Get chat_id from ToxManager
     // manager_impl is already defined at the beginning of the function
     ToxManager* tox_manager = manager_impl->GetToxManager();
-    if (!tox_manager) return 0;
     uint8_t chat_id[TOX_GROUP_CHAT_ID_SIZE];
     Tox_Err_Group_State_Query err_chat_id;
-    if (!tox_manager->getGroupChatId(group_number, chat_id, &err_chat_id) ||
-        err_chat_id != TOX_ERR_GROUP_STATE_QUERY_OK) {
-        return 0;
+    if (tox_manager &&
+        tox_manager->getGroupChatId(group_number, chat_id, &err_chat_id) &&
+        err_chat_id == TOX_ERR_GROUP_STATE_QUERY_OK) {
+        // Convert to hex string (64 characters: 32 bytes * 2)
+        std::ostringstream oss;
+        for (size_t i = 0; i < TOX_GROUP_CHAT_ID_SIZE; ++i) {
+            oss << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(chat_id[i]);
+        }
+        std::string hex_str = oss.str();
+
+        // Copy to output buffer
+        int copy_len = (int)std::min((size_t)(out_len - 1), hex_str.length());
+        memcpy(out_chat_id, hex_str.c_str(), copy_len);
+        out_chat_id[copy_len] = '\0';
+        return 1;
     }
-    
-    // Convert to hex string (64 characters: 32 bytes * 2)
-    std::ostringstream oss;
-    for (size_t i = 0; i < TOX_GROUP_CHAT_ID_SIZE; ++i) {
-        oss << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(chat_id[i]);
+
+    // Live query unavailable even though the group IS mapped (the group's state
+    // isn't queryable this tick — e.g. right after create, before the group is
+    // fully self-connected). The public NGC chat_id is IMMUTABLE, so the value
+    // stored at create time (tim2tox_ffi_set_group_chat_id) is authoritative — a
+    // peer joins by it. Fall back to it instead of returning empty. Without this,
+    // a mapped-group live-query miss returned 0 with the chat_id known, which was
+    // the root of "public group chat-id comes back empty" in the join-by-id path.
+    char stored_chat_id[65];
+    if (manager_impl->GetGroupChatIdFromStorage(std::string(group_id), stored_chat_id, sizeof(stored_chat_id)) &&
+        strlen(stored_chat_id) == 64) {
+        int copy_len = (int)std::min((size_t)(out_len - 1), strlen(stored_chat_id));
+        memcpy(out_chat_id, stored_chat_id, copy_len);
+        out_chat_id[copy_len] = '\0';
+        return 1;
     }
-    std::string hex_str = oss.str();
-    
-    // Copy to output buffer
-    int copy_len = (int)std::min((size_t)(out_len - 1), hex_str.length());
-    memcpy(out_chat_id, hex_str.c_str(), copy_len);
-    out_chat_id[copy_len] = '\0';
-    return 1;
+    return 0;
 }
 
 // R-07: Store group chat_id in Core (FFI forwards to manager); optionally notify Dart for persistence

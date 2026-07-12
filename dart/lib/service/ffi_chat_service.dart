@@ -667,6 +667,19 @@ class FfiChatService {
   Stream<bool> get connectionStatusStream => _connectionStatus.stream;
   bool _isConnected = false;
   bool get isConnected => _isConnected;
+
+  /// TEST-ONLY: inject the exact `isConnected` transition that a real toxcore
+  /// link-loss / restore produces (see the poller at the `conn:failed` /
+  /// `conn:ok` paths). Every offline-UI widget subscribes to
+  /// [connectionStatusStream], so pushing `false` here drives the genuine
+  /// production offline handlers (the Add-Friend/Add-Group offline banner, the
+  /// self online-dot, the connection gate) with byte-identical input — without
+  /// touching the OS network link. Callers must gate this behind kDebugMode + a
+  /// test-account seam. No-op-safe: only flips + re-broadcasts state.
+  void debugSetConnected(bool connected) {
+    _isConnected = connected;
+    _connectionStatus.add(connected);
+  }
   final Map<String, ChatMessage> _lastByPeer = {};
   Map<String, ChatMessage> get lastMessages => _lastByPeer;
   final Map<String, int> _unreadByPeer = {};
