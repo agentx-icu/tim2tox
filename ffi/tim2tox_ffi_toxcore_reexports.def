@@ -1,0 +1,20 @@
+; Windows twin of the macOS/Linux raw-toxcore re-export surface.
+;
+; The account-export test fixture (toxee test/account_export/
+; tox_profile_factory.dart) dlsym's a minimal raw toxcore API from the FFI
+; library to fabricate real tox_profile savedata. ELF exports everything and
+; the Mach-O export list re-exports these, but MSVC exports nothing from
+; linked static libraries unless listed — so a default Windows build made the
+; fixture fail with "The specified procedure could not be found"
+; (tox_options_new), silently gutting ~19 account/export/password tests.
+; Keep this list in sync with the fixture's lookups.
+EXPORTS
+    tox_options_new
+    tox_options_default
+    tox_options_free
+    tox_new
+    tox_kill
+    tox_get_savedata_size
+    tox_get_savedata
+    tox_self_get_public_key
+    tox_self_get_address

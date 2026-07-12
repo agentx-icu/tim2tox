@@ -1308,12 +1308,14 @@ bool IrcClientManager::performSslHandshake(IrcChannel* channel) {
 }
 
 // SSL发送数据
-ssize_t IrcClientManager::sslSend(SSL* ssl, const void* buf, size_t len) {
+IrcClientManager::SslIoResult IrcClientManager::sslSend(SSL* ssl, const void* buf,
+                                                        size_t len) {
     return SSL_write(ssl, buf, len);
 }
 
 // SSL接收数据
-ssize_t IrcClientManager::sslRecv(SSL* ssl, void* buf, size_t len) {
+IrcClientManager::SslIoResult IrcClientManager::sslRecv(SSL* ssl, void* buf,
+                                                        size_t len) {
     return SSL_read(ssl, buf, len);
 }
 

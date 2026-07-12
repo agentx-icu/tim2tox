@@ -1,6 +1,7 @@
 // IrcClientManager.h
 #pragma once
 
+#include <cstddef>
 #include <string>
 #include <unordered_map>
 #include <mutex>
@@ -185,12 +186,17 @@ private:
 
     // 执行SSL/TLS握手（如果使用SSL）
     bool performSslHandshake(IrcChannel* channel);
-    
+
+    // SSL发送/接收数据。返回类型用 SslIoResult 而不是 POSIX 的 ssize_t：
+    // MSVC 没有 ssize_t（构建 libirc_client.dll 时 error C3646），语义上这里
+    // 只需要一个带符号的字节数/错误码。
+    using SslIoResult = std::ptrdiff_t;
+
     // SSL发送数据
-    ssize_t sslSend(SSL* ssl, const void* buf, size_t len);
-    
+    SslIoResult sslSend(SSL* ssl, const void* buf, size_t len);
+
     // SSL接收数据
-    ssize_t sslRecv(SSL* ssl, void* buf, size_t len);
+    SslIoResult sslRecv(SSL* ssl, void* buf, size_t len);
 
     // 内部辅助函数：发送消息但不加锁（调用者必须持有mutex）
     bool sendMessageUnlocked(const std::string& channel, const std::string& message);

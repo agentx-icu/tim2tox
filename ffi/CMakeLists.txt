@@ -355,6 +355,15 @@ set_target_properties(tim2tox_ffi PROPERTIES
     POSITION_INDEPENDENT_CODE ON
 )
 
+if(WIN32)
+    # Windows twin of the macOS export-list re-export (see
+    # tim2tox_ffi_exports_macho.txt): MSVC exports nothing from linked static
+    # libs, so the raw-toxcore symbols the integrator test fixtures dlsym
+    # (tox_options_new, ...) must be listed in a module-definition file.
+    target_sources(tim2tox_ffi PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/tim2tox_ffi_toxcore_reexports.def)
+endif()
+
 # Install rules
 install(TARGETS tim2tox_ffi
     LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
@@ -365,3 +374,57 @@ install(TARGETS tim2tox_ffi
 install(FILES tim2tox_ffi.h
     DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/tim2tox
 )
+
+# ---------------------------------------------------------------------------
+# IRC client dynamic library (optional, -DTIM2TOX_BUILD_IRC=ON)
+#
+# Loaded on demand by integrating clients when the IRC application is
+# installed (toxee lib/util/irc_app_manager.dart resolves it next to the app
+# executable). Historically this was only built for macOS out of
+# example/CMakeLists.txt, whose Homebrew-hardcoded paths cannot build the
+# Linux/Windows variants; it lives HERE so tool/ci/build_tim2tox.sh
+# --with-irc produces it for every desktop platform from the same graph that
+# builds tim2tox_ffi.
+# ---------------------------------------------------------------------------
+option(TIM2TOX_BUILD_IRC "Build the libirc_client dynamic library" OFF)
+if(TIM2TOX_BUILD_IRC)
+    find_package(OpenSSL REQUIRED)
+    add_library(irc_client SHARED
+        ${CMAKE_CURRENT_SOURCE_DIR}/../source/irc_client_api.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../source/IrcClientManager.cpp
+    )
+    target_include_directories(irc_client PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/../include
+        ${CMAKE_CURRENT_SOURCE_DIR}/../source
+        ${CMAKE_CURRENT_SOURCE_DIR}/../third_party/c-toxcore
+        ${CMAKE_CURRENT_SOURCE_DIR}/../third_party/c-toxcore/toxcore
+    )
+    # Reuse the exact link set already resolved for tim2tox_ffi above (tim2tox
+    # core, toxcore_static, nlohmann_json, the platform's libsodium, Windows
+    # system libs, ...) so the per-platform resolution logic is not duplicated.
+    get_target_property(_TIM2TOX_FFI_LINK_LIBS tim2tox_ffi LINK_LIBRARIES)
+    target_link_libraries(irc_client
+        ${_TIM2TOX_FFI_LINK_LIBS}
+        OpenSSL::SSL
+        OpenSSL::Crypto
+    )
+    # The Dart loader expects the `lib` prefix on EVERY platform — including
+    # Windows (libirc_client.dll), where CMake would otherwise drop it.
+    set_target_properties(irc_client PROPERTIES
+        OUTPUT_NAME "irc_client"
+        PREFIX "lib"
+        POSITION_INDEPENDENT_CODE ON
+    )
+    if(WIN32)
+        # MSVC exports nothing by default and irc_client_api.h declares plain
+        # extern "C" (no __declspec) — the integrator resolves irc_client_*
+        # via GetProcAddress, so a default build would produce a DLL that
+        # loads but exports nothing. Export the symbols defined by this
+        # target's own objects (the C API surface).
+        set_target_properties(irc_client PROPERTIES
+            WINDOWS_EXPORT_ALL_SYMBOLS ON)
+        if(MSVC)
+            target_compile_options(irc_client PRIVATE /utf-8)
+        endif()
+    endif()
+endif()
