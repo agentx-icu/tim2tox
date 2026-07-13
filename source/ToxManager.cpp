@@ -20,6 +20,32 @@
 #include <fcntl.h>  // For ::open, O_* flags
 #include <sys/stat.h> // For ::chmod, mode constants
 #endif
+#ifdef __ANDROID__
+#include <sys/system_properties.h> // For __system_property_get (debug.toxee.* automation knobs)
+#endif
+
+// Read a test-harness knob: the process environment first, then (Android only)
+// the `debug.toxee.*` system property of the same meaning. Android apps cannot
+// receive per-process environment variables from a test harness (`am start`
+// has no env support), but `adb shell setprop debug.toxee.<name> <value>`
+// works unrooted and is per-device — exactly the granularity the two-emulator
+// real-UI pair needs (relay on device A only). Production devices never set
+// debug.* properties, so behaviour is unchanged for real clients — the same
+// invariant the TOX_TCP_RELAY_PORT / TOX_FORCE_TCP_ONLY env vars rely on.
+static std::string read_harness_knob(const char* env_name, const char* android_prop_name) {
+    if (const char* env = std::getenv(env_name)) {
+        return env;
+    }
+#ifdef __ANDROID__
+    char prop_value[PROP_VALUE_MAX] = {0};
+    if (android_prop_name && __system_property_get(android_prop_name, prop_value) > 0) {
+        return prop_value;
+    }
+#else
+    (void)android_prop_name;
+#endif
+    return {};
+}
 
 // 默认实例（用于向后兼容）
 static ToxManager* g_default_instance = nullptr;
@@ -163,8 +189,11 @@ void ToxManager::initialize(const Tox_Options* options,
     // the tox_add_tcp_relay calls already issued by add_bootstrap_node (which
     // probes port 3389). Production never sets the env var, so behaviour is
     // unchanged for real clients and on mobile.
-    if (const char* relay_env = std::getenv("TOX_TCP_RELAY_PORT")) {
-        const long parsed = std::strtol(relay_env, nullptr, 10);
+    // On Android the same knob is reachable as the `debug.toxee.tcp_relay_port`
+    // system property (see read_harness_knob) because a device app cannot be
+    // handed an environment variable by the automation harness.
+    if (const std::string relay_env = read_harness_knob("TOX_TCP_RELAY_PORT", "debug.toxee.tcp_relay_port"); !relay_env.empty()) {
+        const long parsed = std::strtol(relay_env.c_str(), nullptr, 10);
         if (parsed > 0 && parsed <= 65535) {
             tox_options_set_tcp_port(opts, static_cast<uint16_t>(parsed));
             V2TIM_LOG(kInfo, "[ToxManager] initialize: TCP relay server enabled on port {}", parsed);
@@ -187,8 +216,9 @@ void ToxManager::initialize(const Tox_Options* options,
     // (the peer's TOX_TCP_RELAY_PORT server + the tox_add_tcp_relay calls
     // add_bootstrap_node already issues). Production never sets the env var, so
     // behaviour is unchanged for real clients and on mobile.
-    if (const char* tcp_only_env = std::getenv("TOX_FORCE_TCP_ONLY")) {
-        const std::string v(tcp_only_env);
+    // Android property fallback: debug.toxee.force_tcp_only (same rationale as
+    // the relay-port knob above).
+    if (const std::string v = read_harness_knob("TOX_FORCE_TCP_ONLY", "debug.toxee.force_tcp_only"); !v.empty()) {
         const bool enable = (v == "1" || v == "true" || v == "TRUE" || v == "yes" || v == "on");
         if (enable) {
             tox_options_set_udp_enabled(opts, false);
