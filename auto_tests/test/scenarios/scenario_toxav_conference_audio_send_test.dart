@@ -164,12 +164,12 @@ void main() {
       }
 
       alice.clearCallbackReceived('onGroupCreated');
-      final createResult = await alice.runWithInstanceAsync(() async =>
-          TIMGroupManager.instance.createGroup(
-            groupType: 'conference',
-            groupName: 'AV Conference Audio Test',
-            groupID: '',
-          ));
+      final createResult = await alice.runWithInstanceAsync(
+          () async => TIMGroupManager.instance.createGroup(
+                groupType: 'conference',
+                groupName: 'AV Conference Audio Test',
+                groupID: '',
+              ));
 
       expect(createResult.code, equals(0));
       final conferenceId = createResult.data!;
@@ -194,11 +194,12 @@ void main() {
       String? charlieInvitedGroupId;
 
       final bobGroupListener = V2TimGroupListener(
-        onMemberInvited:
-            (String groupID, V2TimGroupMemberInfo opUser, List<V2TimGroupMemberInfo> memberList) {
+        onMemberInvited: (String groupID, V2TimGroupMemberInfo opUser,
+            List<V2TimGroupMemberInfo> memberList) {
           // V2TIM onMemberInvited fires on every group member for any new invite;
           // only capture entries where Bob himself is among the invited members.
-          final memberIDs = memberList.map((m) => (m.userID ?? '').toUpperCase()).toSet();
+          final memberIDs =
+              memberList.map((m) => (m.userID ?? '').toUpperCase()).toSet();
           if (!memberIDs.contains(bobPub.toUpperCase())) return;
           bobReceivedInvite = true;
           bobInvitedGroupId = groupID;
@@ -206,9 +207,10 @@ void main() {
         },
       );
       final charlieGroupListener = V2TimGroupListener(
-        onMemberInvited:
-            (String groupID, V2TimGroupMemberInfo opUser, List<V2TimGroupMemberInfo> memberList) {
-          final memberIDs = memberList.map((m) => (m.userID ?? '').toUpperCase()).toSet();
+        onMemberInvited: (String groupID, V2TimGroupMemberInfo opUser,
+            List<V2TimGroupMemberInfo> memberList) {
+          final memberIDs =
+              memberList.map((m) => (m.userID ?? '').toUpperCase()).toSet();
           if (!memberIDs.contains(charliePub.toUpperCase())) return;
           charlieReceivedInvite = true;
           charlieInvitedGroupId = groupID;
@@ -230,11 +232,11 @@ void main() {
         bob.clearCallbackReceived('onMemberInvited');
         charlie.clearCallbackReceived('onMemberInvited');
 
-        final inviteResult = await alice.runWithInstanceAsync(() async =>
-            TIMGroupManager.instance.inviteUserToGroup(
-              groupID: conferenceId,
-              userList: [bobPub, charliePub],
-            ));
+        final inviteResult = await alice.runWithInstanceAsync(
+            () async => TIMGroupManager.instance.inviteUserToGroup(
+                  groupID: conferenceId,
+                  userList: [bobPub, charliePub],
+                ));
         expect(inviteResult.code, equals(0));
 
         try {
@@ -242,14 +244,17 @@ void main() {
             scenario,
             () => bobReceivedInvite && charlieReceivedInvite,
             timeout: const Duration(seconds: 60),
-            description:
-                'Both received invites (attempt ${attempt + 1})',
+            description: 'Both received invites (attempt ${attempt + 1})',
             advanceMs: 200,
             iterationsPerInstance: 4,
             wallSleep: const Duration(milliseconds: 50),
           );
           bothArrived = true;
-        } catch (_) {}
+        } on TimeoutException catch (e) {
+          // Expected between retry attempts (the post-loop expect enforces the
+          // real assertion); a non-timeout error is a real bug and propagates.
+          print('[Test] Attempt timed out; retrying: $e');
+        }
       }
 
       expect(bobInvitedGroupId, isNotNull,
@@ -261,12 +266,12 @@ void main() {
       // invite's local id a moment later, so an explicit join racing that mapping
       // can transiently return 6017. Retry until the mapping settles.
       Future<int> joinWithRetry(TestNode node, String gid) async {
-        var res = await node.runWithInstanceAsync(
-            () async => TIMManager.instance.joinGroup(groupID: gid, message: ''));
+        var res = await node.runWithInstanceAsync(() async =>
+            TIMManager.instance.joinGroup(groupID: gid, message: ''));
         for (int r = 0; r < 6 && res.code != 0; r++) {
           await Future.delayed(const Duration(milliseconds: 500));
-          res = await node.runWithInstanceAsync(
-              () async => TIMManager.instance.joinGroup(groupID: gid, message: ''));
+          res = await node.runWithInstanceAsync(() async =>
+              TIMManager.instance.joinGroup(groupID: gid, message: ''));
         }
         return res.code;
       }
@@ -274,8 +279,7 @@ void main() {
       expect(await joinWithRetry(bob, bobInvitedGroupId!), equals(0));
       expect(await joinWithRetry(charlie, charlieInvitedGroupId!), equals(0));
 
-      await pumpTestTickAv(scenario,
-          advanceMs: 5000, iterationsPerInstance: 2);
+      await pumpTestTickAv(scenario, advanceMs: 5000, iterationsPerInstance: 2);
 
       final aliceJoinedList = await alice.runWithInstanceAsync(
           () async => TIMGroupManager.instance.getJoinedGroupList());
@@ -288,8 +292,8 @@ void main() {
       expect(bobJoinedList.data, isNotNull);
       expect(bobJoinedList.data!.isNotEmpty, isTrue);
       expect(
-        bobJoinedList.data!.any((g) =>
-            g.groupID == conferenceId || g.groupID == bobInvitedGroupId),
+        bobJoinedList.data!.any(
+            (g) => g.groupID == conferenceId || g.groupID == bobInvitedGroupId),
         isTrue,
       );
 
