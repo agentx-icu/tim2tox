@@ -3,6 +3,7 @@
 /// Mirrors scenario_many_nodes_test.dart 1:1 but drives the harness via the
 /// virtual-clock helpers (VirtualClock + pumpTestTick + *Virtual helpers).
 
+import 'dart:async';
 import 'package:test/test.dart';
 import 'package:tencent_cloud_chat_sdk/native_im/adapter/tim_manager.dart';
 import 'package:tencent_cloud_chat_sdk/native_im/adapter/tim_message_manager.dart';
@@ -60,11 +61,11 @@ void main() {
       ]);
       await pumpTestTick(scenario, advanceMs: 2000, iterationsPerInstance: 1);
 
-      final createResult = await nodes[0].runWithInstanceAsync(() async =>
-          TIMGroupManager.instance.createGroup(
-            groupType: 'kTIMGroup_Private',
-            groupName: 'Many Nodes Group',
-          ));
+      final createResult = await nodes[0].runWithInstanceAsync(
+          () async => TIMGroupManager.instance.createGroup(
+                groupType: 'kTIMGroup_Private',
+                groupName: 'Many Nodes Group',
+              ));
       expect(createResult.code, equals(0),
           reason: 'createGroup failed: ${createResult.code}');
       final groupId = createResult.data!;
@@ -80,14 +81,13 @@ void main() {
           if (attempt > 0) {
             // Re-fire the invite.
           }
-          final inviteResult = await nodes[0].runWithInstanceAsync(() async =>
-              TIMGroupManager.instance.inviteUserToGroup(
-                groupID: groupId,
-                userList: [peerPublicKey],
-              ));
+          final inviteResult = await nodes[0].runWithInstanceAsync(
+              () async => TIMGroupManager.instance.inviteUserToGroup(
+                    groupID: groupId,
+                    userList: [peerPublicKey],
+                  ));
           expect(inviteResult.code, equals(0),
-              reason:
-                  'inviteUserToGroup(node$i) failed: ${inviteResult.code}');
+              reason: 'inviteUserToGroup(node$i) failed: ${inviteResult.code}');
           try {
             await waitUntilWithVirtualPump(
               scenario,
@@ -98,20 +98,23 @@ void main() {
               iterationsPerInstance: 1,
             );
             arrived = true;
-          } catch (_) {}
+          } on TimeoutException catch (e) {
+            // Expected between retry attempts (the post-loop expect enforces the
+            // real assertion); a non-timeout error is a real bug and propagates.
+            print('[Test] Attempt timed out; retrying: $e');
+          }
         }
         expect(arrived, isTrue,
             reason: 'node$i never received onGroupInvited after 3 retries');
 
-        await pumpTestTick(scenario,
-            advanceMs: 500, iterationsPerInstance: 1);
+        await pumpTestTick(scenario, advanceMs: 500, iterationsPerInstance: 1);
         final joinGroupId =
             peer.getLastCallbackGroupId('onGroupInvited') ?? groupId;
-        final joinResult = await peer.runWithInstanceAsync(() async =>
-            TIMManager.instance.joinGroup(
-              groupID: joinGroupId,
-              message: 'Hello from node$i',
-            ));
+        final joinResult = await peer
+            .runWithInstanceAsync(() async => TIMManager.instance.joinGroup(
+                  groupID: joinGroupId,
+                  message: 'Hello from node$i',
+                ));
         expect(joinResult.code, equals(0),
             reason: 'node$i joinGroup failed: ${joinResult.code}');
       }
@@ -119,8 +122,8 @@ void main() {
       await pumpTestTick(scenario, advanceMs: 500, iterationsPerInstance: 1);
 
       final sendResult = await nodes[0].runWithInstanceAsync(() async {
-        final messageResult =
-            TIMMessageManager.instance.createTextMessage(text: 'Hello from node0');
+        final messageResult = TIMMessageManager.instance
+            .createTextMessage(text: 'Hello from node0');
         return TIMMessageManager.instance.sendMessage(
           groupID: null,
           message: messageResult.messageInfo!,
@@ -132,12 +135,12 @@ void main() {
 
       await pumpTestTick(scenario, advanceMs: 500, iterationsPerInstance: 1);
 
-      final memberListResult = await nodes[0].runWithInstanceAsync(() async =>
-          TIMGroupManager.instance.getGroupMemberList(
-            groupID: groupId,
-            filter: GroupMemberFilterTypeEnum.V2TIM_GROUP_MEMBER_FILTER_ALL,
-            nextSeq: '0',
-          ));
+      final memberListResult = await nodes[0].runWithInstanceAsync(
+          () async => TIMGroupManager.instance.getGroupMemberList(
+                groupID: groupId,
+                filter: GroupMemberFilterTypeEnum.V2TIM_GROUP_MEMBER_FILTER_ALL,
+                nextSeq: '0',
+              ));
       expect(memberListResult.code, equals(0));
     }, timeout: const Timeout(Duration(seconds: 420)));
   });
