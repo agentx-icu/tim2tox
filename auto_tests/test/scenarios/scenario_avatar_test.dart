@@ -140,11 +140,14 @@ void main() {
               iterationsPerInstance: 1,
             );
             received = true;
-          } catch (_) {}
+          } on TimeoutException catch (e) {
+            // Expected between retry attempts (the post-loop expect enforces the
+            // real assertion); a non-timeout error is a real bug and propagates.
+            print('[Test] Attempt timed out; retrying: $e');
+          }
         }
 
-        expect(received, isTrue,
-            reason: 'Avatar never received after retries');
+        expect(received, isTrue, reason: 'Avatar never received after retries');
         expect(avatarReceived, isTrue, reason: 'Avatar should be received');
         expect(bob.receivedMessages.length, greaterThan(0),
             reason: 'Bob should have received messages');

@@ -58,8 +58,8 @@ void main() {
       final bobPublicKey = bob.getPublicKey();
       final bobToxId = bob.getToxId();
       final aliceToxId = alice.getToxId();
-      final appListResult = await alice.runWithInstanceAsync(() async =>
-          TIMFriendshipManager.instance.getFriendApplicationList());
+      final appListResult = await alice.runWithInstanceAsync(
+          () async => TIMFriendshipManager.instance.getFriendApplicationList());
       final list = appListResult.data?.friendApplicationList;
       if (list != null && list.isNotEmpty) {
         final isFromBob = (String uid) =>
@@ -83,11 +83,11 @@ void main() {
               await pumpTestTick(scenario,
                   advanceMs: 1000, iterationsPerInstance: 1);
             });
-            await bob.runWithInstanceAsync(() async =>
-                TIMFriendshipManager.instance.deleteFromFriendList(
-                  userIDList: [aliceToxId],
-                  deleteType: FriendTypeEnum.V2TIM_FRIEND_TYPE_SINGLE,
-                ));
+            await bob.runWithInstanceAsync(
+                () async => TIMFriendshipManager.instance.deleteFromFriendList(
+                      userIDList: [aliceToxId],
+                      deleteType: FriendTypeEnum.V2TIM_FRIEND_TYPE_SINGLE,
+                    ));
             await pumpTestTick(scenario,
                 advanceMs: 3000, iterationsPerInstance: 1);
           }
@@ -107,25 +107,24 @@ void main() {
           (id.length >= 64 && id.startsWith(alicePublicKey)));
       if (bobInAliceList || aliceInBobList) {
         if (bobInAliceList) {
-          await alice.runWithInstanceAsync(() async =>
-              TIMFriendshipManager.instance.deleteFromFriendList(
-                userIDList: [bobToxId],
-                deleteType: FriendTypeEnum.V2TIM_FRIEND_TYPE_SINGLE,
-              ));
+          await alice.runWithInstanceAsync(
+              () async => TIMFriendshipManager.instance.deleteFromFriendList(
+                    userIDList: [bobToxId],
+                    deleteType: FriendTypeEnum.V2TIM_FRIEND_TYPE_SINGLE,
+                  ));
           await pumpTestTick(scenario,
               advanceMs: 1000, iterationsPerInstance: 1);
         }
         if (aliceInBobList) {
-          await bob.runWithInstanceAsync(() async =>
-              TIMFriendshipManager.instance.deleteFromFriendList(
-                userIDList: [aliceToxId],
-                deleteType: FriendTypeEnum.V2TIM_FRIEND_TYPE_SINGLE,
-              ));
+          await bob.runWithInstanceAsync(
+              () async => TIMFriendshipManager.instance.deleteFromFriendList(
+                    userIDList: [aliceToxId],
+                    deleteType: FriendTypeEnum.V2TIM_FRIEND_TYPE_SINGLE,
+                  ));
           await pumpTestTick(scenario,
               advanceMs: 1000, iterationsPerInstance: 1);
         }
-        await pumpTestTick(scenario,
-            advanceMs: 3000, iterationsPerInstance: 1);
+        await pumpTestTick(scenario, advanceMs: 3000, iterationsPerInstance: 1);
       }
     });
 
@@ -154,26 +153,26 @@ void main() {
       alice.runWithInstance(() =>
           TIMFriendshipManager.instance.addFriendListener(listener: listener));
       final aliceToxId = alice.getToxId();
-      final addResult = await bob.runWithInstanceAsync(() async =>
-          TIMFriendshipManager.instance.addFriend(
-            userID: aliceToxId,
-            addType: FriendTypeEnum.V2TIM_FRIEND_TYPE_BOTH,
-            remark: 'Alice',
-            addWording: 'Hi',
-          ));
+      final addResult = await bob.runWithInstanceAsync(
+          () async => TIMFriendshipManager.instance.addFriend(
+                userID: aliceToxId,
+                addType: FriendTypeEnum.V2TIM_FRIEND_TYPE_BOTH,
+                remark: 'Alice',
+                addWording: 'Hi',
+              ));
       expect(addResult.code, equals(0));
 
       // Drive virtual time toward completer with retries.
       var arrived = false;
       for (var attempt = 0; !arrived && attempt < 3; attempt++) {
         if (attempt > 0) {
-          await bob.runWithInstanceAsync(() async =>
-              TIMFriendshipManager.instance.addFriend(
-                userID: aliceToxId,
-                addType: FriendTypeEnum.V2TIM_FRIEND_TYPE_BOTH,
-                remark: 'Alice',
-                addWording: 'Hi',
-              ));
+          await bob.runWithInstanceAsync(
+              () async => TIMFriendshipManager.instance.addFriend(
+                    userID: aliceToxId,
+                    addType: FriendTypeEnum.V2TIM_FRIEND_TYPE_BOTH,
+                    remark: 'Alice',
+                    addWording: 'Hi',
+                  ));
         }
         try {
           await waitUntilWithVirtualPump(
@@ -186,7 +185,11 @@ void main() {
             iterationsPerInstance: 1,
           );
           arrived = true;
-        } catch (_) {}
+        } on TimeoutException catch (e) {
+          // Expected between retry attempts (the post-loop expect enforces the
+          // real assertion); a non-timeout error is a real bug and propagates.
+          print('[Test] Attempt timed out; retrying: $e');
+        }
       }
 
       expect(requestReceived, isTrue,
@@ -221,15 +224,15 @@ void main() {
         },
       );
 
-      alice.runWithInstance(() => TIMFriendshipManager.instance
-          .addFriendListener(listener: listener1));
+      alice.runWithInstance(() =>
+          TIMFriendshipManager.instance.addFriendListener(listener: listener1));
       final aliceToxId = alice.getToxId();
-      final addResult = await bob.runWithInstanceAsync(() async =>
-          TIMFriendshipManager.instance.addFriend(
-            userID: aliceToxId,
-            addType: FriendTypeEnum.V2TIM_FRIEND_TYPE_BOTH,
-            addWording: 'Hi',
-          ));
+      final addResult = await bob.runWithInstanceAsync(
+          () async => TIMFriendshipManager.instance.addFriend(
+                userID: aliceToxId,
+                addType: FriendTypeEnum.V2TIM_FRIEND_TYPE_BOTH,
+                addWording: 'Hi',
+              ));
 
       try {
         await waitUntilWithVirtualPump(
@@ -240,7 +243,11 @@ void main() {
           advanceMs: 50,
           iterationsPerInstance: 1,
         );
-      } catch (_) {}
+      } on TimeoutException catch (e) {
+        // Best-effort wait: proceed regardless, but keep the timeout visible.
+        // A non-timeout error is a real bug and propagates.
+        print('[Test] Continuing after timeout: $e');
+      }
 
       var applications = await alice.runWithInstanceAsync(() async {
         final p = TencentCloudChatSdkPlatform.instance;
@@ -249,15 +256,13 @@ void main() {
       });
       var appCount1 = applications.data?.friendApplicationList?.length ?? 0;
       for (int poll = 0; poll < 5 && appCount1 == 0; poll++) {
-        await pumpTestTick(scenario,
-            advanceMs: 2000, iterationsPerInstance: 1);
+        await pumpTestTick(scenario, advanceMs: 2000, iterationsPerInstance: 1);
         applications = await alice.runWithInstanceAsync(() async {
           final p = TencentCloudChatSdkPlatform.instance;
           if (p is Tim2ToxSdkPlatform) {
             return await p.getFriendApplicationList();
           }
-          return await TIMFriendshipManager.instance
-              .getFriendApplicationList();
+          return await TIMFriendshipManager.instance.getFriendApplicationList();
         });
         appCount1 = applications.data?.friendApplicationList?.length ?? 0;
         if (appCount1 > 0 && !request1Received) {
@@ -278,12 +283,12 @@ void main() {
         final application = applications.data!.friendApplicationList!.first;
 
         if (application != null) {
-          final acceptResult = await alice.runWithInstanceAsync(() async =>
-              TIMFriendshipManager.instance.acceptFriendApplication(
-                userID: application.userID,
-                responseType:
-                    FriendResponseTypeEnum.V2TIM_FRIEND_ACCEPT_AGREE_AND_ADD,
-              ));
+          final acceptResult = await alice.runWithInstanceAsync(
+              () async => TIMFriendshipManager.instance.acceptFriendApplication(
+                    userID: application.userID,
+                    responseType: FriendResponseTypeEnum
+                        .V2TIM_FRIEND_ACCEPT_AGREE_AND_ADD,
+                  ));
           expect(acceptResult.code, equals(0),
               reason: 'Friend request should be accepted');
         }
@@ -339,8 +344,8 @@ void main() {
               await aliceIso.runWithInstanceAsync(() async {
                 await TIMFriendshipManager.instance.acceptFriendApplication(
                   userID: app.userID,
-                  responseType: FriendResponseTypeEnum
-                      .V2TIM_FRIEND_ACCEPT_AGREE_AND_ADD,
+                  responseType:
+                      FriendResponseTypeEnum.V2TIM_FRIEND_ACCEPT_AGREE_AND_ADD,
                 );
                 await pumpTestTick(scenarioIso,
                     advanceMs: 1000, iterationsPerInstance: 1);
@@ -360,18 +365,18 @@ void main() {
             id == bobIsoToxId ||
             (id.length >= 64 && id.startsWith(bobIsoPublicKey)));
         if (bobIsoInList) {
-          await aliceIso.runWithInstanceAsync(() async =>
-              TIMFriendshipManager.instance.deleteFromFriendList(
-                userIDList: [bobIsoToxId],
-                deleteType: FriendTypeEnum.V2TIM_FRIEND_TYPE_SINGLE,
-              ));
+          await aliceIso.runWithInstanceAsync(
+              () async => TIMFriendshipManager.instance.deleteFromFriendList(
+                    userIDList: [bobIsoToxId],
+                    deleteType: FriendTypeEnum.V2TIM_FRIEND_TYPE_SINGLE,
+                  ));
           await pumpTestTick(scenarioIso,
               advanceMs: 1000, iterationsPerInstance: 1);
-          await bobIso.runWithInstanceAsync(() async =>
-              TIMFriendshipManager.instance.deleteFromFriendList(
-                userIDList: [aliceIsoToxId],
-                deleteType: FriendTypeEnum.V2TIM_FRIEND_TYPE_SINGLE,
-              ));
+          await bobIso.runWithInstanceAsync(
+              () async => TIMFriendshipManager.instance.deleteFromFriendList(
+                    userIDList: [aliceIsoToxId],
+                    deleteType: FriendTypeEnum.V2TIM_FRIEND_TYPE_SINGLE,
+                  ));
           await pumpTestTick(scenarioIso,
               advanceMs: 2000, iterationsPerInstance: 1);
         }
@@ -405,23 +410,23 @@ void main() {
             .addFriendListener(listener: listener));
 
         final aliceToxId = aliceIso.getToxId();
-        final addResultIso = await bobIso.runWithInstanceAsync(() async =>
-            TIMFriendshipManager.instance.addFriend(
-              userID: aliceToxId,
-              addType: FriendTypeEnum.V2TIM_FRIEND_TYPE_BOTH,
-              addWording: 'Hi',
-            ));
+        final addResultIso = await bobIso.runWithInstanceAsync(
+            () async => TIMFriendshipManager.instance.addFriend(
+                  userID: aliceToxId,
+                  addType: FriendTypeEnum.V2TIM_FRIEND_TYPE_BOTH,
+                  addWording: 'Hi',
+                ));
 
         // Retry per-arrival pattern.
         var arrived = false;
         for (var attempt = 0; !arrived && attempt < 3; attempt++) {
           if (attempt > 0) {
-            await bobIso.runWithInstanceAsync(() async =>
-                TIMFriendshipManager.instance.addFriend(
-                  userID: aliceToxId,
-                  addType: FriendTypeEnum.V2TIM_FRIEND_TYPE_BOTH,
-                  addWording: 'Hi',
-                ));
+            await bobIso.runWithInstanceAsync(
+                () async => TIMFriendshipManager.instance.addFriend(
+                      userID: aliceToxId,
+                      addType: FriendTypeEnum.V2TIM_FRIEND_TYPE_BOTH,
+                      addWording: 'Hi',
+                    ));
           }
           try {
             await waitUntilWithVirtualPump(
@@ -434,7 +439,11 @@ void main() {
               iterationsPerInstance: 1,
             );
             arrived = true;
-          } catch (_) {}
+          } on TimeoutException catch (e) {
+            // Expected between retry attempts (the post-loop expect enforces the
+            // real assertion); a non-timeout error is a real bug and propagates.
+            print('[Test] Attempt timed out; retrying: $e');
+          }
         }
         // ignore: avoid_print
         print(

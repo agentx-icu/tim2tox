@@ -214,8 +214,8 @@ void main() {
       var bobReceived = false;
       for (var attempt = 0; !bobReceived && attempt < 3; attempt++) {
         final aliceSendResult = await alice.runWithInstanceAsync(() async {
-          final aliceMessageResult =
-              TIMMessageManager.instance.createTextMessage(text: aliceMessageText);
+          final aliceMessageResult = TIMMessageManager.instance
+              .createTextMessage(text: aliceMessageText);
           return await TIMMessageManager.instance.sendMessage(
             message: aliceMessageResult.messageInfo,
             receiver: bobToxId,
@@ -230,12 +230,17 @@ void main() {
             scenario,
             () => bobCompleter.isCompleted,
             timeout: const Duration(seconds: 15),
-            description: 'Bob receives message from Alice (attempt ${attempt + 1})',
+            description:
+                'Bob receives message from Alice (attempt ${attempt + 1})',
             advanceMs: 50,
             iterationsPerInstance: 1,
           );
           bobReceived = true;
-        } catch (_) {}
+        } on TimeoutException catch (e) {
+          // Expected between retry attempts (the post-loop expect enforces the
+          // real assertion); a non-timeout error is a real bug and propagates.
+          print('[Test] Attempt timed out; retrying: $e');
+        }
       }
       expect(bobReceived, isTrue,
           reason: 'Bob never received Alice message after retries');
@@ -246,8 +251,8 @@ void main() {
       var aliceReceived = false;
       for (var attempt = 0; !aliceReceived && attempt < 3; attempt++) {
         final bobSendResult = await bob.runWithInstanceAsync(() async {
-          final bobMessageResult =
-              TIMMessageManager.instance.createTextMessage(text: bobMessageText);
+          final bobMessageResult = TIMMessageManager.instance
+              .createTextMessage(text: bobMessageText);
           return await TIMMessageManager.instance.sendMessage(
             message: bobMessageResult.messageInfo,
             receiver: aliceToxId,
@@ -268,7 +273,11 @@ void main() {
             iterationsPerInstance: 1,
           );
           aliceReceived = true;
-        } catch (_) {}
+        } on TimeoutException catch (e) {
+          // Expected between retry attempts (the post-loop expect enforces the
+          // real assertion); a non-timeout error is a real bug and propagates.
+          print('[Test] Attempt timed out; retrying: $e');
+        }
       }
       expect(aliceReceived, isTrue,
           reason: 'Alice never received Bob message after retries');
@@ -327,13 +336,16 @@ void main() {
             scenario,
             () => completer.isCompleted,
             timeout: const Duration(seconds: 15),
-            description:
-                'Bob receives custom message (attempt ${attempt + 1})',
+            description: 'Bob receives custom message (attempt ${attempt + 1})',
             advanceMs: 50,
             iterationsPerInstance: 1,
           );
           received = true;
-        } catch (_) {}
+        } on TimeoutException catch (e) {
+          // Expected between retry attempts (the post-loop expect enforces the
+          // real assertion); a non-timeout error is a real bug and propagates.
+          print('[Test] Attempt timed out; retrying: $e');
+        }
       }
       expect(received, isTrue,
           reason: 'Bob never received custom message after retries');
