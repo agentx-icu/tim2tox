@@ -1471,14 +1471,6 @@ bool V2TIMManagerImpl::InitSDK(uint32_t sdkAppID, const V2TIMSDKConfig& config) 
                     if (!running_.load(std::memory_order_acquire)) break;
                     if (!tox_manager_ || tox_manager_->isShuttingDown()) break;
                     // Centralized iterate through ToxManager to ensure correct user_data
-                    int64_t current_instance_id = GetCurrentInstanceId();
-                    static int event_thread_iterate_count = 0;
-                    event_thread_iterate_count++;
-                    if (event_thread_iterate_count % 500 == 0) {
-                        fprintf(stdout, "[V2TIMManagerImpl] event_thread: instance_id=%lld, iterate #%d\n",
-                                (long long)current_instance_id, event_thread_iterate_count);
-                        fflush(stdout);
-                    }
                     tox_manager_->iterate();
                     if (!running_.load(std::memory_order_acquire)) break;
                     if (!tox_manager_ || tox_manager_->isShuttingDown()) break;
