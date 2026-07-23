@@ -200,8 +200,8 @@ void main() {
       // Helper: status propagation across friend P2P may drop the first
       // packet on a flaky local bootstrap; retry up to 3x like other Tox
       // custom-packet message paths.
-      Future<void> waitForStatus(String status,
-          Future<void> Function() rePublish) async {
+      Future<void> waitForStatus(
+          String status, Future<void> Function() rePublish) async {
         var received = false;
         for (var attempt = 0; !received && attempt < 3; attempt++) {
           if (attempt > 0) {
@@ -217,7 +217,11 @@ void main() {
               iterationsPerInstance: 1,
             );
             received = true;
-          } catch (_) {}
+          } on TimeoutException catch (e) {
+            // Expected between retry attempts (the post-loop expect enforces the
+            // real assertion); a non-timeout error is a real bug and propagates.
+            print('[Test] Attempt timed out; retrying: $e');
+          }
         }
         expect(received, isTrue,
             reason: 'Bob never observed $status status after retries');
@@ -263,7 +267,7 @@ void main() {
         reason: 'Listener should be registered on Bob instance',
       );
     },
-        timeout: const Timeout(Duration(
-            seconds: 120))); // Allow for status propagation + retries
+        timeout: const Timeout(
+            Duration(seconds: 120))); // Allow for status propagation + retries
   });
 }

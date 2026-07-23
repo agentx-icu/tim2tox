@@ -99,13 +99,13 @@ void main() {
 
       // Alice sends a signaling invite to Bob (use Tox ID for invitee)
       final inviteData = '{"type":"video_call","room_id":"test_room_123"}';
-      final inviteResult = await alice.runWithInstanceAsync(() async =>
-          TIMSignalingManager.instance.invite(
-            invitee: bob.getToxId(),
-            data: inviteData,
-            timeout: 30,
-            onlineUserOnly: false,
-          ));
+      final inviteResult = await alice
+          .runWithInstanceAsync(() async => TIMSignalingManager.instance.invite(
+                invitee: bob.getToxId(),
+                data: inviteData,
+                timeout: 30,
+                onlineUserOnly: false,
+              ));
 
       print(
           '[Signaling] Send invite: code=${inviteResult.code} desc=${inviteResult.desc} data=${inviteResult.data}');
@@ -202,12 +202,12 @@ void main() {
       });
 
       // Alice sends invite (use Tox ID for invitee)
-      final inviteResult = await alice.runWithInstanceAsync(() async =>
-          TIMSignalingManager.instance.invite(
-            invitee: bob.getToxId(),
-            data: '{"type":"video_call"}',
-            timeout: 30,
-          ));
+      final inviteResult = await alice
+          .runWithInstanceAsync(() async => TIMSignalingManager.instance.invite(
+                invitee: bob.getToxId(),
+                data: '{"type":"video_call"}',
+                timeout: 30,
+              ));
 
       expect(inviteResult.code, equals(0));
       final inviteID = inviteResult.data!;
@@ -223,11 +223,11 @@ void main() {
       );
 
       // Bob accepts the invite on bob's instance
-      final acceptResult = await bob.runWithInstanceAsync(() async =>
-          TIMSignalingManager.instance.accept(
-            inviteID: bobInviteID!,
-            data: '{"type":"accept"}',
-          ));
+      final acceptResult = await bob
+          .runWithInstanceAsync(() async => TIMSignalingManager.instance.accept(
+                inviteID: bobInviteID!,
+                data: '{"type":"accept"}',
+              ));
 
       expect(acceptResult.code, equals(0));
       // Aggressive immediate pump to push the SIGNALING_ACCEPT packet out
@@ -244,11 +244,11 @@ void main() {
         if (attempt > 0) {
           // Re-fire accept; original packet may have been dropped while
           // friend P2P was still warming up on the back-direction link.
-          await bob.runWithInstanceAsync(() async =>
-              TIMSignalingManager.instance.accept(
-                inviteID: bobInviteID!,
-                data: '{"type":"accept"}',
-              ));
+          await bob.runWithInstanceAsync(
+              () async => TIMSignalingManager.instance.accept(
+                    inviteID: bobInviteID!,
+                    data: '{"type":"accept"}',
+                  ));
           await pumpTestTick(scenario,
               advanceMs: 50, iterationsPerInstance: 250);
         }
@@ -262,7 +262,11 @@ void main() {
             iterationsPerInstance: 1,
           );
           aliceWaited = true;
-        } catch (_) {}
+        } on TimeoutException catch (e) {
+          // Expected between retry attempts (the post-loop expect enforces the
+          // real assertion); a non-timeout error is a real bug and propagates.
+          print('[Test] Attempt timed out; retrying: $e');
+        }
       }
       expect(aliceReceivedAccept, isTrue,
           reason: 'Alice never received onInviteeAccepted after retries');
@@ -341,12 +345,12 @@ void main() {
       });
 
       // Alice sends invite (use Tox ID for invitee)
-      final inviteResult = await alice.runWithInstanceAsync(() async =>
-          TIMSignalingManager.instance.invite(
-            invitee: bob.getToxId(),
-            data: '{"type":"video_call"}',
-            timeout: 30,
-          ));
+      final inviteResult = await alice
+          .runWithInstanceAsync(() async => TIMSignalingManager.instance.invite(
+                invitee: bob.getToxId(),
+                data: '{"type":"video_call"}',
+                timeout: 30,
+              ));
 
       expect(inviteResult.code, equals(0));
       final inviteID = inviteResult.data!;
@@ -362,11 +366,11 @@ void main() {
       );
 
       // Bob rejects the invite on bob's instance
-      final rejectResult = await bob.runWithInstanceAsync(() async =>
-          TIMSignalingManager.instance.reject(
-            inviteID: bobInviteID!,
-            data: '{"type":"reject","reason":"busy"}',
-          ));
+      final rejectResult = await bob
+          .runWithInstanceAsync(() async => TIMSignalingManager.instance.reject(
+                inviteID: bobInviteID!,
+                data: '{"type":"reject","reason":"busy"}',
+              ));
 
       expect(rejectResult.code, equals(0));
 
@@ -431,12 +435,12 @@ void main() {
       });
 
       // Alice sends invite (use Tox ID for invitee)
-      final inviteResult = await alice.runWithInstanceAsync(() async =>
-          TIMSignalingManager.instance.invite(
-            invitee: bob.getToxId(),
-            data: '{"type":"video_call"}',
-            timeout: 30,
-          ));
+      final inviteResult = await alice
+          .runWithInstanceAsync(() async => TIMSignalingManager.instance.invite(
+                invitee: bob.getToxId(),
+                data: '{"type":"video_call"}',
+                timeout: 30,
+              ));
 
       expect(inviteResult.code, equals(0));
       final inviteID = inviteResult.data!;
@@ -446,11 +450,11 @@ void main() {
       await pumpTestTick(scenario, advanceMs: 50, iterationsPerInstance: 100);
 
       // Alice cancels the invite on alice's instance
-      final cancelResult = await alice.runWithInstanceAsync(() async =>
-          TIMSignalingManager.instance.cancel(
-            inviteID: inviteID,
-            data: '{"type":"cancel","reason":"changed_mind"}',
-          ));
+      final cancelResult = await alice
+          .runWithInstanceAsync(() async => TIMSignalingManager.instance.cancel(
+                inviteID: inviteID,
+                data: '{"type":"cancel","reason":"changed_mind"}',
+              ));
 
       expect(cancelResult.code, equals(0));
       await pumpTestTick(scenario, advanceMs: 50, iterationsPerInstance: 250);
@@ -461,11 +465,11 @@ void main() {
       var bobWaited = false;
       for (var attempt = 0; !bobWaited && attempt < 2; attempt++) {
         if (attempt > 0) {
-          await alice.runWithInstanceAsync(() async =>
-              TIMSignalingManager.instance.cancel(
-                inviteID: inviteID,
-                data: '{"type":"cancel","reason":"changed_mind"}',
-              ));
+          await alice.runWithInstanceAsync(
+              () async => TIMSignalingManager.instance.cancel(
+                    inviteID: inviteID,
+                    data: '{"type":"cancel","reason":"changed_mind"}',
+                  ));
           await pumpTestTick(scenario,
               advanceMs: 50, iterationsPerInstance: 250);
         }
@@ -479,7 +483,11 @@ void main() {
             iterationsPerInstance: 1,
           );
           bobWaited = true;
-        } catch (_) {}
+        } on TimeoutException catch (e) {
+          // Expected between retry attempts (the post-loop expect enforces the
+          // real assertion); a non-timeout error is a real bug and propagates.
+          print('[Test] Attempt timed out; retrying: $e');
+        }
       }
       expect(bobReceivedCancel, isTrue,
           reason: 'Bob never received onInvitationCancelled after retries');
@@ -528,12 +536,12 @@ void main() {
       });
 
       // Alice sends invite with short timeout (use Tox ID for invitee)
-      final inviteResult = await alice.runWithInstanceAsync(() async =>
-          TIMSignalingManager.instance.invite(
-            invitee: bob.getToxId(),
-            data: '{"type":"video_call"}',
-            timeout: 5, // 5 seconds timeout
-          ));
+      final inviteResult = await alice
+          .runWithInstanceAsync(() async => TIMSignalingManager.instance.invite(
+                invitee: bob.getToxId(),
+                data: '{"type":"video_call"}',
+                timeout: 5, // 5 seconds timeout
+              ));
 
       expect(inviteResult.code, equals(0));
       final inviteID = inviteResult.data!;
@@ -561,12 +569,12 @@ void main() {
 
     test('Group signaling invite', () async {
       // Create a group on alice's instance first
-      final createResult = await alice.runWithInstanceAsync(() async =>
-          TIMGroupManager.instance.createGroup(
-            groupType: 'Meeting',
-            groupName: 'Signaling Test Group',
-            groupID: '',
-          ));
+      final createResult = await alice.runWithInstanceAsync(
+          () async => TIMGroupManager.instance.createGroup(
+                groupType: 'Meeting',
+                groupName: 'Signaling Test Group',
+                groupID: '',
+              ));
 
       expect(createResult.code, equals(0));
       final groupId = createResult.data!;
@@ -581,11 +589,11 @@ void main() {
       var inviteArrived = false;
       for (var attempt = 0; !inviteArrived && attempt < 3; attempt++) {
         bob.clearCallbackReceived('onGroupInvited');
-        final groupInvResult = await alice.runWithInstanceAsync(() async =>
-            TIMGroupManager.instance.inviteUserToGroup(
-              groupID: groupId,
-              userList: [bobPk],
-            ));
+        final groupInvResult = await alice.runWithInstanceAsync(
+            () async => TIMGroupManager.instance.inviteUserToGroup(
+                  groupID: groupId,
+                  userList: [bobPk],
+                ));
         expect(groupInvResult.code, equals(0),
             reason: 'inviteUserToGroup failed: ${groupInvResult.desc}');
         try {
@@ -639,13 +647,13 @@ void main() {
       });
 
       // Alice sends group signaling invite (native may expect 64-char for inviteeList)
-      final groupInviteResult = await alice.runWithInstanceAsync(() async =>
-          TIMSignalingManager.instance.inviteInGroup(
-            groupID: groupId,
-            inviteeList: [bobPk],
-            data: '{"type":"group_video_call"}',
-            timeout: 30,
-          ));
+      final groupInviteResult = await alice.runWithInstanceAsync(
+          () async => TIMSignalingManager.instance.inviteInGroup(
+                groupID: groupId,
+                inviteeList: [bobPk],
+                data: '{"type":"group_video_call"}',
+                timeout: 30,
+              ));
 
       expect(groupInviteResult.code, equals(0));
       expect(groupInviteResult.data, isNotNull);

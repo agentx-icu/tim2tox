@@ -78,25 +78,24 @@ void main() {
       final bobToxId = bob.getToxId();
       print(
           '[Test] setUp - Alice Tox ID: $aliceToxId (length=${aliceToxId.length})');
-      print(
-          '[Test] setUp - Bob Tox ID: $bobToxId (length=${bobToxId.length})');
+      print('[Test] setUp - Bob Tox ID: $bobToxId (length=${bobToxId.length})');
 
       // Add friends using actual Tox IDs
       print('[Test] setUp - Adding friends using actual Tox IDs...');
-      await alice.runWithInstanceAsync(() async =>
-          TIMFriendshipManager.instance.addFriend(
-            userID: bobToxId,
-            addType: FriendTypeEnum.V2TIM_FRIEND_TYPE_BOTH,
-            remark: 'Bob',
-            addWording: 'test',
-          ));
-      await bob.runWithInstanceAsync(() async =>
-          TIMFriendshipManager.instance.addFriend(
-            userID: aliceToxId,
-            addType: FriendTypeEnum.V2TIM_FRIEND_TYPE_BOTH,
-            remark: 'Alice',
-            addWording: 'test',
-          ));
+      await alice.runWithInstanceAsync(
+          () async => TIMFriendshipManager.instance.addFriend(
+                userID: bobToxId,
+                addType: FriendTypeEnum.V2TIM_FRIEND_TYPE_BOTH,
+                remark: 'Bob',
+                addWording: 'test',
+              ));
+      await bob.runWithInstanceAsync(
+          () async => TIMFriendshipManager.instance.addFriend(
+                userID: aliceToxId,
+                addType: FriendTypeEnum.V2TIM_FRIEND_TYPE_BOTH,
+                remark: 'Alice',
+                addWording: 'test',
+              ));
 
       // Friend list populate. Drive a burst of pump first so addFriend
       // auto-accept side-effects propagate, then poll the friend list via
@@ -151,14 +150,15 @@ void main() {
       }
       final bobFriendNumber = alice
           .runWithInstance(() => aliceAV.getFriendNumberByUserId(bobToxId));
-      final aliceFriendNumber = bob
-          .runWithInstance(() => bobAV.getFriendNumberByUserId(aliceToxId));
-      if (bobFriendNumber == 0xFFFFFFFF ||
-          aliceFriendNumber == 0xFFFFFFFF) {
+      final aliceFriendNumber =
+          bob.runWithInstance(() => bobAV.getFriendNumberByUserId(aliceToxId));
+      if (bobFriendNumber == 0xFFFFFFFF || aliceFriendNumber == 0xFFFFFFFF) {
         return;
       }
-      await alice.runWithInstanceAsync(() async => aliceAV.endCall(bobFriendNumber));
-      await bob.runWithInstanceAsync(() async => bobAV.endCall(aliceFriendNumber));
+      await alice
+          .runWithInstanceAsync(() async => aliceAV.endCall(bobFriendNumber));
+      await bob
+          .runWithInstanceAsync(() async => bobAV.endCall(aliceFriendNumber));
       // Drive virtual clock + AV iterate so hangup packets propagate.
       for (int i = 0; i < 30; i++) {
         await pumpTestTickAv(scenario,
@@ -176,8 +176,8 @@ void main() {
 
       final bobFriendNumber = alice
           .runWithInstance(() => aliceAV.getFriendNumberByUserId(bobToxId));
-      final aliceFriendNumber = bob
-          .runWithInstance(() => bobAV.getFriendNumberByUserId(aliceToxId));
+      final aliceFriendNumber =
+          bob.runWithInstance(() => bobAV.getFriendNumberByUserId(aliceToxId));
 
       print('[Test] Alice sees Bob as friend number: $bobFriendNumber');
       print('[Test] Bob sees Alice as friend number: $aliceFriendNumber');
@@ -206,7 +206,8 @@ void main() {
       await waitForFriendConnectionVirtual(scenario, bob, aliceToxId,
           timeout: const Duration(seconds: 60));
 
-      print('[Test] Iterating ToxAV to ensure friend connection is established...');
+      print(
+          '[Test] Iterating ToxAV to ensure friend connection is established...');
       for (int i = 0; i < 10; i++) {
         await pumpTestTickAv(scenario,
             advanceMs: 50,
@@ -220,8 +221,8 @@ void main() {
       for (var attempt = 0; !callReceived && attempt < 3; attempt++) {
         if (attempt > 0) {
           print('[Test] Retrying call (attempt ${attempt + 1})...');
-          await alice
-              .runWithInstanceAsync(() async => aliceAV.endCall(bobFriendNumber));
+          await alice.runWithInstanceAsync(
+              () async => aliceAV.endCall(bobFriendNumber));
           for (int i = 0; i < 5; i++) {
             await pumpTestTickAv(scenario,
                 advanceMs: 50,
@@ -230,12 +231,12 @@ void main() {
           }
           bobReceivedCall = false;
         }
-        final callResult = await alice.runWithInstanceAsync(() async =>
-            aliceAV.startCall(
-              bobFriendNumber,
-              audioBitRate: 48,
-              videoBitRate: 4000,
-            ));
+        final callResult =
+            await alice.runWithInstanceAsync(() async => aliceAV.startCall(
+                  bobFriendNumber,
+                  audioBitRate: 48,
+                  videoBitRate: 4000,
+                ));
         expect(callResult, isTrue, reason: 'Failed to start call');
         print('[Test] Alice call started: $callResult');
 
@@ -259,12 +260,12 @@ void main() {
 
       // Bob answers
       print('[Test] Bob answering call...');
-      final answerResult = await bob.runWithInstanceAsync(() async =>
-          bobAV.answerCall(
-            aliceFriendNumber,
-            audioBitRate: 48,
-            videoBitRate: 4000,
-          ));
+      final answerResult =
+          await bob.runWithInstanceAsync(() async => bobAV.answerCall(
+                aliceFriendNumber,
+                audioBitRate: 48,
+                videoBitRate: 4000,
+              ));
       expect(answerResult, isTrue, reason: 'Failed to answer call');
 
       // Process call establishment
@@ -298,8 +299,8 @@ void main() {
 
       final bobFriendNumber = alice
           .runWithInstance(() => aliceAV.getFriendNumberByUserId(bobToxId));
-      final aliceFriendNumber = bob
-          .runWithInstance(() => bobAV.getFriendNumberByUserId(aliceToxId));
+      final aliceFriendNumber =
+          bob.runWithInstance(() => bobAV.getFriendNumberByUserId(aliceToxId));
 
       expect(bobFriendNumber, isNot(equals(0xFFFFFFFF)),
           reason: 'Bob friend number not found');
@@ -343,12 +344,12 @@ void main() {
           }
           bobReceivedCall = false;
         }
-        final callResult = await alice.runWithInstanceAsync(() async =>
-            aliceAV.startCall(
-              bobFriendNumber,
-              audioBitRate: 48,
-              videoBitRate: 0,
-            ));
+        final callResult =
+            await alice.runWithInstanceAsync(() async => aliceAV.startCall(
+                  bobFriendNumber,
+                  audioBitRate: 48,
+                  videoBitRate: 0,
+                ));
         expect(callResult, isTrue);
         try {
           await waitUntilWithAvVirtualPump(
@@ -361,7 +362,11 @@ void main() {
             wallSleep: const Duration(milliseconds: 30),
           );
           callReceived = true;
-        } catch (_) {}
+        } on TimeoutException catch (e) {
+          // Expected between retry attempts (the post-loop expect enforces the
+          // real assertion); a non-timeout error is a real bug and propagates.
+          print('[Test] Attempt timed out; retrying: $e');
+        }
       }
       expect(bobReceivedCall, isTrue,
           reason: 'Bob never received onCall after retries');
@@ -389,8 +394,8 @@ void main() {
 
       final bobFriendNumber = alice
           .runWithInstance(() => aliceAV.getFriendNumberByUserId(bobToxId));
-      final aliceFriendNumber = bob
-          .runWithInstance(() => bobAV.getFriendNumberByUserId(aliceToxId));
+      final aliceFriendNumber =
+          bob.runWithInstance(() => bobAV.getFriendNumberByUserId(aliceToxId));
 
       expect(bobFriendNumber, isNot(equals(0xFFFFFFFF)));
       expect(aliceFriendNumber, isNot(equals(0xFFFFFFFF)));
@@ -431,12 +436,12 @@ void main() {
           }
           bobReceivedCall = false;
         }
-        final callResult = await alice.runWithInstanceAsync(() async =>
-            aliceAV.startCall(
-              bobFriendNumber,
-              audioBitRate: 48,
-              videoBitRate: 0,
-            ));
+        final callResult =
+            await alice.runWithInstanceAsync(() async => aliceAV.startCall(
+                  bobFriendNumber,
+                  audioBitRate: 48,
+                  videoBitRate: 0,
+                ));
         expect(callResult, isTrue);
         try {
           await waitUntilWithAvVirtualPump(
@@ -449,7 +454,11 @@ void main() {
             wallSleep: const Duration(milliseconds: 30),
           );
           callReceived = true;
-        } catch (_) {}
+        } on TimeoutException catch (e) {
+          // Expected between retry attempts (the post-loop expect enforces the
+          // real assertion); a non-timeout error is a real bug and propagates.
+          print('[Test] Attempt timed out; retrying: $e');
+        }
       }
       expect(bobReceivedCall, isTrue,
           reason: 'Bob never received onCall after retries');

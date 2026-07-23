@@ -62,7 +62,8 @@ void main() {
               timeout: const Duration(seconds: 15));
         }
       } catch (e) {
-        print('[Test] setUp - Warning: Connection wait timeout, continuing: $e');
+        print(
+            '[Test] setUp - Warning: Connection wait timeout, continuing: $e');
       }
 
       // Drive virtual clock so Tox IDs settle.
@@ -236,26 +237,29 @@ void main() {
             }
             bobReceivedCalls[i] = false;
           }
-          final callResult = await alice.runWithInstanceAsync(() async =>
-              aliceAV.startCall(
-                bobFriendNumbers[i],
-                audioBitRate: 48,
-                videoBitRate: 3000,
-              ));
+          final callResult =
+              await alice.runWithInstanceAsync(() async => aliceAV.startCall(
+                    bobFriendNumbers[i],
+                    audioBitRate: 48,
+                    videoBitRate: 3000,
+                  ));
           expect(callResult, isTrue, reason: 'Failed to call Bob $i');
           try {
             await waitUntilWithAvVirtualPump(
               scenario,
               () => bobReceivedCalls[i],
               timeout: const Duration(seconds: 25),
-              description:
-                  'Bob $i received call (attempt ${attempt + 1})',
+              description: 'Bob $i received call (attempt ${attempt + 1})',
               advanceMs: 50,
               iterationsPerInstance: 1,
               wallSleep: const Duration(milliseconds: 30),
             );
             callReceivedI = true;
-          } catch (_) {}
+          } on TimeoutException catch (e) {
+            // Expected between retry attempts (the post-loop expect enforces the
+            // real assertion); a non-timeout error is a real bug and propagates.
+            print('[Test] Attempt timed out; retrying: $e');
+          }
         }
         expect(bobReceivedCalls[i], isTrue,
             reason: 'Bob $i never received call after retries');
@@ -263,12 +267,12 @@ void main() {
 
       // All Bobs answer
       for (int i = 0; i < numBobs; i++) {
-        final answerResult = await bobs[i].runWithInstanceAsync(() async =>
-            bobAVs[i].answerCall(
-              aliceFriendNumbers[i],
-              audioBitRate: 8,
-              videoBitRate: 500,
-            ));
+        final answerResult =
+            await bobs[i].runWithInstanceAsync(() async => bobAVs[i].answerCall(
+                  aliceFriendNumbers[i],
+                  audioBitRate: 8,
+                  videoBitRate: 500,
+                ));
         expect(answerResult, isTrue, reason: 'Bob $i failed to answer');
       }
 

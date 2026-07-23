@@ -5,6 +5,7 @@
 /// Note: tim2tox uses Tox Group instead of Conference; this maps to group
 /// features.
 
+import 'dart:async';
 import 'package:test/test.dart';
 import 'package:tencent_cloud_chat_sdk/native_im/adapter/tim_manager.dart';
 import 'package:tencent_cloud_chat_sdk/native_im/adapter/tim_group_manager.dart';
@@ -75,8 +76,8 @@ void main() {
       // delivered (per-instance routing).
       alice.runWithInstance(() =>
           TIMGroupManager.instance.addGroupListener(V2TimGroupListener(
-            onGroupCreated: (gid) => alice.markCallbackReceived('onGroupCreated',
-                data: {'groupID': gid}),
+            onGroupCreated: (gid) => alice
+                .markCallbackReceived('onGroupCreated', data: {'groupID': gid}),
           )));
       bob.runWithInstance(() =>
           TIMGroupManager.instance.addGroupListener(V2TimGroupListener(
@@ -85,18 +86,17 @@ void main() {
           )));
       charlie.runWithInstance(() =>
           TIMGroupManager.instance.addGroupListener(V2TimGroupListener(
-            onMemberInvited: (gid, op, list) => charlie.markCallbackReceived(
-                'onGroupInvited',
-                data: {'groupID': gid}),
+            onMemberInvited: (gid, op, list) => charlie
+                .markCallbackReceived('onGroupInvited', data: {'groupID': gid}),
           )));
 
       String groupId;
-      final createResult = await alice.runWithInstanceAsync(() async =>
-          TIMGroupManager.instance.createGroup(
-            groupType: 'Meeting',
-            groupName: 'Test Conference',
-            groupID: '',
-          ));
+      final createResult = await alice.runWithInstanceAsync(
+          () async => TIMGroupManager.instance.createGroup(
+                groupType: 'Meeting',
+                groupName: 'Test Conference',
+                groupID: '',
+              ));
       expect(createResult.code, equals(0));
       expect(createResult.data, isNotNull);
       groupId = createResult.data!;
@@ -119,7 +119,8 @@ void main() {
       try {
         await waitForFriendConnectionVirtual(scenario, alice, bob.getToxId(),
             timeout: const Duration(seconds: 15));
-        await waitForFriendConnectionVirtual(scenario, alice, charlie.getToxId(),
+        await waitForFriendConnectionVirtual(
+            scenario, alice, charlie.getToxId(),
             timeout: const Duration(seconds: 15));
       } catch (e) {
         print(
@@ -135,11 +136,11 @@ void main() {
           await pumpTestTick(scenario,
               advanceMs: 3000, iterationsPerInstance: 1);
         }
-        final inviteResult = await alice.runWithInstanceAsync(() async =>
-            TIMGroupManager.instance.inviteUserToGroup(
-              groupID: groupId,
-              userList: [bobPublicKey, charliePublicKey],
-            ));
+        final inviteResult = await alice.runWithInstanceAsync(
+            () async => TIMGroupManager.instance.inviteUserToGroup(
+                  groupID: groupId,
+                  userList: [bobPublicKey, charliePublicKey],
+                ));
         expect(inviteResult.code, equals(0));
         expect(inviteResult.data, isNotNull);
         expect(inviteResult.data!.length, equals(2));
@@ -169,11 +170,11 @@ void main() {
         var arrived = false;
         for (var attempt = 0; !arrived && attempt < 3; attempt++) {
           if (attempt > 0) {
-            await alice.runWithInstanceAsync(() async =>
-                TIMGroupManager.instance.inviteUserToGroup(
-                  groupID: groupId,
-                  userList: [invitee.getPublicKey()],
-                ));
+            await alice.runWithInstanceAsync(
+                () async => TIMGroupManager.instance.inviteUserToGroup(
+                      groupID: groupId,
+                      userList: [invitee.getPublicKey()],
+                    ));
           }
           try {
             await waitUntilWithVirtualPump(
@@ -186,7 +187,11 @@ void main() {
               iterationsPerInstance: 1,
             );
             arrived = true;
-          } catch (_) {}
+          } on TimeoutException catch (e) {
+            // Expected between retry attempts (the post-loop expect enforces the
+            // real assertion); a non-timeout error is a real bug and propagates.
+            print('[Test] Attempt timed out; retrying: $e');
+          }
         }
         expect(arrived, isTrue,
             reason:
@@ -227,12 +232,12 @@ void main() {
             timeout: const Duration(seconds: 20)),
       ]);
 
-      final createResult = await alice.runWithInstanceAsync(() async =>
-          TIMGroupManager.instance.createGroup(
-            groupType: 'Meeting',
-            groupName: 'Test Conference',
-            groupID: '',
-          ));
+      final createResult = await alice.runWithInstanceAsync(
+          () async => TIMGroupManager.instance.createGroup(
+                groupType: 'Meeting',
+                groupName: 'Test Conference',
+                groupID: '',
+              ));
       expect(createResult.code, equals(0));
       final groupId = createResult.data!;
       await waitUntilWithVirtualPump(
@@ -251,7 +256,8 @@ void main() {
       try {
         await waitForFriendConnectionVirtual(scenario, alice, bob.getToxId(),
             timeout: const Duration(seconds: 15));
-        await waitForFriendConnectionVirtual(scenario, alice, charlie.getToxId(),
+        await waitForFriendConnectionVirtual(
+            scenario, alice, charlie.getToxId(),
             timeout: const Duration(seconds: 15));
       } catch (e) {
         print(
@@ -260,22 +266,22 @@ void main() {
       await pumpTestTick(scenario, advanceMs: 3000, iterationsPerInstance: 1);
 
       // Initial invite + retry per invitee for onGroupInvited.
-      final inviteResult = await alice.runWithInstanceAsync(() async =>
-          TIMGroupManager.instance.inviteUserToGroup(
-            groupID: groupId,
-            userList: [bob.getPublicKey(), charlie.getPublicKey()],
-          ));
+      final inviteResult = await alice.runWithInstanceAsync(
+          () async => TIMGroupManager.instance.inviteUserToGroup(
+                groupID: groupId,
+                userList: [bob.getPublicKey(), charlie.getPublicKey()],
+              ));
       expect(inviteResult.code, equals(0));
       await pumpTestTick(scenario, advanceMs: 2000, iterationsPerInstance: 1);
       for (final invitee in <TestNode>[bob, charlie]) {
         var arrived = false;
         for (var attempt = 0; !arrived && attempt < 3; attempt++) {
           if (attempt > 0) {
-            await alice.runWithInstanceAsync(() async =>
-                TIMGroupManager.instance.inviteUserToGroup(
-                  groupID: groupId,
-                  userList: [invitee.getPublicKey()],
-                ));
+            await alice.runWithInstanceAsync(
+                () async => TIMGroupManager.instance.inviteUserToGroup(
+                      groupID: groupId,
+                      userList: [invitee.getPublicKey()],
+                    ));
           }
           try {
             await waitUntilWithVirtualPump(
@@ -288,7 +294,11 @@ void main() {
               iterationsPerInstance: 1,
             );
             arrived = true;
-          } catch (_) {}
+          } on TimeoutException catch (e) {
+            // Expected between retry attempts (the post-loop expect enforces the
+            // real assertion); a non-timeout error is a real bug and propagates.
+            print('[Test] Attempt timed out; retrying: $e');
+          }
         }
         expect(arrived, isTrue,
             reason:
@@ -302,9 +312,8 @@ void main() {
         onRecvNewMessage: (V2TimMessage message) {
           final msgGroupId = message.groupID ?? '';
           final senderStr = message.sender ?? message.userID ?? '';
-          final senderPublicKey = senderStr.length >= 64
-              ? senderStr.substring(0, 64)
-              : senderStr;
+          final senderPublicKey =
+              senderStr.length >= 64 ? senderStr.substring(0, 64) : senderStr;
           final textPreview = message.textElem?.text ?? '(no text)';
 
           if (msgGroupId == groupId) {
@@ -400,8 +409,8 @@ void main() {
 
       alice.runWithInstance(() =>
           TIMGroupManager.instance.addGroupListener(V2TimGroupListener(
-            onGroupCreated: (gid) => alice.markCallbackReceived('onGroupCreated',
-                data: {'groupID': gid}),
+            onGroupCreated: (gid) => alice
+                .markCallbackReceived('onGroupCreated', data: {'groupID': gid}),
           )));
       bob.runWithInstance(() =>
           TIMGroupManager.instance.addGroupListener(V2TimGroupListener(
@@ -409,12 +418,12 @@ void main() {
                 .markCallbackReceived('onGroupInvited', data: {'groupID': gid}),
           )));
 
-      final createResult = await alice.runWithInstanceAsync(() async =>
-          TIMGroupManager.instance.createGroup(
-            groupType: 'Meeting',
-            groupName: 'Test Conference',
-            groupID: '',
-          ));
+      final createResult = await alice.runWithInstanceAsync(
+          () async => TIMGroupManager.instance.createGroup(
+                groupType: 'Meeting',
+                groupName: 'Test Conference',
+                groupID: '',
+              ));
       expect(createResult.code, equals(0));
       final groupId = createResult.data!;
       await waitUntilWithVirtualPump(
@@ -443,11 +452,11 @@ void main() {
           await pumpTestTick(scenario,
               advanceMs: 3000, iterationsPerInstance: 1);
         }
-        final inviteResult = await alice.runWithInstanceAsync(() async =>
-            TIMGroupManager.instance.inviteUserToGroup(
-              groupID: groupId,
-              userList: [bobPk],
-            ));
+        final inviteResult = await alice.runWithInstanceAsync(
+            () async => TIMGroupManager.instance.inviteUserToGroup(
+                  groupID: groupId,
+                  userList: [bobPk],
+                ));
         expect(inviteResult.code, equals(0));
         expect(inviteResult.data, isNotNull);
         final bobRes =
@@ -464,11 +473,11 @@ void main() {
       var arrived = false;
       for (var attempt = 0; !arrived && attempt < 3; attempt++) {
         if (attempt > 0) {
-          await alice.runWithInstanceAsync(() async =>
-              TIMGroupManager.instance.inviteUserToGroup(
-                groupID: groupId,
-                userList: [bobPk],
-              ));
+          await alice.runWithInstanceAsync(
+              () async => TIMGroupManager.instance.inviteUserToGroup(
+                    groupID: groupId,
+                    userList: [bobPk],
+                  ));
         }
         try {
           await waitUntilWithVirtualPump(
@@ -480,7 +489,11 @@ void main() {
             iterationsPerInstance: 1,
           );
           arrived = true;
-        } catch (_) {}
+        } on TimeoutException catch (e) {
+          // Expected between retry attempts (the post-loop expect enforces the
+          // real assertion); a non-timeout error is a real bug and propagates.
+          print('[Test] Attempt timed out; retrying: $e');
+        }
       }
       expect(arrived, isTrue,
           reason: 'Bob never received onGroupInvited after 3 retries');
@@ -492,20 +505,19 @@ void main() {
       await pumpGroupPeerDiscoveryVirtual(scenario, alice, bob,
           duration: const Duration(seconds: 6));
 
-      var memberResult = await bob.runWithInstanceAsync(() async =>
-          TIMGroupManager.instance.getGroupMemberList(
-            groupID: groupId,
-            filter: GroupMemberFilterTypeEnum.V2TIM_GROUP_MEMBER_FILTER_ALL,
-            nextSeq: '0',
-          ));
+      var memberResult = await bob.runWithInstanceAsync(
+          () async => TIMGroupManager.instance.getGroupMemberList(
+                groupID: groupId,
+                filter: GroupMemberFilterTypeEnum.V2TIM_GROUP_MEMBER_FILTER_ALL,
+                nextSeq: '0',
+              ));
       final syncDeadline =
           VirtualClock.nowMs + const Duration(seconds: 25).inMilliseconds;
       while (VirtualClock.nowMs < syncDeadline &&
           (memberResult.data?.memberInfoList?.length ?? 0) < 2) {
         await pumpGroupPeerDiscoveryVirtual(scenario, alice, bob,
             duration: const Duration(seconds: 1));
-        await pumpTestTick(scenario,
-            advanceMs: 200, iterationsPerInstance: 1);
+        await pumpTestTick(scenario, advanceMs: 200, iterationsPerInstance: 1);
         memberResult = await bob.runWithInstanceAsync(() async =>
             TIMGroupManager.instance.getGroupMemberList(
               groupID: groupId,
@@ -524,8 +536,7 @@ void main() {
           uid == publicKey || (uid.length >= 64 && uid.startsWith(publicKey));
       final memberIds =
           memberResult.data!.memberInfoList!.map((m) => m.userID).toList();
-      final hasAlice =
-          memberIds.any((id) => memberMatches(id, alicePublicKey));
+      final hasAlice = memberIds.any((id) => memberMatches(id, alicePublicKey));
       final hasBob = memberIds.any((id) => memberMatches(id, bobPublicKey));
       expect(hasAlice || hasBob, isTrue,
           reason: 'Neither Alice nor Bob in member list: $memberIds');

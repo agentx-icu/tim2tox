@@ -52,8 +52,7 @@ void main() {
           timeout: const Duration(seconds: 15));
       await waitUntilWithVirtualPump(
         scenario,
-        () =>
-            alice.getToxId().length == 76 && bob.getToxId().length == 76,
+        () => alice.getToxId().length == 76 && bob.getToxId().length == 76,
         timeout: const Duration(seconds: 10),
         description: 'Tox IDs available',
       );
@@ -104,12 +103,12 @@ void main() {
 
     test('AV conference setup for audio handling', () async {
       alice.clearCallbackReceived('onGroupCreated');
-      final createResult = await alice.runWithInstanceAsync(() async =>
-          TIMGroupManager.instance.createGroup(
-            groupType: 'conference',
-            groupName: 'AV Conference Audio Test',
-            groupID: '',
-          ));
+      final createResult = await alice.runWithInstanceAsync(
+          () async => TIMGroupManager.instance.createGroup(
+                groupType: 'conference',
+                groupName: 'AV Conference Audio Test',
+                groupID: '',
+              ));
 
       expect(createResult.code, equals(0));
       final conferenceId = createResult.data!;
@@ -125,8 +124,8 @@ void main() {
       String? bobInvitedGroupId;
 
       final bobGroupListener = V2TimGroupListener(
-        onMemberInvited:
-            (String groupID, V2TimGroupMemberInfo opUser, List<V2TimGroupMemberInfo> memberList) {
+        onMemberInvited: (String groupID, V2TimGroupMemberInfo opUser,
+            List<V2TimGroupMemberInfo> memberList) {
           bobReceivedInvite = true;
           bobInvitedGroupId = groupID;
           bob.markCallbackReceived('onMemberInvited');
@@ -143,11 +142,11 @@ void main() {
         bobReceivedInvite = false;
         bobInvitedGroupId = null;
         bob.clearCallbackReceived('onMemberInvited');
-        final inviteResult = await alice.runWithInstanceAsync(() async =>
-            TIMGroupManager.instance.inviteUserToGroup(
-              groupID: conferenceId,
-              userList: [bobPublicKey],
-            ));
+        final inviteResult = await alice.runWithInstanceAsync(
+            () async => TIMGroupManager.instance.inviteUserToGroup(
+                  groupID: conferenceId,
+                  userList: [bobPublicKey],
+                ));
         expect(inviteResult.code, equals(0));
         try {
           await waitUntilWithAvVirtualPump(
@@ -160,19 +159,22 @@ void main() {
             wallSleep: const Duration(milliseconds: 30),
           );
           inviteArrived = true;
-        } catch (_) {}
+        } on TimeoutException catch (e) {
+          // Expected between retry attempts (the post-loop expect enforces the
+          // real assertion); a non-timeout error is a real bug and propagates.
+          print('[Test] Attempt timed out; retrying: $e');
+        }
       }
       expect(bobInvitedGroupId, isNotNull);
 
-      final joinResult = await bob.runWithInstanceAsync(
-          () async => TIMManager.instance.joinGroup(
+      final joinResult = await bob
+          .runWithInstanceAsync(() async => TIMManager.instance.joinGroup(
                 groupID: bobInvitedGroupId!,
                 message: '',
               ));
       expect(joinResult.code, equals(0));
 
-      await pumpTestTickAv(scenario,
-          advanceMs: 5000, iterationsPerInstance: 1);
+      await pumpTestTickAv(scenario, advanceMs: 5000, iterationsPerInstance: 1);
 
       final aliceJoinedList = await alice.runWithInstanceAsync(
           () async => TIMGroupManager.instance.getJoinedGroupList());
@@ -185,8 +187,8 @@ void main() {
       expect(bobJoinedList.data, isNotNull);
       expect(bobJoinedList.data!.isNotEmpty, isTrue);
       expect(
-        bobJoinedList.data!.any((g) =>
-            g.groupID == conferenceId || g.groupID == bobInvitedGroupId),
+        bobJoinedList.data!.any(
+            (g) => g.groupID == conferenceId || g.groupID == bobInvitedGroupId),
         isTrue,
       );
 
@@ -196,12 +198,12 @@ void main() {
 
     test('AV conference type verification', () async {
       alice.clearCallbackReceived('onGroupCreated');
-      final createResult = await alice.runWithInstanceAsync(() async =>
-          TIMGroupManager.instance.createGroup(
-            groupType: 'conference',
-            groupName: 'Conference Type Verification',
-            groupID: '',
-          ));
+      final createResult = await alice.runWithInstanceAsync(
+          () async => TIMGroupManager.instance.createGroup(
+                groupType: 'conference',
+                groupName: 'Conference Type Verification',
+                groupID: '',
+              ));
 
       expect(createResult.code, equals(0));
       final conferenceId = createResult.data!;

@@ -8,6 +8,7 @@
 /// RUN_NATIVE_CRASH_TESTS=1 because of a known native crash in DHT crawling
 /// (run_tests_ordered.sh). That crash is unrelated to virtual mode.
 
+import 'dart:async';
 import 'dart:ffi' as ffi;
 import 'package:test/test.dart';
 import 'package:ffi/ffi.dart' as pkgffi;
@@ -68,8 +69,7 @@ void main() {
       // Most tests don't need cleanup since they use shared scenario
     });
 
-    test('DHT nodes crawling: All nodes discover each other via DHT',
-        () async {
+    test('DHT nodes crawling: All nodes discover each other via DHT', () async {
       try {
         final connectionFutures = nodes.asMap().entries.map((entry) {
           final node = entry.value;
@@ -141,7 +141,11 @@ Future<void> configureLinearBootstrapVirtual(TestScenario scenario) async {
   try {
     await waitForConnectionVirtual(scenario, rootNode,
         timeout: const Duration(seconds: 5));
-  } catch (_) {}
+  } on TimeoutException catch (e) {
+    // Best-effort wait: proceed regardless, but keep the timeout visible.
+    // A non-timeout error is a real bug and propagates.
+    print('[Test] Continuing after timeout: $e');
+  }
 
   final rootPortDhtId = await rootNode.runWithInstanceAsync(() async {
     final ffiInstance = ffi_lib.Tim2ToxFfi.open();
@@ -171,7 +175,11 @@ Future<void> configureLinearBootstrapVirtual(TestScenario scenario) async {
     try {
       await waitForConnectionVirtual(scenario, bootstrapSource,
           timeout: const Duration(seconds: 5));
-    } catch (_) {}
+    } on TimeoutException catch (e) {
+      // Best-effort wait: proceed regardless, but keep the timeout visible.
+      // A non-timeout error is a real bug and propagates.
+      print('[Test] Continuing after timeout: $e');
+    }
 
     final bsPortDhtId = await bootstrapSource.runWithInstanceAsync(() async {
       final ffiInstance = ffi_lib.Tim2ToxFfi.open();
@@ -214,6 +222,10 @@ Future<void> configureLinearBootstrapVirtual(TestScenario scenario) async {
     try {
       await waitForConnectionVirtual(scenario, node,
           timeout: const Duration(seconds: 10));
-    } catch (_) {}
+    } on TimeoutException catch (e) {
+      // Best-effort wait: proceed regardless, but keep the timeout visible.
+      // A non-timeout error is a real bug and propagates.
+      print('[Test] Continuing after timeout: $e');
+    }
   }
 }

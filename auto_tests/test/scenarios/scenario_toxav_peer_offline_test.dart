@@ -67,20 +67,20 @@ void main() {
       final aliceToxId = alice.getToxId();
       final bobToxId = bob.getToxId();
 
-      await alice.runWithInstanceAsync(() async =>
-          TIMFriendshipManager.instance.addFriend(
-            userID: bobToxId,
-            addType: FriendTypeEnum.V2TIM_FRIEND_TYPE_BOTH,
-            remark: 'Bob',
-            addWording: 'test',
-          ));
-      await bob.runWithInstanceAsync(() async =>
-          TIMFriendshipManager.instance.addFriend(
-            userID: aliceToxId,
-            addType: FriendTypeEnum.V2TIM_FRIEND_TYPE_BOTH,
-            remark: 'Alice',
-            addWording: 'test',
-          ));
+      await alice.runWithInstanceAsync(
+          () async => TIMFriendshipManager.instance.addFriend(
+                userID: bobToxId,
+                addType: FriendTypeEnum.V2TIM_FRIEND_TYPE_BOTH,
+                remark: 'Bob',
+                addWording: 'test',
+              ));
+      await bob.runWithInstanceAsync(
+          () async => TIMFriendshipManager.instance.addFriend(
+                userID: aliceToxId,
+                addType: FriendTypeEnum.V2TIM_FRIEND_TYPE_BOTH,
+                remark: 'Alice',
+                addWording: 'test',
+              ));
 
       // Drive a burst so auto-accept side-effects propagate.
       for (int i = 0; i < 30; i++) {
@@ -123,8 +123,8 @@ void main() {
 
       final bobFriendNumber = alice
           .runWithInstance(() => aliceAV.getFriendNumberByUserId(bobToxId));
-      final aliceFriendNumber = bob
-          .runWithInstance(() => bobAV.getFriendNumberByUserId(aliceToxId));
+      final aliceFriendNumber =
+          bob.runWithInstance(() => bobAV.getFriendNumberByUserId(aliceToxId));
 
       expect(bobFriendNumber, isNot(equals(0xFFFFFFFF)),
           reason: 'Bob friend number not found');
@@ -183,12 +183,12 @@ void main() {
           }
           bobReceivedCall = false;
         }
-        final callResult = await alice.runWithInstanceAsync(() async =>
-            aliceAV.startCall(
-              bobFriendNumber,
-              audioBitRate: 48,
-              videoBitRate: 0,
-            ));
+        final callResult =
+            await alice.runWithInstanceAsync(() async => aliceAV.startCall(
+                  bobFriendNumber,
+                  audioBitRate: 48,
+                  videoBitRate: 0,
+                ));
         expect(callResult, isTrue, reason: 'Failed to start call');
         try {
           await waitUntilWithAvVirtualPump(
@@ -201,18 +201,22 @@ void main() {
             wallSleep: const Duration(milliseconds: 30),
           );
           callReceived = true;
-        } catch (_) {}
+        } on TimeoutException catch (e) {
+          // Expected between retry attempts (the post-loop expect enforces the
+          // real assertion); a non-timeout error is a real bug and propagates.
+          print('[Test] Attempt timed out; retrying: $e');
+        }
       }
       expect(bobReceivedCall, isTrue,
           reason: 'Bob never received onCall after retries');
 
       // Bob answers.
-      final answerResult = await bob.runWithInstanceAsync(() async =>
-          bobAV.answerCall(
-            aliceFriendNumber,
-            audioBitRate: 48,
-            videoBitRate: 0,
-          ));
+      final answerResult =
+          await bob.runWithInstanceAsync(() async => bobAV.answerCall(
+                aliceFriendNumber,
+                audioBitRate: 48,
+                videoBitRate: 0,
+              ));
       expect(answerResult, isTrue, reason: 'Failed to answer call');
 
       // Wait until Alice sees SENDING_A (call active).
@@ -231,11 +235,11 @@ void main() {
       // tox_friend_get_connection_status() inside toxav_iterate returns NONE,
       // which routes to msi_call_timeout and ends the call with FINISHED.
       final bobPub = bob.getPublicKey();
-      final deleteResult = await alice.runWithInstanceAsync(() async =>
-          TIMFriendshipManager.instance.deleteFromFriendList(
-            userIDList: [bobPub],
-            deleteType: FriendTypeEnum.V2TIM_FRIEND_TYPE_SINGLE,
-          ));
+      final deleteResult = await alice.runWithInstanceAsync(
+          () async => TIMFriendshipManager.instance.deleteFromFriendList(
+                userIDList: [bobPub],
+                deleteType: FriendTypeEnum.V2TIM_FRIEND_TYPE_SINGLE,
+              ));
       expect(deleteResult.code, equals(0),
           reason: 'Failed to delete Bob from Alice friend list');
 
@@ -246,8 +250,7 @@ void main() {
       // Alice's state callback fires the FINISHED transition.
       await waitUntilWithAvVirtualPump(
         scenario,
-        () =>
-            (aliceLastState & (_kCallStateFinished | _kCallStateError)) != 0,
+        () => (aliceLastState & (_kCallStateFinished | _kCallStateError)) != 0,
         timeout: const Duration(seconds: 30),
         description: 'Alice call ends after Bob goes offline',
         advanceMs: 100,
