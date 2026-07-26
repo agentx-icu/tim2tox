@@ -1,6 +1,7 @@
 // Message Functions
 // Extracted from dart_compat_layer.cpp for modularization
 #include "dart_compat_internal.h"
+#include "dart_send_message_contract.h"
 #include "tim2tox_ffi.h"
 #include <chrono>
 
@@ -236,7 +237,7 @@ extern "C" {
         
         if (!message_created) {
             V2TIM_LOG(kError, "[DartSendMessage] Failed to parse message from JSON");
-            V2TIM_LOG(kError, "[DartSendMessage] Full JSON content: {}", json_str);
+            V2TIM_LOG(kError, "[DartSendMessage] JSON payload length: {}", json_str.size());
             V2TIM_LOG(kError, "[DartSendMessage] Attempted to find:");
             V2TIM_LOG(kError, "[DartSendMessage]   1. message_elem_array with elem_type");
             V2TIM_LOG(kError, "[DartSendMessage]   2. elem_type directly in JSON");
@@ -257,12 +258,10 @@ extern "C" {
         V2TIMConversationType conversation_type = (conv_type == 1) ? 
             V2TIMConversationType::V2TIM_C2C : V2TIMConversationType::V2TIM_GROUP;
         
-        // Store message ID for return (will be updated in callback)
-        static std::string temp_msg_id;
-        temp_msg_id = message.msgID.CString();
-        if (temp_msg_id.empty()) {
+        std::string return_msg_id = message.msgID.CString();
+        if (return_msg_id.empty()) {
             // Generate temporary ID if not set
-            temp_msg_id = "temp_" + std::to_string(time(nullptr));
+            return_msg_id = "temp_" + std::to_string(time(nullptr));
         }
         
         // Helper class to implement V2TIMSendCallback
@@ -272,6 +271,7 @@ extern "C" {
             std::function<void(const V2TIMMessage&)> on_success_;
             std::function<void(int, const V2TIMString&)> on_error_;
             std::function<void(uint32_t)> on_progress_;
+            TerminalCallbackGate terminal_gate_;
             
         public:
             DartSendCallback(
@@ -282,15 +282,29 @@ extern "C" {
             ) : user_data_(user_data), on_success_(on_success), on_error_(on_error), on_progress_(on_progress) {}
             
             void OnSuccess(const V2TIMMessage& msg) override {
+                if (!terminal_gate_.TryComplete()) {
+                    V2TIM_LOG(kError, "[DartSendMessage] Duplicate terminal OnSuccess attempt {} suppressed",
+                              terminal_gate_.attempt_count());
+                    return;
+                }
                 if (on_success_) on_success_(msg);
             }
             
             void OnError(int error_code, const V2TIMString& error_message) override {
+                if (!terminal_gate_.TryComplete()) {
+                    V2TIM_LOG(kError, "[DartSendMessage] Duplicate terminal OnError attempt {} suppressed",
+                              terminal_gate_.attempt_count());
+                    return;
+                }
                 if (on_error_) on_error_(error_code, error_message);
             }
             
             void OnProgress(uint32_t progress) override {
                 if (on_progress_) on_progress_(progress);
+            }
+
+            uint32_t terminal_attempt_count() const {
+                return terminal_gate_.attempt_count();
             }
         };
         
@@ -327,7 +341,7 @@ extern "C" {
                     result_fields["message_msg_id"] = message.msgID.CString();
                     std::string data_json = BuildJsonObject(result_fields);
                     SendApiCallbackResult(user_data, 0, "", data_json);
-                    return temp_msg_id.c_str();
+                    return StoreDartSendMessageReturnId(return_msg_id);
                 }
                 V2TIM_LOG(kError, "[DartSendMessage] C2C file send failed: ffi_ret={}", ffi_ret);
                 SendApiCallbackResult(user_data, ERR_SDK_INTERNAL_ERROR, "File send failed (tox_file_send or friend not connected)");
@@ -335,7 +349,29 @@ extern "C" {
             }
         }
         
-        // Send message (async)
+        DartSendCallback callback(
+            user_data,
+            [user_data](const V2TIMMessage& msg) {
+                // OnSuccess
+                std::string msg_id = msg.msgID.CString();
+                std::map<std::string, std::string> result_fields;
+                result_fields["message_msg_id"] = msg_id;
+                std::string data_json = BuildJsonObject(result_fields);
+                SendApiCallbackResult(user_data, 0, "", data_json);
+            },
+            [user_data](int error_code, const V2TIMString& error_message) {
+                // OnError
+                std::string error_msg = error_message.CString();
+                SendApiCallbackResult(user_data, error_code, error_msg);
+            },
+            [](uint32_t progress) {
+                // OnProgress (upload progress)
+                // TODO: Send progress callback via globalCallback
+            }
+        );
+
+        // The current send stack is synchronous/non-retaining; SendMessage receives
+        // a borrowed pointer valid only for this call. Redesign ownership if it becomes async.
         SafeGetV2TIMManager()->GetMessageManager()->SendMessage(
             message,
             receiver,
@@ -343,29 +379,21 @@ extern "C" {
             priority,
             false, // onlineUserOnly
             offlinePushInfo,
-            new DartSendCallback(
-                user_data,
-                [user_data](const V2TIMMessage& msg) {
-                    // OnSuccess
-                    std::string msg_id = msg.msgID.CString();
-                    std::map<std::string, std::string> result_fields;
-                    result_fields["message_msg_id"] = msg_id;
-                    std::string data_json = BuildJsonObject(result_fields);
-                    SendApiCallbackResult(user_data, 0, "", data_json);
-                },
-                [user_data](int error_code, const V2TIMString& error_message) {
-                    // OnError
-                    std::string error_msg = error_message.CString();
-                    SendApiCallbackResult(user_data, error_code, error_msg);
-                },
-                [](uint32_t progress) {
-                    // OnProgress (upload progress)
-                    // TODO: Send progress callback via globalCallback
-                }
-            )
+            &callback
         );
-        // Return message ID immediately (will be updated in callback)
-        return temp_msg_id.c_str();
+        const uint32_t terminal_attempt_count = callback.terminal_attempt_count();
+        if (terminal_attempt_count != 1) {
+            V2TIM_LOG(kError,
+                      "[DartSendMessage] HARD ERROR: expected exactly one synchronous terminal callback attempt, got {}",
+                      terminal_attempt_count);
+            if (terminal_attempt_count == 0) {
+                SendApiCallbackResult(
+                    user_data,
+                    ERR_SDK_INTERNAL_ERROR,
+                    "SendMessage returned without a terminal callback");
+            }
+        }
+        return StoreDartSendMessageReturnId(return_msg_id);
     }
     
     // ============================================================================
@@ -1737,4 +1765,3 @@ extern "C" {
     }
     
 } // extern "C"
-
