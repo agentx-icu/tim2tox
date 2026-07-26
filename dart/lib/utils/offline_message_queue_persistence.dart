@@ -29,6 +29,7 @@ typedef OfflineMessageItem = ({
   String? fileName,
   DateTime timestamp,
   String? msgID,
+  String? cloudCustomData,
 });
 
 /// Offline message queue persistence service
@@ -39,7 +40,8 @@ typedef OfflineMessageItem = ({
 class OfflineMessageQueuePersistence {
   final String? _queueFilePath;
 
-  OfflineMessageQueuePersistence({String? queueFilePath}) : _queueFilePath = queueFilePath;
+  OfflineMessageQueuePersistence({String? queueFilePath})
+      : _queueFilePath = queueFilePath;
 
   // In-memory cache: peerId -> List<OfflineMessageItem>
   final Map<String, List<OfflineMessageItem>> _offlineQueue = {};
@@ -65,14 +67,18 @@ class OfflineMessageQueuePersistence {
       final jsonMap = <String, dynamic>{};
 
       for (final entry in queue.entries) {
-        jsonMap[entry.key] = entry.value.map((item) => {
-          'kind': item.kind,
-          'text': item.text,
-          'filePath': item.filePath,
-          'fileName': item.fileName,
-          'timestamp': item.timestamp.toIso8601String(),
-          'msgID': item.msgID,
-        }).toList();
+        jsonMap[entry.key] = entry.value
+            .map((item) => {
+                  'kind': item.kind,
+                  'text': item.text,
+                  'filePath': item.filePath,
+                  'fileName': item.fileName,
+                  'timestamp': item.timestamp.toIso8601String(),
+                  'msgID': item.msgID,
+                  if (item.cloudCustomData != null)
+                    'cloudCustomData': item.cloudCustomData,
+                })
+            .toList();
       }
 
       await file.writeAsString(jsonEncode(jsonMap));
@@ -90,7 +96,8 @@ class OfflineMessageQueuePersistence {
   /// drain on next online transition can resend them. Callers that explicitly
   /// want the legacy "drop everything on startup" semantics can still pass
   /// `clearOnLoad: true`.
-  Future<Map<String, List<OfflineMessageItem>>> loadQueue({bool clearOnLoad = false}) async {
+  Future<Map<String, List<OfflineMessageItem>>> loadQueue(
+      {bool clearOnLoad = false}) async {
     try {
       final file = await _getQueueFile();
       if (!await file.exists()) {
@@ -130,6 +137,7 @@ class OfflineMessageQueuePersistence {
             // Backward-compat: pre-2026-05-29 entries lack `msgID` → null, and
             // the drain matchers fall back to exact-ms timestamp for those.
             msgID: map['msgID'] as String?,
+            cloudCustomData: map['cloudCustomData'] as String?,
           );
         }).toList();
         queue[peerId] = items;
@@ -145,7 +153,8 @@ class OfflineMessageQueuePersistence {
 
   /// Add a message to the offline queue for a peer
   void addMessage(String peerId, OfflineMessageItem item) {
-    final list = _offlineQueue.putIfAbsent(peerId, () => <OfflineMessageItem>[]);
+    final list =
+        _offlineQueue.putIfAbsent(peerId, () => <OfflineMessageItem>[]);
     list.add(item);
     // Save asynchronously
     unawaited(saveQueue(_offlineQueue));
@@ -203,14 +212,18 @@ class OfflineMessageQueuePersistence {
       final file = await _getQueueFile();
       final jsonMap = <String, dynamic>{};
       for (final entry in _offlineQueue.entries) {
-        jsonMap[entry.key] = entry.value.map((item) => {
-              'kind': item.kind,
-              'text': item.text,
-              'filePath': item.filePath,
-              'fileName': item.fileName,
-              'timestamp': item.timestamp.toIso8601String(),
-              'msgID': item.msgID,
-            }).toList();
+        jsonMap[entry.key] = entry.value
+            .map((item) => {
+                  'kind': item.kind,
+                  'text': item.text,
+                  'filePath': item.filePath,
+                  'fileName': item.fileName,
+                  'timestamp': item.timestamp.toIso8601String(),
+                  'msgID': item.msgID,
+                  if (item.cloudCustomData != null)
+                    'cloudCustomData': item.cloudCustomData,
+                })
+            .toList();
       }
       await file.writeAsString(jsonEncode(jsonMap));
     } catch (e) {
@@ -230,7 +243,8 @@ class OfflineMessageQueuePersistence {
   }
 
   /// Get the in-memory cache (for direct access if needed)
-  Map<String, List<OfflineMessageItem>> get cache => Map.unmodifiable(_offlineQueue);
+  Map<String, List<OfflineMessageItem>> get cache =>
+      Map.unmodifiable(_offlineQueue);
 
   /// Set the in-memory cache (for initialization)
   void setCache(Map<String, List<OfflineMessageItem>> cache) {
