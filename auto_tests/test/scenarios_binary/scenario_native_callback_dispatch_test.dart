@@ -207,5 +207,49 @@ void main() {
       expect(applications, isNotEmpty);
       expect(applications.first.userID, equals('user_charlie'));
     }, timeout: const Timeout(Duration(seconds: 10)));
+
+    test('malformed payloads do not stop later callback dispatch', () async {
+      final validCallback = Completer<void>();
+      NativeLibraryManager.setSdkListener(V2TimSDKListener(
+        onConnectSuccess: () {
+          if (!validCallback.isCompleted) validCallback.complete();
+        },
+        onConnectFailed: (code, desc) {},
+        onConnecting: () {},
+        onKickedOffline: () {},
+        onUserSigExpired: () {},
+        onSelfInfoUpdated: (info) {},
+        onUserStatusChanged: (statusList) {},
+      ));
+
+      expect(ffiInstance.injectCallback('{"callback":"globalCallback",'), 1);
+      expect(
+        ffiInstance.injectCallback(jsonEncode({
+          'callback': 'globalCallback',
+          'callbackType': 7,
+          'instance_id': 0,
+          'json_msg_array': '',
+        })),
+        1,
+      );
+      expect(
+        ffiInstance.injectCallback(jsonEncode({
+          'callback': 'globalCallback',
+          'callbackType': 0,
+          'instance_id': 0,
+          'code': 0,
+          'desc': '',
+          'status': 0,
+        })),
+        1,
+      );
+
+      await validCallback.future.timeout(
+        const Duration(seconds: 5),
+        onTimeout: () => fail(
+          'valid callback was not dispatched after malformed payloads',
+        ),
+      );
+    }, timeout: const Timeout(Duration(seconds: 10)));
   });
 }

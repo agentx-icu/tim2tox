@@ -15,6 +15,7 @@ library tim2tox_sdk_platform;
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:math';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/painting.dart';
 import 'package:tencent_cloud_chat_sdk/tencent_cloud_chat_sdk_platform_interface.dart';
@@ -85,6 +86,7 @@ import 'package:tencent_cloud_chat_sdk/models/v2_tim_message_online_url.dart';
 import 'package:tencent_cloud_chat_sdk/enum/image_types.dart';
 import '../service/ffi_chat_service.dart';
 import '../models/chat_message.dart';
+import '../utils/control_message_envelope.dart';
 import '../utils/message_converter.dart';
 import '../utils/tim2tox_failed_message_persistence.dart';
 import '../utils/conversation_id_utils.dart';
@@ -264,6 +266,36 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
   bool _isLoggedIn = false;
   int? _sdkAppID;
   String? _currentUserID;
+  static final String _clientMessageIDProcessNonce = () {
+    final random = Random.secure();
+    return List.generate(
+      16,
+      (_) => random.nextInt(256).toRadixString(16).padLeft(2, '0'),
+    ).join();
+  }();
+  static int _clientMessageIDSequence = 0;
+
+  String _nextClientMessageID(String senderID) =>
+      '${DateTime.now().microsecondsSinceEpoch}_${_clientMessageIDSequence++}_${_clientMessageIDProcessNonce}-$senderID';
+
+  Future<ChatMessageSendResult?> _sendProviderText(
+    ChatMessageProvider provider, {
+    String? userID,
+    String? groupID,
+    required String text,
+    String? clientMessageID,
+  }) async {
+    if (provider is ChatMessageProviderWithSendResult) {
+      return provider.sendTextWithResult(
+        userID: userID,
+        groupID: groupID,
+        text: text,
+        clientMessageID: clientMessageID,
+      );
+    }
+    await provider.sendText(userID: userID, groupID: groupID, text: text);
+    return null;
+  }
 
   // Cache for forward messages created by createForwardMessage
   // Key: message id (e.g., "1766056010217_forward_unknown")
@@ -288,6 +320,7 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
   // Entries are cleaned up after 60 s.
   final Map<String, ({int durationMs, int timestampMs})>
       _pendingSoundDurations = {};
+  final Map<String, Timer> _soundScratchCleanupTimers = <String, Timer>{};
 
   void _rememberSoundDuration(String filePath, int? durationMs) {
     if (filePath.isEmpty || durationMs == null || durationMs <= 0) return;
@@ -314,6 +347,25 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
       return int.tryParse(m.group(1)!);
     }
     return null;
+  }
+
+  void _scheduleSoundScratchCleanup(String scratchPath) {
+    _soundScratchCleanupTimers.remove(scratchPath)?.cancel();
+    _soundScratchCleanupTimers[scratchPath] = Timer(
+      const Duration(minutes: 5),
+      () {
+        _soundScratchCleanupTimers.remove(scratchPath);
+        unawaited(_deleteSoundScratchBestEffort(scratchPath));
+      },
+    );
+  }
+
+  Future<void> _deleteSoundScratchBestEffort(String scratchPath) async {
+    try {
+      await ffiService.deleteScratchFile(scratchPath);
+    } on Object {
+      // Cleanup remains best-effort after a transfer has had time to read.
+    }
   }
 
   // Avatar path cache for populating faceUrl on V2TimMessages
@@ -940,27 +992,6 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
       final v2Msg = chatMessageToV2TimMessage(chatMsg, ffiService.selfId,
           forwardTargetUserID: forwardTargetUserID,
           forwardTargetGroupID: forwardTargetGroupID);
-
-      // U-1 / U-2: __face__ / __custom__ / __location__ → keep message but
-      // rewrite the bubble text and stash the original JSON into
-      // customElem.data for later rich rendering. The chatMsg.text in
-      // history will still be the raw payload (since ChatMessage is
-      // immutable); UIKit only ever sees the rewritten v2Msg.
-      if (controlIntercept != null &&
-          !controlIntercept.swallow &&
-          (controlIntercept.rewriteText != null ||
-              controlIntercept.rewriteCustomData != null)) {
-        if (controlIntercept.rewriteText != null) {
-          v2Msg.textElem = V2TimTextElem(text: controlIntercept.rewriteText);
-        }
-        if (controlIntercept.rewriteCustomData != null) {
-          v2Msg.customElem = V2TimCustomElem(
-            data: controlIntercept.rewriteCustomData,
-            desc: controlIntercept.originalText ?? '',
-            extension: '',
-          );
-        }
-      }
 
       // U-3: patch local sender's soundElem.duration from
       // `_pendingSoundDurations`. Receiver-side duration recovery is
@@ -2169,22 +2200,6 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
             errorDesc: '',
           );
 
-          // Notify per-instance listeners first (e.g. Bob's listener in _instanceAdvancedMsgListeners[2])
-          if (progress.instanceId != 0) {
-            for (final listener
-                in _instanceAdvancedMsgListeners[progress.instanceId] ?? []) {
-              try {
-                listener.onMessageDownloadProgressCallback
-                    ?.call(downloadProgress);
-              } catch (e, st) {
-                _logListenerError(
-                    'V2TimAdvancedMsgListener.onMessageDownloadProgressCallback'
-                    ' (instance ${progress.instanceId})',
-                    e,
-                    st);
-              }
-            }
-          }
           _notifyAdvancedMsgListeners((listener) {
             listener.onMessageDownloadProgressCallback?.call(downloadProgress);
           }, dispatchInstanceId: progress.instanceId);
@@ -2663,6 +2678,15 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
     _avatarUpdatedSubscription?.cancel();
     _nicknameUpdatedSubscription?.cancel();
     _friendStatusCheckTimer?.cancel();
+    final soundScratchPaths = _soundScratchCleanupTimers.keys.toList();
+    for (final timer in _soundScratchCleanupTimers.values) {
+      timer.cancel();
+    }
+    _soundScratchCleanupTimers.clear();
+    for (final scratchPath in soundScratchPaths) {
+      unawaited(_deleteSoundScratchBestEffort(scratchPath));
+    }
+    _pendingSoundDurations.clear();
     _sdkListeners.clear();
     _advancedMsgListeners.clear();
     _conversationListeners.clear();
@@ -2728,6 +2752,23 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
   /// for the reasoning.
   void dispatchInstanceGlobalCallback(int instanceId, int callbackType,
       Map<String, dynamic> dataFromNativeMap) {
+    try {
+      _dispatchInstanceGlobalCallbackUnchecked(
+        instanceId,
+        callbackType,
+        dataFromNativeMap,
+      );
+    } catch (error, stackTrace) {
+      _logListenerError(
+        'Tim2ToxSdkPlatform.dispatchInstanceGlobalCallback',
+        error,
+        stackTrace,
+      );
+    }
+  }
+
+  void _dispatchInstanceGlobalCallbackUnchecked(int instanceId,
+      int callbackType, Map<String, dynamic> dataFromNativeMap) {
     if (callbackType == 67) {
       ToxAVService.dispatchAvCall(
         instanceId,
@@ -4013,11 +4054,8 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
   Future<V2TimValueCallback<V2TimConversation>> getConversation({
     required String conversationID,
   }) async {
-    if (_debugLog)
-      print(
-          '[Tim2ToxSdkPlatform] getConversation: START, conversationID=$conversationID');
-    debugPrint(
-        '[Tim2ToxSdkPlatform] getConversation: START, conversationID=$conversationID');
+    if (_debugLog) print('[Tim2ToxSdkPlatform] getConversation: START');
+    debugPrint('[Tim2ToxSdkPlatform] getConversation: START');
     try {
       final conversationManager = conversationManagerProvider;
       if (_debugLog)
@@ -4049,10 +4087,8 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
       debugPrint(
           '[Tim2ToxSdkPlatform] getConversation: getConversationList() returned, count=${fakeConvs.length}');
       if (_debugLog)
-        print(
-            '[Tim2ToxSdkPlatform] getConversation: Searching for conversationID=$conversationID in list...');
-      debugPrint(
-          '[Tim2ToxSdkPlatform] getConversation: Searching for conversationID=$conversationID in list...');
+        print('[Tim2ToxSdkPlatform] getConversation: Searching list');
+      debugPrint('[Tim2ToxSdkPlatform] getConversation: Searching list');
       final fakeConv = fakeConvs.firstWhere(
         (c) => c.conversationID == conversationID,
         orElse: () {
@@ -4072,9 +4108,9 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
       );
       if (_debugLog)
         print(
-            '[Tim2ToxSdkPlatform] getConversation: Found/created fakeConv, conversationID=${fakeConv.conversationID}, isGroup=${fakeConv.isGroup}');
+            '[Tim2ToxSdkPlatform] getConversation: Found/created fakeConv, isGroup=${fakeConv.isGroup}');
       debugPrint(
-          '[Tim2ToxSdkPlatform] getConversation: Found/created fakeConv, conversationID=${fakeConv.conversationID}, isGroup=${fakeConv.isGroup}');
+          '[Tim2ToxSdkPlatform] getConversation: Found/created fakeConv, isGroup=${fakeConv.isGroup}');
 
       if (_debugLog)
         print(
@@ -4083,10 +4119,8 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
           '[Tim2ToxSdkPlatform] getConversation: Calling fakeConversationToV2TimConversation()...');
       final v2Conv = await fakeConversationToV2TimConversation(fakeConv);
       if (_debugLog)
-        print(
-            '[Tim2ToxSdkPlatform] getConversation: fakeConversationToV2TimConversation() returned, conversationID=${v2Conv.conversationID}');
-      debugPrint(
-          '[Tim2ToxSdkPlatform] getConversation: fakeConversationToV2TimConversation() returned, conversationID=${v2Conv.conversationID}');
+        print('[Tim2ToxSdkPlatform] getConversation: conversion returned');
+      debugPrint('[Tim2ToxSdkPlatform] getConversation: conversion returned');
 
       if (_debugLog)
         print('[Tim2ToxSdkPlatform] getConversation: END, returning success');
@@ -4374,9 +4408,9 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
         ? ffiService.selfId
         : (_currentUserID ?? 'unknown');
     print(
-        '[Tim2ToxSdkPlatform] createTextMessage called - text length=${text.length}, senderID=$senderID, _currentUserID=$_currentUserID, ffiService.selfId=${ffiService.selfId}');
+        '[Tim2ToxSdkPlatform] createTextMessage called - text length=${text.length}');
     try {
-      final msgID = '${DateTime.now().millisecondsSinceEpoch}_$senderID';
+      final msgID = _nextClientMessageID(senderID);
       final msg = V2TimMessage(
         elemType: MessageElemType.V2TIM_ELEM_TYPE_TEXT,
         msgID: msgID,
@@ -4388,8 +4422,7 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
       msg.sender = senderID;
       await _setFaceUrlForMsg(msg);
 
-      print(
-          '[Tim2ToxSdkPlatform] createTextMessage - Created message with msgID=$msgID');
+      print('[Tim2ToxSdkPlatform] createTextMessage - Created message');
       return V2TimValueCallback<V2TimMsgCreateInfoResult>(
         code: 0,
         desc: 'success',
@@ -4420,7 +4453,7 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
       final senderID = ffiService.selfId.isNotEmpty
           ? ffiService.selfId
           : (_currentUserID ?? 'unknown');
-      final msgID = '${DateTime.now().millisecondsSinceEpoch}_$senderID';
+      final msgID = _nextClientMessageID(senderID);
       final msg = V2TimMessage(
         elemType: MessageElemType.V2TIM_ELEM_TYPE_TEXT,
         msgID: msgID,
@@ -5052,7 +5085,7 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
   }) async {
     try {
       print(
-          '[Tim2ToxSdkPlatform] sendMessage called: id=$id, receiver=$receiver, groupID=$groupID');
+          '[Tim2ToxSdkPlatform] sendMessage called: hasReceiver=${receiver.isNotEmpty}, hasGroup=${groupID.isNotEmpty}');
       // Get message by id from message data
       // UIKit stores messages in messageData before calling sendMessage
       final userID = receiver.isNotEmpty ? receiver : null;
@@ -5068,7 +5101,7 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
 
       if (_debugLog)
         print(
-            '[Tim2ToxSdkPlatform] Looking for message in targetID: $targetID');
+            '[Tim2ToxSdkPlatform] Looking for message in target conversation');
       // Try to find the message in messageData by id
       final messageList =
           TencentCloudChat.instance.dataInstance.messageData.getMessageList(
@@ -5082,7 +5115,7 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
 
       if (id != null && id.isNotEmpty) {
         if (_debugLog)
-          print('[Tim2ToxSdkPlatform] Searching for message with id: $id');
+          print('[Tim2ToxSdkPlatform] Searching for message by id');
         // Find message by id
         messageToSend = messageList.firstWhere(
           (msg) => msg.id == id || msg.msgID == id,
@@ -5091,10 +5124,10 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
         );
         if (messageToSend.elemType != MessageElemType.V2TIM_ELEM_TYPE_NONE) {
           print(
-              '[Tim2ToxSdkPlatform] Found message: msgID=${messageToSend.msgID}, elemType=${messageToSend.elemType}');
+              '[Tim2ToxSdkPlatform] Found message: elemType=${messageToSend.elemType}');
         } else {
           print(
-              '[Tim2ToxSdkPlatform] Message not found by id. Available message IDs: ${messageList.map((m) => 'id=${m.id}, msgID=${m.msgID}').join(", ")}');
+              '[Tim2ToxSdkPlatform] Message not found by id; candidateCount=${messageList.length}');
         }
       } else {
         print(
@@ -5108,11 +5141,10 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
               V2TimMessage(elemType: MessageElemType.V2TIM_ELEM_TYPE_NONE),
         );
         if (messageToSend.elemType != MessageElemType.V2TIM_ELEM_TYPE_NONE) {
-          print(
-              '[Tim2ToxSdkPlatform] Found SENDING message: msgID=${messageToSend.msgID}');
+          print('[Tim2ToxSdkPlatform] Found SENDING message');
         } else {
           print(
-              '[Tim2ToxSdkPlatform] No SENDING message found. Message statuses: ${messageList.map((m) => '${m.msgID}: status=${m.status}, isSelf=${m.isSelf}').join(", ")}');
+              '[Tim2ToxSdkPlatform] No SENDING message found; candidateCount=${messageList.length}');
         }
       }
 
@@ -5123,7 +5155,7 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
           id != null &&
           id.isNotEmpty) {
         print(
-            '[Tim2ToxSdkPlatform] Message not found in target conversation, searching all conversations for id: $id');
+            '[Tim2ToxSdkPlatform] Message not found in target conversation; searching all conversations');
         // Search through all conversations in messageData
         final messageListMap =
             TencentCloudChat.instance.dataInstance.messageData.messageListMap;
@@ -5136,8 +5168,7 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
                 V2TimMessage(elemType: MessageElemType.V2TIM_ELEM_TYPE_NONE),
           );
           if (foundMessage.elemType != MessageElemType.V2TIM_ELEM_TYPE_NONE) {
-            print(
-                '[Tim2ToxSdkPlatform] Found message in conversation $conversationID: msgID=${foundMessage.msgID}');
+            print('[Tim2ToxSdkPlatform] Found message in another conversation');
             messageToSend = foundMessage;
             break;
           }
@@ -5148,22 +5179,21 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
         // (e.g., when forwarding to non-current conversations)
         if (messageToSend.elemType == MessageElemType.V2TIM_ELEM_TYPE_NONE) {
           print(
-              '[Tim2ToxSdkPlatform] Message not found in messageData, checking forward message cache for id: $id');
+              '[Tim2ToxSdkPlatform] Message not found in messageData; checking forward message cache');
           final cachedMessage = _forwardMessageCache[id];
           if (cachedMessage != null) {
             print(
-                '[Tim2ToxSdkPlatform] Found message in forward cache: msgID=${cachedMessage.msgID}, elemType=${cachedMessage.elemType}');
+                '[Tim2ToxSdkPlatform] Found message in forward cache: elemType=${cachedMessage.elemType}');
             messageToSend = cachedMessage;
           } else {
             print(
-                '[Tim2ToxSdkPlatform] Message not found in forward cache. Cache keys: ${_forwardMessageCache.keys.join(", ")}');
+                '[Tim2ToxSdkPlatform] Message not found in forward cache; cacheSize=${_forwardMessageCache.length}');
           }
         }
       }
 
       if (messageToSend.elemType == MessageElemType.V2TIM_ELEM_TYPE_NONE) {
-        print(
-            '[Tim2ToxSdkPlatform] sendMessage failed: Message not found (id: $id)');
+        print('[Tim2ToxSdkPlatform] sendMessage failed: Message not found');
         return V2TimValueCallback<V2TimMessage>(
           code: -1,
           desc: 'Message not found (id: $id)',
@@ -5196,6 +5226,14 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
         );
       }
 
+      final messageIdentity =
+          messageToSend.id != null && messageToSend.id!.isNotEmpty
+              ? messageToSend.id
+              : messageToSend.msgID;
+      final String? clientMessageID =
+          id != null && id.isNotEmpty ? id : messageIdentity;
+      ChatMessageSendResult? textSendResult;
+
       print(
           '[Tim2ToxSdkPlatform] ChatMessageProvider found, sending message type: ${messageToSend.elemType}');
 
@@ -5209,7 +5247,7 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
         if (messageText.isNotEmpty) {
           final timestamp = DateTime.now().millisecondsSinceEpoch;
           print(
-              '[Tim2ToxSdkPlatform] Tracking forward message target: text="$messageText", userID=$userID, groupID=$groupID, timestamp=$timestamp');
+              '[Tim2ToxSdkPlatform] Tracking forward message target: textLength=${messageText.length}, timestamp=$timestamp');
           _pendingForwardTargets[messageText] = (
             userID: userID,
             groupID: groupID.isNotEmpty ? groupID : null,
@@ -5224,7 +5262,8 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
           // Text message (including forward messages which are text)
           final text = messageToSend.textElem!.text ?? '';
           if (_debugLog)
-            print('[Tim2ToxSdkPlatform] Sending text message: "$text"');
+            print(
+                '[Tim2ToxSdkPlatform] Sending text message: length=${text.length}');
           // ChatMessageProvider.sendText's interface carries no cloudCustomData,
           // so a reply-quote / forward built by the composer would be lost. Arm
           // it on the FfiChatService for the next send (sendText/sendGroupText
@@ -5238,10 +5277,12 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
                 : messageToSend.cloudCustomData,
           );
           try {
-            await provider.sendText(
+            textSendResult = await _sendProviderText(
+              provider,
               userID: userID,
               groupID: groupID.isNotEmpty ? groupID : null,
               text: text,
+              clientMessageID: clientMessageID,
             );
           } finally {
             // Belt-and-suspenders against an armed-value LEAK: the consuming
@@ -5260,8 +5301,7 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
         } else if (messageToSend.imageElem != null &&
             messageToSend.imageElem!.path != null) {
           // Image message
-          print(
-              '[Tim2ToxSdkPlatform] Sending image message: ${messageToSend.imageElem!.path}');
+          print('[Tim2ToxSdkPlatform] Sending image message');
           await provider.sendImage(
             userID: userID,
             groupID: groupID.isNotEmpty ? groupID : null,
@@ -5273,8 +5313,7 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
         } else if (messageToSend.fileElem != null &&
             messageToSend.fileElem!.path != null) {
           // File message
-          print(
-              '[Tim2ToxSdkPlatform] Sending file message: ${messageToSend.fileElem!.path}');
+          print('[Tim2ToxSdkPlatform] Sending file message');
           await provider.sendFile(
             userID: userID,
             groupID: groupID.isNotEmpty ? groupID : null,
@@ -5289,9 +5328,9 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
           final compatibleText =
               messageToSend.mergerElem!.compatibleText ?? '转发消息';
           print(
-              '[Tim2ToxSdkPlatform] Sending merger message with compatibleText: "$compatibleText"');
+              '[Tim2ToxSdkPlatform] Sending merger message: compatibleTextLength=${compatibleText.length}');
           print(
-              '[Tim2ToxSdkPlatform] Merger message cloudCustomData: ${messageToSend.cloudCustomData}');
+              '[Tim2ToxSdkPlatform] Merger metadata present=${messageToSend.cloudCustomData?.isNotEmpty ?? false}');
           // Persist the FORWARD's OWN metadata (the merger cloudCustomData the
           // UIKit built — e.g. {"mergerMessageIDs":[...]}) on the sent message,
           // mirroring the text-elem reply persistence. Prefer the explicit
@@ -5308,10 +5347,12 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
                 : messageToSend.cloudCustomData,
           );
           try {
-            await provider.sendText(
+            textSendResult = await _sendProviderText(
+              provider,
               userID: userID,
               groupID: groupID.isNotEmpty ? groupID : null,
               text: compatibleText,
+              clientMessageID: clientMessageID,
             );
           } finally {
             ffiService.armNextSendCloudCustomData(null);
@@ -5327,19 +5368,19 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
           final soundPath = messageToSend.soundElem!.path!;
           final soundDuration = messageToSend.soundElem!.duration ?? 0;
           print(
-              '[Tim2ToxSdkPlatform] Sending sound message: $soundPath (duration=$soundDuration ms)');
+              '[Tim2ToxSdkPlatform] Sending sound message: duration=$soundDuration ms');
           // U-3: Tox's file-transfer envelope has no duration field, so we
           // smuggle it via the filename: `<base>__dur{ms}<ext>`. Because
           // FfiChatService.sendFile derives the wire filename from the
-          // on-disk basename and we cannot edit FfiChatService here, we
-          // copy the audio file to a temp file with the encoded name and
-          // send that. The receive-side fake_msg_provider mapping decoder
+          // on-disk basename, we ask its scratch owner for a copy with the
+          // encoded name and send that. The receive-side fake_msg_provider
+          // mapping decoder
           // strips `__dur{ms}` back out when constructing
           // soundElem.duration. We also remember the local sender-side
           // duration for our own echo so the sender's UI does not show
           // 0 ms.
-          // Best-effort: if copy fails or duration is 0, fall back to the
-          // original path/name.
+          // A zero duration uses the original path. An encoding copy failure
+          // fails the send below so the receiver never gets false metadata.
           _rememberSoundDuration(soundPath, soundDuration);
           String pathToSend = soundPath;
           String? encodedName;
@@ -5360,12 +5401,11 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
               encodedName = '${base}__dur$soundDuration$ext';
               final srcFile = File(soundPath);
               if (await srcFile.exists()) {
-                final tmpDir = Directory.systemTemp;
-                final tmpPath = '${tmpDir.path}/$encodedName';
-                final tmpFile = File(tmpPath);
-                // Copy is idempotent: overwrite if it somehow exists from a
-                // previous send of the same recording.
-                await srcFile.copy(tmpPath);
+                final tmpPath = await ffiService.copyFileToScratch(
+                  soundPath,
+                  category: 'sound_duration',
+                  suggestedFileName: encodedName,
+                );
                 // Map the temp path → duration too so the local echo
                 // (which may arrive with the temp path) is patched.
                 _rememberSoundDuration(tmpPath, soundDuration);
@@ -5373,15 +5413,7 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
                 // Schedule a delayed cleanup. Tox file transfer might still
                 // be reading the file when we return; keep it around for a
                 // few minutes.
-                Future.delayed(const Duration(minutes: 5), () async {
-                  try {
-                    if (await tmpFile.exists()) {
-                      await tmpFile.delete();
-                    }
-                  } catch (_) {
-                    // Cleanup is best-effort.
-                  }
-                });
+                _scheduleSoundScratchCleanup(tmpPath);
               }
               // If the source file doesn't exist we leave pathToSend
               // unchanged and let provider.sendFile produce the canonical
@@ -5399,7 +5431,7 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
             // kicks in and the user can retry.
             final l = ffiService.logger;
             final msg =
-                '[Tim2ToxSdkPlatform] U-3 sound duration encode failed for $soundPath: $durationEncodeError';
+                '[Tim2ToxSdkPlatform] U-3 sound duration encode failed: ${durationEncodeError.runtimeType}';
             if (l != null) {
               l.logWarning(msg);
             } else {
@@ -5421,8 +5453,7 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
             fileName: encodedName ?? pathToSend.split('/').last,
           );
           if (_debugLog)
-            print(
-                '[Tim2ToxSdkPlatform] Sound message sent successfully (pathToSend=$pathToSend, encodedName=${encodedName ?? "(none)"})');
+            print('[Tim2ToxSdkPlatform] Sound message sent successfully');
         } else if (messageToSend.videoElem != null &&
             messageToSend.videoElem!.videoPath != null &&
             messageToSend.videoElem!.videoPath!.isNotEmpty) {
@@ -5430,7 +5461,7 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
           // Video uses `videoPath` (not `path`); verified against
           // tencent_cloud_chat_sdk/lib/models/v2_tim_video_elem.dart:15.
           final videoPath = messageToSend.videoElem!.videoPath!;
-          print('[Tim2ToxSdkPlatform] Sending video message: $videoPath');
+          print('[Tim2ToxSdkPlatform] Sending video message');
           await provider.sendFile(
             userID: userID,
             groupID: groupID.isNotEmpty ? groupID : null,
@@ -5450,11 +5481,14 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
           });
           final payload = '__face__:$faceJson';
           if (_debugLog)
-            print('[Tim2ToxSdkPlatform] Sending face message: $payload');
-          await provider.sendText(
+            print(
+                '[Tim2ToxSdkPlatform] Sending face message: payloadLength=${payload.length}');
+          textSendResult = await _sendProviderText(
+            provider,
             userID: userID,
             groupID: groupID.isNotEmpty ? groupID : null,
             text: payload,
+            clientMessageID: clientMessageID,
           );
           if (_debugLog)
             print('[Tim2ToxSdkPlatform] Face message sent successfully');
@@ -5469,11 +5503,14 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
           });
           final payload = '__location__:$locJson';
           if (_debugLog)
-            print('[Tim2ToxSdkPlatform] Sending location message: $payload');
-          await provider.sendText(
+            print(
+                '[Tim2ToxSdkPlatform] Sending location message: payloadLength=${payload.length}');
+          textSendResult = await _sendProviderText(
+            provider,
             userID: userID,
             groupID: groupID.isNotEmpty ? groupID : null,
             text: payload,
+            clientMessageID: clientMessageID,
           );
           if (_debugLog)
             print('[Tim2ToxSdkPlatform] Location message sent successfully');
@@ -5486,10 +5523,12 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
           // Receiver-side parsing is deferred (TODO(P0-1)).
           final payload = '__custom__:${messageToSend.customElem!.data}';
           if (_debugLog) print('[Tim2ToxSdkPlatform] Sending custom message');
-          await provider.sendText(
+          textSendResult = await _sendProviderText(
+            provider,
             userID: userID,
             groupID: groupID.isNotEmpty ? groupID : null,
             text: payload,
+            clientMessageID: clientMessageID,
           );
           if (_debugLog)
             print('[Tim2ToxSdkPlatform] Custom message sent successfully');
@@ -5509,10 +5548,20 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
           );
         }
 
-        // Update message status to SEND_SUCC
-        messageToSend.status = MessageStatus.V2TIM_MSG_STATUS_SEND_SUCC;
+        if (textSendResult != null) {
+          messageToSend.id = textSendResult.messageID;
+          messageToSend.msgID = textSendResult.messageID;
+          messageToSend.status = textSendResult.isPending
+              ? MessageStatus.V2TIM_MSG_STATUS_SENDING
+              : MessageStatus.V2TIM_MSG_STATUS_SEND_SUCC;
+        } else {
+          // Media and local-only group tips preserve their existing success
+          // behavior because their provider contracts do not return pending state.
+          messageToSend.status = MessageStatus.V2TIM_MSG_STATUS_SEND_SUCC;
+        }
         if (_debugLog)
-          print('[Tim2ToxSdkPlatform] Message status updated to SEND_SUCC');
+          print(
+              '[Tim2ToxSdkPlatform] Message status updated to ${messageToSend.status}');
 
         // CRITICAL: Ensure id and msgID are both set to the same value for proper matching
         // UIKit messages may have id (temporary ID) while FFI messages have msgID (actual ID)
@@ -5524,27 +5573,23 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
               messageToSend.id != messageToSend.msgID) {
             messageToSend.id = messageToSend.msgID;
             if (_debugLog)
-              print(
-                  '[Tim2ToxSdkPlatform] Set message id to msgID: ${messageToSend.msgID}');
+              print('[Tim2ToxSdkPlatform] Reconciled message id to msgID');
           }
         } else if (messageToSend.id != null && messageToSend.id!.isNotEmpty) {
           // If msgID is not set but id is, set msgID to id
           messageToSend.msgID = messageToSend.id;
           if (_debugLog)
-            print(
-                '[Tim2ToxSdkPlatform] Set message msgID to id: ${messageToSend.id}');
+            print('[Tim2ToxSdkPlatform] Reconciled message msgID to id');
         }
 
         // Populate faceUrl from local avatar cache so the sent message row shows correct avatar
         await _setFaceUrlForMsg(messageToSend);
 
-        // CRITICAL: Immediately notify UIKit about the status change
-        // This ensures the temporary message (created_temp_id) is updated to SEND_SUCC
-        // before the FFI service returns the actual message with a different msgID
-        // This prevents duplicate messages (one failed, one success)
+        // Immediately notify UIKit about the reconciled identity/status on the
+        // same optimistic message instance.
         if (_debugLog)
           print(
-              '[Tim2ToxSdkPlatform] Notifying UIKit about message status update: msgID=${messageToSend.msgID}, id=${messageToSend.id}');
+              '[Tim2ToxSdkPlatform] Notifying UIKit about message status update');
         _notifyAdvancedMsgListeners((listener) {
           listener.onRecvMessageModified?.call(messageToSend);
         });
@@ -5561,7 +5606,7 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
           final timestamp = DateTime.now().millisecondsSinceEpoch;
           if (_debugLog)
             print(
-                '[Tim2ToxSdkPlatform] Tracking sent message target: msgID=${messageToSend.msgID}, id=${messageToSend.id}, userID=$userID, groupID=$groupID, text="$messageText"');
+                '[Tim2ToxSdkPlatform] Tracking sent message target: textLength=${messageText.length}, hasUser=${userID != null}, hasGroup=${groupID.isNotEmpty}');
           _pendingForwardTargets[messageToSend.msgID!] = (
             userID: userID,
             groupID: groupID.isNotEmpty ? groupID : null,
@@ -5633,8 +5678,7 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
         // This ensures the temporary message (created_temp_id) is updated to SEND_FAIL
         // so the user can see the error and potentially retry
         if (_debugLog)
-          print(
-              '[Tim2ToxSdkPlatform] Notifying UIKit about message failure: msgID=${messageToSend.msgID}, id=${messageToSend.id}');
+          print('[Tim2ToxSdkPlatform] Notifying UIKit about message failure');
         _notifyAdvancedMsgListeners((listener) {
           listener.onRecvMessageModified?.call(messageToSend);
         });
@@ -6025,7 +6069,8 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
         for (final u in searchParam.userIDList ?? const <String>[])
           if (u.trim().isNotEmpty) ConversationIdUtils.normalize(u),
       };
-      final timePeriod = searchParam.searchTimePeriod ?? 0; // secs; 0 = no bound
+      final timePeriod =
+          searchParam.searchTimePeriod ?? 0; // secs; 0 = no bound
       final hasTimeFilter = timePeriod > 0;
       // searchTimePosition == 0 means "from now" (NOT unset), so the window is
       // [end - period, end] only when a period is given (codex).
@@ -6085,8 +6130,8 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
           }
           // Sender filter (userIDList) on the message's sender.
           if (userIdFilter.isNotEmpty &&
-              !userIdFilter.contains(
-                  ConversationIdUtils.normalize(msg.fromUserId))) {
+              !userIdFilter
+                  .contains(ConversationIdUtils.normalize(msg.fromUserId))) {
             continue;
           }
           // Time window: [end - period, end] when a period was given.
@@ -7043,12 +7088,12 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
         // UTF-8 (codex P2). The receiver matches by full length + this prefix
         // via startsWith, so a shorter prefix still disambiguates.
         String revokePayload(String prefix) => '__revoke__:${json.encode({
-              'msgID': msgID,
-              'senderTimestampMs': senderTimestampMs,
-              'fromUserId': ffiService.selfId,
-              'textPrefix': prefix,
-              'textLen': recalledText.length,
-            })}';
+                  'msgID': msgID,
+                  'senderTimestampMs': senderTimestampMs,
+                  'fromUserId': ffiService.selfId,
+                  'textPrefix': prefix,
+                  'textLen': recalledText.length,
+                })}';
         var textPrefix = recalledText;
         while (textPrefix.isNotEmpty &&
             utf8.encode(revokePayload(textPrefix)).length > 1100) {
@@ -7152,13 +7197,13 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
       })> _maybeInterceptControlSignal(ChatMessage chatMsg) async {
     final text = chatMsg.text;
     if (text.isEmpty) return _interceptResult();
+    final envelope = parseTextControlEnvelope(text);
 
     // __revoke__: { msgID, senderTimestampMs?, fromUserId? }
-    if (text.startsWith('__revoke__:')) {
+    if (envelope is RevokeTextEnvelope) {
       try {
-        final payload = text.substring('__revoke__:'.length);
-        final parsed = json.decode(payload);
-        if (parsed is Map) {
+        final parsed = envelope.payload;
+        if (parsed != null) {
           final revokedID = parsed['msgID'] as String?;
           final senderTimestampMs = parsed['senderTimestampMs'] is int
               ? parsed['senderTimestampMs'] as int
@@ -7281,69 +7326,7 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
       return _interceptResult(swallow: true, originalText: text);
     }
 
-    // __face__: { index, data } — keep message, show "[Sticker]" placeholder.
-    if (text.startsWith('__face__:')) {
-      final payload = text.substring('__face__:'.length);
-      if (!_isValidControlPayload('__face__', payload)) {
-        return _interceptResult();
-      }
-      return _interceptResult(
-        rewriteText: '[Sticker]',
-        rewriteCustomData: payload,
-        originalText: text,
-      );
-    }
-
-    // __location__: { desc, longitude, latitude } — show "[Location]".
-    if (text.startsWith('__location__:')) {
-      final payload = text.substring('__location__:'.length);
-      if (!_isValidControlPayload('__location__', payload)) {
-        return _interceptResult();
-      }
-      return _interceptResult(
-        rewriteText: '[Location]',
-        rewriteCustomData: payload,
-        originalText: text,
-      );
-    }
-
-    // __custom__: arbitrary JSON — show "[Custom Message]".
-    if (text.startsWith('__custom__:')) {
-      final payload = text.substring('__custom__:'.length);
-      if (!_isValidControlPayload('__custom__', payload)) {
-        return _interceptResult();
-      }
-      return _interceptResult(
-        rewriteText: '[Custom Message]',
-        rewriteCustomData: payload,
-        originalText: text,
-      );
-    }
-
-    return _interceptResult();
-  }
-
-  /// Hardening guard for `__face__`/`__location__`/`__custom__` payloads.
-  ///
-  /// A malformed JSON payload from a peer (intentional or buggy client) can
-  /// poison the downstream `customElem.data` consumers that `json.decode` it
-  /// later. Validate eagerly so the message falls back to plain text instead
-  /// of throwing later in the listener dispatch.
-  ///
-  /// Returns `true` when [payload] parses as JSON, `false` otherwise. On
-  /// failure logs a warning with the prefix name and the offending text
-  /// truncated to 200 chars.
-  bool _isValidControlPayload(String prefix, String payload) {
-    try {
-      json.decode(payload);
-      return true;
-    } catch (e) {
-      final truncated =
-          payload.length > 200 ? '${payload.substring(0, 200)}…' : payload;
-      _log(
-          '[Tim2ToxSdkPlatform] $prefix: malformed JSON payload, falling back to plain text: $e (text="$truncated")');
-      return false;
-    }
+    return _interceptResult(originalText: text);
   }
 
   @override
@@ -9026,8 +9009,9 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
             }
           }
           if (byPubkey.length != validCount) {
-            result.data!.memberInfoList =
-                [for (final pk in order) byPubkey[pk]!];
+            result.data!.memberInfoList = [
+              for (final pk in order) byPubkey[pk]!
+            ];
           }
         }
 
