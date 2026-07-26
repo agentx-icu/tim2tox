@@ -1,5 +1,5 @@
 /// Tim2Tox Dart Package
-/// 
+///
 /// This package provides Dart bindings and SDK platform implementation
 /// for the Tim2Tox framework.
 
@@ -26,7 +26,7 @@ export 'interfaces/bootstrap_service.dart';
 export 'interfaces/event_bus.dart';
 export 'interfaces/event_bus_provider.dart';
 export 'interfaces/conversation_manager_provider.dart';
+export 'interfaces/scratch_file_service.dart';
 
 // Models
 export 'models/fake_models.dart';
-
