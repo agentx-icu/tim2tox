@@ -20,6 +20,8 @@ import 'package:tencent_cloud_chat_sdk/models/v2_tim_file_elem.dart';
 import 'package:tencent_cloud_chat_sdk/models/v2_tim_sound_elem.dart';
 import 'package:tencent_cloud_chat_sdk/models/v2_tim_video_elem.dart';
 import 'package:tencent_cloud_chat_sdk/models/v2_tim_custom_elem.dart';
+import 'package:tencent_cloud_chat_sdk/models/v2_tim_face_elem.dart';
+import 'package:tencent_cloud_chat_sdk/models/v2_tim_location_elem.dart';
 import 'package:tencent_cloud_chat_sdk/models/v2_tim_merger_elem.dart';
 import 'package:tencent_cloud_chat_sdk/enum/image_types.dart';
 import 'dart:io';
@@ -27,6 +29,7 @@ import '../models/chat_message.dart';
 import '../models/fake_models.dart';
 import '../service/ffi_chat_service.dart';
 import '../interfaces/extended_preferences_service.dart';
+import '../utils/control_message_envelope.dart';
 import 'tim2tox_sdk_platform.dart';
 
 /// Extension methods for Tim2ToxSdkPlatform to handle type conversions
@@ -115,6 +118,9 @@ extension Tim2ToxSdkPlatformConverters on Tim2ToxSdkPlatform {
   }) {
     // First, check for merger message or reply message in text (only for text messages)
     bool isTextMessage = chatMsg.mediaKind == null || chatMsg.mediaKind == '';
+    final controlEnvelope = isTextMessage
+        ? parseTextControlEnvelope(chatMsg.text)
+        : const PlainTextEnvelope('');
 
     // Check for merger message first (priority)
     if (isTextMessage) {
@@ -238,7 +244,13 @@ extension Tim2ToxSdkPlatformConverters on Tim2ToxSdkPlatform {
 
     // Determine element type for non-text or normal text messages
     int elemType = MessageElemType.V2TIM_ELEM_TYPE_TEXT;
-    if (chatMsg.mediaKind == 'image') {
+    if (controlEnvelope is FaceTextEnvelope) {
+      elemType = MessageElemType.V2TIM_ELEM_TYPE_FACE;
+    } else if (controlEnvelope is LocationTextEnvelope) {
+      elemType = MessageElemType.V2TIM_ELEM_TYPE_LOCATION;
+    } else if (controlEnvelope is CustomTextEnvelope) {
+      elemType = MessageElemType.V2TIM_ELEM_TYPE_CUSTOM;
+    } else if (chatMsg.mediaKind == 'image') {
       elemType = MessageElemType.V2TIM_ELEM_TYPE_IMAGE;
     } else if (chatMsg.mediaKind == 'video') {
       elemType = MessageElemType.V2TIM_ELEM_TYPE_VIDEO;
@@ -309,7 +321,29 @@ extension Tim2ToxSdkPlatformConverters on Tim2ToxSdkPlatform {
     // Set element type based on mediaKind
     // NOTE: elemType is already set when creating V2TimMessage, but we set it again here for clarity
     // This is redundant but harmless
-    if (chatMsg.mediaKind == 'image') {
+    if (controlEnvelope is FaceTextEnvelope) {
+      msg.faceElem = V2TimFaceElem(
+        index: controlEnvelope.payload['index'] as int?,
+        data: controlEnvelope.payload['data'] as String?,
+      );
+      msg.elemList.add(msg.faceElem!);
+    } else if (controlEnvelope is LocationTextEnvelope) {
+      final longitude = controlEnvelope.payload['longitude'] as num?;
+      final latitude = controlEnvelope.payload['latitude'] as num?;
+      msg.locationElem = V2TimLocationElem(
+        desc: controlEnvelope.payload['desc'] as String?,
+        longitude: longitude!.toDouble(),
+        latitude: latitude!.toDouble(),
+      );
+      msg.elemList.add(msg.locationElem!);
+    } else if (controlEnvelope is CustomTextEnvelope) {
+      msg.customElem = V2TimCustomElem(
+        data: controlEnvelope.rawPayload,
+        desc: '',
+        extension: '',
+      );
+      msg.elemList.add(msg.customElem!);
+    } else if (chatMsg.mediaKind == 'image') {
       // msg.elemType is already set to MessageElemType.V2TIM_ELEM_TYPE_IMAGE
       if (chatMsg.filePath != null) {
         // Generate UUID from msgID for download identification
@@ -374,14 +408,16 @@ extension Tim2ToxSdkPlatformConverters on Tim2ToxSdkPlatform {
       if (chatMsg.filePath != null) {
         // Generate UUID from msgID for download identification
         final fileUuid = msgID.replaceAll(RegExp(r'[^a-zA-Z0-9]'), '_');
-        int? fileSize;
-        try {
-          final file = File(chatMsg.filePath!);
-          if (file.existsSync()) {
-            fileSize = file.lengthSync();
+        int? fileSize = chatMsg.fileSize;
+        if (fileSize == null) {
+          try {
+            final file = File(chatMsg.filePath!);
+            if (file.existsSync()) {
+              fileSize = file.lengthSync();
+            }
+          } catch (e) {
+            // Ignore file size errors
           }
-        } catch (e) {
-          // Ignore file size errors
         }
 
         msg.fileElem = V2TimFileElem(
@@ -430,7 +466,8 @@ extension Tim2ToxSdkPlatformConverters on Tim2ToxSdkPlatform {
     // (the composer's in-memory V2TimMessage carries it) but is LOST on cold
     // reload through getHistoryMessageList* — the quote silently vanishes after
     // reopening the chat. Round-trips the composer's format verbatim. (codex.)
-    if (chatMsg.cloudCustomData != null && chatMsg.cloudCustomData!.isNotEmpty) {
+    if (chatMsg.cloudCustomData != null &&
+        chatMsg.cloudCustomData!.isNotEmpty) {
       msg.cloudCustomData = chatMsg.cloudCustomData;
     }
 
@@ -469,8 +506,10 @@ extension Tim2ToxSdkPlatformConverters on Tim2ToxSdkPlatform {
     {
       final prefs = preferencesService ?? ffiService.preferencesService;
       conv.recvOpt = (fakeConv.isGroup
-              ? await prefs?.getGroupReceiveMessageOpt(peerId, ffiService.selfId)
-              : await prefs?.getC2CReceiveMessageOpt(peerId, ffiService.selfId)) ??
+              ? await prefs?.getGroupReceiveMessageOpt(
+                  peerId, ffiService.selfId)
+              : await prefs?.getC2CReceiveMessageOpt(
+                  peerId, ffiService.selfId)) ??
           0;
     }
 

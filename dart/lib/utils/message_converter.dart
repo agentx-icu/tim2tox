@@ -6,6 +6,8 @@
 // dart/lib/sdk/tim2tox_sdk_platform_converters.dart) because the
 // Platform version also takes forward-target user/group parameters
 // used by the forward-message flow.
+import 'dart:convert';
+
 import 'package:tencent_cloud_chat_sdk/models/v2_tim_message.dart';
 import 'package:tencent_cloud_chat_sdk/enum/message_elem_type.dart';
 import 'package:tencent_cloud_chat_sdk/enum/message_status.dart';
@@ -14,16 +16,18 @@ import '../models/chat_message.dart';
 /// Message converter utility class.
 class MessageConverter {
   /// Convert V2TimMessage to ChatMessage
-  /// 
+  ///
   /// Extracts relevant fields from V2TimMessage and creates a ChatMessage.
   /// Handles different message types (text, image, video, audio, file).
-  static ChatMessage v2TimMessageToChatMessage(V2TimMessage v2Msg, String selfId) {
+  static ChatMessage v2TimMessageToChatMessage(
+      V2TimMessage v2Msg, String selfId) {
     // Determine media kind and extract content
     String text = '';
     String? filePath;
     String? fileName;
     String? mediaKind;
-    
+    int? fileSize;
+
     // Extract text and file information based on element type
     switch (v2Msg.elemType) {
       case MessageElemType.V2TIM_ELEM_TYPE_TEXT:
@@ -59,33 +63,49 @@ class MessageConverter {
         text = '';
         filePath = v2Msg.fileElem?.path;
         fileName = v2Msg.fileElem?.fileName;
+        fileSize = v2Msg.fileElem?.fileSize;
         break;
       case MessageElemType.V2TIM_ELEM_TYPE_CUSTOM:
-        // Custom messages might have text in custom data
+        mediaKind = 'custom';
         text = v2Msg.customElem?.data ?? '';
+        break;
+      case MessageElemType.V2TIM_ELEM_TYPE_FACE:
+        final face = v2Msg.faceElem;
+        text = '__face__:${jsonEncode({
+              'index': face?.index ?? 0,
+              'data': face?.data ?? '',
+            })}';
+        break;
+      case MessageElemType.V2TIM_ELEM_TYPE_LOCATION:
+        final location = v2Msg.locationElem;
+        text = '__location__:${jsonEncode({
+              'desc': location?.desc ?? '',
+              'longitude': location?.longitude ?? 0.0,
+              'latitude': location?.latitude ?? 0.0,
+            })}';
         break;
       default:
         // For other types, try to get text from textElem as fallback
         text = v2Msg.textElem?.text ?? '';
         break;
     }
-    
+
     // Determine if message is from self
     final isSelf = v2Msg.isSelf ?? (v2Msg.sender == selfId);
-    
+
     // Determine message status
     final isPending = v2Msg.status == MessageStatus.V2TIM_MSG_STATUS_SENDING;
     final isReceived = v2Msg.status == MessageStatus.V2TIM_MSG_STATUS_SEND_SUCC;
     final isRead = v2Msg.isRead ?? false;
-    
+
     // Get timestamp (convert from seconds to milliseconds)
     final timestamp = v2Msg.timestamp != null
         ? DateTime.fromMillisecondsSinceEpoch(v2Msg.timestamp! * 1000)
         : DateTime.now();
-    
+
     // Get sender ID
     final fromUserId = v2Msg.sender ?? v2Msg.userID ?? '';
-    
+
     // Create ChatMessage
     return ChatMessage(
       text: text,
@@ -96,10 +116,12 @@ class MessageConverter {
       filePath: filePath,
       fileName: fileName,
       mediaKind: mediaKind,
+      fileSize: fileSize,
       isPending: isPending,
       isReceived: isReceived,
       isRead: isRead,
       msgID: v2Msg.msgID,
+      cloudCustomData: v2Msg.cloudCustomData,
     );
   }
 }
