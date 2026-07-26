@@ -82,6 +82,8 @@ static const char* tim2tox_dlerror() {
 #include "../third_party/c-toxcore/toxcore/DHT.h"
 #include "json_parser.h"
 #include "callback_bridge.h"
+#include "file_io_compat.h"
+#include "event_line_parser.h"
 #ifndef _WIN32
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -119,6 +121,8 @@ static int64_t g_next_instance_id = 1;
 static int64_t g_current_instance_id = 0; // 0 means use default instance
 // Sentinel for "manager not in map" (instance being torn down). Callers must not route to instance 0.
 static constexpr int64_t kInstanceIdDestroyed = -1;
+static constexpr uint64_t kAvatarAutoAcceptMaxBytes =
+    10ULL * 1024ULL * 1024ULL;
 
 // Test instance options (for passing Tox_Options to InitSDK)
 // Made non-static so V2TIMManagerImpl can access it
@@ -294,32 +298,11 @@ public:
     void OnUserStatusChanged(const V2TIMUserStatusVector&) override {}
 };
 
-// Parse instance_id from event line for instance-routed events; 0 = broadcast to all.
-static int64_t parse_instance_id_from_line(const std::string& s) {
-    if (s.size() < 14) return 0;
-    if (s.compare(0, 13, "progress_recv:") == 0) {
-        const char* p = s.c_str() + 13;
-        char* end = nullptr;
-        long long id = strtoll(p, &end, 10);
-        if (end != p && *end == ':') return static_cast<int64_t>(id);
-    } else if (s.compare(0, 9, "file_done:") == 0) {
-        const char* p = s.c_str() + 9;
-        char* end = nullptr;
-        long long id = strtoll(p, &end, 10);
-        if (end != p && *end == ':') return static_cast<int64_t>(id);
-    } else if (s.compare(0, 12, "file_request:") == 0) {
-        const char* p = s.c_str() + 12;
-        char* end = nullptr;
-        long long id = strtoll(p, &end, 10);
-        if (end != p && *end == ':') return static_cast<int64_t>(id);
-    }
-    return 0;
-}
-
 class SimpleMsgListenerImpl : public V2TIMSimpleMsgListener {
 public:
     void enqueue_text_line(const std::string& s) {
-        int64_t instance_id = parse_instance_id_from_line(s);
+        int64_t instance_id =
+            tim2tox::event_line::ParseInstanceIdFromLine(s);
         if (instance_id == 0) {
             instance_id = GetReceiverInstanceOverride();
         }
@@ -411,7 +394,7 @@ struct GlobalState {
     // file sending contexts: instance_id -> (key (friend_no<<32 | file_no) -> FILE* and size)
     std::mutex send_mtx;
     std::map<int64_t, std::unordered_map<uint64_t, std::pair<FILE*, uint64_t>>> send_files; // instance_id -> file map
-    struct RecvCtx { FILE* fp; uint64_t size; uint64_t received; std::string path; std::string sender_hex; uint32_t kind; };
+    struct RecvCtx { FILE* fp; uint64_t size; uint64_t received; std::string path; std::string sender_hex; uint32_t kind; bool io_failed; };
     // file receiving contexts: instance_id -> (key (friend_no<<32 | file_no) -> RecvCtx)
     std::map<int64_t, std::unordered_map<uint64_t, RecvCtx>> recv_files; // instance_id -> file map
 } G;
@@ -486,8 +469,8 @@ static void RegisterToxManagerFileCallbacks(V2TIMManagerImpl* manager_impl) {
             return;
         }
         std::vector<uint8_t> buf(length);
-        if (fseek(fp, static_cast<long>(position), SEEK_SET) != 0) return;
-        size_t nread = fread(buf.data(), 1, length, fp);
+        size_t nread = tim2tox::file_io::ReadAt64(
+            fp, position, buf.data(), length);
         if (nread == 0) return;
         tox_file_send_chunk(tox, friend_number, file_number, position, buf.data(), nread, nullptr);
         uint8_t pubkey[TOX_PUBLIC_KEY_SIZE];
@@ -527,7 +510,7 @@ static void RegisterToxManagerFileCallbacks(V2TIMManagerImpl* manager_impl) {
         std::string dir = G.file_recv_dir;
         int mkdir_result = tim2tox_mkdir(dir.c_str(), 0755);
         if (mkdir_result != 0 && errno != EEXIST) {
-            V2TIM_LOG(kError, "[ffi] fileRecvCallback: failed to create directory {} (errno: {})", dir, errno);
+            V2TIM_LOG(kError, "[ffi] fileRecvCallback: failed to create receive directory (errno: {})", errno);
         }
         std::string name(reinterpret_cast<const char*>(filename), filename_length);
         bool has_invalid_chars = false;
@@ -549,13 +532,16 @@ static void RegisterToxManagerFileCallbacks(V2TIMManagerImpl* manager_impl) {
         }
         char fname_buf[64];
         snprintf(fname_buf, sizeof(fname_buf), "_%u_%u", friend_number, file_number);
-        std::string full = dir + "/" + sender_hex + fname_buf + "_" + name;
+        const std::string storage_prefix = sender_hex + fname_buf + "_";
+        const std::string safe_storage_name =
+            tim2tox::file_io::ComposeStorageBasename(storage_prefix, name);
+        std::string full = dir + "/" + safe_storage_name;
         int64_t instance_id = GetInstanceIdFromManager(manager_impl);
         if (instance_id == kInstanceIdDestroyed) return;
         uint64_t key = (static_cast<uint64_t>(friend_number) << 32) | file_number;
         {
             std::lock_guard<std::mutex> lk(G.send_mtx);
-            G.recv_files[instance_id][key] = {nullptr, file_size, 0, full, sender_hex, kind};
+            G.recv_files[instance_id][key] = {nullptr, file_size, 0, full, sender_hex, kind, false};
         }
         // PROTOCOL LIMITATION (tracked for the framing redesign): this event is a ':'-delimited
         // string parsed by Dart via split(':'). A filename/path containing ':' will mis-parse on
@@ -565,12 +551,11 @@ static void RegisterToxManagerFileCallbacks(V2TIMManagerImpl* manager_impl) {
         // silently truncated by the encoder. Field order/delimiters unchanged:
         //   file_request:<instance_id>:<sender_hex>:<file_number>:<file_size>:<kind>:<name>
         {
-            char hdr[128];
-            snprintf(hdr, sizeof(hdr), "file_request:%lld:%s:%u:%llu:%u:", (long long)instance_id,
-                     sender_hex.c_str(), file_number, (unsigned long long)file_size, kind);
-            std::string line;
-            line.reserve(strlen(hdr) + name.size());
-            line.append(hdr).append(name);
+            std::string line = "file_request:" + std::to_string(instance_id) +
+                               ":" + sender_hex + ":" +
+                               std::to_string(file_number) + ":" +
+                               std::to_string(file_size) + ":" +
+                               std::to_string(kind) + ":" + name;
             G.simple_listener.enqueue_text_line(line);
         }
         // File messages are handled solely by FfiChatService via file_request polling.
@@ -591,9 +576,17 @@ static void RegisterToxManagerFileCallbacks(V2TIMManagerImpl* manager_impl) {
         int64_t instance_id = GetInstanceIdFromManager(manager_impl);
         if (instance_id == kInstanceIdDestroyed) return;
         uint64_t key = (static_cast<uint64_t>(friend_number) << 32) | file_number;
+        const auto mark_io_failed = [instance_id, key]() {
+            std::lock_guard<std::mutex> lk(G.send_mtx);
+            auto instance_it = G.recv_files.find(instance_id);
+            if (instance_it == G.recv_files.end()) return;
+            auto it = instance_it->second.find(key);
+            if (it != instance_it->second.end()) it->second.io_failed = true;
+        };
         FILE* fp = nullptr;
         std::string full, sender_hex;
         uint32_t file_kind = 0;
+        uint64_t expected_size = 0;
         {
             std::lock_guard<std::mutex> lk(G.send_mtx);
             auto instance_it = G.recv_files.find(instance_id);
@@ -610,18 +603,32 @@ static void RegisterToxManagerFileCallbacks(V2TIMManagerImpl* manager_impl) {
             full = it->second.path;
             sender_hex = it->second.sender_hex;
             file_kind = it->second.kind;
+            expected_size = it->second.size;
         }
         if (length == 0) {
             uint64_t final_size = 0;
+            bool io_failed = false;
             {
                 std::lock_guard<std::mutex> lk(G.send_mtx);
                 auto instance_it = G.recv_files.find(instance_id);
                 if (instance_it != G.recv_files.end()) {
                     auto it = instance_it->second.find(key);
-                    if (it != instance_it->second.end()) final_size = it->second.size;
+                    if (it != instance_it->second.end()) {
+                        final_size = it->second.size;
+                        io_failed = it->second.io_failed;
+                    }
                 }
                 if (fp) { fflush(fp); fclose(fp); }
                 if (instance_it != G.recv_files.end()) instance_it->second.erase(key);
+            }
+            if (io_failed ||
+                !tim2tox::file_io::HasExactFileSize(full, final_size)) {
+                tim2tox::file_io::RemoveUtf8(full);
+                V2TIM_LOG(kError,
+                          "[ffi] OnRecvFileData: discarded incomplete receive expected_size={} io_failed={} friend={} file={}",
+                          (unsigned long long)final_size, io_failed,
+                          friend_number, file_number);
+                return;
             }
             /* Send final progress_recv (100%) so Dart progress listener gets transferComplete */
             if (final_size > 0) {
@@ -639,8 +646,7 @@ static void RegisterToxManagerFileCallbacks(V2TIMManagerImpl* manager_impl) {
                 line.append(hdr).append(full);
                 G.simple_listener.enqueue_text_line(line);
             }
-            struct stat st{};
-            if (stat(full.c_str(), &st) == 0 && st.st_size > 0) {
+            if (final_size > 0) {
                 // PROTOCOL LIMITATION (tracked for the framing redesign): ':'-delimited; a path
                 // containing ':' will mis-parse on the Dart split(':') side. Escaping/reframing is
                 // a breaking ABI change and out of scope. Build with std::string so the path is
@@ -652,30 +658,57 @@ static void RegisterToxManagerFileCallbacks(V2TIMManagerImpl* manager_impl) {
                 std::string line;
                 line.reserve(strlen(hdr) + full.size());
                 line.append(hdr).append(full);
-                V2TIM_LOG(kInfo, "[ffi] Sending file_done event: {}", line);
+                V2TIM_LOG(kInfo,
+                          "[ffi] Enqueueing file_done event instance={} friend={} file={} kind={} path_length={}",
+                          (long long)instance_id, friend_number, file_number,
+                          file_kind, full.size());
                 G.simple_listener.enqueue_text_line(line);
             } else {
-                V2TIM_LOG(kError, "[ffi] Received file does not exist or is empty: {}", full);
+                V2TIM_LOG(kError,
+                          "[ffi] Received file is empty friend={} file={}",
+                          friend_number, file_number);
             }
+            return;
+        }
+        uint64_t requested_end = 0;
+        if (!tim2tox::file_io::CheckedWriteRange(
+                position, length, expected_size, &requested_end)) {
+            mark_io_failed();
+            V2TIM_LOG(kError,
+                      "[ffi] OnRecvFileData: rejected out-of-range chunk friend={} file={} position={} length={} expected_size={}",
+                      friend_number, file_number,
+                      (unsigned long long)position, length,
+                      (unsigned long long)expected_size);
             return;
         }
         if (!fp) {
             V2TIM_LOG(kError, "[ffi] OnRecvFileData: file pointer is null for friend={}, file={}", friend_number, file_number);
             return;
         }
-        fseek(fp, static_cast<long>(position), SEEK_SET);
-        size_t written = fwrite(data, 1, length, fp);
+        size_t written = tim2tox::file_io::WriteAt64(
+            fp, position, data, length);
         if (written != length) {
+            mark_io_failed();
             V2TIM_LOG(kError, "[ffi] OnRecvFileData: partial write: expected {} bytes, wrote {}", length, written);
         }
+        if (written == 0) return;
         fflush(fp);
+        uint64_t received_end = 0;
+        if (!tim2tox::file_io::CheckedEndPosition(position, written,
+                                                  &received_end)) {
+            mark_io_failed();
+            V2TIM_LOG(kError,
+                      "[ffi] OnRecvFileData: received position overflow at {} with {} bytes",
+                      (unsigned long long)position, written);
+            return;
+        }
         {
             std::lock_guard<std::mutex> lk(G.send_mtx);
             auto instance_it = G.recv_files.find(instance_id);
             if (instance_it != G.recv_files.end()) {
                 auto it = instance_it->second.find(key);
                 if (it != instance_it->second.end()) {
-                    it->second.received = position + length;
+                    it->second.received = received_end;
                     // PROTOCOL LIMITATION (tracked for the framing redesign): ':'-delimited; a path
                     // containing ':' mis-parses on the Dart split(':') side. Escaping/reframing is a
                     // breaking ABI change and out of scope. Build with std::string so the path is
@@ -833,6 +866,10 @@ int64_t tim2tox_ffi_get_current_instance_id(void) {
     return GetCurrentInstanceId();
 }
 
+int tim2tox_ffi_is_instance_initialized(int64_t instance_id) {
+    return IsInstanceInited(instance_id) ? 1 : 0;
+}
+
 // Get V2TIMManager for a given instance_id. Used by dart_compat when request includes instance_id
 // (e.g. inviteUserToGroup) so the operation runs on the correct instance even if "current" changed.
 // Returns nullptr if instance_id not found.
@@ -846,6 +883,16 @@ V2TIMManager* GetManagerForInstanceId(int64_t instance_id) {
         return static_cast<V2TIMManager*>(it->second);
     }
     return nullptr;
+}
+
+int tim2tox_ffi_is_instance_event_loop_running(int64_t instance_id) {
+    if (instance_id == 0) {
+        auto* manager = V2TIMManagerImpl::GetInstance();
+        return manager && manager->IsEventThreadRunning() ? 1 : 0;
+    }
+    std::lock_guard<std::mutex> lock(g_test_instances_mutex);
+    auto it = g_test_instances.find(instance_id);
+    return it != g_test_instances.end() && it->second->IsEventThreadRunning() ? 1 : 0;
 }
 
 // Get instance ID from V2TIMManagerImpl pointer
@@ -1213,9 +1260,17 @@ int tim2tox_ffi_send_c2c_text(const char* user_id, const char* text) {
     V2TIM_LOG(kInfo, "[ffi] tim2tox_ffi_send_c2c_text: Calling SendC2CTextMessage()");
 
     V2TIMManagerImpl* manager_impl = GetCurrentInstance();
-    manager_impl->SendC2CTextMessage(text, user_id, &sendcb);
+    if (!manager_impl) {
+        V2TIM_LOG(kError, "[ffi] tim2tox_ffi_send_c2c_text: ERROR - manager is null, returning 0");
+        return 0;
+    }
+    V2TIMString msg_id = manager_impl->SendC2CTextMessage(text, user_id, &sendcb);
+    if (msg_id.Empty()) {
+        V2TIM_LOG(kError, "[ffi] tim2tox_ffi_send_c2c_text: EXIT - empty msg_id, returning 0");
+        return 0;
+    }
 
-    V2TIM_LOG(kInfo, "[ffi] tim2tox_ffi_send_c2c_text: EXIT - returning 1");
+    V2TIM_LOG(kInfo, "[ffi] tim2tox_ffi_send_c2c_text: EXIT - msg_id={}, returning 1", msg_id.CString());
     return 1;
 }
 
@@ -1277,10 +1332,12 @@ int tim2tox_ffi_get_self_tox_id(char* buffer, int buffer_len) {
 }
 
 void tim2tox_ffi_uninit(void) {
-    if (!IsInstanceInited(0)) return;
     V2TIMManagerImpl* manager_impl = GetCurrentInstance();
+    if (!manager_impl) return;
+    int64_t instance_id = GetInstanceIdFromManager(manager_impl);
+    if (instance_id == kInstanceIdDestroyed || !IsInstanceInited(instance_id)) return;
     manager_impl->UnInitSDK();
-    MarkInstanceUninited(0);
+    MarkInstanceUninited(instance_id);
 }
 
 void tim2tox_ffi_save_tox_profile(void) {
@@ -1564,8 +1621,10 @@ int tim2tox_ffi_send_group_text(const char* group_id, const char* text) {
         }
         void OnProgress(uint32_t) override {}
     } sendcb;
-    GetCurrentInstance()->SendGroupTextMessage(text, group_id, V2TIMMessagePriority::V2TIM_PRIORITY_NORMAL, &sendcb);
-    return 1;
+    V2TIMManagerImpl* manager_impl = GetCurrentInstance();
+    if (!manager_impl) return 0;
+    V2TIMString msg_id = manager_impl->SendGroupTextMessage(text, group_id, V2TIMMessagePriority::V2TIM_PRIORITY_NORMAL, &sendcb);
+    return msg_id.Empty() ? 0 : 1;
 }
 
 // R-07: Update known groups in Core (FFI forwards to manager)
@@ -1955,26 +2014,27 @@ int tim2tox_ffi_send_file(int64_t instance_id, const char* user_id, const char* 
     TOX_ERR_FRIEND_BY_PUBLIC_KEY err;
     uint32_t friend_no = tox_friend_by_public_key(tox, pubkey, &err);
     if (err != TOX_ERR_FRIEND_BY_PUBLIC_KEY_OK) {
-        V2TIM_LOG(kError, "[ffi] send_file: friend {} not found in tox (err={})", user_id, err);
+        V2TIM_LOG(kError, "[ffi] send_file: friend not found in tox (err={})", err);
         return -3;
     }
     TOX_ERR_FRIEND_QUERY query_err;
     TOX_CONNECTION friend_conn = tox_friend_get_connection_status(tox, friend_no, &query_err);
     if (query_err != TOX_ERR_FRIEND_QUERY_OK || friend_conn == TOX_CONNECTION_NONE) {
-        V2TIM_LOG(kError, "[ffi] send_file: friend {} not connected (err={})", user_id, query_err);
+        V2TIM_LOG(kError, "[ffi] send_file: friend not connected (err={})", query_err);
         return -4;
     }
-    struct stat st{};
-    if (stat(file_path, &st) != 0 || st.st_size <= 0) {
-        V2TIM_LOG(kError, "[ffi] send_file: file missing or empty {}", file_path);
+    std::string path(file_path);
+    uint64_t file_size = 0;
+    if (!tim2tox::file_io::GetFileSizeUtf8(path, &file_size) ||
+        file_size == 0) {
+        V2TIM_LOG(kError, "[ffi] send_file: local file missing or empty");
         return -5;
     }
-    FILE* fp = fopen(file_path, "rb");
+    FILE* fp = tim2tox::file_io::OpenUtf8(path, "rb");
     if (!fp) {
-        V2TIM_LOG(kError, "[ffi] send_file: fopen failed for {}", file_path);
+        V2TIM_LOG(kError, "[ffi] send_file: failed to open local file");
         return -6;
     }
-    std::string path(file_path);
     std::string name = path;
     size_t pos = path.find_last_of("/\\");
     if (pos != std::string::npos) name = path.substr(pos + 1);
@@ -2007,10 +2067,13 @@ int tim2tox_ffi_send_file(int64_t instance_id, const char* user_id, const char* 
         (is_image && avatar_name_pattern && from_avatar_dir)
             ? TOX_FILE_KIND_AVATAR
             : TOX_FILE_KIND_DATA;
+    const std::string wire_name =
+        tim2tox::file_io::TruncateUtf8Filename(name);
     TOX_ERR_FILE_SEND f_err;
     uint32_t file_no = tox_file_send(
-        tox, friend_no, tox_file_kind, (uint64_t)st.st_size, nullptr,
-        reinterpret_cast<const uint8_t*>(name.c_str()), name.size(), &f_err);
+        tox, friend_no, tox_file_kind, file_size, nullptr,
+        reinterpret_cast<const uint8_t*>(wire_name.c_str()), wire_name.size(),
+        &f_err);
     if (f_err != TOX_ERR_FILE_SEND_OK) {
         V2TIM_LOG(kError, "[ffi] send_file: tox_file_send failed err={}", f_err);
         fclose(fp);
@@ -2019,7 +2082,7 @@ int tim2tox_ffi_send_file(int64_t instance_id, const char* user_id, const char* 
     {
         std::lock_guard<std::mutex> lk(G.send_mtx);
         uint64_t key = (static_cast<uint64_t>(friend_no) << 32) | file_no;
-        G.send_files[instance_id][key] = std::make_pair(fp, static_cast<uint64_t>(st.st_size));
+        G.send_files[instance_id][key] = std::make_pair(fp, file_size);
     }
     return 1;
 }
@@ -2168,22 +2231,21 @@ int tim2tox_ffi_get_udp_port(int64_t instance_id) {
     return (int)port;
 }
 
-int tim2tox_ffi_get_dht_id(char* out_dht_id, int out_len) {
+int tim2tox_ffi_get_dht_id_for_instance(int64_t instance_id, char* out_dht_id, int out_len) {
     if (!out_dht_id || out_len < 65) return 0;
-    // Get ToxManager from current V2TIMManagerImpl instance
-    V2TIMManagerImpl* manager_impl = GetCurrentInstance();
+    V2TIMManagerImpl* manager_impl = static_cast<V2TIMManagerImpl*>(GetManagerForInstanceId(instance_id));
     if (!manager_impl) {
-        V2TIM_LOG(kError, "[ffi] get_dht_id: V2TIMManagerImpl instance is null");
+        V2TIM_LOG(kError, "[ffi] get_dht_id_for_instance: instance_id={} V2TIMManagerImpl instance is null", (long long)instance_id);
         return 0;
     }
     ToxManager* tox_manager = manager_impl->GetToxManager();
     if (!tox_manager) {
-        V2TIM_LOG(kError, "[ffi] get_dht_id: ToxManager instance is null");
+        V2TIM_LOG(kError, "[ffi] get_dht_id_for_instance: instance_id={} ToxManager instance is null", (long long)instance_id);
         return 0;
     }
     Tox* tox = tox_manager->getTox();
     if (!tox) {
-        V2TIM_LOG(kError, "[ffi] get_dht_id: Tox instance is null");
+        V2TIM_LOG(kError, "[ffi] get_dht_id_for_instance: instance_id={} Tox instance is null", (long long)instance_id);
         return 0;
     }
     
@@ -2194,7 +2256,7 @@ int tim2tox_ffi_get_dht_id(char* out_dht_id, int out_len) {
     std::string dht_id_hex = ToxUtil::tox_bytes_to_hex(dht_id, TOX_PUBLIC_KEY_SIZE);
     
     if (dht_id_hex.length() >= (size_t)out_len) {
-        V2TIM_LOG(kError, "[ffi] get_dht_id: buffer too small (need {}, got {})", dht_id_hex.length(), out_len);
+        V2TIM_LOG(kError, "[ffi] get_dht_id_for_instance: buffer too small (need {}, got {})", dht_id_hex.length(), out_len);
         return 0;
     }
     
@@ -2202,6 +2264,14 @@ int tim2tox_ffi_get_dht_id(char* out_dht_id, int out_len) {
     out_dht_id[out_len - 1] = '\0';
     
     return (int)dht_id_hex.length();
+}
+
+int tim2tox_ffi_get_dht_id(char* out_dht_id, int out_len) {
+    V2TIMManagerImpl* manager_impl = GetCurrentInstance();
+    if (!manager_impl) return 0;
+    int64_t instance_id = GetInstanceIdFromManager(manager_impl);
+    if (instance_id == kInstanceIdDestroyed) return 0;
+    return tim2tox_ffi_get_dht_id_for_instance(instance_id, out_dht_id, out_len);
 }
 
 int tim2tox_ffi_add_bootstrap_node(int64_t instance_id, const char* host, int port, const char* public_key_hex) {
@@ -2291,7 +2361,7 @@ int tim2tox_ffi_file_control(int64_t instance_id, const char* user_id, uint32_t 
     TOX_ERR_FRIEND_BY_PUBLIC_KEY err;
     uint32_t friend_no = tox_friend_by_public_key(tox, pubkey, &err);
     if (err != TOX_ERR_FRIEND_BY_PUBLIC_KEY_OK) {
-        V2TIM_LOG(kError, "[ffi] file_control: friend {} not found (err={})", user_id, err);
+        V2TIM_LOG(kError, "[ffi] file_control: friend not found (err={})", err);
         return -2;
     }
     // Map control value to TOX_FILE_CONTROL
@@ -2304,61 +2374,82 @@ int tim2tox_ffi_file_control(int64_t instance_id, const char* user_id, uint32_t 
             V2TIM_LOG(kError, "[ffi] file_control: invalid control value {}", control);
             return -1;
     }
+    FILE* opened_file = nullptr;
+    std::string opened_path;
+    if (control == 0) {
+        const uint64_t key =
+            (static_cast<uint64_t>(friend_no) << 32) | file_number;
+        std::lock_guard<std::mutex> lk(G.send_mtx);
+        auto instance_it = G.recv_files.find(instance_id);
+        if (instance_it == G.recv_files.end()) {
+            V2TIM_LOG(kError, "[ffi] file_control: receive transfer instance not found for file={}", file_number);
+            return -3;
+        }
+        auto it = instance_it->second.find(key);
+        if (it == instance_it->second.end()) {
+            V2TIM_LOG(kError, "[ffi] file_control: receive transfer not found for friend={}, file={}", friend_no, file_number);
+            return -3;
+        }
+        if (it->second.kind == TOX_FILE_KIND_AVATAR &&
+            it->second.size > kAvatarAutoAcceptMaxBytes) {
+            V2TIM_LOG(kWarning,
+                      "[ffi] file_control: rejected oversized avatar size={} max={} friend={} file={}",
+                      (unsigned long long)it->second.size,
+                      (unsigned long long)kAvatarAutoAcceptMaxBytes,
+                      friend_no, file_number);
+            return -6;
+        }
+        if (it->second.fp == nullptr) {
+            opened_path = it->second.path;
+            const std::string::size_type last_slash =
+                opened_path.find_last_of("/\\");
+            if (last_slash != std::string::npos) {
+                const std::string parent_dir = opened_path.substr(0, last_slash);
+                if (!parent_dir.empty()) {
+                    const int mkdir_result =
+                        tim2tox_mkdir(parent_dir.c_str(), 0755);
+                    if (mkdir_result != 0 && errno != EEXIST) {
+                        V2TIM_LOG(kError, "[ffi] file_control: failed to create receive parent directory (errno: {})", errno);
+                    }
+                }
+            }
+            opened_file = tim2tox::file_io::OpenUtf8(opened_path, "wb");
+            if (opened_file == nullptr) {
+                V2TIM_LOG(kError, "[ffi] file_control: failed to open local receive file (errno: {})", errno);
+                return -5;
+            }
+            it->second.fp = opened_file;
+            V2TIM_LOG(kInfo,
+                      "[ffi] file_control: opened local receive file friend={} file={} path_length={}",
+                      friend_no, file_number, opened_path.size());
+        }
+    }
+
     TOX_ERR_FILE_CONTROL f_err;
     bool success = tox_file_control(tox, friend_no, file_number, tox_control, &f_err);
     if (!success) {
+        if (opened_file != nullptr) {
+            const uint64_t key =
+                (static_cast<uint64_t>(friend_no) << 32) | file_number;
+            std::lock_guard<std::mutex> lk(G.send_mtx);
+            auto instance_it = G.recv_files.find(instance_id);
+            if (instance_it != G.recv_files.end()) {
+                auto it = instance_it->second.find(key);
+                if (it != instance_it->second.end() &&
+                    it->second.fp == opened_file) {
+                    fclose(opened_file);
+                    it->second.fp = nullptr;
+                    if (tim2tox::file_io::HasExactFileSize(opened_path, 0)) {
+                        tim2tox::file_io::RemoveUtf8(opened_path);
+                    }
+                }
+            }
+        }
         V2TIM_LOG(kError, "[ffi] file_control: tox_file_control failed (err={}) for friend={}, file={}, control={}", f_err, friend_no, file_number, control);
         return -4;
     }
     V2TIM_LOG(kInfo, "[ffi] file_control: tox_file_control succeeded for friend={}, file={}, control={} (TOX_FILE_CONTROL_RESUME={})",
               friend_no, file_number, control, TOX_FILE_CONTROL_RESUME);
-    // If accepting (RESUME), open file for writing
-    if (control == 0) { // RESUME
-        uint64_t key = (static_cast<uint64_t>(friend_no) << 32) | file_number;
-        std::lock_guard<std::mutex> lk(G.send_mtx);
-        auto instance_it = G.recv_files.find(instance_id);
-        if (instance_it != G.recv_files.end()) {
-            auto it = instance_it->second.find(key);
-            if (it != instance_it->second.end() && it->second.fp == nullptr) {
-                // Ensure directory exists before opening file (use configured directory)
-                std::string dir = G.file_recv_dir;
-                int mkdir_result = tim2tox_mkdir(dir.c_str(), 0755);
-                if (mkdir_result != 0 && errno != EEXIST) {
-                    V2TIM_LOG(kError, "[ffi] file_control: failed to create directory {} (errno: {})", dir, errno);
-                }
-                // File request was stored but not accepted yet - open file now
-                FILE* fp = fopen(it->second.path.c_str(), "wb");
-                if (fp) {
-                    it->second.fp = fp;
-                    V2TIM_LOG(kInfo, "[ffi] file_control: successfully opened file {}", it->second.path);
-                } else {
-                    V2TIM_LOG(kError, "[ffi] file_control: failed to open file {} (errno: {})", it->second.path, errno);
-                    // Try to create parent directory if it doesn't exist
-                    std::string::size_type last_slash = it->second.path.find_last_of('/');
-                    if (last_slash != std::string::npos) {
-                        std::string parent_dir = it->second.path.substr(0, last_slash);
-                        if (!parent_dir.empty()) {
-                            mkdir_result = tim2tox_mkdir(parent_dir.c_str(), 0755);
-                            if (mkdir_result == 0 || errno == EEXIST) {
-                                // Retry opening file after creating parent directory
-                                fp = fopen(it->second.path.c_str(), "wb");
-                                if (fp) {
-                                    it->second.fp = fp;
-                                    V2TIM_LOG(kInfo, "[ffi] file_control: successfully opened file after creating parent directory: {}", it->second.path);
-                                } else {
-                                    V2TIM_LOG(kError, "[ffi] file_control: still failed to open file after creating parent directory (errno: {}): {}", errno, it->second.path);
-                                }
-                            } else {
-                                V2TIM_LOG(kError, "[ffi] file_control: failed to create parent directory (errno: {}): {}", errno, parent_dir);
-                            }
-                        }
-                    } else {
-                        V2TIM_LOG(kError, "[ffi] file_control: no parent directory found in path: {}", it->second.path);
-                    }
-                }
-            }
-        }
-    }
     if (control == 2) { // CANCEL
         // Clean up file context
         uint64_t key = (static_cast<uint64_t>(friend_no) << 32) | file_number;
@@ -2371,7 +2462,7 @@ int tim2tox_ffi_file_control(int64_t instance_id, const char* user_id, uint32_t 
                     fclose(it->second.fp);
                 }
                 // Remove file if it exists
-                unlink(it->second.path.c_str());
+                tim2tox::file_io::RemoveUtf8(it->second.path);
                 instance_it->second.erase(it);
             }
         }
@@ -2385,10 +2476,10 @@ int tim2tox_ffi_set_file_recv_dir(const char* dir_path) {
     // Ensure directory exists
     int mkdir_result = tim2tox_mkdir(G.file_recv_dir.c_str(), 0755);
     if (mkdir_result != 0 && errno != EEXIST) {
-        V2TIM_LOG(kError, "[ffi] set_file_recv_dir: failed to create directory {} (errno: {})", G.file_recv_dir.c_str(), errno);
+        V2TIM_LOG(kError, "[ffi] set_file_recv_dir: failed to create receive directory (errno: {})", errno);
         return 0;
     }
-    V2TIM_LOG(kInfo, "[ffi] set_file_recv_dir: set to {}", G.file_recv_dir.c_str());
+    V2TIM_LOG(kInfo, "[ffi] set_file_recv_dir: configured path_length={}", G.file_recv_dir.size());
     return 1;
 }
 

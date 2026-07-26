@@ -74,8 +74,11 @@ set_target_properties(nlohmann_json::nlohmann_json PROPERTIES
 # Note: dart_api_dl.c will be added after we find it
 add_library(tim2tox_ffi SHARED 
     tim2tox_ffi.cpp
+    file_io_compat.cpp
+    event_line_parser.cpp
     callback_bridge.cpp
     json_parser.cpp
+    dart_send_message_contract.cpp
     dart_compat_layer.cpp
     dart_compat_utils.cpp
     dart_compat_listeners.cpp

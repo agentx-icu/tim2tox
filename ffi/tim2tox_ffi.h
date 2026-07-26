@@ -45,6 +45,15 @@ int tim2tox_ffi_destroy_test_instance(int64_t instance_handle);
 // Returns: instance ID (>0 for test instances, 0 for default instance)
 int64_t tim2tox_ffi_get_current_instance_id(void);
 
+// Return 1 if the exact instance is initialized, otherwise 0.
+// Unlike ambient APIs, instance_id 0 always means the default instance.
+int tim2tox_ffi_is_instance_initialized(int64_t instance_id);
+
+// Return 1 while the exact instance's native Tox event loop thread is active.
+// Test-mode instances, destroyed handles, and missing instances return 0.
+// Unlike ambient APIs, instance_id 0 always means the default instance.
+int tim2tox_ffi_is_instance_event_loop_running(int64_t instance_id);
+
 // Run N iterations on current instance (for tests: accelerate Tox group peer discovery).
 // Call from test with set_current_instance set to founder then member1 in turn.
 // Returns 1 on success, 0 if current instance or ToxManager is null.
@@ -262,7 +271,7 @@ int tim2tox_ffi_send_file(int64_t instance_id, const char* user_id, const char* 
 // user_id: friend's user ID (hex string)
 // file_number: file number from file request event
 // control: 0=RESUME (accept/continue), 1=PAUSE, 2=CANCEL (reject/abort)
-// Returns: 1 on success, negative on error (-1=invalid args, -2=friend not found, -3=file not found, -4=control failed)
+// Returns: 1 on success, negative on error (-1=invalid args, -2=friend not found, -3=file not found, -4=control failed, -5=local receive file open failed, -6=avatar exceeds receive limit)
 int tim2tox_ffi_file_control(int64_t instance_id, const char* user_id, uint32_t file_number, int control);
 
 // Get self connection status: returns 0=NONE, 1=TCP, 2=UDP
@@ -277,6 +286,11 @@ int tim2tox_ffi_get_udp_port(int64_t instance_id);
 // out_len: size of output buffer (should be at least 65 for null terminator)
 // Returns: length of DHT ID string on success, 0 on error
 int tim2tox_ffi_get_dht_id(char* out_dht_id, int out_len);
+
+// Get the DHT ID for an exact instance without changing the ambient current
+// instance. instance_id 0 always means the default instance.
+// The caller owns out_dht_id, which must have room for 65 bytes.
+int tim2tox_ffi_get_dht_id_for_instance(int64_t instance_id, char* out_dht_id, int out_len);
 
 // Add bootstrap node and re-login: host, port, public_key_hex (64-char string)
 // Returns 1 on success, 0 on failure
@@ -676,5 +690,3 @@ int tim2tox_ffi_inject_callback(const char* json_callback);
 #ifdef __cplusplus
 }
 #endif
-
-
