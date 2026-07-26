@@ -61,6 +61,9 @@ typedef _file_control_c = ffi.Int32 Function(ffi.Int64, ffi.Pointer<pkgffi.Utf8>
 typedef _get_self_connection_status_c = ffi.Int32 Function();
 typedef _get_udp_port_c = ffi.Int32 Function(ffi.Int64);
 typedef _get_dht_id_c = ffi.Int32 Function(ffi.Pointer<ffi.Int8>, ffi.Int32);
+typedef _get_dht_id_for_instance_c = ffi.Int32 Function(ffi.Int64, ffi.Pointer<ffi.Int8>, ffi.Int32);
+typedef _is_instance_initialized_c = ffi.Int32 Function(ffi.Int64);
+typedef _is_instance_event_loop_running_c = ffi.Int32 Function(ffi.Int64);
 typedef _add_bootstrap_node_c = ffi.Int32 Function(ffi.Int64, ffi.Pointer<pkgffi.Utf8>, ffi.Int32, ffi.Pointer<pkgffi.Utf8>);
 // Test instance management functions
 typedef _create_test_instance_c = ffi.Int64 Function(ffi.Pointer<pkgffi.Utf8>);
@@ -320,6 +323,16 @@ typedef _set_default_test_mode_c = ffi.Int32 Function(ffi.Int32);
 class Tim2ToxFfi {
   Tim2ToxFfi._(this._lib);
   final ffi.DynamicLibrary _lib;
+
+  static String? fileControlErrorMessage(int result) => switch (result) {
+        -1 => 'Invalid arguments.',
+        -2 => 'Friend not found.',
+        -3 => 'File transfer not found.',
+        -4 => 'File control failed.',
+        -5 => 'Local receive file could not be opened.',
+        -6 => 'Avatar exceeds the 10 MiB receive limit.',
+        _ => null,
+      };
   
   late final int Function() init = _lib.lookupFunction<_init_c, int Function()>('tim2tox_ffi_init');
   late final int Function(ffi.Pointer<pkgffi.Utf8>) initWithPath =
@@ -385,6 +398,12 @@ class Tim2ToxFfi {
       _lib.lookupFunction<_get_udp_port_c, int Function(int)>('tim2tox_ffi_get_udp_port');
   late final int Function(ffi.Pointer<ffi.Int8>, int) getDhtIdNative =
       _lib.lookupFunction<_get_dht_id_c, int Function(ffi.Pointer<ffi.Int8>, int)>('tim2tox_ffi_get_dht_id');
+  late final int Function(int, ffi.Pointer<ffi.Int8>, int) getDhtIdForInstanceNative =
+      _lib.lookupFunction<_get_dht_id_for_instance_c, int Function(int, ffi.Pointer<ffi.Int8>, int)>('tim2tox_ffi_get_dht_id_for_instance');
+  late final int Function(int) isInstanceInitialized =
+      _lib.lookupFunction<_is_instance_initialized_c, int Function(int)>('tim2tox_ffi_is_instance_initialized');
+  late final int Function(int) isInstanceEventLoopRunning =
+      _lib.lookupFunction<_is_instance_event_loop_running_c, int Function(int)>('tim2tox_ffi_is_instance_event_loop_running');
   late final int Function(int, ffi.Pointer<pkgffi.Utf8>, int, ffi.Pointer<pkgffi.Utf8>) addBootstrapNode =
       _lib.lookupFunction<_add_bootstrap_node_c, int Function(int, ffi.Pointer<pkgffi.Utf8>, int, ffi.Pointer<pkgffi.Utf8>)>('tim2tox_ffi_add_bootstrap_node');
   // DHT nodes API
@@ -847,4 +866,3 @@ class Tim2ToxFfi {
     }
   }
 }
-
