@@ -212,7 +212,7 @@ extern "C" {
         }
         if (group_name.empty()) {
             V2TIM_LOG(kError, "[dart_compat] DartCreateGroup: ERROR - group_name is required");
-            V2TIM_LOG(kError, "[dart_compat] DartCreateGroup: Full JSON received: {}", json_str);
+            V2TIM_LOG(kError, "[dart_compat] DartCreateGroup: JSON payload length={}", json_str.size());
             SendApiCallbackResult(user_data, ERR_INVALID_PARAMETERS, "group_name is required");
             return 1; // Error
         }
@@ -1858,4 +1858,3 @@ extern "C" {
     }
 
 } // extern "C"
-

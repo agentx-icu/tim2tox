@@ -128,6 +128,7 @@ public:
     bool GetChatIdFromGroupID(const V2TIMString& groupID, uint8_t chat_id[TOX_GROUP_CHAT_ID_SIZE]);
     bool GetGroupIDFromChatId(const uint8_t chat_id[TOX_GROUP_CHAT_ID_SIZE], V2TIMString& groupID);
     bool IsRunning() const;  // Implementation in .cpp file to avoid inline optimization issues
+    bool IsEventThreadRunning() const;
     
     // Helper method to notify group listeners about member kicked
     void NotifyGroupMemberKicked(const V2TIMString& groupID, const V2TIMGroupMemberInfoVector& memberList);
@@ -306,6 +307,7 @@ private:
     
     std::thread event_thread_;
     std::thread::id event_thread_id_;  // Set by event thread at start; used to avoid deadlock when RunOnEventThread is called from event thread
+    std::atomic<bool> event_thread_running_{false};
     std::atomic<bool> running_{true};  // Use atomic to prevent compiler optimization issues
     // Test mode: when true, InitSDK skips event_thread start and installs the
     // virtual-clock callback on tox->mono_time. Auto_tests harness only.

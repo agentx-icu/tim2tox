@@ -1451,10 +1451,12 @@ bool V2TIMManagerImpl::InitSDK(uint32_t sdkAppID, const V2TIMSDKConfig& config) 
     // starting the per-instance event_thread entirely.
     if (!test_mode_.load(std::memory_order_acquire)) {
         fprintf(stdout, "InitSDK: starting event thread\n");
-        event_thread_ = std::thread([this] {
-            event_thread_id_ = std::this_thread::get_id();
-            while (running_.load(std::memory_order_acquire)) {
-                try {
+        event_thread_running_.store(true, std::memory_order_release);
+        try {
+            event_thread_ = std::thread([this] {
+                event_thread_id_ = std::this_thread::get_id();
+                while (running_.load(std::memory_order_acquire)) {
+                    try {
                     // Process pending tasks first (Invite/signaling etc. run on this thread to avoid tox lock deadlock)
                     {
                         std::unique_lock<std::mutex> lock(task_mutex_);
@@ -1485,11 +1487,16 @@ bool V2TIMManagerImpl::InitSDK(uint32_t sdkAppID, const V2TIMSDKConfig& config) 
                     Tox* t = tox_manager_->getTox();
                     uint32_t interval = t ? tox_iteration_interval(t) : 50;
                     std::this_thread::sleep_for(std::chrono::milliseconds(interval));
-                } catch (...) {
-                    break;
+                    } catch (...) {
+                        break;
+                    }
                 }
-            }
-        });
+                event_thread_running_.store(false, std::memory_order_release);
+            });
+        } catch (...) {
+            event_thread_running_.store(false, std::memory_order_release);
+            throw;
+        }
     } else {
         fprintf(stdout, "InitSDK: SKIP event thread (test mode)\n");
         fflush(stdout);
@@ -1662,6 +1669,10 @@ bool V2TIMManagerImpl::HasGroup(const V2TIMString& group_id) const {
 // IsRunning() implementation - moved to .cpp to avoid inline optimization issues
 bool V2TIMManagerImpl::IsRunning() const {
     return running_.load(std::memory_order_acquire);
+}
+
+bool V2TIMManagerImpl::IsEventThreadRunning() const {
+    return event_thread_running_.load(std::memory_order_acquire);
 }
 
 // Messaging
@@ -4898,11 +4909,10 @@ void V2TIMManagerImpl::HandleGroupMessageGroup(Tox_Group_Number group_number, To
     sender_hex_id[TOX_PUBLIC_KEY_SIZE * 2] = '\0'; 
     senderUserID = sender_hex_id;
 
-    V2TIM_LOG(kInfo, "[V2TIMManagerImpl::HandleGroupMessageGroup] Sender public key hex: {}", senderUserID.CString());
-    V2TIM_LOG(kInfo, "[V2TIMManagerImpl::HandleGroupMessageGroup] Received group msg type {} in group {} from {}",
-             type, groupID.CString(), senderUserID.CString());
-    fprintf(stdout, "[HandleGroupMessageGroup] Sender UserID: %s, GroupID: %s, Type: %d, Length: %zu\n",
-            senderUserID.CString(), groupID.CString(), static_cast<int>(type), length);
+    V2TIM_LOG(kInfo, "[V2TIMManagerImpl::HandleGroupMessageGroup] Received group msg type {} group_number={} peer_id={} length={}",
+             type, group_number, peer_id, length);
+    fprintf(stdout, "[HandleGroupMessageGroup] Received group message: group_number=%u, peer_id=%u, type=%d, length=%zu\n",
+            group_number, peer_id, static_cast<int>(type), length);
     fflush(stdout);
 
     // Populate the peer_id cache so GetGroupMemberList can list this peer even if
@@ -4912,8 +4922,8 @@ void V2TIMManagerImpl::HandleGroupMessageGroup(Tox_Group_Number group_number, To
         std::transform(key_lower.begin(), key_lower.end(), key_lower.begin(), ::tolower);
         std::lock_guard<std::mutex> lock(mutex_);
         group_peer_id_cache_[group_number][key_lower] = peer_id;
-        fprintf(stdout, "[HandleGroupMessageGroup] Cached peer group_number=%u peer_id=%u pubkey=%s\n",
-                group_number, peer_id, key_lower.c_str());
+        fprintf(stdout, "[HandleGroupMessageGroup] Cached peer group_number=%u peer_id=%u\n",
+                group_number, peer_id);
         fflush(stdout);
     }
 
@@ -4994,8 +5004,7 @@ void V2TIMManagerImpl::HandleGroupMessageGroup(Tox_Group_Number group_number, To
                 msgMgr->NotifyMessageRevoked(revokedMsgID, revokerID, revokeReason);
             }
             
-            V2TIM_LOG(kInfo, "Received revoke notification for message: %s from: %s in group: %s", 
-                      msgID.c_str(), revoker.c_str(), groupID.CString());
+            V2TIM_LOG(kInfo, "Received group revoke notification");
             return; // 撤回通知不需要创建消息对象
         }
         
@@ -5021,15 +5030,15 @@ void V2TIMManagerImpl::HandleGroupMessageGroup(Tox_Group_Number group_number, To
         // v2_message.faceURL = ...
         
         // [tim2tox-debug] Record message creation completion
-        V2TIM_LOG(kInfo, "[tim2tox-debug] HandleGroupMessageGroup: Message creation completed - msgID={}, groupID={}, sender={}, elemCount={}", 
-                 v2_message.msgID.CString(), groupID.CString(), senderUserID.CString(), v2_message.elemList.Size());
-        V2TIM_LOG(kInfo, "[V2TIMManagerImpl::HandleGroupMessageGroup] Message created: msgID={}, groupID={}, sender={}, timestamp={}", 
-                 v2_message.msgID.CString(), groupID.CString(), senderUserID.CString(), v2_message.timestamp);
-        fprintf(stdout, "[HandleGroupMessageGroup] Message created - msgID: %s, groupID: %s, sender: %s, isSelf: %d\n",
-                v2_message.msgID.CString(), groupID.CString(), senderUserID.CString(), v2_message.isSelf ? 1 : 0);
+        V2TIM_LOG(kInfo, "[tim2tox-debug] HandleGroupMessageGroup: Message creation completed elemCount={}",
+                 v2_message.elemList.Size());
+        V2TIM_LOG(kInfo, "[V2TIMManagerImpl::HandleGroupMessageGroup] Message created: timestamp={}",
+                 v2_message.timestamp);
+        fprintf(stdout, "[HandleGroupMessageGroup] Message created: isSelf=%d, elemCount=%zu\n",
+                v2_message.isSelf ? 1 : 0, v2_message.elemList.Size());
         if (v2_message.elemList.Size() > 0 && v2_message.elemList[0]->elemType == V2TIM_ELEM_TYPE_TEXT) {
             V2TIMTextElem* textElem = static_cast<V2TIMTextElem*>(v2_message.elemList[0]);
-            fprintf(stdout, "[HandleGroupMessageGroup] Message text: %s\n", textElem->text.CString());
+            fprintf(stdout, "[HandleGroupMessageGroup] Message text length: %zu\n", textElem->text.Size());
         }
         fflush(stdout);
         
@@ -5038,8 +5047,8 @@ void V2TIMManagerImpl::HandleGroupMessageGroup(Tox_Group_Number group_number, To
         int64_t receiver_instance_id = GetInstanceIdFromManager(this);
         V2TIM_LOG(kInfo, "[V2TIMManagerImpl::HandleGroupMessageGroup] About to notify advanced listeners, msgManager={}, receiver_instance_id={}", 
                  (void*)msgManager, (long long)receiver_instance_id);
-        fprintf(stdout, "[HandleGroupMessageGroup] About to notify advanced listeners for message from %s in group %s (receiver_instance_id=%lld)\n",
-                senderUserID.CString(), groupID.CString(), (long long)receiver_instance_id);
+        fprintf(stdout, "[HandleGroupMessageGroup] About to notify advanced listeners (receiver_instance_id=%lld)\n",
+                (long long)receiver_instance_id);
         fflush(stdout);
         SetReceiverInstanceOverride(receiver_instance_id);
         msgManager->NotifyAdvancedListenersReceivedMessage(v2_message);
@@ -5150,9 +5159,9 @@ void V2TIMManagerImpl::HandleFriendMessage(uint32_t friend_number, TOX_MESSAGE_T
     sender_hex_id[TOX_PUBLIC_KEY_SIZE * 2] = '\0';
     senderUserID = sender_hex_id;
 
-    V2TIM_LOG(kInfo, "Received C2C msg type {} from {} (friend {})", type, senderUserID.CString(), friend_number);
-    fprintf(stdout, "[HandleFriendMessage] Received C2C msg: type=%d, sender=%s, friend_number=%u, length=%zu\n",
-            type, senderUserID.CString(), friend_number, length);
+    V2TIM_LOG(kInfo, "Received C2C msg type {} from friend {} with length {}", type, friend_number, length);
+    fprintf(stdout, "[HandleFriendMessage] Received C2C msg: type=%d, friend_number=%u, length=%zu\n",
+            type, friend_number, length);
     fflush(stdout);
 
     // --- Create V2TIMMessage Object --- 
@@ -5259,14 +5268,8 @@ void V2TIMManagerImpl::HandleFriendMessage(uint32_t friend_number, TOX_MESSAGE_T
         bool is_self_sent = (memcmp(sender_pubkey, self_pubkey, TOX_PUBLIC_KEY_SIZE) == 0);
         v2_message.isSelf = is_self_sent;
         
-        // Debug: Print both public keys for comparison
-        char self_hex_id[TOX_PUBLIC_KEY_SIZE * 2 + 1];
-        std::string self_hex_id_str = ToxUtil::tox_bytes_to_hex(self_pubkey, TOX_PUBLIC_KEY_SIZE);
-        strcpy(self_hex_id, self_hex_id_str.c_str());
-        self_hex_id[TOX_PUBLIC_KEY_SIZE * 2] = '\0';
-        
-        fprintf(stdout, "[HandleFriendMessage] Checking if self-sent: sender_pubkey=%.64s, self_pubkey=%.64s, is_self=%d\n",
-                senderUserID.CString(), self_hex_id, is_self_sent ? 1 : 0);
+        fprintf(stdout, "[HandleFriendMessage] Self-sent check complete: is_self=%d\n",
+                is_self_sent ? 1 : 0);
         fflush(stdout);
         
         v2_message.status = V2TIM_MSG_STATUS_SEND_SUCC;
@@ -5274,17 +5277,16 @@ void V2TIMManagerImpl::HandleFriendMessage(uint32_t friend_number, TOX_MESSAGE_T
                                     std::chrono::system_clock::now().time_since_epoch()).count();
         // TODO: Potentially retrieve sender Nickname/FaceURL here if needed/cached
 
-        fprintf(stdout, "[HandleFriendMessage] Message created: msgID=%s, sender=%s, userID=%s, timestamp=%lld, elemCount=%zu\n",
-                v2_message.msgID.CString(), v2_message.sender.CString(), v2_message.userID.CString(), 
+        fprintf(stdout, "[HandleFriendMessage] Message created: timestamp=%lld, elemCount=%zu\n",
                 v2_message.timestamp, v2_message.elemList.Size());
         fflush(stdout);
         
-        // Log message content
+        // Keep diagnostics metadata-only: message bodies and identities are private.
         if (!v2_message.elemList.Empty()) {
             V2TIMElem* firstElem = v2_message.elemList[0];
             if (firstElem->elemType == V2TIM_ELEM_TYPE_TEXT) {
                 V2TIMTextElem* textElem = static_cast<V2TIMTextElem*>(firstElem);
-                fprintf(stdout, "[HandleFriendMessage] Text message content: %s\n", textElem->text.CString());
+                fprintf(stdout, "[HandleFriendMessage] Text message length: %zu\n", textElem->text.Size());
                 fflush(stdout);
             } else if (firstElem->elemType == V2TIM_ELEM_TYPE_CUSTOM) {
                 V2TIMCustomElem* customElem = static_cast<V2TIMCustomElem*>(firstElem);
@@ -5575,13 +5577,7 @@ void V2TIMManagerImpl::HandleFriendRequest(const uint8_t* public_key, const uint
     V2TIMString senderUserID = sender_hex_id;
     V2TIMString requestMessage(reinterpret_cast<const char*>(message_data), length);
 
-    V2TIM_LOG(kInfo, "HandleFriendRequest from {} with message: {}", senderUserID.CString(), requestMessage.CString());
-    fprintf(stdout, "[HandleFriendRequest] Received friend request from: %.64s, message length: %zu, message (first 40 chars): %.40s\n",
-            senderUserID.CString(), length, requestMessage.CString());
-    fprintf(stderr, "[HandleFriendRequest] Received friend request from: %.64s, message length: %zu, message (first 40 chars): %.40s\n",
-            senderUserID.CString(), length, requestMessage.CString());
-    fflush(stdout);
-    fflush(stderr);
+    V2TIM_LOG(kInfo, "HandleFriendRequest received message_length={}", length);
 
     // Create the friend application
     V2TIMFriendApplication application;
@@ -5595,8 +5591,7 @@ void V2TIMManagerImpl::HandleFriendRequest(const uint8_t* public_key, const uint
     V2TIMFriendApplicationVector applications;
     applications.PushBack(application);
     
-    fprintf(stdout, "[HandleFriendRequest] Created application: userID=%.64s, addWording=%.40s\n",
-            application.userID.CString(), application.addWording.CString());
+    fprintf(stdout, "[HandleFriendRequest] Created application with message_length=%zu\n", length);
     fflush(stdout);
     
     // Notify only the current instance's listener (not all instances)

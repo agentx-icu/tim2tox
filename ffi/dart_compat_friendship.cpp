@@ -641,7 +641,7 @@ extern "C" {
         
         // Parse JSON handle friend add parameter
         std::string json_str = json_handle_friend_add_param;
-        V2TIM_LOG(kInfo, "[dart_compat] DartHandleFriendAddRequest: json_str='{}'", json_str);
+        V2TIM_LOG(kInfo, "[dart_compat] DartHandleFriendAddRequest: JSON payload length={}", json_str.size());
         fflush(stdout);
         
         // Try multiple possible field names (Dart SDK may use different names)
@@ -979,4 +979,3 @@ extern "C" {
     }
     
 } // extern "C"
-
