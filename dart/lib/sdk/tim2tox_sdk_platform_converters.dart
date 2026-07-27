@@ -493,6 +493,13 @@ extension Tim2ToxSdkPlatformConverters on Tim2ToxSdkPlatform {
     conv.unreadCount = fakeConv.unreadCount;
     conv.isPinned = fakeConv.isPinned;
 
+    final draft =
+        await ffiService.loadConversationDraft(fakeConv.conversationID);
+    if (draft != null) {
+      conv.draftText = draft.text;
+      conv.draftTimestamp = draft.timestamp;
+    }
+
     final peerId = fakeConv.isGroup
         ? fakeConv.conversationID.replaceFirst('group_', '')
         : fakeConv.conversationID.replaceFirst('c2c_', '');
