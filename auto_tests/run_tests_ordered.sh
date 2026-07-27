@@ -503,6 +503,9 @@ PHASE13_BINARY_REPLACEMENT=(
 
 PHASE14_UNIT=(
   "test/unit_tests/test_listeners.dart"
+  "test/unit_tests/ffi_chat_service_group_cleanup_test.dart"
+  "test/unit_tests/conversation_draft_persistence_test.dart"
+  "test/unit_tests/ffi_chat_service_scratch_test.dart"
 )
 
 # Initialize counters

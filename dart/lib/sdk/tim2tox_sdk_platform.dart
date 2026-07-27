@@ -91,15 +91,16 @@ import '../utils/message_converter.dart';
 import '../utils/tim2tox_failed_message_persistence.dart';
 import '../utils/conversation_id_utils.dart';
 import 'message_search.dart';
+import 'sound_file_name.dart';
 import 'package:tencent_cloud_chat_sdk/models/v2_tim_message_search_param.dart';
 import 'package:tencent_cloud_chat_sdk/models/v2_tim_message_search_result.dart';
 import 'package:tencent_cloud_chat_sdk/models/v2_tim_message_search_result_item.dart';
-import 'package:shared_preferences/shared_preferences.dart';
 import '../ffi/tim2tox_ffi.dart' as ffi_lib;
 import 'dart:ffi' as ffi;
 import 'package:ffi/ffi.dart' as pkgffi;
 import '../interfaces/event_bus_provider.dart';
 import '../interfaces/conversation_manager_provider.dart';
+import '../interfaces/draft_preferences_service.dart';
 import '../interfaces/extended_preferences_service.dart';
 import '../interfaces/event_bus.dart';
 import '../models/fake_models.dart';
@@ -119,6 +120,37 @@ import 'package:tencent_cloud_chat_sdk/native_im/bindings/native_imsdk_bindings_
     show GlobalCallbackType, TIMResult, TIMErrCode;
 import 'package:tencent_cloud_chat_sdk/native_im/tools.dart';
 import 'package:tim2tox_dart/service/toxav_service.dart';
+
+Future<void> _persistFailedSend({
+  required V2TimMessage message,
+  required String receiver,
+  required String groupID,
+  required String? accountToxId,
+}) async {
+  if (accountToxId == null || accountToxId.isEmpty) return;
+  final group = groupID.isNotEmpty ? groupID : null;
+  final user = group == null && receiver.isNotEmpty ? receiver : null;
+  if (group == null && user == null) return;
+
+  final msgID = message.msgID;
+  final id = message.id;
+  if ((msgID == null || msgID.isEmpty) && id != null && id.isNotEmpty) {
+    message.msgID = id;
+  } else if ((id == null || id.isEmpty) && msgID != null && msgID.isNotEmpty) {
+    message.id = msgID;
+  }
+  message.userID = user;
+  message.groupID = group;
+  message.isSelf = true;
+  message.status = MessageStatus.V2TIM_MSG_STATUS_SEND_FAIL;
+
+  await Tim2ToxFailedMessagePersistence.saveFailedMessage(
+    message: message,
+    userID: user,
+    groupID: group,
+    accountToxId: accountToxId,
+  );
+}
 
 /// Custom SDK Platform implementation that routes calls to tim2tox.
 ///
@@ -417,6 +449,7 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
       })>? _progressSubscription;
   StreamSubscription<String>? _avatarUpdatedSubscription;
   StreamSubscription<String>? _nicknameUpdatedSubscription;
+  StreamSubscription<ConversationDraft>? _conversationDraftSubscription;
   final Map<String, V2TimMessage> _progressMsgCache =
       {}; // msgID -> cached V2TimMessage for progress lookup
 
@@ -439,6 +472,8 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
     _setupMessageListener();
     // Setup conversation listener
     _setupConversationListener();
+    // Project durable draft changes into sparse conversation updates.
+    _setupConversationDraftListener();
     // Setup friendship listener
     _setupFriendshipListener();
     // Setup group listener
@@ -2276,6 +2311,39 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
     }
   }
 
+  Future<void> _persistFinalizedFailedMessage({
+    required V2TimMessage message,
+    required String receiver,
+    required String groupID,
+  }) {
+    return _persistFailedSend(
+      message: message,
+      receiver: receiver,
+      groupID: groupID,
+      accountToxId: ffiService.getSelfToxId(),
+    );
+  }
+
+  Future<void> _removeFailedMessagesByIDsForCurrentAccount(
+    Iterable<String> msgIDs,
+  ) async {
+    final ids = msgIDs.where((msgID) => msgID.isNotEmpty).toSet();
+    if (ids.isEmpty) return;
+    final accountToxId = ffiService.getSelfToxId();
+    if (accountToxId != null && accountToxId.isNotEmpty) {
+      await Tim2ToxFailedMessagePersistence.removeFailedMessagesByIDs(
+        messageIDs: ids,
+        accountToxId: accountToxId,
+      );
+    }
+    // Pre-account-scoping rows have no account suffix. Clean only that legacy
+    // base key in addition to the current full-ID key; never scan other keys.
+    await Tim2ToxFailedMessagePersistence.removeFailedMessagesByIDs(
+      messageIDs: ids,
+      accountToxId: null,
+    );
+  }
+
   /// Fill [members] faceUrl, nickName, and role from local prefs.
   /// Handles the case where the native layer returns the raw public key as nickName
   /// (a placeholder, not a real nickname) by detecting nickName == userID.
@@ -2444,6 +2512,21 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
         eventBus.on<FakeUnreadTotal>(EventTopics.unread).listen((unread) {
       _notifyConversationListeners((listener) {
         listener.onTotalUnreadMessageCountChanged?.call(unread.total);
+      });
+    });
+  }
+
+  void _setupConversationDraftListener() {
+    _conversationDraftSubscription?.cancel();
+    _conversationDraftSubscription =
+        ffiService.conversationDraftChanges.listen((draft) {
+      final conversation = V2TimConversation(
+        conversationID: draft.conversationID,
+        draftText: draft.text,
+        draftTimestamp: draft.timestamp,
+      );
+      _notifyConversationListeners((listener) {
+        listener.onConversationChanged?.call([conversation]);
       });
     });
   }
@@ -2677,6 +2760,7 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
     _progressSubscription?.cancel();
     _avatarUpdatedSubscription?.cancel();
     _nicknameUpdatedSubscription?.cancel();
+    _conversationDraftSubscription?.cancel();
     _friendStatusCheckTimer?.cancel();
     final soundScratchPaths = _soundScratchCleanupTimers.keys.toList();
     for (final timer in _soundScratchCleanupTimers.values) {
@@ -4271,12 +4355,19 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
     required String conversationID,
     String? draftText,
   }) async {
-    // Draft is stored locally
-    // For now, just return success
-    return V2TimCallback(
-      code: 0,
-      desc: 'success',
-    );
+    try {
+      await ffiService.setConversationDraft(
+        conversationID: conversationID,
+        draftText: draftText,
+      );
+      return V2TimCallback(code: 0, desc: 'success');
+    } catch (_) {
+      _log('[Tim2ToxSdkPlatform] Conversation draft persistence failed');
+      return V2TimCallback(
+        code: -1,
+        desc: 'setConversationDraft failed',
+      );
+    }
   }
 
   @override
@@ -5220,6 +5311,11 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
       if (provider == null) {
         print(
             '[Tim2ToxSdkPlatform] sendMessage failed: ChatMessageProvider is not available');
+        await _persistFinalizedFailedMessage(
+          message: messageToSend,
+          receiver: receiver,
+          groupID: groupID,
+        );
         return V2TimValueCallback<V2TimMessage>(
           code: -1,
           desc: 'ChatMessageProvider is not available',
@@ -5393,12 +5489,10 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
           Object? durationEncodeError;
           if (durationEncodeRequested) {
             try {
-              final originalName = soundPath.split('/').last;
-              final dotIdx = originalName.lastIndexOf('.');
-              final base =
-                  dotIdx > 0 ? originalName.substring(0, dotIdx) : originalName;
-              final ext = dotIdx > 0 ? originalName.substring(dotIdx) : '';
-              encodedName = '${base}__dur$soundDuration$ext';
+              encodedName = soundFileNameForPath(
+                soundPath,
+                durationMs: soundDuration,
+              );
               final srcFile = File(soundPath);
               if (await srcFile.exists()) {
                 final tmpPath = await ffiService.copyFileToScratch(
@@ -5438,6 +5532,11 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
               // ignore: avoid_print
               print(msg);
             }
+            await _persistFinalizedFailedMessage(
+              message: messageToSend,
+              receiver: receiver,
+              groupID: groupID,
+            );
             return V2TimValueCallback<V2TimMessage>(
               code: -1,
               desc:
@@ -5450,7 +5549,8 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
             userID: userID,
             groupID: groupID.isNotEmpty ? groupID : null,
             filePath: pathToSend,
-            fileName: encodedName ?? pathToSend.split('/').last,
+            fileName: encodedName ??
+                soundFileNameForPath(pathToSend, durationMs: 0),
           );
           if (_debugLog)
             print('[Tim2ToxSdkPlatform] Sound message sent successfully');
@@ -5542,6 +5642,11 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
         } else {
           print(
               '[Tim2ToxSdkPlatform] sendMessage failed: Unsupported message type: ${messageToSend.elemType}');
+          await _persistFinalizedFailedMessage(
+            message: messageToSend,
+            receiver: receiver,
+            groupID: groupID,
+          );
           return V2TimValueCallback<V2TimMessage>(
             code: -1,
             desc: 'Unsupported message type: ${messageToSend.elemType}',
@@ -5671,6 +5776,11 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
               '[Tim2ToxSdkPlatform] sendMessage exception stack trace: $stackTrace');
         // Update message status to SEND_FAIL
         messageToSend.status = MessageStatus.V2TIM_MSG_STATUS_SEND_FAIL;
+        await _persistFinalizedFailedMessage(
+          message: messageToSend,
+          receiver: receiver,
+          groupID: groupID,
+        );
 
         await _setFaceUrlForMsg(messageToSend);
 
@@ -5708,18 +5818,43 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
         print(
             '[Tim2ToxSdkPlatform] sendMessage outer exception stack trace: $stackTrace');
       }
-      // H-L: outer-catch path — when failure happens before we found
-      // `messageToSend` (e.g. provider lookup, registry missing), we don't
-      // have a V2TimMessage to flip to FAIL. Try to recover one from
-      // _forwardMessageCache by `id` so the bubble doesn't get stuck in
-      // SENDING. If unrecoverable, return a non-null `data` with status
-      // marked FAIL so UIKit can route status updates correctly.
-      V2TimMessage failedMsg;
-      if (id != null && _forwardMessageCache.containsKey(id)) {
-        failedMsg = _forwardMessageCache[id]!;
-      } else {
-        failedMsg =
-            V2TimMessage(elemType: MessageElemType.V2TIM_ELEM_TYPE_TEXT);
+      // H-L: recover the optimistic UIKit message whenever possible so failed
+      // persistence retains its text/media payload. The outer catch cannot
+      // directly access the try block's `messageToSend` local.
+      V2TimMessage? recoveredFailedMsg;
+      try {
+        if (id != null && id.isNotEmpty) {
+          recoveredFailedMsg = _forwardMessageCache[id];
+          if (recoveredFailedMsg == null) {
+            for (final messages in TencentCloudChat
+                .instance.dataInstance.messageData.messageListMap.values) {
+              for (final candidate in messages) {
+                if (candidate.id == id || candidate.msgID == id) {
+                  recoveredFailedMsg = candidate;
+                  break;
+                }
+              }
+              if (recoveredFailedMsg != null) break;
+            }
+          }
+        } else {
+          final targetID = groupID.isNotEmpty ? groupID : receiver;
+          for (final candidate in TencentCloudChat
+              .instance.dataInstance.messageData
+              .getMessageList(key: targetID)) {
+            if (candidate.status == MessageStatus.V2TIM_MSG_STATUS_SENDING &&
+                candidate.isSelf == true) {
+              recoveredFailedMsg = candidate;
+              break;
+            }
+          }
+        }
+      } catch (_) {
+        // The original exception may have come from UIKit state access.
+      }
+      final failedMsg = recoveredFailedMsg ??
+          V2TimMessage(elemType: MessageElemType.V2TIM_ELEM_TYPE_TEXT);
+      if (recoveredFailedMsg == null) {
         failedMsg.msgID = id;
         failedMsg.id = id;
       }
@@ -5733,6 +5868,11 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
         failedMsg.sender = ffiService.selfId;
       }
       failedMsg.status = MessageStatus.V2TIM_MSG_STATUS_SEND_FAIL;
+      await _persistFinalizedFailedMessage(
+        message: failedMsg,
+        receiver: receiver,
+        groupID: groupID,
+      );
       await _setFaceUrlForMsg(failedMsg);
       try {
         _notifyAdvancedMsgListeners((listener) {
@@ -6195,61 +6335,28 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
         );
       }
 
-      // We don't know which conversation contains the failed entry up
-      // front, so we walk through prefs and search every conversation
-      // bucket. This is acceptable because failed-message storage is
-      // small in practice.
-      final prefs = await SharedPreferences.getInstance();
-      // Reuse the persistence helper's keying logic by listing all
-      // candidate keys directly: we can't enumerate the
-      // accountToxId here, so we attempt the legacy (un-suffixed) key
-      // first and any current account key suffix.
-      // Practical approach: iterate over all keys that start with the
-      // persistence prefix.
-      final allKeys = prefs.getKeys();
-      String? matchedConvKey;
-      Map<String, dynamic>? entry;
-      String? accountToxIdForRemoval;
-      for (final key in allKeys) {
-        if (!key.startsWith('tencent_cloud_chat_failed_messages')) continue;
-        final raw = prefs.getString(key);
-        if (raw == null || raw.isEmpty) continue;
-        try {
-          final decoded = json.decode(raw);
-          if (decoded is! Map) continue;
-          for (final convEntry in decoded.entries) {
-            final convList = convEntry.value;
-            if (convList is! List) continue;
-            for (final mEntry in convList) {
-              if (mEntry is! Map) continue;
-              if (mEntry['msgID'] == msgID || mEntry['id'] == msgID) {
-                entry = Map<String, dynamic>.from(mEntry);
-                matchedConvKey = convEntry.key as String;
-                // Recover the per-account suffix (if any) so we can call
-                // removeFailedMessage with the right scope. Suffix is
-                // everything after `<persistenceKey>_`.
-                const base = 'tencent_cloud_chat_failed_messages';
-                if (key.length > base.length + 1 &&
-                    key.startsWith('${base}_')) {
-                  accountToxIdForRemoval = key.substring(base.length + 1);
-                }
-                break;
-              }
-            }
-            if (entry != null) break;
-          }
-        } catch (_) {
-          continue;
-        }
-        if (entry != null) break;
+      final accountToxId = ffiService.getSelfToxId();
+      if (accountToxId == null || accountToxId.isEmpty) {
+        return V2TimValueCallback<V2TimMessage>(
+          code: -1,
+          desc: 'reSendMessage: current account identity is unavailable',
+        );
       }
+      final stored =
+          await Tim2ToxFailedMessagePersistence.findFailedMessageByID(
+        messageID: msgID,
+        accountToxId: accountToxId,
+      );
 
-      if (entry == null || matchedConvKey == null) {
+      if (stored == null) {
         return V2TimValueCallback<V2TimMessage>(
           code: -1,
           desc: 'reSendMessage: failed message not found for msgID=$msgID',
         );
       }
+
+      final matchedConvKey = stored.conversationKey;
+      final entry = stored.messageData;
 
       // Decide userID/groupID. The persisted `userID`/`groupID` fields
       // are authoritative when present; the conversation key is a useful
@@ -6276,6 +6383,11 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
       }
 
       // Rebuild a V2TimMessage from the entry.
+      final storedID = entry['id'] as String?;
+      final storedMsgID = entry['msgID'] as String?;
+      final rebuiltID = storedID == null || storedID.isEmpty ? msgID : storedID;
+      final realMsgID =
+          storedMsgID == null || storedMsgID.isEmpty ? msgID : storedMsgID;
       final mediaKind = entry['mediaKind'] as String?;
       final text = entry['text'] as String? ?? '';
       final filePath = entry['filePath'] as String?;
@@ -6308,8 +6420,8 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
       }
 
       final rebuilt = V2TimMessage(elemType: elemType);
-      rebuilt.msgID = msgID;
-      rebuilt.id = msgID;
+      rebuilt.msgID = realMsgID;
+      rebuilt.id = rebuiltID;
       rebuilt.isSelf = entry['isSelf'] as bool? ?? true;
       rebuilt.timestamp = DateTime.now().millisecondsSinceEpoch ~/ 1000;
       rebuilt.status = MessageStatus.V2TIM_MSG_STATUS_SENDING;
@@ -6399,9 +6511,11 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
       // H-A: drop the old failed entry from history BEFORE we kick off the
       // new send. Otherwise the user sees two bubbles (the original failed
       // one and the new sending/successful one) until manual cleanup. Done
-      // best-effort: a failure here must not block the resend.
+      // best-effort: a failure here must not block the resend. Call the service
+      // directly so the durable failed row remains until the send succeeds;
+      // platform.deleteMessages also removes failed persistence.
       try {
-        await deleteMessages(msgIDs: [msgID]);
+        await ffiService.deleteMessages([realMsgID]);
       } catch (e) {
         if (_debugLog) {
           print(
@@ -6416,16 +6530,29 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
         receiver: userID ?? '',
         groupID: groupID ?? '',
       );
+      // sendMessage normalizes ordinary successful sends to id == msgID for
+      // UIKit deduplication. A resend must retain the persisted local id and
+      // wire msgID as distinct identifiers for subsequent retries/lookups.
+      if (result.data != null) {
+        result.data!.id = rebuiltID;
+        result.data!.msgID = realMsgID;
+      }
 
       if (result.code == 0) {
         // Remove from failed persistence on success.
         try {
           await Tim2ToxFailedMessagePersistence.removeFailedMessage(
-            messageID: msgID,
+            messageID: realMsgID,
             userID: userID,
             groupID: groupID,
-            accountToxId: accountToxIdForRemoval,
+            accountToxId: stored.accountToxId,
           );
+          if (stored.accountToxId != null) {
+            await Tim2ToxFailedMessagePersistence.removeFailedMessagesByIDs(
+              messageIDs: {realMsgID},
+              accountToxId: null,
+            );
+          }
         } catch (_) {
           // Non-fatal: the message is sent; failure to clean up is just
           // a stale entry.
@@ -6458,6 +6585,7 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
 
       // Delete messages via FfiChatService
       await ffiService.deleteMessages(msgIDs);
+      await _removeFailedMessagesByIDsForCurrentAccount(msgIDs);
 
       return V2TimCallback(
         code: 0,
