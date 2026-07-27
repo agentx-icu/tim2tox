@@ -4,32 +4,106 @@ import 'dart:typed_data';
 import 'package:path/path.dart' as p;
 
 import '../interfaces/scratch_file_service.dart';
+import 'scratch_fallback_file_operations.dart';
+
+export 'scratch_fallback_file_operations.dart'
+    show
+        ScratchFallbackFileOperations,
+        ScratchFallbackStagingFileReserver,
+        ScratchFallbackStagingNameBuilder;
+
+final class _LocalScratchFallbackFileOperations
+    implements ScratchFallbackFileOperations {
+  const _LocalScratchFallbackFileOperations();
+
+  @override
+  Future<void> writeBytes(File destination, Uint8List bytes) async {
+    final output = await destination.open(mode: FileMode.writeOnly);
+    try {
+      await output.writeFrom(bytes);
+      await output.flush();
+    } finally {
+      await output.close();
+    }
+  }
+
+  @override
+  Future<void> copyFile(File source, File destination) async {
+    final input = await source.open();
+    try {
+      final output = await destination.open(mode: FileMode.writeOnly);
+      try {
+        while (true) {
+          final chunk = await input.read(64 * 1024);
+          if (chunk.isEmpty) break;
+          await output.writeFrom(chunk);
+        }
+        await output.flush();
+      } finally {
+        await output.close();
+      }
+    } finally {
+      await input.close();
+    }
+  }
+}
 
 /// Validates and tracks scratch files created for Tim2Tox helper operations.
 ///
-/// When the host does not inject a [ScratchFileService], files are isolated
-/// below `Directory.systemTemp/toxee_tim2tox_scratch`. Only paths returned by
-/// this manager can be deleted through it.
+/// Without an injected owner, files are isolated below the exact fallback
+/// `Directory.systemTemp/toxee_tim2tox_scratch`. Only paths returned by this
+/// manager can be deleted through it.
 final class ScratchFileManager {
-  ScratchFileManager({ScratchFileService? scratchFileService})
-      : _scratchFileService = scratchFileService;
+  ScratchFileManager({
+    ScratchFileService? scratchFileService,
+    Directory? fallbackRootDirectory,
+    ScratchFallbackFileOperations? fallbackOperations,
+    ScratchFallbackStagingFileReserver? fallbackStagingFileReserver,
+  })  : _scratchFileService = scratchFileService,
+        _fallbackRootDirectory = fallbackRootDirectory ??
+            Directory(
+              p.join(Directory.systemTemp.path, fallbackDirectoryName),
+            ),
+        _fallbackOperations =
+            fallbackOperations ?? const _LocalScratchFallbackFileOperations(),
+        _fallbackStagingFileReserver =
+            fallbackStagingFileReserver ?? ScratchFallbackStagingFileReserver();
 
   static const String fallbackDirectoryName = 'toxee_tim2tox_scratch';
 
-  final ScratchFileService? _scratchFileService;
+  ScratchFileService? _scratchFileService;
+  final Directory _fallbackRootDirectory;
+  final ScratchFallbackFileOperations _fallbackOperations;
+  final ScratchFallbackStagingFileReserver _fallbackStagingFileReserver;
   final Set<String> _trackedPaths = <String>{};
   final Map<String, Future<void>> _pendingDeletes = <String, Future<void>>{};
+  bool _scratchOperationStarted = false;
   bool _disposed = false;
+  String? _canonicalFallbackRoot;
 
-  String get _fallbackRoot =>
-      p.join(Directory.systemTemp.path, fallbackDirectoryName);
+  /// Installs a host owner for account services created before account paths
+  /// were available. Constructor injection remains preferred.
+  void installScratchFileService(ScratchFileService service) {
+    _ensureActive();
+    if (_scratchOperationStarted) {
+      throw StateError(
+        'Scratch owner cannot be installed after scratch use has started.',
+      );
+    }
+    final current = _scratchFileService;
+    if (current != null) {
+      if (identical(current, service)) return;
+      throw StateError('A different scratch owner is already installed.');
+    }
+    _scratchFileService = service;
+  }
 
   Future<String> writeBytesToScratch(
     Uint8List bytes, {
     required String category,
     required String suggestedFileName,
   }) async {
-    _ensureActive();
+    _beginScratchOperation();
     _validateSegments(category, suggestedFileName);
     final owner = _scratchFileService;
     final result = owner != null
@@ -51,7 +125,7 @@ final class ScratchFileManager {
     required String category,
     required String suggestedFileName,
   }) async {
-    _ensureActive();
+    _beginScratchOperation();
     _validateSegments(category, suggestedFileName);
     final owner = _scratchFileService;
     final result = owner != null
@@ -73,7 +147,7 @@ final class ScratchFileManager {
   }
 
   Future<void> deleteScratchFile(String path) async {
-    _ensureActive();
+    _beginScratchOperation();
     final normalized = _normalizeAbsolute(path);
     if (!_trackedPaths.contains(normalized)) {
       throw ArgumentError('Only tracked scratch files may be deleted.');
@@ -99,6 +173,11 @@ final class ScratchFileManager {
     if (_disposed) {
       throw StateError('Scratch file manager has been disposed.');
     }
+  }
+
+  void _beginScratchOperation() {
+    _ensureActive();
+    _scratchOperationStarted = true;
   }
 
   static void _validateSegments(String category, String suggestedFileName) {
@@ -139,9 +218,8 @@ final class ScratchFileManager {
       }
     }
     if (sourcePath != null) {
-      final normalizedSource = _normalizeAbsolute(
-        File(sourcePath).absolute.path,
-      );
+      final normalizedSource =
+          _normalizeAbsolute(File(sourcePath).absolute.path);
       if (p.equals(normalized, normalizedSource)) {
         throw StateError('Scratch owner returned the source file.');
       }
@@ -161,9 +239,72 @@ final class ScratchFileManager {
   }
 
   Future<Directory> _createFallbackItemDirectory(String category) async {
-    final categoryDirectory = Directory(p.join(_fallbackRoot, category));
-    await categoryDirectory.create(recursive: true);
-    return categoryDirectory.createTemp('item_');
+    final rootParent = _fallbackRootDirectory.parent;
+    final canonicalParent =
+        p.normalize(await rootParent.resolveSymbolicLinks());
+    final canonicalRoot = await _ensureOwnedDirectory(
+      _fallbackRootDirectory,
+      canonicalParent: canonicalParent,
+    );
+    _canonicalFallbackRoot = canonicalRoot;
+    final categoryDirectory = Directory(p.join(canonicalRoot, category));
+    final canonicalCategory = await _ensureOwnedDirectory(
+      categoryDirectory,
+      canonicalParent: canonicalRoot,
+    );
+
+    // Both directories were resolved and containment-proven before this call.
+    final itemDirectory =
+        await Directory(canonicalCategory).createTemp('item_');
+    final itemType = await FileSystemEntity.type(
+      itemDirectory.path,
+      followLinks: false,
+    );
+    if (itemType != FileSystemEntityType.directory) {
+      throw StateError('Fallback scratch item is not a real directory.');
+    }
+    final canonicalItem = p.normalize(
+      await itemDirectory.resolveSymbolicLinks(),
+    );
+    if (!p.isWithin(canonicalCategory, canonicalItem)) {
+      await _deleteDirectoryBestEffort(itemDirectory);
+      throw StateError('Fallback scratch item escaped its category.');
+    }
+    return Directory(canonicalItem);
+  }
+
+  static Future<String> _ensureOwnedDirectory(
+    Directory directory, {
+    required String canonicalParent,
+  }) async {
+    final typeBefore = await FileSystemEntity.type(
+      directory.path,
+      followLinks: false,
+    );
+    if (typeBefore == FileSystemEntityType.link) {
+      throw StateError('Fallback scratch directory must not be a symlink.');
+    }
+    if (typeBefore == FileSystemEntityType.notFound) {
+      await directory.create();
+    } else if (typeBefore != FileSystemEntityType.directory) {
+      throw StateError('Fallback scratch path must be a directory.');
+    }
+
+    final typeAfter = await FileSystemEntity.type(
+      directory.path,
+      followLinks: false,
+    );
+    if (typeAfter != FileSystemEntityType.directory) {
+      throw StateError('Fallback scratch directory changed unexpectedly.');
+    }
+    final canonicalDirectory = p.normalize(
+      await directory.resolveSymbolicLinks(),
+    );
+    if (!p.isWithin(canonicalParent, canonicalDirectory) ||
+        !p.equals(p.dirname(canonicalDirectory), canonicalParent)) {
+      throw StateError('Fallback scratch directory escaped its parent.');
+    }
+    return canonicalDirectory;
   }
 
   Future<String> _writeBytesToFallback(
@@ -172,14 +313,11 @@ final class ScratchFileManager {
     required String suggestedFileName,
   }) async {
     final itemDirectory = await _createFallbackItemDirectory(category);
-    final target = p.join(itemDirectory.path, suggestedFileName);
-    try {
-      await File(target).writeAsBytes(bytes, flush: true);
-      return target;
-    } on Object {
-      await _deleteDirectoryBestEffort(itemDirectory);
-      rethrow;
-    }
+    return _stageAndCommitFallbackFile(
+      itemDirectory,
+      suggestedFileName,
+      (staging) => _fallbackOperations.writeBytes(staging, bytes),
+    );
   }
 
   Future<String> _copyFileToFallback(
@@ -192,11 +330,37 @@ final class ScratchFileManager {
       throw const FileSystemException('Scratch source file does not exist.');
     }
     final itemDirectory = await _createFallbackItemDirectory(category);
-    final target = p.join(itemDirectory.path, suggestedFileName);
+    return _stageAndCommitFallbackFile(
+      itemDirectory,
+      suggestedFileName,
+      (staging) => _fallbackOperations.copyFile(source, staging),
+    );
+  }
+
+  Future<String> _stageAndCommitFallbackFile(
+    Directory itemDirectory,
+    String suggestedFileName,
+    Future<void> Function(File staging) populate,
+  ) async {
+    File? staging;
+    final target = File(p.join(itemDirectory.path, suggestedFileName));
     try {
-      await source.copy(target);
-      return target;
+      staging = await _fallbackStagingFileReserver.reserve(itemDirectory);
+      await populate(staging);
+      final stagingType = await FileSystemEntity.type(
+        staging.path,
+        followLinks: false,
+      );
+      if (stagingType != FileSystemEntityType.file) {
+        throw StateError('Fallback staging path is not a regular file.');
+      }
+      await staging.rename(target.path);
+      return target.path;
     } on Object {
+      if (staging != null) {
+        await _deleteEntityBestEffort(staging.path);
+      }
+      await _deleteEntityBestEffort(target.path);
       await _deleteDirectoryBestEffort(itemDirectory);
       rethrow;
     }
@@ -228,7 +392,10 @@ final class ScratchFileManager {
       return;
     }
 
-    final root = p.normalize(_fallbackRoot);
+    final root = _canonicalFallbackRoot;
+    if (root == null) {
+      throw StateError('Fallback scratch root was not initialized.');
+    }
     if (!p.isWithin(root, normalizedPath)) {
       throw StateError('Fallback scratch path escaped its owned directory.');
     }
@@ -245,6 +412,19 @@ final class ScratchFileManager {
       if (await directory.exists()) await directory.delete();
     } on FileSystemException {
       // Leave non-empty or concurrently used directories intact.
+    }
+  }
+
+  static Future<void> _deleteEntityBestEffort(String path) async {
+    try {
+      final type = await FileSystemEntity.type(path, followLinks: false);
+      if (type == FileSystemEntityType.file) {
+        await File(path).delete();
+      } else if (type == FileSystemEntityType.link) {
+        await Link(path).delete();
+      }
+    } on FileSystemException {
+      // Failure cleanup must not mask the original write/copy error.
     }
   }
 }

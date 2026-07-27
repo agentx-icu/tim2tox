@@ -21,6 +21,7 @@ export 'sdk/tim2tox_sdk_platform.dart';
 // Interfaces
 export 'interfaces/preferences_service.dart';
 export 'interfaces/extended_preferences_service.dart';
+export 'interfaces/draft_preferences_service.dart';
 export 'interfaces/logger_service.dart';
 export 'interfaces/bootstrap_service.dart';
 export 'interfaces/event_bus.dart';
