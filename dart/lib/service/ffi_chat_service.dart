@@ -11,6 +11,7 @@ import '../ffi/tim2tox_ffi.dart';
 import '../models/chat_message.dart';
 import '../interfaces/preferences_service.dart';
 import '../interfaces/extended_preferences_service.dart';
+import '../interfaces/draft_preferences_service.dart';
 import '../interfaces/logger_service.dart';
 import '../interfaces/bootstrap_service.dart';
 import '../interfaces/scratch_file_service.dart';
@@ -439,6 +440,10 @@ class AddFriendResult {
   bool get isSuccess => dispatched && resultCode == 0;
 }
 
+DraftPreferencesService? _draftServiceFrom(Object? value) {
+  return value is DraftPreferencesService ? value : null;
+}
+
 class FfiChatService {
   // Static counter for msgID sequence to ensure uniqueness
   static int _msgIDSequence = 0;
@@ -475,6 +480,7 @@ class FfiChatService {
 
   FfiChatService({
     ExtendedPreferencesService? preferencesService,
+    DraftPreferencesService? draftPreferencesService,
     LoggerService? loggerService,
     BootstrapService? bootstrapService,
     MessageHistoryPersistence? messageHistoryPersistence,
@@ -487,6 +493,8 @@ class FfiChatService {
     ScratchFileService? scratchFileService,
   })  : _ffi = Tim2ToxFfi.open(),
         _prefs = preferencesService,
+        _draftPrefs =
+            draftPreferencesService ?? _draftServiceFrom(preferencesService),
         _logger = loggerService,
         _bootstrap = bootstrapService,
         // X11: forward the injected logger so the no-historyDirectory
@@ -534,6 +542,7 @@ class FfiChatService {
 
   final Tim2ToxFfi _ffi;
   final ExtendedPreferencesService? _prefs;
+  final DraftPreferencesService? _draftPrefs;
   final LoggerService? _logger;
   final BootstrapService? _bootstrap;
   final MessageHistoryPersistence _messageHistoryPersistence;
@@ -585,6 +594,12 @@ class FfiChatService {
   /// Get the offline message queue persistence service
   OfflineMessageQueuePersistence get offlineMessageQueuePersistence =>
       _offlineQueuePersistence;
+
+  /// Installs the account scratch owner for a service created before account
+  /// paths were available. Must be called before the first scratch operation.
+  void installScratchFileService(ScratchFileService service) {
+    _scratchFiles.installScratchFileService(service);
+  }
 
   /// Writes short-lived helper bytes through the host's scratch owner, or an
   /// isolated Tim2Tox fallback when no owner was injected.
@@ -770,6 +785,138 @@ class FfiChatService {
     } finally {
       pkgffi.malloc.free(buf);
     }
+  }
+
+  static final RegExp _fullToxIdPattern = RegExp(r'^[0-9a-fA-F]{76}$');
+  final StreamController<ConversationDraft> _conversationDraftChanges =
+      StreamController<ConversationDraft>.broadcast();
+  Future<void> _draftOperationTail = Future<void>.value();
+  bool _draftDisposing = false;
+
+  /// Whether this service has a durable draft storage capability.
+  bool get supportsConversationDrafts => _draftPrefs != null;
+
+  /// Draft changes emitted only after the corresponding storage mutation has
+  /// completed successfully. An empty [ConversationDraft.text] means removal.
+  Stream<ConversationDraft> get conversationDraftChanges =>
+      _conversationDraftChanges.stream;
+
+  String _resolveDraftAccountToxId() {
+    final accountToxId = getSelfToxId()?.trim();
+    if (accountToxId == null || !_fullToxIdPattern.hasMatch(accountToxId)) {
+      throw StateError(
+        'Conversation drafts require a full 76-character Tox account ID',
+      );
+    }
+    return accountToxId.toUpperCase();
+  }
+
+  String _validatedConversationID(String conversationID) {
+    final value = conversationID.trim();
+    if (value.isEmpty) {
+      throw ArgumentError.value(
+        conversationID,
+        'conversationID',
+        'must not be empty',
+      );
+    }
+    return value;
+  }
+
+  Future<T> _enqueueDraftOperation<T>(Future<T> Function() operation) {
+    final completer = Completer<T>();
+    _draftOperationTail = _draftOperationTail.then((_) async {
+      try {
+        completer.complete(await operation());
+      } catch (error, stackTrace) {
+        completer.completeError(error, stackTrace);
+      }
+    });
+    return completer.future;
+  }
+
+  /// Loads one durable draft after all previously submitted draft mutations.
+  Future<ConversationDraft?> loadConversationDraft(
+    String conversationID,
+  ) {
+    if (_draftDisposing) {
+      return Future<ConversationDraft?>.error(
+        StateError('FfiChatService is disposing'),
+      );
+    }
+    final draftPrefs = _draftPrefs;
+    if (draftPrefs == null) return Future<ConversationDraft?>.value();
+    final validatedConversationID = _validatedConversationID(conversationID);
+
+    return _enqueueDraftOperation(() async {
+      try {
+        final draft = await draftPrefs.loadConversationDraft(
+          accountToxId: _resolveDraftAccountToxId(),
+          conversationID: validatedConversationID,
+        );
+        if (draft == null || draft.text.isEmpty) {
+          return null;
+        }
+        if (draft.conversationID != validatedConversationID) {
+          throw StateError('Draft storage returned a mismatched conversation');
+        }
+        return draft;
+      } catch (_) {
+        _logger?.logWarning(
+          '[FfiChatService] Conversation draft load failed',
+        );
+        rethrow;
+      }
+    });
+  }
+
+  /// Persists or clears a draft and emits a change only after durable success.
+  Future<ConversationDraft> setConversationDraft({
+    required String conversationID,
+    String? draftText,
+  }) {
+    if (_draftDisposing) {
+      return Future<ConversationDraft>.error(
+        StateError('FfiChatService is disposing'),
+      );
+    }
+    final draftPrefs = _draftPrefs;
+    if (draftPrefs == null) {
+      return Future<ConversationDraft>.error(
+        StateError('Conversation draft persistence is unavailable'),
+      );
+    }
+    final validatedConversationID = _validatedConversationID(conversationID);
+
+    return _enqueueDraftOperation(() async {
+      final change = ConversationDraft(
+        conversationID: validatedConversationID,
+        text: draftText ?? '',
+        timestamp: DateTime.now().millisecondsSinceEpoch ~/ 1000,
+      );
+      try {
+        final accountToxId = _resolveDraftAccountToxId();
+        if (change.text.isEmpty) {
+          await draftPrefs.removeConversationDraft(
+            accountToxId: accountToxId,
+            conversationID: validatedConversationID,
+          );
+        } else {
+          await draftPrefs.saveConversationDraft(
+            accountToxId: accountToxId,
+            draft: change,
+          );
+        }
+        _conversationDraftChanges.add(change);
+        _logger?.log('[FfiChatService] Conversation draft persisted');
+        return change;
+      } catch (_) {
+        _logger?.logWarning(
+          '[FfiChatService] Conversation draft persistence failed',
+        );
+        rethrow;
+      }
+    });
   }
 
   Stream<ChatMessage> get messages => _messages.stream;
@@ -1061,8 +1208,8 @@ class FfiChatService {
     return _offlineQueuePersistence.getMessages(peerId);
   }
 
-  void _addToOfflineQueue(String peerId, OfflineMessageItem item) {
-    _offlineQueuePersistence.addMessage(peerId, item);
+  Future<void> _addToOfflineQueue(String peerId, OfflineMessageItem item) {
+    return _offlineQueuePersistence.addMessage(peerId, item);
   }
 
   /// True if history [row] is the optimistic pending row that offline queue
@@ -1088,8 +1235,8 @@ class FfiChatService {
         '[FfiChatService] _clearOfflineQueue: EXIT - Removed offline messages for peerId=$peerId');
   }
 
-  Future<void> _clearAllOfflineQueue() async {
-    await _offlineQueuePersistence.clearQueue();
+  Future<void> _clearGroupOfflineQueue(String groupId) {
+    return _clearOfflineQueue(_groupOfflineQueueKey(groupId));
   }
 
   /// Returns true if [messageFilePath] (e.g. temp path like /tmp/receiving_foo.txt in history)
@@ -4051,13 +4198,10 @@ class FfiChatService {
   ///
   /// SCOPE (deliberate, documented): it is NOT sent over Tox (`_ffi.sendText`
   /// carries plain text only — the peer never sees the quote). Both the C2C and
-  /// GROUP offline paths now persist it on the pending bubble IN-SESSION
-  /// (`_queueOfflineText`/`_queueOfflineGroupText` thread `cloudCustomData` into
-  /// the pending ChatMessage; the drain flips that same row to delivered). The
-  /// durable OfflineMessageItem queue entry is still text-only for both, so a
-  /// restart BEFORE reconnect drains as plain text — a pre-existing offline-
-  /// queue-schema gap (tracked follow-up). The over-the-wire delivery is also
-  /// out of scope for this sender-side persistence fix.
+  /// GROUP offline paths now persist it on both the pending bubble and the
+  /// durable OfflineMessageItem; the drain flips that same row to delivered.
+  /// The over-the-wire delivery is still out of scope for this sender-side
+  /// persistence fix.
   Future<void> sendText(String peerId, String text,
       {String? cloudCustomData}) async {
     await sendTextWithResult(
@@ -4183,7 +4327,7 @@ class FfiChatService {
     final msgID = clientMessageID != null && clientMessageID.isNotEmpty
         ? clientMessageID
         : '${now.millisecondsSinceEpoch}_${_msgIDSequence++}_$_selfId';
-    _addToOfflineQueue(normalizedPeerId, (
+    await _addToOfflineQueue(normalizedPeerId, (
       kind: 'text',
       text: text,
       filePath: null,
@@ -4202,15 +4346,15 @@ class FfiChatService {
       msgID: msgID,
       // Reply/forward quote (sender-side persistence). Carried even while the
       // peer is offline so the local quote bubble survives reload; copyWith on
-      // drain (`_drainTextItem`) preserves it. The queue also persists it for
-      // local history reconstruction after restart; it is still not sent over
-      // the current text-only Tox wire format.
+      // drain (`_drainTextItem`) preserves it. The offline queue item also
+      // carries it now, so the sender-side quote survives a restart before
+      // reconnect. The quote is still not sent over Tox; documented S18
+      // limitation.
       cloudCustomData: cloudCustomData,
     );
     _lastByPeer[normalizedPeerId] = msg;
     _appendHistory(normalizedPeerId, msg);
     _messages.add(msg);
-    await _saveOfflineQueue();
     return msg;
   }
 
@@ -4227,7 +4371,7 @@ class FfiChatService {
     final timestamp = now.millisecondsSinceEpoch;
     final sequence = _msgIDSequence++;
     final msgID = '${timestamp}_${sequence}_$_selfId';
-    _addToOfflineQueue(normalizedPeerId, (
+    await _addToOfflineQueue(normalizedPeerId, (
       kind: 'file',
       text: '',
       filePath: filePath,
@@ -4253,7 +4397,6 @@ class FfiChatService {
     _lastByPeer[normalizedPeerId] = msg;
     _appendHistory(normalizedPeerId, msg);
     _messages.add(msg);
-    await _saveOfflineQueue();
   }
 
   Future<void> updateSelfProfile(
@@ -5872,7 +6015,7 @@ class FfiChatService {
 
       // Clear offline message queue for this group
       print('[FfiChatService] quitGroup: Clearing offline message queue');
-      await _clearOfflineQueue(groupId);
+      await _clearGroupOfflineQueue(groupId);
       print('[FfiChatService] quitGroup: Offline message queue cleared');
 
       print(
@@ -5939,7 +6082,7 @@ class FfiChatService {
       // Clear offline message queue for this group
       print(
           '[FfiChatService] cleanupGroupState: Clearing offline message queue');
-      await _clearOfflineQueue(groupId);
+      await _clearGroupOfflineQueue(groupId);
       print(
           '[FfiChatService] cleanupGroupState: Offline message queue cleared');
 
@@ -6344,7 +6487,7 @@ class FfiChatService {
     final msgID = clientMessageID != null && clientMessageID.isNotEmpty
         ? clientMessageID
         : '${now.millisecondsSinceEpoch}_${_msgIDSequence++}_${_selfId}_$groupId';
-    _addToOfflineQueue(storageKey, (
+    await _addToOfflineQueue(storageKey, (
       kind: 'text',
       text: text,
       filePath: null,
@@ -6362,15 +6505,13 @@ class FfiChatService {
       isPending: true,
       msgID: msgID,
       // Persist the armed reply/forward metadata on the pending bubble so it
-      // survives in-session (drain flips this same row to delivered, keeping
-      // it). Parity with the C2C offline path. The durable queue item carries
-      // the same local metadata across restart, while the wire remains text-only.
+      // survives restart before reconnect (drain flips this same row to
+      // delivered, keeping it). Parity with the C2C offline path.
       cloudCustomData: cloudCustomData,
     );
     _lastByPeer[groupId] = msg;
     _appendHistory(groupId, msg);
     _messages.add(msg);
-    await _saveOfflineQueue();
     return msg;
   }
 
@@ -6493,7 +6634,6 @@ class FfiChatService {
         await _offlineQueuePersistence.removeItem(storageKey, item);
       }
     }
-    await _saveOfflineQueue();
   }
 
   Future<void> _drainAllPendingGroupMessages() async {
@@ -7896,13 +8036,6 @@ class FfiChatService {
     }
   }
 
-  // Save offline message queue to disk (delegate to persistence service)
-  Future<void> _saveOfflineQueue() async {
-    // Build queue map from persistence service cache
-    final queue = _offlineQueuePersistence.cache;
-    await _offlineQueuePersistence.saveQueue(queue);
-  }
-
   // Load offline message queue from disk (delegate to persistence service).
   // Queue persists across restart; drain runs on the next online transition.
   Future<void> _loadOfflineQueue() async {
@@ -8242,6 +8375,7 @@ class FfiChatService {
     //   4. Finally clear caches and tear down FFI / streams.
 
     // 1. Stop new work.
+    _draftDisposing = true;
     if (_globalService == this) {
       _globalService = null;
     }
@@ -8270,19 +8404,19 @@ class FfiChatService {
 
     // 2. Flush pending debounced history writes. By this point no new
     // appendHistory should arrive, so the snapshot the flush takes is final.
-    // M5: save the offline queue here too — it must run BEFORE `_ffi.uninit()`
-    // and BEFORE stream controllers close, while the queue persistence is
-    // still in a usable state.
+    // Offline queue mutations are durable at their add/remove boundary; wait
+    // for any already-submitted mutation instead of issuing a redundant save.
     try {
       await _messageHistoryPersistence.flushPendingSaves();
     } catch (_) {
       // Best-effort: don't block dispose on a single conversation's save error.
     }
     try {
-      await _saveOfflineQueue();
+      await _offlineQueuePersistence.flushPendingMutations();
     } catch (_) {
-      // Best-effort: don't block dispose if the queue save fails.
+      // Best-effort: don't block dispose if a queue mutation fails.
     }
+    await _draftOperationTail;
 
     // 3. Switch persistence into disposed mode. After this, any late call
     // into _scheduleDebouncedSave (defensive — should not happen given step 1)
@@ -8337,5 +8471,6 @@ class FfiChatService {
     await _reactionCtrl.close();
     await _avatarUpdatedCtrl.close();
     await _nicknameUpdatedCtrl.close();
+    await _conversationDraftChanges.close();
   }
 }
