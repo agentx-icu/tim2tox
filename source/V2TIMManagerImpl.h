@@ -177,44 +177,59 @@ public:
     // Save Tox profile to disk (call after friend list changes to persist state)
     void SaveToxProfile();
     
-    // Upper bound for how long RunOnEventThread will block waiting on the event
-    // thread before giving up and returning a default-constructed R. Generous so
-    // legitimately slow tox API calls still complete, but finite so a stopped /
-    // never-draining event thread (e.g. after UnInitSDK) can't hang the caller.
+    // Upper bound for how long RunOnEventThread will block waiting for the event
+    // thread to start queued work. If the task is still pending at timeout it is
+    // cancelled before f() can run; once f() is running the caller waits for the
+    // real result so side-effecting calls cannot execute after a false failure.
     static constexpr std::chrono::seconds kRunOnEventThreadTimeout{10};
 
     /** Run a function on the event thread (tox iterate loop). Use to avoid deadlock when calling tox API from another thread.
      *  If already on the event thread, runs f() inline to avoid self-deadlock.
      *  In test_mode there is no event thread; we execute inline so the caller
      *  doesn't deadlock waiting on a future no one will fulfil.
-     *  If the event thread is not running we also run inline as a best-effort fallback;
-     *  if it stops while we wait, the bounded wait returns a default R rather than hanging. */
+     *  If the event thread is not running we also run inline as a best-effort fallback.
+     *  Queued calls time out only while still pending; running work is waited on so the
+     *  caller observes the real value or exception. */
     template<typename R>
     R RunOnEventThread(std::function<R()> f) {
+        enum class RunOnEventThreadTaskState { pending, running, completed, cancelled };
+
         if (std::this_thread::get_id() == event_thread_id_) {
-            return f();
+            return f.operator()();
         }
         if (test_mode_.load(std::memory_order_acquire)) {
-            return f();
+            return f.operator()();
         }
         // If the event thread isn't running (e.g. during/after UnInitSDK, where
         // the loop break()s without draining task_queue_), enqueue-and-block would
-        // hang forever. Run f() inline as a best-effort fallback instead — same
+        // hang forever. Run inline as a best-effort fallback instead — same
         // approach as the same-thread / test_mode_ short-circuits above.
         if (!running_.load(std::memory_order_acquire)) {
-            return f();
+            return f.operator()();
         }
+        auto state = std::make_shared<std::atomic<RunOnEventThreadTaskState>>(RunOnEventThreadTaskState::pending);
         auto promise = std::make_shared<std::promise<R>>();
         auto future = promise->get_future();
-        std::function<void()> task = [f, promise]() {
+        std::function<void()> task = [f, promise, state]() {
+            auto pending = RunOnEventThreadTaskState::pending;
+            if (!state->compare_exchange_strong(
+                    pending,
+                    RunOnEventThreadTaskState::running,
+                    std::memory_order_acq_rel,
+                    std::memory_order_acquire)) {
+                return;
+            }
             try {
                 if constexpr (std::is_void_v<R>) {
                     f();
                     promise->set_value();
+                    state->store(RunOnEventThreadTaskState::completed, std::memory_order_release);
                 } else {
                     promise->set_value(f());
+                    state->store(RunOnEventThreadTaskState::completed, std::memory_order_release);
                 }
             } catch (...) {
+                state->store(RunOnEventThreadTaskState::completed, std::memory_order_release);
                 promise->set_exception(std::current_exception());
             }
         };
@@ -223,28 +238,28 @@ public:
             task_queue_.push(task);
         }
         task_cv_.notify_one();
-        // Bounded wait: if the event thread is stopped after we enqueued (or never
-        // drains), future.get() would block forever. Wait with a generous timeout
-        // and return a default-constructed R so the caller unblocks instead.
-        //
-        // CONTRACT: on timeout a non-void caller gets a default-constructed R that
-        // is indistinguishable from a real default result. The enqueued tox call
-        // is effectively lost (the task may still run later, harmlessly, since it
-        // holds its own ref to the promise). Typed callers that need to tell a
-        // timeout apart from a genuine empty/false result MUST carry their own
-        // success signal — e.g. tim2tox_ffi_signaling_invite gates on
-        // `invite_id.Length() > 0 && callback.success`, so a timeout (empty id +
-        // OnSuccess never fired) is reported as failure. Log at error level: a
-        // 10s stall after we already observed `running_ == true` means the event
-        // thread is genuinely stuck and a native call was dropped.
+        // Bounded wait before the event thread starts the task. Timeout may cancel
+        // only a still-pending task. If the task already reached running/completed,
+        // wait for future.get() so callers receive the real value or exception and
+        // never report failure while a side-effecting tox call continues.
         if (future.wait_for(kRunOnEventThreadTimeout) != std::future_status::ready) {
-            V2TIM_LOG(kError, "[V2TIMManagerImpl::RunOnEventThread] Timed out after {}s waiting for event thread; the tox call was dropped and a default value is being returned",
-                      (long long)kRunOnEventThreadTimeout.count());
-            if constexpr (std::is_void_v<R>) {
-                return;
-            } else {
-                return R{};
+            auto pending = RunOnEventThreadTaskState::pending;
+            if (state->compare_exchange_strong(
+                    pending,
+                    RunOnEventThreadTaskState::cancelled,
+                    std::memory_order_acq_rel,
+                    std::memory_order_acquire)) {
+                V2TIM_LOG(kError, "[V2TIMManagerImpl::RunOnEventThread] Timed out after {}s waiting for event thread to start task; pending work was cancelled before execution and a default value is being returned",
+                          (long long)kRunOnEventThreadTimeout.count());
+                if constexpr (std::is_void_v<R>) {
+                    return;
+                } else {
+                    return R{};
+                }
             }
+            V2TIM_LOG(kError, "[V2TIMManagerImpl::RunOnEventThread] Timed out after {}s, but event-thread work is already running/completed; waiting for the real result",
+                      (long long)kRunOnEventThreadTimeout.count());
+            return future.get();
         }
         return future.get();
     }

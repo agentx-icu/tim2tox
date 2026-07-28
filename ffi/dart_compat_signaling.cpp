@@ -1,10 +1,25 @@
 // Signaling Functions
 // Extracted from dart_compat_layer.cpp for modularization
 #include "dart_compat_internal.h"
+#include "dart_send_message_contract.h"
+#include "V2TIMManagerImpl.h"
 
-// Static storage for invite_id strings (to avoid use-after-free)
-static std::map<std::string, std::string> g_invite_id_storage;
-static std::mutex g_invite_id_storage_mutex;
+namespace {
+
+const char* StoreDartInviteReturnId(std::string invite_id) {
+    thread_local std::string stored_invite_id;
+    stored_invite_id = std::move(invite_id);
+    return stored_invite_id.empty() ? nullptr : stored_invite_id.c_str();
+}
+
+void SendNoTerminalCallbackFailure(void* user_data, const char* operation) {
+    V2TIM_LOG(kError, "[dart_compat] {} returned without terminal callback", operation);
+    if (user_data) {
+        SendApiCallbackResult(user_data, V2TIMErrorCode::ERR_SDK_INTERNAL_ERROR, "Signaling operation returned without terminal callback");
+    }
+}
+
+}
 
 extern "C" {
     // ============================================================================
@@ -14,8 +29,7 @@ extern "C" {
     // DartInvite: Invite user for signaling
     // Signature: Pointer<Char> DartInvite(Pointer<Char> invitee, Pointer<Char> data, Bool online_user_only, Pointer<Char> json_offline_push_info, Int timeout, Pointer<Char> invite_id_buffer, Pointer<Void> user_data)
     const char* DartInvite(const char* invitee, const char* data, bool online_user_only, const char* json_offline_push_info, int timeout, const char* invite_id_buffer, void* user_data) {
-        V2TIM_LOG(kInfo, "[dart_compat] DartInvite: invitee={}, timeout={}",
-                  invitee ? invitee : "null", timeout);
+        V2TIM_LOG(kInfo, "[dart_compat] DartInvite: timeout={}", timeout);
         fflush(stdout);
         
         if (!invitee) {
@@ -52,53 +66,49 @@ extern "C" {
             // For now, use default offline push info
         }
         
-        // Create callback to handle async result
         class DartInviteCallback : public V2TIMCallback {
         public:
             void* user_data_;
-            std::string invite_id_;
-            bool success_;
+            std::atomic<bool> success_;
+            TerminalCallbackGate terminal_gate_;
             
             DartInviteCallback(void* user_data) : user_data_(user_data), success_(false) {}
             
             void OnSuccess() override {
-                success_ = true;
-                // invite_id_ is set by the Invite call
-                std::string user_data_str = UserDataToString(user_data_);
-                if (!user_data_str.empty() && !invite_id_.empty()) {
-                    std::ostringstream json;
-                    json << "{\"invite_id\":\"" << EscapeJsonString(invite_id_) << "\"}";
-                    SendApiCallbackResult(user_data_, 0, "", json.str());
+                if (terminal_gate_.TryComplete()) {
+                    success_.store(true, std::memory_order_release);
                 }
             }
             
             void OnError(int error_code, const V2TIMString& error_message) override {
-                success_ = false;
+                if (!terminal_gate_.TryComplete()) return;
                 std::string error_msg = error_message.CString();
                 SendApiCallbackResult(user_data_, error_code, error_msg);
             }
+
+            auto success() const -> bool { return success_.load(std::memory_order_acquire); }
+            uint32_t terminal_attempt_count() const { return terminal_gate_.attempt_count(); }
         };
         
-        DartInviteCallback* callback = new DartInviteCallback(user_data);
-        
-        // Call Invite (synchronous call that returns invite_id immediately; may run on event thread)
-        V2TIMString invite_id = signaling_mgr->Invite(invitee_str, data_str, online_user_only, offline_push, timeout, callback);
+        std::shared_ptr<DartInviteCallback> callback = std::make_shared<DartInviteCallback>(user_data);
+        auto* manager_impl = static_cast<V2TIMManagerImpl*>(manager);
+        V2TIMString invite_id = manager_impl->RunOnEventThread<V2TIMString>([signaling_mgr, invitee_str, data_str,
+                                                                             online_user_only, offline_push, timeout,
+                                                                             callback]() -> V2TIMString {
+            return signaling_mgr->Invite(invitee_str, data_str, online_user_only, offline_push, timeout, callback.get());
+        });
         
         std::string invite_id_str = invite_id.CString();
         
-        // Send apiCallback so Dart completer completes. OnSuccess() in callback never sets invite_id_
-        // so it does not send; we send here after Invite() returns with the actual invite_id.
-        if (user_data && !invite_id_str.empty()) {
+        if (user_data && callback->success() && !invite_id_str.empty()) {
             std::ostringstream json;
             json << "{\"invite_id\":\"" << EscapeJsonString(invite_id_str) << "\"}";
             SendApiCallbackResult(user_data, 0, "", json.str());
         }
-        
-        // Store invite_id in static storage to avoid use-after-free
-        std::string storage_key = std::to_string(reinterpret_cast<uintptr_t>(user_data)) + "_" + std::to_string(time(nullptr));
-        {
-            std::lock_guard<std::mutex> lock(g_invite_id_storage_mutex);
-            g_invite_id_storage[storage_key] = invite_id_str;
+        if (callback->terminal_attempt_count() == 0) {
+            if (callback->terminal_gate_.TryComplete()) {
+                SendNoTerminalCallbackFailure(user_data, "DartInvite");
+            }
         }
         
         // Copy to buffer if provided
@@ -107,20 +117,13 @@ extern "C" {
             // This is a limitation - we'll return the stored string pointer instead
         }
         
-        // Return pointer to stored string
-        if (!invite_id_str.empty()) {
-            std::lock_guard<std::mutex> lock(g_invite_id_storage_mutex);
-            return g_invite_id_storage[storage_key].c_str();
-        }
-        
-        return nullptr;
+        return StoreDartInviteReturnId(invite_id_str);
     }
     
     // DartInviteInGroup: Invite users in group for signaling
     // Signature: Pointer<Char> DartInviteInGroup(Pointer<Char> group_id, Pointer<Char> json_invitee_array, Pointer<Char> data, Bool online_user_only, Int timeout, Pointer<Char> invite_id_buffer, Pointer<Void> user_data)
     const char* DartInviteInGroup(const char* group_id, const char* json_invitee_array, const char* data, bool online_user_only, int timeout, const char* invite_id_buffer, void* user_data) {
-        V2TIM_LOG(kInfo, "[dart_compat] DartInviteInGroup: group_id={}, timeout={}",
-                  group_id ? group_id : "null", timeout);
+        V2TIM_LOG(kInfo, "[dart_compat] DartInviteInGroup: timeout={}", timeout);
         fflush(stdout);
         
         if (!group_id || !json_invitee_array) {
@@ -201,65 +204,54 @@ extern "C" {
             return nullptr;
         }
         
-        // Create callback to handle async result
         class DartInviteInGroupCallback : public V2TIMCallback {
         public:
             void* user_data_;
-            std::string invite_id_;
             bool success_;
+            TerminalCallbackGate terminal_gate_;
             
             DartInviteInGroupCallback(void* user_data) : user_data_(user_data), success_(false) {}
             
             void OnSuccess() override {
-                success_ = true;
-                std::string user_data_str = UserDataToString(user_data_);
-                if (!user_data_str.empty() && !invite_id_.empty()) {
-                    std::ostringstream json;
-                    json << "{\"invite_id\":\"" << EscapeJsonString(invite_id_) << "\"}";
-                    SendApiCallbackResult(user_data_, 0, "", json.str());
+                if (terminal_gate_.TryComplete()) {
+                    success_ = true;
                 }
             }
             
             void OnError(int error_code, const V2TIMString& error_message) override {
-                success_ = false;
+                if (!terminal_gate_.TryComplete()) return;
                 std::string error_msg = error_message.CString();
                 SendApiCallbackResult(user_data_, error_code, error_msg);
             }
+
+            bool success() const { return success_; }
+            uint32_t terminal_attempt_count() const { return terminal_gate_.attempt_count(); }
         };
         
-        DartInviteInGroupCallback* callback = new DartInviteInGroupCallback(user_data);
+        DartInviteInGroupCallback callback(user_data);
         
         // Call InviteInGroup (synchronous call that returns invite_id immediately)
-        V2TIMString invite_id = signaling_mgr->InviteInGroup(group_id_str, invitee_vec, data_str, online_user_only, timeout, callback);
+        V2TIMString invite_id = signaling_mgr->InviteInGroup(group_id_str, invitee_vec, data_str, online_user_only, timeout, &callback);
         
         std::string invite_id_str = invite_id.CString();
         
-        // Store invite_id in static storage
-        std::string storage_key = std::to_string(reinterpret_cast<uintptr_t>(user_data)) + "_" + std::to_string(time(nullptr));
-        {
-            std::lock_guard<std::mutex> lock(g_invite_id_storage_mutex);
-            g_invite_id_storage[storage_key] = invite_id_str;
-        }
-        
         // Always send callback to Dart so adapter's completer completes (group invite returns empty invite_id)
-        if (user_data && callback->success_) {
+        if (user_data && callback.success()) {
             std::ostringstream json;
             json << "{\"invite_id\":\"" << EscapeJsonString(invite_id_str) << "\"}";
             SendApiCallbackResult(user_data, 0, "", json.str());
         }
-        
-        if (!invite_id_str.empty()) {
-            std::lock_guard<std::mutex> lock(g_invite_id_storage_mutex);
-            return g_invite_id_storage[storage_key].c_str();
+        if (callback.terminal_attempt_count() == 0) {
+            SendNoTerminalCallbackFailure(user_data, "DartInviteInGroup");
         }
         
-        return nullptr;
+        return StoreDartInviteReturnId(invite_id_str);
     }
     
     // DartCancel: Cancel signaling invitation
     // Signature: int DartCancel(Pointer<Char> invite_id, Pointer<Char> data, Pointer<Void> user_data)
     int DartCancel(const char* invite_id, const char* data, void* user_data) {
-        V2TIM_LOG(kInfo, "[dart_compat] DartCancel: invite_id={}", invite_id ? invite_id : "null");
+        V2TIM_LOG(kInfo, "[dart_compat] DartCancel");
         
         if (!invite_id) {
             if (user_data) {
@@ -290,21 +282,30 @@ extern "C" {
         class DartCancelCallback : public V2TIMCallback {
         public:
             void* user_data_;
+            TerminalCallbackGate terminal_gate_;
             
             DartCancelCallback(void* user_data) : user_data_(user_data) {}
             
             void OnSuccess() override {
+                if (!terminal_gate_.TryComplete()) return;
                 SendApiCallbackResult(user_data_, 0, "");
             }
             
             void OnError(int error_code, const V2TIMString& error_message) override {
+                if (!terminal_gate_.TryComplete()) return;
                 std::string error_msg = error_message.CString();
                 SendApiCallbackResult(user_data_, error_code, error_msg);
             }
+
+            uint32_t terminal_attempt_count() const { return terminal_gate_.attempt_count(); }
         };
         
-        DartCancelCallback* callback = new DartCancelCallback(user_data);
-        signaling_mgr->Cancel(invite_id_str, data_str, callback);
+        DartCancelCallback callback(user_data);
+        signaling_mgr->Cancel(invite_id_str, data_str, &callback);
+        if (callback.terminal_attempt_count() == 0) {
+            SendNoTerminalCallbackFailure(user_data, "DartCancel");
+            return V2TIMErrorCode::ERR_SDK_INTERNAL_ERROR;
+        }
         
         return 0; // TIM_SUCC (request accepted)
     }
@@ -312,7 +313,7 @@ extern "C" {
     // DartAccept: Accept signaling invitation
     // Signature: int DartAccept(Pointer<Char> invite_id, Pointer<Char> data, Pointer<Void> user_data)
     int DartAccept(const char* invite_id, const char* data, void* user_data) {
-        V2TIM_LOG(kInfo, "[dart_compat] DartAccept: invite_id={}", invite_id ? invite_id : "null");
+        V2TIM_LOG(kInfo, "[dart_compat] DartAccept");
         
         if (!invite_id) {
             if (user_data) {
@@ -343,21 +344,30 @@ extern "C" {
         class DartAcceptCallback : public V2TIMCallback {
         public:
             void* user_data_;
+            TerminalCallbackGate terminal_gate_;
             
             DartAcceptCallback(void* user_data) : user_data_(user_data) {}
             
             void OnSuccess() override {
+                if (!terminal_gate_.TryComplete()) return;
                 SendApiCallbackResult(user_data_, 0, "");
             }
             
             void OnError(int error_code, const V2TIMString& error_message) override {
+                if (!terminal_gate_.TryComplete()) return;
                 std::string error_msg = error_message.CString();
                 SendApiCallbackResult(user_data_, error_code, error_msg);
             }
+
+            uint32_t terminal_attempt_count() const { return terminal_gate_.attempt_count(); }
         };
         
-        DartAcceptCallback* callback = new DartAcceptCallback(user_data);
-        signaling_mgr->Accept(invite_id_str, data_str, callback);
+        DartAcceptCallback callback(user_data);
+        signaling_mgr->Accept(invite_id_str, data_str, &callback);
+        if (callback.terminal_attempt_count() == 0) {
+            SendNoTerminalCallbackFailure(user_data, "DartAccept");
+            return V2TIMErrorCode::ERR_SDK_INTERNAL_ERROR;
+        }
         
         return 0; // TIM_SUCC (request accepted)
     }
@@ -365,7 +375,7 @@ extern "C" {
     // DartReject: Reject signaling invitation
     // Signature: int DartReject(Pointer<Char> invite_id, Pointer<Char> data, Pointer<Void> user_data)
     int DartReject(const char* invite_id, const char* data, void* user_data) {
-        V2TIM_LOG(kInfo, "[dart_compat] DartReject: invite_id={}", invite_id ? invite_id : "null");
+        V2TIM_LOG(kInfo, "[dart_compat] DartReject");
         
         if (!invite_id) {
             if (user_data) {
@@ -396,21 +406,30 @@ extern "C" {
         class DartRejectCallback : public V2TIMCallback {
         public:
             void* user_data_;
+            TerminalCallbackGate terminal_gate_;
             
             DartRejectCallback(void* user_data) : user_data_(user_data) {}
             
             void OnSuccess() override {
+                if (!terminal_gate_.TryComplete()) return;
                 SendApiCallbackResult(user_data_, 0, "");
             }
             
             void OnError(int error_code, const V2TIMString& error_message) override {
+                if (!terminal_gate_.TryComplete()) return;
                 std::string error_msg = error_message.CString();
                 SendApiCallbackResult(user_data_, error_code, error_msg);
             }
+
+            uint32_t terminal_attempt_count() const { return terminal_gate_.attempt_count(); }
         };
         
-        DartRejectCallback* callback = new DartRejectCallback(user_data);
-        signaling_mgr->Reject(invite_id_str, data_str, callback);
+        DartRejectCallback callback(user_data);
+        signaling_mgr->Reject(invite_id_str, data_str, &callback);
+        if (callback.terminal_attempt_count() == 0) {
+            SendNoTerminalCallbackFailure(user_data, "DartReject");
+            return V2TIMErrorCode::ERR_SDK_INTERNAL_ERROR;
+        }
         
         return 0; // TIM_SUCC (request accepted)
     }
@@ -463,17 +482,19 @@ extern "C" {
             return V2TIMErrorCode::ERR_INVALID_PARAMETERS;
         }
         
-        // Find message by ID (async operation)
+        // Find message by ID. The current FindMessages implementation completes inline.
         // We need to use FindMessages to get the message, then call GetSignalingInfo
         class DartGetSignalingInfoCallback : public V2TIMValueCallback<V2TIMMessageVector> {
         public:
             void* user_data_;
             V2TIMSignalingManager* signaling_mgr_;
+            TerminalCallbackGate terminal_gate_;
             
             DartGetSignalingInfoCallback(void* user_data, V2TIMSignalingManager* signaling_mgr) 
                 : user_data_(user_data), signaling_mgr_(signaling_mgr) {}
             
             void OnSuccess(const V2TIMMessageVector& messages) override {
+                if (!terminal_gate_.TryComplete()) return;
                 if (messages.Size() == 0) {
                     SendApiCallbackResult(user_data_, V2TIMErrorCode::ERR_INVALID_PARAMETERS, "Message not found");
                     return;
@@ -504,17 +525,24 @@ extern "C" {
             }
             
             void OnError(int error_code, const V2TIMString& error_message) override {
+                if (!terminal_gate_.TryComplete()) return;
                 std::string error_msg = error_message.CString();
                 SendApiCallbackResult(user_data_, error_code, error_msg);
             }
+
+            uint32_t terminal_attempt_count() const { return terminal_gate_.attempt_count(); }
         };
         
         // Find message by ID using V2TIMStringVector
         V2TIMStringVector message_id_vector;
         message_id_vector.PushBack(V2TIMString(msg_id.c_str()));
         
-        DartGetSignalingInfoCallback* callback = new DartGetSignalingInfoCallback(user_data, signaling_mgr);
-        manager->GetMessageManager()->FindMessages(message_id_vector, callback);
+        DartGetSignalingInfoCallback callback(user_data, signaling_mgr);
+        manager->GetMessageManager()->FindMessages(message_id_vector, &callback);
+        if (callback.terminal_attempt_count() == 0) {
+            SendNoTerminalCallbackFailure(user_data, "DartGetSignalingInfo");
+            return V2TIMErrorCode::ERR_SDK_INTERNAL_ERROR;
+        }
         
         return 0; // TIM_SUCC (request accepted)
     }
@@ -522,7 +550,7 @@ extern "C" {
     // DartModifyInvitation: Modify signaling invitation
     // Signature: int DartModifyInvitation(Pointer<Char> invite_id, Pointer<Char> data, Pointer<Void> user_data)
     int DartModifyInvitation(const char* invite_id, const char* data, void* user_data) {
-        V2TIM_LOG(kInfo, "[dart_compat] DartModifyInvitation: invite_id={}", invite_id ? invite_id : "null");
+        V2TIM_LOG(kInfo, "[dart_compat] DartModifyInvitation");
         
         if (!invite_id) {
             if (user_data) {
@@ -553,24 +581,32 @@ extern "C" {
         class DartModifyInvitationCallback : public V2TIMCallback {
         public:
             void* user_data_;
+            TerminalCallbackGate terminal_gate_;
             
             DartModifyInvitationCallback(void* user_data) : user_data_(user_data) {}
             
             void OnSuccess() override {
+                if (!terminal_gate_.TryComplete()) return;
                 SendApiCallbackResult(user_data_, 0, "");
             }
             
             void OnError(int error_code, const V2TIMString& error_message) override {
+                if (!terminal_gate_.TryComplete()) return;
                 std::string error_msg = error_message.CString();
                 SendApiCallbackResult(user_data_, error_code, error_msg);
             }
+
+            uint32_t terminal_attempt_count() const { return terminal_gate_.attempt_count(); }
         };
         
-        DartModifyInvitationCallback* callback = new DartModifyInvitationCallback(user_data);
-        signaling_mgr->ModifyInvitation(invite_id_str, data_str, callback);
+        DartModifyInvitationCallback callback(user_data);
+        signaling_mgr->ModifyInvitation(invite_id_str, data_str, &callback);
+        if (callback.terminal_attempt_count() == 0) {
+            SendNoTerminalCallbackFailure(user_data, "DartModifyInvitation");
+            return V2TIMErrorCode::ERR_SDK_INTERNAL_ERROR;
+        }
         
         return 0; // TIM_SUCC (request accepted)
     }
     
 } // extern "C"
-
