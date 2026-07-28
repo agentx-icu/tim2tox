@@ -87,6 +87,9 @@ typedef _AvVideoBitrateChangedCallbackNative = ffi.Void Function(
 
 /// ToxAV Service for managing audio/video calls
 class ToxAVService implements CallAvBackend {
+  static const int _maxVideoDimension = 0xFFFF;
+  static const int _maxVideoStride = 0x7FFFFFFF;
+
   final Tim2ToxFfi _ffi;
   final LoggerService? _logger;
   bool _initialized = false;
@@ -127,8 +130,8 @@ class ToxAVService implements CallAvBackend {
 
       if (_instanceId != null && _instanceId! != 0) {
         _instanceServices[_instanceId!] = this;
-        _logger
-            ?.logDebug('[ToxAVService] Registered service for instance $_instanceId');
+        _logger?.logDebug(
+            '[ToxAVService] Registered service for instance $_instanceId');
       } else {
         // Default instance (backward compatibility)
         _globalService = this;
@@ -136,8 +139,8 @@ class ToxAVService implements CallAvBackend {
             '[ToxAVService] Registered as global service (default instance)');
       }
     } catch (e, st) {
-      _logger?.logError('[ToxAVService] Constructor: failed to get instance ID',
-          e, st);
+      _logger?.logError(
+          '[ToxAVService] Constructor: failed to get instance ID', e, st);
       // Fallback to global service
       _globalService = this;
     }
@@ -212,7 +215,8 @@ class ToxAVService implements CallAvBackend {
   /// Setup callbacks
   void _setupCallbacks() {
     final instanceId = _instanceId ?? 0;
-    _logger?.logDebug('[ToxAVService] _setupCallbacks() instanceId=$instanceId');
+    _logger
+        ?.logDebug('[ToxAVService] _setupCallbacks() instanceId=$instanceId');
 
     // Allocate memory for instance ID (will be passed as user_data).
     //
@@ -523,7 +527,8 @@ class ToxAVService implements CallAvBackend {
     _logger?.log(
         '[ToxAVService] startCall: friendNumber=$friendNumber audio=$audioBitRate video=$videoBitRate');
     if (!_initialized) {
-      _logger?.logDebug('[ToxAVService] startCall: not initialized, initializing…');
+      _logger?.logDebug(
+          '[ToxAVService] startCall: not initialized, initializing…');
       final initResult = await initialize();
       if (!initResult) {
         _logger?.logWarning('[ToxAVService] startCall: initialization failed');
@@ -535,7 +540,8 @@ class ToxAVService implements CallAvBackend {
         _ffi.getCurrentInstanceId(), friendNumber, audioBitRate, videoBitRate);
     final success = result == 1;
     if (success) {
-      _logger?.log('[ToxAVService] startCall succeeded: friendNumber=$friendNumber');
+      _logger?.log(
+          '[ToxAVService] startCall succeeded: friendNumber=$friendNumber');
     } else {
       _logger?.logWarning(
           '[ToxAVService] startCall failed: friendNumber=$friendNumber result=$result');
@@ -550,7 +556,8 @@ class ToxAVService implements CallAvBackend {
     _logger?.log(
         '[ToxAVService] answerCall: friendNumber=$friendNumber audio=$audioBitRate video=$videoBitRate');
     if (!_initialized) {
-      _logger?.logDebug('[ToxAVService] answerCall: not initialized, initializing…');
+      _logger?.logDebug(
+          '[ToxAVService] answerCall: not initialized, initializing…');
       final initResult = await initialize();
       if (!initResult) {
         _logger?.logWarning('[ToxAVService] answerCall: initialization failed');
@@ -562,7 +569,8 @@ class ToxAVService implements CallAvBackend {
         _ffi.getCurrentInstanceId(), friendNumber, audioBitRate, videoBitRate);
     final success = result == 1;
     if (success) {
-      _logger?.log('[ToxAVService] answerCall succeeded: friendNumber=$friendNumber');
+      _logger?.log(
+          '[ToxAVService] answerCall succeeded: friendNumber=$friendNumber');
     } else {
       _logger?.logWarning(
           '[ToxAVService] answerCall failed: friendNumber=$friendNumber result=$result');
@@ -597,8 +605,7 @@ class ToxAVService implements CallAvBackend {
     try {
       return ptr.toDartString();
     } catch (e, st) {
-      _logger?.logError(
-          '[ToxAVService] getUserIdByFriendNumber error', e, st);
+      _logger?.logError('[ToxAVService] getUserIdByFriendNumber error', e, st);
       return null;
     }
   }
@@ -627,6 +634,10 @@ class ToxAVService implements CallAvBackend {
   Future<bool> sendAudioFrame(int friendNumber, List<int> pcm, int sampleCount,
       int channels, int samplingRate) async {
     if (!_initialized) return false;
+    if (!_isValidOutboundAudioFrame(
+        pcm.length, sampleCount, channels, samplingRate)) {
+      return false;
+    }
 
     final pcmPtr = pkgffi.malloc<ffi.Int16>(pcm.length);
     try {
@@ -647,10 +658,39 @@ class ToxAVService implements CallAvBackend {
       List<int> y, List<int> u, List<int> v,
       {int yStride = 0, int uStride = 0, int vStride = 0}) async {
     if (!_initialized) return false;
+    if (!_isValidVideoDimensionForAbi(width) ||
+        !_isValidVideoDimensionForAbi(height)) {
+      return false;
+    }
+    if (yStride < 0 || uStride < 0 || vStride < 0) return false;
+    final resolvedYStride = yStride > 0 ? yStride : width;
+    final chromaWidth = width ~/ 2;
+    final resolvedUStride = uStride > 0 ? uStride : _defaultStride(chromaWidth);
+    final resolvedVStride = vStride > 0 ? vStride : _defaultStride(chromaWidth);
+    if (!_isValidVideoStrideForAbi(resolvedYStride) ||
+        !_isValidVideoStrideForAbi(resolvedUStride) ||
+        !_isValidVideoStrideForAbi(resolvedVStride)) {
+      return false;
+    }
+    if (!_isValidOutboundVideoFrame(
+      width: width,
+      height: height,
+      yLength: y.length,
+      uLength: u.length,
+      vLength: v.length,
+      yStride: resolvedYStride,
+      uStride: resolvedUStride,
+      vStride: resolvedVStride,
+    )) {
+      return false;
+    }
 
-    final yPtr = pkgffi.malloc<ffi.Uint8>(y.length);
-    final uPtr = pkgffi.malloc<ffi.Uint8>(u.length);
-    final vPtr = pkgffi.malloc<ffi.Uint8>(v.length);
+    final yAllocationLength = y.isEmpty ? 1 : y.length;
+    final uAllocationLength = u.isEmpty ? 1 : u.length;
+    final vAllocationLength = v.isEmpty ? 1 : v.length;
+    final yPtr = pkgffi.malloc<ffi.Uint8>(yAllocationLength);
+    final uPtr = pkgffi.malloc<ffi.Uint8>(uAllocationLength);
+    final vPtr = pkgffi.malloc<ffi.Uint8>(vAllocationLength);
 
     try {
       for (int i = 0; i < y.length; i++) {
@@ -671,9 +711,9 @@ class ToxAVService implements CallAvBackend {
         yPtr,
         uPtr,
         vPtr,
-        yStride > 0 ? yStride : width,
-        uStride > 0 ? uStride : width ~/ 2,
-        vStride > 0 ? vStride : width ~/ 2,
+        resolvedYStride,
+        resolvedUStride,
+        resolvedVStride,
       );
       return result == 1;
     } finally {
@@ -736,4 +776,79 @@ class ToxAVService implements CallAvBackend {
       return -1;
     }
   }
+
+  static bool _isValidOutboundAudioFrame(
+    int pcmLength,
+    int sampleCount,
+    int channels,
+    int samplingRate,
+  ) {
+    if (channels != 1 && channels != 2) return false;
+    if (!_isSupportedAudioSampleCount(sampleCount, samplingRate)) return false;
+    return sampleCount <= pcmLength ~/ channels;
+  }
+
+  static bool _isSupportedAudioSampleCount(
+    int sampleCount,
+    int samplingRate,
+  ) {
+    if (!_isSupportedAudioSamplingRate(samplingRate)) return false;
+    return sampleCount == samplingRate ~/ 400 ||
+        sampleCount == samplingRate ~/ 200 ||
+        sampleCount == samplingRate ~/ 100 ||
+        sampleCount == samplingRate ~/ 50 ||
+        sampleCount == samplingRate ~/ 25 ||
+        sampleCount == (samplingRate * 3) ~/ 50;
+  }
+
+  static bool _isSupportedAudioSamplingRate(int samplingRate) {
+    return samplingRate == 8000 ||
+        samplingRate == 12000 ||
+        samplingRate == 16000 ||
+        samplingRate == 24000 ||
+        samplingRate == 48000;
+  }
+
+  static bool _isValidOutboundVideoFrame({
+    required int width,
+    required int height,
+    required int yLength,
+    required int uLength,
+    required int vLength,
+    required int yStride,
+    required int uStride,
+    required int vStride,
+  }) {
+    if (width <= 0 || height <= 0) return false;
+    final chromaWidth = width ~/ 2;
+    final chromaHeight = height ~/ 2;
+    if (!_isValidPlaneSpan(yLength, width, height, yStride)) return false;
+    if (!_isValidPlaneSpan(uLength, chromaWidth, chromaHeight, uStride)) {
+      return false;
+    }
+    return _isValidPlaneSpan(vLength, chromaWidth, chromaHeight, vStride);
+  }
+
+  static bool _isValidVideoDimensionForAbi(int value) {
+    return value >= 1 && value <= _maxVideoDimension;
+  }
+
+  static bool _isValidVideoStrideForAbi(int value) {
+    return value >= 1 && value <= _maxVideoStride;
+  }
+
+  static bool _isValidPlaneSpan(
+    int length,
+    int rowWidth,
+    int height,
+    int stride,
+  ) {
+    if (rowWidth < 0 || height < 0) return false;
+    if (stride <= 0 || stride < rowWidth) return false;
+    if (rowWidth == 0 || height == 0) return true;
+    final lastRowOffset = stride * (height - 1);
+    return length >= lastRowOffset + rowWidth;
+  }
+
+  static int _defaultStride(int rowWidth) => rowWidth > 0 ? rowWidth : 1;
 }

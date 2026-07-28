@@ -11,6 +11,7 @@
 #include <string>
 #include <vector>
 #include <atomic>
+#include <memory>
 #include <mutex>
 #include <condition_variable>
 #include "ToxManager.h"
@@ -18,6 +19,7 @@
 #include "V2TIMManagerImpl.h"
 #include "V2TIMMessageManagerImpl.h"
 #include "V2TIMLog.h"
+#include "dart_send_message_contract.h"
 #include "irc_client_api.h"
 #include "V2TIMSignalingManager.h"
 #include "V2TIMSignalingManagerImpl.h"  // For CheckTimeouts() in iterate hook
@@ -2827,23 +2829,29 @@ void tim2tox_ffi_signaling_remove_listener(void) {
 }
 
 int tim2tox_ffi_signaling_invite(const char* invitee, const char* data, int online_user_only, int timeout, char* out_invite_id, int out_invite_id_len) {
-    V2TIM_LOG(kInfo, "[ffi] signaling_invite: called with invitee={}, data={}, timeout={}",
-              invitee ? invitee : "(null)", data ? data : "(null)", timeout);
+    const long long input_length = data ? (long long)std::strlen(data) : 0LL;
+    const bool has_target = invitee != nullptr;
+    const bool has_out_buffer = out_invite_id != nullptr;
+    const int buffer_length = out_invite_id_len;
+    V2TIM_LOG(kInfo, "[ffi] signaling_invite: called status=start timeout={} has_target={} input_length={} online_user_only={} has_out_buffer={} out_buffer_length={}",
+              timeout, has_target ? 1 : 0, input_length,
+              online_user_only != 0 ? 1 : 0, has_out_buffer ? 1 : 0, buffer_length);
 
     if (!IsCurrentInstanceInited()) {
-        V2TIM_LOG(kError, "[ffi] signaling_invite: current instance not inited");
+        V2TIM_LOG(kError, "[ffi] signaling_invite: status=not_initialized timeout={}", timeout);
         return 0;
     }
 
     if (!invitee || !out_invite_id || out_invite_id_len < 1) {
-        V2TIM_LOG(kError, "[ffi] signaling_invite: invalid parameters (invitee={}, out_invite_id={}, len={})",
-                  (void*)invitee, (void*)out_invite_id, out_invite_id_len);
+        V2TIM_LOG(kError, "[ffi] signaling_invite: status=invalid_parameters timeout={} has_target={} has_out_buffer={} out_buffer_length={}",
+                  timeout, has_target ? 1 : 0, has_out_buffer ? 1 : 0, buffer_length);
         return 0;
     }
 
-    auto* signaling_mgr = GetCurrentInstance()->GetSignalingManager();
+    auto* manager_impl = GetCurrentInstance();
+    auto* signaling_mgr = manager_impl->GetSignalingManager();
     if (!signaling_mgr) {
-        V2TIM_LOG(kError, "[ffi] signaling_invite: signaling manager is null");
+        V2TIM_LOG(kError, "[ffi] signaling_invite: status=no_signaling_manager timeout={}", timeout);
         return 0;
     }
     
@@ -2853,36 +2861,59 @@ int tim2tox_ffi_signaling_invite(const char* invitee, const char* data, int onli
     
     class CallbackImpl : public V2TIMCallback {
     public:
-        bool success = false;
-        int error_code = 0;
-        V2TIMString error_desc;
+        CallbackImpl() : success_(false) {}
+
         void OnSuccess() override {
-            success = true;
-            V2TIM_LOG(kInfo, "[ffi] signaling_invite: callback OnSuccess");
+            if (!terminal_gate_.TryComplete()) return;
+            success_.store(true, std::memory_order_release);
+            V2TIM_LOG(kInfo, "[ffi] signaling_invite: callback status=success");
         }
         void OnError(int code, const V2TIMString& desc) override {
-            success = false;
-            error_code = code;
-            error_desc = desc;
-            V2TIM_LOG(kError, "[ffi] signaling_invite: callback OnError code={}, desc={}", code, desc.CString());
+            (void)code;
+            (void)desc;
+            if (!terminal_gate_.TryComplete()) return;
+            success_.store(false, std::memory_order_release);
+            V2TIM_LOG(kError, "[ffi] signaling_invite: callback status=error");
         }
-    } callback;
 
-    V2TIM_LOG(kInfo, "[ffi] signaling_invite: calling signaling_mgr->Invite");
+        auto success() const -> bool { return success_.load(std::memory_order_acquire); }
+        std::uint32_t terminal_attempt_count() const { return terminal_gate_.attempt_count(); }
+        bool TryCompleteTimeout() { return terminal_gate_.TryComplete(); }
 
-    V2TIMString invite_id = signaling_mgr->Invite(invitee_str, data_str, online_user_only != 0, offline_push, timeout, &callback);
+    private:
+        std::atomic<bool> success_;
+        TerminalCallbackGate terminal_gate_;
+    };
 
-    V2TIM_LOG(kInfo, "[ffi] signaling_invite: Invite returned invite_id='{}' (length={}), callback.success={}",
-              invite_id.CString(), invite_id.Length(), callback.success ? 1 : 0);
+    auto callback = std::make_shared<CallbackImpl>();
+    V2TIM_LOG(kInfo, "[ffi] signaling_invite: status=dispatch timeout={}", timeout);
 
-    if (invite_id.Length() > 0 && callback.success) {
-        int len = std::min((int)invite_id.Length(), out_invite_id_len - 1);
+    V2TIMString invite_id = manager_impl->RunOnEventThread<V2TIMString>([signaling_mgr, invitee_str, data_str,
+                                                                         online_user_only, offline_push, timeout,
+                                                                         callback]() -> V2TIMString {
+        return signaling_mgr->Invite(invitee_str, data_str, online_user_only != 0, offline_push, timeout, callback.get());
+    });
+
+    int result_length = (int)invite_id.Length();
+    if (callback->terminal_attempt_count() == 0 && callback->TryCompleteTimeout()) {
+        V2TIM_LOG(kError, "[ffi] signaling_invite: callback status=no_terminal timeout={} result_length={}",
+                  timeout, result_length);
+    }
+
+    bool callback_succeeded = callback->success();
+    V2TIM_LOG(kInfo, "[ffi] signaling_invite: status=returned timeout={} result_length={} callback_succeeded={}",
+              timeout, result_length, callback_succeeded ? 1 : 0);
+
+    if (result_length > 0 && callback_succeeded) {
+        int len = std::min(result_length, out_invite_id_len - 1);
         memcpy(out_invite_id, invite_id.CString(), len);
         out_invite_id[len] = '\0';
-        V2TIM_LOG(kInfo, "[ffi] signaling_invite: success, returning invite_id='{}'", out_invite_id);
+        V2TIM_LOG(kInfo, "[ffi] signaling_invite: status=success timeout={} result_length={} copied_length={}",
+                  timeout, result_length, len);
         return 1;
     } else {
-        V2TIM_LOG(kError, "[ffi] signaling_invite: failed - invite_id empty or callback failed");
+        V2TIM_LOG(kError, "[ffi] signaling_invite: status=failure timeout={} result_length={} callback_succeeded={}",
+                  timeout, result_length, callback_succeeded ? 1 : 0);
     }
     return 0;
 }
@@ -3013,6 +3044,7 @@ extern "C" int tim2tox_ffi_av_backend_toxav(void) { return 1; }
 
 #ifdef BUILD_TOXAV
 
+extern "C++" {
 namespace {
     // AV callback storage per instance
     struct AVCallbacks {
@@ -3022,7 +3054,12 @@ namespace {
         tim2tox_av_video_receive_callback_t on_video_receive = nullptr;
         tim2tox_av_audio_bitrate_callback_t on_audio_bitrate = nullptr;
         tim2tox_av_video_bitrate_callback_t on_video_bitrate = nullptr;
-        void* user_data = nullptr;
+        void* on_call_user_data = nullptr;
+        void* on_call_state_user_data = nullptr;
+        void* on_audio_receive_user_data = nullptr;
+        void* on_video_receive_user_data = nullptr;
+        void* on_audio_bitrate_user_data = nullptr;
+        void* on_video_bitrate_user_data = nullptr;
     };
     
     // Map instance ID to callbacks (for multi-instance support)
@@ -3031,6 +3068,15 @@ namespace {
     
     // Track which instances have initialized ToxAV
     std::unordered_set<int64_t> g_av_initialized_instances;
+
+    struct PendingAVBitrateEvent {
+        bool is_video;
+        uint32_t friend_number;
+        uint32_t bit_rate;
+    };
+
+    std::unordered_map<int64_t, std::queue<PendingAVBitrateEvent>> g_pending_av_bitrate_events;
+    std::mutex g_av_bitrate_events_mutex;
     
     static AVCallbacks* GetCallbacksForInstance(int64_t instance_id) {
         if (instance_id == 0) instance_id = GetCurrentInstanceId();
@@ -3046,6 +3092,67 @@ namespace {
         int64_t instance_id = GetCurrentInstanceId();
         return GetCallbacksForInstance(instance_id);
     }
+
+    void EnqueueAVBitrateEvent(int64_t instance_id, bool is_video, uint32_t friend_number, uint32_t bit_rate) {
+        std::lock_guard<std::mutex> lock(g_av_bitrate_events_mutex);
+        g_pending_av_bitrate_events[instance_id].push(PendingAVBitrateEvent{is_video, friend_number, bit_rate});
+    }
+
+    std::vector<PendingAVBitrateEvent> TakePendingAVBitrateEvents(int64_t instance_id) {
+        std::vector<PendingAVBitrateEvent> events;
+        std::lock_guard<std::mutex> lock(g_av_bitrate_events_mutex);
+        auto it = g_pending_av_bitrate_events.find(instance_id);
+        if (it == g_pending_av_bitrate_events.end()) return events;
+
+        while (!it->second.empty()) {
+            events.push_back(it->second.front());
+            it->second.pop();
+        }
+        g_pending_av_bitrate_events.erase(it);
+        return events;
+    }
+
+    void ClearPendingAVBitrateEvents(int64_t instance_id) {
+        std::lock_guard<std::mutex> lock(g_av_bitrate_events_mutex);
+        g_pending_av_bitrate_events.erase(instance_id);
+    }
+
+    void DrainAVBitrateEvents(int64_t instance_id) {
+        std::vector<PendingAVBitrateEvent> events = TakePendingAVBitrateEvents(instance_id);
+        for (const PendingAVBitrateEvent& event : events) {
+            if (event.is_video) {
+                tim2tox_av_video_bitrate_callback_t video_callback = nullptr;
+                void* video_user_data = nullptr;
+                {
+                    std::lock_guard<std::mutex> lock(g_av_callbacks_mutex);
+                    auto callbacks_it = g_instance_av_callbacks.find(instance_id);
+                    if (callbacks_it != g_instance_av_callbacks.end() && callbacks_it->second.on_video_bitrate) {
+                        video_callback = callbacks_it->second.on_video_bitrate;
+                        video_user_data = callbacks_it->second.on_video_bitrate_user_data;
+                    }
+                }
+                if (video_callback) {
+                    video_callback(event.friend_number, event.bit_rate, video_user_data);
+                }
+            } else {
+                tim2tox_av_audio_bitrate_callback_t audio_callback = nullptr;
+                void* audio_user_data = nullptr;
+                {
+                    std::lock_guard<std::mutex> lock(g_av_callbacks_mutex);
+                    auto callbacks_it = g_instance_av_callbacks.find(instance_id);
+                    if (callbacks_it != g_instance_av_callbacks.end() && callbacks_it->second.on_audio_bitrate) {
+                        audio_callback = callbacks_it->second.on_audio_bitrate;
+                        audio_user_data = callbacks_it->second.on_audio_bitrate_user_data;
+                    }
+                }
+                if (audio_callback) {
+                    audio_callback(event.friend_number, event.bit_rate, audio_user_data);
+                }
+            }
+        }
+    }
+
+}
 }
 
 int tim2tox_ffi_av_initialize(int64_t instance_id) {
@@ -3090,62 +3197,92 @@ int tim2tox_ffi_av_initialize(int64_t instance_id) {
         // Set up callbacks (capture instance_id for routing)
         int64_t captured_instance_id = instance_id;
         av_mgr->setCallCallback([captured_instance_id](uint32_t friend_number, bool audio_enabled, bool video_enabled) {
-            V2TIM_LOG(kInfo, "[ffi] ToxAV on_call callback: instance_id={}, friend_number={}, audio={}, video={} (posting to Dart)",
-                      (long long)captured_instance_id, friend_number, audio_enabled ? 1 : 0, video_enabled ? 1 : 0);
-            std::map<std::string, std::string> fields;
-            fields["friend_number"] = std::to_string(friend_number);
-            fields["audio_enabled"] = audio_enabled ? "1" : "0";
-            fields["video_enabled"] = video_enabled ? "1" : "0";
-            std::string json_msg = BuildGlobalCallbackJson(GlobalCallbackType::ToxAVCall, fields, "", captured_instance_id);
-            SendCallbackToDart("globalCallback", json_msg, nullptr);
+            tim2tox_av_call_callback_t call_callback = nullptr;
+            void* call_user_data = nullptr;
+            {
+                std::lock_guard<std::mutex> lock(g_av_callbacks_mutex);
+                auto callbacks_it = g_instance_av_callbacks.find(captured_instance_id);
+                if (callbacks_it != g_instance_av_callbacks.end() && callbacks_it->second.on_call) {
+                    call_callback = callbacks_it->second.on_call;
+                    call_user_data = callbacks_it->second.on_call_user_data;
+                }
+            }
+            if (call_callback) {
+                call_callback(friend_number, audio_enabled ? 1 : 0, video_enabled ? 1 : 0, call_user_data);
+            } else {
+                V2TIM_LOG(kInfo, "[ffi] ToxAV on_call callback: instance_id={}, friend_number={}, audio={}, video={} (posting to Dart)",
+                          (long long)captured_instance_id, friend_number, audio_enabled ? 1 : 0, video_enabled ? 1 : 0);
+                std::map<std::string, std::string> fields;
+                fields["friend_number"] = std::to_string(friend_number);
+                fields["audio_enabled"] = audio_enabled ? "1" : "0";
+                fields["video_enabled"] = video_enabled ? "1" : "0";
+                std::string json_msg = BuildGlobalCallbackJson(GlobalCallbackType::ToxAVCall, fields, "", captured_instance_id);
+                SendCallbackToDart("globalCallback", json_msg, nullptr);
+            }
         });
         
         av_mgr->setCallStateCallback([captured_instance_id](uint32_t friend_number, uint32_t state) {
-            V2TIM_LOG(kInfo, "[ffi] ToxAV on_call_state callback: instance_id={}, friend_number={}, state={} (posting to Dart)",
-                      (long long)captured_instance_id, friend_number, state);
-            std::map<std::string, std::string> fields;
-            fields["friend_number"] = std::to_string(friend_number);
-            fields["state"] = std::to_string(state);
-            std::string json_msg = BuildGlobalCallbackJson(GlobalCallbackType::ToxAVCallState, fields, "", captured_instance_id);
-            SendCallbackToDart("globalCallback", json_msg, nullptr);
+            tim2tox_av_call_state_callback_t call_state_callback = nullptr;
+            void* call_state_user_data = nullptr;
+            {
+                std::lock_guard<std::mutex> lock(g_av_callbacks_mutex);
+                auto callbacks_it = g_instance_av_callbacks.find(captured_instance_id);
+                if (callbacks_it != g_instance_av_callbacks.end() && callbacks_it->second.on_call_state) {
+                    call_state_callback = callbacks_it->second.on_call_state;
+                    call_state_user_data = callbacks_it->second.on_call_state_user_data;
+                }
+            }
+            if (call_state_callback) {
+                call_state_callback(friend_number, state, call_state_user_data);
+            } else {
+                V2TIM_LOG(kInfo, "[ffi] ToxAV on_call_state callback: instance_id={}, friend_number={}, state={} (posting to Dart)",
+                          (long long)captured_instance_id, friend_number, state);
+                std::map<std::string, std::string> fields;
+                fields["friend_number"] = std::to_string(friend_number);
+                fields["state"] = std::to_string(state);
+                std::string json_msg = BuildGlobalCallbackJson(GlobalCallbackType::ToxAVCallState, fields, "", captured_instance_id);
+                SendCallbackToDart("globalCallback", json_msg, nullptr);
+            }
         });
         
         av_mgr->setAudioReceiveFrameCallback([captured_instance_id](uint32_t friend_number, const int16_t* pcm, size_t sample_count, uint8_t channels, uint32_t sampling_rate) {
-            std::lock_guard<std::mutex> lock(g_av_callbacks_mutex);
-            auto it = g_instance_av_callbacks.find(captured_instance_id);
-            if (it != g_instance_av_callbacks.end() && it->second.on_audio_receive) {
-                it->second.on_audio_receive(friend_number, pcm, sample_count, channels, sampling_rate, it->second.user_data);
+            tim2tox_av_audio_receive_callback_t audio_receive_callback = nullptr;
+            void* audio_receive_user_data = nullptr;
+            {
+                std::lock_guard<std::mutex> lock(g_av_callbacks_mutex);
+                auto it = g_instance_av_callbacks.find(captured_instance_id);
+                if (it != g_instance_av_callbacks.end() && it->second.on_audio_receive) {
+                    audio_receive_callback = it->second.on_audio_receive;
+                    audio_receive_user_data = it->second.on_audio_receive_user_data;
+                }
+            }
+            if (audio_receive_callback) {
+                audio_receive_callback(friend_number, pcm, sample_count, channels, sampling_rate, audio_receive_user_data);
             }
         });
         
         av_mgr->setVideoReceiveFrameCallback([captured_instance_id](uint32_t friend_number, uint16_t width, uint16_t height, const uint8_t* y, const uint8_t* u, const uint8_t* v) {
-            std::lock_guard<std::mutex> lock(g_av_callbacks_mutex);
-            auto it = g_instance_av_callbacks.find(captured_instance_id);
-            if (it != g_instance_av_callbacks.end() && it->second.on_video_receive) {
-                it->second.on_video_receive(friend_number, width, height, y, u, v, it->second.user_data);
+            tim2tox_av_video_receive_callback_t video_receive_callback = nullptr;
+            void* video_receive_user_data = nullptr;
+            {
+                std::lock_guard<std::mutex> lock(g_av_callbacks_mutex);
+                auto it = g_instance_av_callbacks.find(captured_instance_id);
+                if (it != g_instance_av_callbacks.end() && it->second.on_video_receive) {
+                    video_receive_callback = it->second.on_video_receive;
+                    video_receive_user_data = it->second.on_video_receive_user_data;
+                }
+            }
+            if (video_receive_callback) {
+                video_receive_callback(friend_number, width, height, y, u, v, video_receive_user_data);
             }
         });
 
-        // Bitrate-change suggestions from c-toxcore. These fire when the peer
-        // requests a different audio/video bit rate (e.g. on congestion or
-        // when audio/video is toggled). Dispatch via the same direct
-        // function-pointer pattern as the receive callbacks — we do NOT want
-        // these queued through SendCallbackToDart because Dart-side handlers
-        // are cheap and we want to reflect quality changes promptly.
         av_mgr->setAudioBitrateCallback([captured_instance_id](uint32_t friend_number, uint32_t audio_bit_rate) {
-            std::lock_guard<std::mutex> lock(g_av_callbacks_mutex);
-            auto it = g_instance_av_callbacks.find(captured_instance_id);
-            if (it != g_instance_av_callbacks.end() && it->second.on_audio_bitrate) {
-                it->second.on_audio_bitrate(friend_number, audio_bit_rate, it->second.user_data);
-            }
+            EnqueueAVBitrateEvent(captured_instance_id, false, friend_number, audio_bit_rate);
         });
 
         av_mgr->setVideoBitrateCallback([captured_instance_id](uint32_t friend_number, uint32_t video_bit_rate) {
-            std::lock_guard<std::mutex> lock(g_av_callbacks_mutex);
-            auto it = g_instance_av_callbacks.find(captured_instance_id);
-            if (it != g_instance_av_callbacks.end() && it->second.on_video_bitrate) {
-                it->second.on_video_bitrate(friend_number, video_bit_rate, it->second.user_data);
-            }
+            EnqueueAVBitrateEvent(captured_instance_id, true, friend_number, video_bit_rate);
         });
 
         {
@@ -3167,6 +3304,7 @@ void tim2tox_ffi_av_shutdown(int64_t instance_id) {
     V2TIM_LOG(kInfo, "[ffi] tim2tox_ffi_av_shutdown() called");
     if (instance_id == 0) instance_id = GetCurrentInstanceId();
     V2TIM_LOG(kInfo, "[ffi] tim2tox_ffi_av_shutdown() instance_id={}", (long long)instance_id);
+    ClearPendingAVBitrateEvents(instance_id);
 
     {
         std::lock_guard<std::mutex> lock(g_av_callbacks_mutex);
@@ -3183,6 +3321,7 @@ void tim2tox_ffi_av_shutdown(int64_t instance_id) {
             av_mgr->shutdown();
         }
     }
+    ClearPendingAVBitrateEvents(instance_id);
     
     {
         std::lock_guard<std::mutex> lock(g_av_callbacks_mutex);
@@ -3207,6 +3346,7 @@ void tim2tox_ffi_av_iterate(int64_t instance_id) {
         ToxAVManager* av_mgr = manager_impl->GetToxAVManager();
         if (av_mgr) {
             av_mgr->iterate();
+            DrainAVBitrateEvents(instance_id);
         }
     }
 }
@@ -3387,6 +3527,18 @@ int tim2tox_ffi_av_send_video_frame(int64_t instance_id, uint32_t friend_number,
                   eff_y_stride, eff_u_stride, eff_v_stride, width);
         return 0;
     }
+    if (packed_uv == 0 || chroma_h == 0) {
+        if (eff_y_stride == packed_y) {
+            return av_mgr->sendVideoFrame(friend_number, width, height, y, u, v) ? 1 : 0;
+        }
+        std::vector<uint8_t> y_buf(static_cast<size_t>(packed_y) * height);
+        for (uint16_t row = 0; row < height; ++row) {
+            memcpy(y_buf.data() + static_cast<size_t>(row) * packed_y,
+                   y + static_cast<size_t>(row) * eff_y_stride, packed_y);
+        }
+        return av_mgr->sendVideoFrame(friend_number, width, height,
+                                      y_buf.data(), u, v) ? 1 : 0;
+    }
     std::vector<uint8_t> y_buf(static_cast<size_t>(packed_y) * height);
     std::vector<uint8_t> u_buf(static_cast<size_t>(packed_uv) * chroma_h);
     std::vector<uint8_t> v_buf(static_cast<size_t>(packed_uv) * chroma_h);
@@ -3441,7 +3593,7 @@ void tim2tox_ffi_av_set_call_callback(int64_t instance_id, tim2tox_av_call_callb
     std::lock_guard<std::mutex> lock(g_av_callbacks_mutex);
     AVCallbacks* callbacks = GetCallbacksForInstance(instance_id);
     callbacks->on_call = callback;
-    callbacks->user_data = user_data;
+    callbacks->on_call_user_data = user_data;
     V2TIM_LOG(kInfo, "[ffi] tim2tox_ffi_av_set_call_callback() set for instance {}", (long long)instance_id);
 }
 
@@ -3450,7 +3602,7 @@ void tim2tox_ffi_av_set_call_state_callback(int64_t instance_id, tim2tox_av_call
     std::lock_guard<std::mutex> lock(g_av_callbacks_mutex);
     AVCallbacks* callbacks = GetCallbacksForInstance(instance_id);
     callbacks->on_call_state = callback;
-    callbacks->user_data = user_data;
+    callbacks->on_call_state_user_data = user_data;
     V2TIM_LOG(kInfo, "[ffi] tim2tox_ffi_av_set_call_state_callback() set for instance {}", (long long)instance_id);
 }
 
@@ -3459,7 +3611,7 @@ void tim2tox_ffi_av_set_audio_receive_callback(int64_t instance_id, tim2tox_av_a
     std::lock_guard<std::mutex> lock(g_av_callbacks_mutex);
     AVCallbacks* callbacks = GetCallbacksForInstance(instance_id);
     callbacks->on_audio_receive = callback;
-    callbacks->user_data = user_data;
+    callbacks->on_audio_receive_user_data = user_data;
     V2TIM_LOG(kInfo, "[ffi] tim2tox_ffi_av_set_audio_receive_callback() set for instance {}", (long long)instance_id);
 }
 
@@ -3468,7 +3620,7 @@ void tim2tox_ffi_av_set_video_receive_callback(int64_t instance_id, tim2tox_av_v
     std::lock_guard<std::mutex> lock(g_av_callbacks_mutex);
     AVCallbacks* callbacks = GetCallbacksForInstance(instance_id);
     callbacks->on_video_receive = callback;
-    callbacks->user_data = user_data;
+    callbacks->on_video_receive_user_data = user_data;
     V2TIM_LOG(kInfo, "[ffi] tim2tox_ffi_av_set_video_receive_callback() set for instance {}", (long long)instance_id);
 }
 
@@ -3477,7 +3629,7 @@ void tim2tox_ffi_av_set_audio_bitrate_callback(int64_t instance_id, tim2tox_av_a
     std::lock_guard<std::mutex> lock(g_av_callbacks_mutex);
     AVCallbacks* callbacks = GetCallbacksForInstance(instance_id);
     callbacks->on_audio_bitrate = callback;
-    callbacks->user_data = user_data;
+    callbacks->on_audio_bitrate_user_data = user_data;
     V2TIM_LOG(kInfo, "[ffi] tim2tox_ffi_av_set_audio_bitrate_callback() set for instance {}", (long long)instance_id);
 }
 
@@ -3486,7 +3638,7 @@ void tim2tox_ffi_av_set_video_bitrate_callback(int64_t instance_id, tim2tox_av_v
     std::lock_guard<std::mutex> lock(g_av_callbacks_mutex);
     AVCallbacks* callbacks = GetCallbacksForInstance(instance_id);
     callbacks->on_video_bitrate = callback;
-    callbacks->user_data = user_data;
+    callbacks->on_video_bitrate_user_data = user_data;
     V2TIM_LOG(kInfo, "[ffi] tim2tox_ffi_av_set_video_bitrate_callback() set for instance {}", (long long)instance_id);
 }
 
