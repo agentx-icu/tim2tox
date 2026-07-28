@@ -49,14 +49,54 @@ class CallInfo {
   });
 }
 
+enum _TeardownOperation { reject, cancel, avEnd }
+
+class _TeardownKey {
+  const _TeardownKey(this.operation, this.target);
+
+  final _TeardownOperation operation;
+  final Object target;
+
+  @override
+  bool operator ==(Object other) {
+    return other is _TeardownKey &&
+        other.operation == operation &&
+        other.target == target;
+  }
+
+  @override
+  int get hashCode => Object.hash(operation, target);
+}
+
+class _PendingTeardown {
+  _PendingTeardown(this.action);
+
+  final Future<bool> Function() action;
+  int attempts = 0;
+  Timer? timer;
+}
+
+typedef _AvTeardownToken = ({String inviteID, int friendNumber});
+
 /// Bridge service that connects signaling to ToxAV
 class CallBridgeService {
+  static const List<Duration> _teardownRetryDelays = <Duration>[
+    Duration(seconds: 1),
+    Duration(seconds: 2),
+    Duration(seconds: 3),
+    Duration(seconds: 5),
+    Duration(seconds: 8),
+  ];
+  static const int _maxTeardownAttempts = 6;
+
   final TencentCloudChatSdkPlatform _sdkPlatform;
   final CallAvBackend _avService;
   final LoggerService? _logger;
 
   // Active calls: inviteID -> CallInfo
   final Map<String, CallInfo> _activeCalls = {};
+
+  final Map<_TeardownKey, _PendingTeardown> _pendingTeardowns = {};
 
   // Signaling listener
   V2TimSignalingListener? _signalingListener;
@@ -86,7 +126,7 @@ class CallBridgeService {
     _signalingListener = V2TimSignalingListener(
       onReceiveNewInvitation: (inviteID, inviter, groupID, inviteeList, data) {
         _logger?.log(
-            '[CallBridge] onReceiveNewInvitation inviteID=$inviteID inviter=$inviter groupID=$groupID invitees=${inviteeList.join(",")} data=$data');
+            '[CallBridge] onReceiveNewInvitation groupPresent=${groupID.isNotEmpty} inviteeCount=${inviteeList.length} dataLength=${data.length}');
         // New invitation received
         final callInfo = CallInfo(
           inviteID: inviteID,
@@ -109,26 +149,26 @@ class CallBridgeService {
 
         _activeCalls[inviteID] = callInfo;
         _logger?.log(
-            '[CallBridge] invitation mapped inviteID=$inviteID friendNumber=${callInfo.friendNumber} state=${callInfo.state}');
+            '[CallBridge] invitation mapped friendResolved=${callInfo.friendNumber != null && callInfo.friendNumber != 0xFFFFFFFF} state=${callInfo.state}');
         onCallStateChanged?.call(inviteID, CallState.ringing);
       },
       onInvitationCancelled: (inviteID, inviter, data) {
         _logger?.log(
-            '[CallBridge] onInvitationCancelled inviteID=$inviteID inviter=$inviter data=$data');
-        // Caller cancelled the invitation before it was answered.
+            '[CallBridge] onInvitationCancelled dataLength=${data.length}');
         final callInfo = _activeCalls[inviteID];
         if (callInfo != null) {
+          final wasInCall = callInfo.state == CallState.inCall;
           callInfo.state = CallState.ended;
           // Only ends the ToxAV leg if it was actually started (avLegStarted).
           _endAvLegIfStarted(callInfo);
           _activeCalls.remove(inviteID);
           onCallStateChanged?.call(inviteID, CallState.ended,
-              endReason: 'cancel');
+              endReason: wasInCall ? 'hangup' : 'cancel');
         }
       },
       onInviteeAccepted: (inviteID, invitee, data) {
-        _logger?.log(
-            '[CallBridge] onInviteeAccepted inviteID=$inviteID invitee=$invitee data=$data');
+        _logger
+            ?.log('[CallBridge] onInviteeAccepted dataLength=${data.length}');
         // Invitee accepted - this callback is for the inviter (caller)
         // The inviter already started the ToxAV leg after the signaling invite
         // succeeded (see TUICallKitAdapter._handleCall). Do not call
@@ -145,8 +185,8 @@ class CallBridgeService {
         }
       },
       onInviteeRejected: (inviteID, invitee, data) {
-        _logger?.log(
-            '[CallBridge] onInviteeRejected inviteID=$inviteID invitee=$invitee data=$data');
+        _logger
+            ?.log('[CallBridge] onInviteeRejected dataLength=${data.length}');
         // Invitee rejected the invitation.
         final callInfo = _activeCalls[inviteID];
         if (callInfo != null) {
@@ -159,7 +199,7 @@ class CallBridgeService {
       },
       onInvitationTimeout: (inviteID, inviteeList) {
         _logger?.log(
-            '[CallBridge] onInvitationTimeout inviteID=$inviteID invitees=${inviteeList.join(",")}');
+            '[CallBridge] onInvitationTimeout inviteeCount=${inviteeList.length}');
         // Invitation rang out without an answer.
         final callInfo = _activeCalls[inviteID];
         if (callInfo != null) {
@@ -186,11 +226,92 @@ class CallBridgeService {
     if (friendNumber == null || !callInfo.avLegStarted) {
       return;
     }
-    unawaited(
-        _avService.endCall(friendNumber).catchError((Object e, StackTrace st) {
-      _logger?.logError('[CallBridge] Error ending ToxAV leg', e, st);
+    unawaited(_startAvLegTeardown(callInfo.inviteID, friendNumber));
+  }
+
+  Future<bool> _startAvLegTeardown(String inviteID, int friendNumber) {
+    return _startBoundedTeardown(
+      _TeardownKey(
+        _TeardownOperation.avEnd,
+        (inviteID: inviteID, friendNumber: friendNumber),
+      ),
+      () => _tryEndAvLeg((
+        inviteID: inviteID,
+        friendNumber: friendNumber,
+      )),
+    );
+  }
+
+  Future<bool> _tryRejectInvite(String inviteID) async {
+    try {
+      final result = await _sdkPlatform.reject(inviteID: inviteID);
+      return result.code == 0;
+    } catch (_) {
       return false;
-    }));
+    }
+  }
+
+  Future<bool> _tryCancelInvite(String inviteID) async {
+    try {
+      final result = await _sdkPlatform.cancel(inviteID: inviteID);
+      return result.code == 0;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  Future<bool> _tryEndAvLeg(_AvTeardownToken token) async {
+    final activeCall = _activeCalls.values.where(
+      (callInfo) =>
+          callInfo.inviteID != token.inviteID &&
+          callInfo.friendNumber == token.friendNumber &&
+          callInfo.avLegStarted,
+    );
+    if (activeCall.isNotEmpty) {
+      return true;
+    }
+    try {
+      return await _avService.endCall(token.friendNumber);
+    } catch (_) {
+      return false;
+    }
+  }
+
+  Future<bool> _startBoundedTeardown(
+    _TeardownKey key,
+    Future<bool> Function() action,
+  ) async {
+    _pendingTeardowns.remove(key)?.timer?.cancel();
+    final pending = _PendingTeardown(action);
+    _pendingTeardowns[key] = pending;
+
+    final success = await _runTeardownAttempt(key, pending);
+    return success;
+  }
+
+  Future<bool> _runTeardownAttempt(
+    _TeardownKey key,
+    _PendingTeardown pending,
+  ) async {
+    if (_pendingTeardowns[key] != pending) {
+      return false;
+    }
+
+    pending.attempts += 1;
+    final success = await pending.action();
+    if (_pendingTeardowns[key] != pending) {
+      return success;
+    }
+    if (success || pending.attempts >= _maxTeardownAttempts) {
+      _pendingTeardowns.remove(key);
+      return success;
+    }
+
+    final delay = _teardownRetryDelays[pending.attempts - 1];
+    pending.timer = Timer(delay, () {
+      unawaited(_runTeardownAttempt(key, pending));
+    });
+    return false;
   }
 
   /// Register a just-created outgoing signaling call so later cancel/end events
@@ -204,7 +325,7 @@ class CallBridgeService {
     String? groupID,
   }) {
     _logger?.log(
-        '[CallBridge] registerOutgoingCall inviteID=$inviteID inviter=$inviter invitee=$invitee friendNumber=$friendNumber groupID=$groupID data=$data');
+        '[CallBridge] registerOutgoingCall groupPresent=${groupID != null && groupID.isNotEmpty} hasFriendNumber=${friendNumber != null} dataLength=${data.length}');
     _activeCalls[inviteID] = CallInfo(
       inviteID: inviteID,
       inviter: inviter,
@@ -218,13 +339,27 @@ class CallBridgeService {
     );
   }
 
-  /// Mark the outgoing call's ToxAV media leg as started. The adapter calls
-  /// this right after `_avService.startCall()` succeeds, so teardown paths
-  /// (cancel/reject/timeout/endCall) know there is a real media leg to stop.
-  /// No-op if the invite is already gone (e.g. a fast cancel removed it).
-  void markAvLegStarted(String inviteID) {
-    _logger?.log('[CallBridge] markAvLegStarted inviteID=$inviteID');
-    _activeCalls[inviteID]?.avLegStarted = true;
+  /// Claim ownership of a just-started outgoing ToxAV media leg.
+  ///
+  /// Returns false when the invite was already removed while `startCall` was
+  /// awaiting. In that stale-success case the bridge owns cleanup and starts a
+  /// bounded AV teardown using the resolved friend number supplied by the
+  /// adapter.
+  bool markAvLegStarted(String inviteID, {int? friendNumber}) {
+    _logger?.log(
+        '[CallBridge] markAvLegStarted hasFriendNumber=${friendNumber != null}');
+    final callInfo = _activeCalls[inviteID];
+    if (callInfo == null) {
+      if (friendNumber != null) {
+        unawaited(_startAvLegTeardown(inviteID, friendNumber));
+      }
+      return false;
+    }
+    if (friendNumber != null) {
+      callInfo.friendNumber = friendNumber;
+    }
+    callInfo.avLegStarted = true;
+    return true;
   }
 
   /// Accept an invitation and start call.
@@ -240,25 +375,33 @@ class CallBridgeService {
     final callInfo = _activeCalls[inviteID];
     if (callInfo == null) return false;
 
+    final friendNumber = callInfo.friendNumber;
+    if (friendNumber == null || friendNumber == 0xFFFFFFFF) {
+      await _failAccept(inviteID, postAccept: false);
+      return false;
+    }
+
     // Accept signaling invitation. If the SDK rejects the accept (transport
-    // failure, expired invite, etc.) or if we can't resolve a ToxAV friend
-    // number, the signaling side is left in a half-open state — the peer
-    // believes the invite is still ringing and our `_activeCalls` map keeps
-    // a zombie entry forever. Tear both down explicitly (F-9).
+    // failure, expired invite, etc.), signaling never reached the peer's
+    // accepted state, so hidden cleanup must stay on the pre-accept reject path.
     final result = await _sdkPlatform.accept(inviteID: inviteID);
+    if (!identical(_activeCalls[inviteID], callInfo)) {
+      return false;
+    }
     if (result.code != 0) {
       await _failAccept(inviteID, postAccept: false);
       return false;
     }
 
-    if (callInfo.friendNumber == null) {
-      await _failAccept(inviteID, postAccept: true);
+    // Start ToxAV call
+    final avResult = await _avService.answerCall(friendNumber,
+        audioBitRate: audioBitRate, videoBitRate: videoBitRate);
+    if (!identical(_activeCalls[inviteID], callInfo)) {
+      if (avResult) {
+        await _startAvLegTeardown(inviteID, friendNumber);
+      }
       return false;
     }
-
-    // Start ToxAV call
-    final avResult = await _avService.answerCall(callInfo.friendNumber!,
-        audioBitRate: audioBitRate, videoBitRate: videoBitRate);
     if (avResult) {
       callInfo.avLegStarted = true;
       callInfo.state = CallState.inCall;
@@ -269,53 +412,56 @@ class CallBridgeService {
     return false;
   }
 
-  /// Tear down a half-accepted invitation. When `accept()` itself failed
-  /// signaling never reached the peer, so a `reject` is the correct teardown
-  /// and `endReason: 'cancel'` mirrors the never-connected outcome. Once
-  /// `accept()` succeeded the peer has already transitioned to inCall, so the
-  /// only correct post-accept teardown is `cancel` with `endReason: 'hangup'`.
-  ///
-  /// V2TIMSignaling exposes only four verbs — `invite`/`cancel`/`accept`/
-  /// `reject` — with no dedicated post-accept callee hangup verb. For a
-  /// post-accept failure we therefore tear down in two layers: first
-  /// `_avService.endCall(...)` on the ToxAV layer (this is the layer that
-  /// actually reaches the peer over the friend connection and stops media),
-  /// then `_sdkPlatform.cancel(...)` as a best-effort signaling fallback —
-  /// the caller's `onInvitationCancelled` path already maps inCall→ended
-  /// correctly, so a post-accept `cancel` is consumable on the caller side.
+  /// Tear down a failed accept while hiding visible call state immediately.
+  /// When `accept()` itself failed, signaling never reached the peer's accepted
+  /// state, so bounded cleanup uses `reject` and reports `cancel`. Once
+  /// `accept()` succeeded, native signaling has consumed the received route;
+  /// if the AV answer then fails, only the ToxAV leg can be retried and the
+  /// visible outcome is an established-call `hangup`.
   Future<void> _failAccept(String inviteID, {required bool postAccept}) async {
     // Capture friendNumber before remove(); endCall() needs it and the entry
     // is still in the map when acceptInvitation calls into _failAccept.
     final int? friendNumber =
         postAccept ? _activeCalls[inviteID]?.friendNumber : null;
-    if (postAccept && friendNumber != null) {
-      try {
-        await _avService.endCall(friendNumber);
-      } catch (e, st) {
-        _logger?.logError(
-            '[CallBridge] ToxAV endCall during failed accept', e, st);
-      }
-    }
-    try {
-      if (postAccept) {
-        await _sdkPlatform.cancel(inviteID: inviteID);
-      } else {
-        await _sdkPlatform.reject(inviteID: inviteID);
-      }
-    } catch (e, st) {
-      _logger?.logError(
-          '[CallBridge] signaling teardown during failed accept', e, st);
-    }
+
     _activeCalls.remove(inviteID);
     onCallStateChanged?.call(inviteID, CallState.ended,
         endReason: postAccept ? 'hangup' : 'cancel');
+
+    if (postAccept && friendNumber != null) {
+      await _startBoundedTeardown(
+        _TeardownKey(
+          _TeardownOperation.avEnd,
+          (inviteID: inviteID, friendNumber: friendNumber),
+        ),
+        () => _tryEndAvLeg((
+          inviteID: inviteID,
+          friendNumber: friendNumber,
+        )),
+      );
+    }
+    if (postAccept) {
+      return;
+    }
+    await _startBoundedTeardown(
+      _TeardownKey(_TeardownOperation.reject, inviteID),
+      () => _tryRejectInvite(inviteID),
+    );
   }
 
   /// Reject an invitation
   Future<bool> rejectInvitation(String inviteID) async {
+    if (_activeCalls.containsKey(inviteID)) {
+      _activeCalls.remove(inviteID);
+      onCallStateChanged?.call(inviteID, CallState.ended, endReason: 'reject');
+      return _startBoundedTeardown(
+        _TeardownKey(_TeardownOperation.reject, inviteID),
+        () => _tryRejectInvite(inviteID),
+      );
+    }
+
     final result = await _sdkPlatform.reject(inviteID: inviteID);
     if (result.code == 0) {
-      _activeCalls.remove(inviteID);
       onCallStateChanged?.call(inviteID, CallState.ended, endReason: 'reject');
       return true;
     }
@@ -329,22 +475,37 @@ class CallBridgeService {
     final callInfo = _activeCalls[inviteID];
     if (callInfo == null) return false;
 
-    // Only end the ToxAV leg if it was actually started — an outgoing call torn
-    // down during the registerOutgoingCall→startCall gap has friendNumber set
-    // but no media leg yet, and endCall on a never-started call can block/error.
-    if (callInfo.friendNumber != null && callInfo.avLegStarted) {
-      await _avService.endCall(callInfo.friendNumber!);
-    }
-
+    final friendNumber = callInfo.friendNumber;
+    final avLegStarted = callInfo.avLegStarted;
     final isOutgoingPreAnswer = callInfo.state == CallState.calling;
-    if (isOutgoingPreAnswer) {
-      await _sdkPlatform.cancel(inviteID: inviteID);
-    }
 
     callInfo.state = CallState.ended;
     _activeCalls.remove(inviteID);
     onCallStateChanged?.call(inviteID, CallState.ended,
         endReason: isOutgoingPreAnswer ? 'cancel' : 'hangup');
+
+    // Only end the ToxAV leg if it was actually started — an outgoing call torn
+    // down during the registerOutgoingCall→startCall gap has friendNumber set
+    // but no media leg yet, and endCall on a never-started call can block/error.
+    if (friendNumber != null && avLegStarted) {
+      unawaited(_startBoundedTeardown(
+        _TeardownKey(
+          _TeardownOperation.avEnd,
+          (inviteID: inviteID, friendNumber: friendNumber),
+        ),
+        () => _tryEndAvLeg((
+          inviteID: inviteID,
+          friendNumber: friendNumber,
+        )),
+      ));
+    }
+
+    if (isOutgoingPreAnswer) {
+      unawaited(_startBoundedTeardown(
+        _TeardownKey(_TeardownOperation.cancel, inviteID),
+        () => _tryCancelInvite(inviteID),
+      ));
+    }
     return true;
   }
 
@@ -360,6 +521,10 @@ class CallBridgeService {
 
   /// Cleanup
   void dispose() {
+    for (final pending in _pendingTeardowns.values) {
+      pending.timer?.cancel();
+    }
+    _pendingTeardowns.clear();
     if (_signalingListener != null) {
       _sdkPlatform.removeSignalingListener(listener: _signalingListener);
     }

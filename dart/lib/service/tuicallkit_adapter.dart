@@ -135,31 +135,29 @@ class TUICallKitAdapter {
     String? groupid,
   }) async {
     try {
-      await _handleCall({
+      return await _handleCall({
         PARAM_NAME_TYPE: type,
         PARAM_NAME_USERIDS: userids,
         PARAM_NAME_GROUPID: groupid ?? "",
       });
-      return true;
-    } catch (e, st) {
-      _logger?.logError('[TUICallKitAdapter] Error handling call', e, st);
+    } catch (e) {
       final reason = e is CallSetupException
           ? e.reason
           : CallSetupFailureReason.internalError;
+      _logger?.logWarning(
+          '[TUICallKitAdapter] handleCall status=${reason.name} type=$type userCount=${userids.length}');
       try {
         onCallSetupFailed?.call(reason, List.unmodifiable(userids));
-      } catch (cbError, cbStack) {
-        _logger?.logError(
-            '[TUICallKitAdapter] onCallSetupFailed callback threw',
-            cbError,
-            cbStack);
+      } catch (_) {
+        _logger?.logWarning(
+            '[TUICallKitAdapter] handleCall status=callbackFailed type=$type userCount=${userids.length}');
       }
       return false;
     }
   }
 
   /// Handle call method. Throws on failure so handleCall() can return false.
-  Future<void> _handleCall(Map<String, Object> params) async {
+  Future<bool> _handleCall(Map<String, Object> params) async {
     final type = params[PARAM_NAME_TYPE] as String?;
     final userids = params[PARAM_NAME_USERIDS] as List<String>?;
     final groupID = params[PARAM_NAME_GROUPID] as String?;
@@ -184,7 +182,7 @@ class TUICallKitAdapter {
         type ?? TYPE_AUDIO,
       );
       _logger?.log(
-          '[TUICallKitAdapter] preflight result allowed=$allowed userID=$userID type=$type');
+          '[TUICallKitAdapter] preflight status=checked type=${type ?? TYPE_AUDIO} userCount=${userids.length} allowed=$allowed');
       if (!allowed) {
         throw CallSetupException(CallSetupFailureReason.preflightDenied,
             'Outgoing call preflight denied');
@@ -206,7 +204,7 @@ class TUICallKitAdapter {
       timeout: 30,
     );
     _logger?.log(
-        '[TUICallKitAdapter] invite result code=${result.code} data=${result.data} userID=$userID type=$type');
+        '[TUICallKitAdapter] invite status=${result.code} type=${type ?? TYPE_AUDIO} userCount=${userids.length} hasInvite=${result.data != null}');
 
     if (result.code != 0 || result.data == null) {
       throw CallSetupException(CallSetupFailureReason.inviteFailed,
@@ -225,7 +223,7 @@ class TUICallKitAdapter {
     final resolvedFriendNumber = _avService.getFriendNumberByUserId(userID);
     final hasFriend = resolvedFriendNumber != 0xFFFFFFFF;
     _logger?.log(
-        '[TUICallKitAdapter] resolvedFriendNumber=$resolvedFriendNumber hasFriend=$hasFriend userID=$userID inviteID=$inviteID');
+        '[TUICallKitAdapter] resolveFriend status=done type=${type ?? TYPE_AUDIO} userCount=${userids.length} hasFriend=$hasFriend');
 
     _callBridge.registerOutgoingCall(
       inviteID: inviteID,
@@ -237,16 +235,21 @@ class TUICallKitAdapter {
     );
 
     // Notify listeners about the outgoing call so UI can show ringing overlay
-    _logger
-        ?.log('[TUICallKitAdapter] _handleCall firing onOutgoingCallInitiated: '
-            'inviteID=$inviteID userID=$userID type=$type '
-            'cb=${onOutgoingCallInitiated != null ? "SET" : "NULL"}');
+    _logger?.log(
+        '[TUICallKitAdapter] outgoingInitiated status=notify type=${type ?? TYPE_AUDIO} userCount=${userids.length} hasCallback=${onOutgoingCallInitiated != null}');
     onOutgoingCallInitiated?.call(inviteID, userID, type ?? TYPE_AUDIO);
+
+    if (!_ownsBridgeCall(inviteID)) {
+      _userToInviteId.remove(userID);
+      _logger?.log(
+          '[TUICallKitAdapter] setup status=cancelled type=${type ?? TYPE_AUDIO} userCount=${userids.length} hasFriend=$hasFriend');
+      return false;
+    }
 
     if (!hasFriend) {
       _logger?.logWarning(
-          '[TUICallKitAdapter] Friend not found for userID=$userID; signaling-only call');
-      return;
+          '[TUICallKitAdapter] setup status=signalingOnly type=${type ?? TYPE_AUDIO} userCount=${userids.length} hasFriend=false');
+      return true;
     }
 
     // Mid-tier opening targets in kbit/s. Adaptive bitrate callbacks (see
@@ -258,6 +261,12 @@ class TUICallKitAdapter {
     // Initialize ToxAV if needed
     if (!_avService.isInitialized) {
       await _avService.initialize();
+      if (!_ownsBridgeCall(inviteID)) {
+        _userToInviteId.remove(userID);
+        _logger?.log(
+            '[TUICallKitAdapter] setup status=cancelled type=${type ?? TYPE_AUDIO} userCount=${userids.length} hasFriend=true');
+        return false;
+      }
     }
 
     // End any existing call to this friend before starting a new one
@@ -270,13 +279,38 @@ class TUICallKitAdapter {
       } catch (_) {
         // Ignore — no active call to end
       }
+      if (!_ownsBridgeCall(inviteID)) {
+        _userToInviteId.remove(userID);
+        _logger?.log(
+            '[TUICallKitAdapter] setup status=cancelled type=${type ?? TYPE_AUDIO} userCount=${userids.length} hasFriend=true');
+        return false;
+      }
+    }
+
+    if (!_ownsBridgeCall(inviteID)) {
+      _userToInviteId.remove(userID);
+      _logger?.log(
+          '[TUICallKitAdapter] setup status=cancelled type=${type ?? TYPE_AUDIO} userCount=${userids.length} hasFriend=true');
+      return false;
     }
 
     // Start the call
     final callResult = await _avService.startCall(resolvedFriendNumber,
         audioBitRate: audioBitRate, videoBitRate: videoBitRate);
     _logger?.log(
-        '[TUICallKitAdapter] _handleCall startCall result=$callResult friendNumber=$resolvedFriendNumber');
+        '[TUICallKitAdapter] startCall status=done type=${type ?? TYPE_AUDIO} userCount=${userids.length} result=$callResult');
+    if (!_ownsBridgeCall(inviteID)) {
+      _userToInviteId.remove(userID);
+      if (callResult) {
+        _callBridge.markAvLegStarted(
+          inviteID,
+          friendNumber: resolvedFriendNumber,
+        );
+      }
+      _logger?.log(
+          '[TUICallKitAdapter] setup status=cancelled type=${type ?? TYPE_AUDIO} userCount=${userids.length} hasStarted=$callResult');
+      return false;
+    }
     if (!callResult) {
       _userToInviteId.remove(userID);
       await _callBridge.endCall(inviteID);
@@ -288,8 +322,21 @@ class TUICallKitAdapter {
     // cancel/reject/timeout/endCall tears it down — and, crucially, so a
     // teardown that lands in the registerOutgoingCall→startCall gap above does
     // NOT call endCall() on a leg that never started.
-    _callBridge.markAvLegStarted(inviteID);
+    final claimed = _callBridge.markAvLegStarted(
+      inviteID,
+      friendNumber: resolvedFriendNumber,
+    );
+    if (!claimed) {
+      _userToInviteId.remove(userID);
+      _logger?.log(
+          '[TUICallKitAdapter] setup status=cancelled type=${type ?? TYPE_AUDIO} userCount=${userids.length} hasStarted=true');
+      return false;
+    }
+    return true;
   }
+
+  bool _ownsBridgeCall(String inviteID) =>
+      _callBridge.getCallInfo(inviteID) != null;
 
   /// Dispose
   ///
