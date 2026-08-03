@@ -257,7 +257,9 @@ JSON 字段名必须与 `NativeLibraryManager._handleGlobalCallback` / `_handleA
 
 ```sh
 # 列出所有当前实现的 Dart* C 函数
-grep -hE '^\s*(int|void|const char\*)\s+Dart[A-Z][A-Za-z0-9_]+\s*\(' ffi/dart_compat_*.cpp \\n  | grep -oE 'Dart[A-Z][A-Za-z0-9_]+' \\n  | sort -u
+grep -hE '^\s*(int|void|const char\*)\s+Dart[A-Z][A-Za-z0-9_]+\s*\(' ffi/dart_compat_*.cpp \
+  | grep -oE 'Dart[A-Z][A-Za-z0-9_]+' \
+  | sort -u
 ```
 
 按模块的职责清单见 [MODULARIZATION.md](MODULARIZATION.md)。**没有被列出的 `Dart*` 名字通常意味着"未实现"** —— UIKit 调用会落到默认实现或返回错误。如果发现某个 Tencent SDK 期望的 `Dart*` 缺失，新增时按 [FFI_FUNCTION_DECLARATION_GUIDE.md](../development/FFI_FUNCTION_DECLARATION_GUIDE.md) 流程办。

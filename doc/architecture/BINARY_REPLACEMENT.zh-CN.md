@@ -501,12 +501,14 @@ make tim2tox_ffi
 
 **macOS**（路径以实际客户端项目为准）:
 ```bash
-cp tim2tox/build/ffi/libtim2tox_ffi.dylib \\n   <客户端项目>/build/macos/Build/Products/Debug/<app>.app/Contents/MacOS/
+cp tim2tox/build/ffi/libtim2tox_ffi.dylib \
+   <客户端项目>/build/macos/Build/Products/Debug/<app>.app/Contents/MacOS/
 ```
 
 **Linux**:
 ```bash
-cp tim2tox/build/ffi/libtim2tox_ffi.so \\n   <客户端项目>/build/linux/x64/debug/bundle/lib/
+cp tim2tox/build/ffi/libtim2tox_ffi.so \
+   <客户端项目>/build/linux/x64/debug/bundle/lib/
 ```
 
 ### 3. 依赖库处理

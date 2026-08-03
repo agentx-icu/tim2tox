@@ -257,7 +257,9 @@ This document does not maintain a list of "all implemented `Dart*` functions" â€
 
 ```sh
 # List all currently implemented Dart* C functions
-grep -hE '^\s*(int|void|const char\*)\s+Dart[A-Z][A-Za-z0-9_]+\s*\(' ffi/dart_compat_*.cpp \\n  | grep -oE 'Dart[A-Z][A-Za-z0-9_]+' \\n  | sort -u
+grep -hE '^\s*(int|void|const char\*)\s+Dart[A-Z][A-Za-z0-9_]+\s*\(' ffi/dart_compat_*.cpp \
+  | grep -oE 'Dart[A-Z][A-Za-z0-9_]+' \
+  | sort -u
 ```
 
 For module-by-module responsibilities, see [MODULARIZATION.md](MODULARIZATION.md). **A `Dart*` name absent from the listing typically means "not implemented"** â€” UIKit calls fall through to default behavior or return errors. To add one, follow [FFI_FUNCTION_DECLARATION_GUIDE.md](../development/FFI_FUNCTION_DECLARATION_GUIDE.md).

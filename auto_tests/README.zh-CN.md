@@ -424,7 +424,9 @@ flutter test --name "login"
 
 ```bash
 # 运行基础测试
-flutter test test/scenarios/scenario_sdk_init_test.dart \\n            test/scenarios/scenario_login_test.dart \\n            test/scenarios/scenario_self_query_test.dart
+flutter test test/scenarios/scenario_sdk_init_test.dart \
+            test/scenarios/scenario_login_test.dart \
+            test/scenarios/scenario_self_query_test.dart
 
 # 运行好友测试
 flutter test test/scenarios/scenario_friend_*.dart

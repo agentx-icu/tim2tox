@@ -501,12 +501,14 @@ make tim2tox_ffi
 
 **macOS**:
 ```bash
-cp tim2tox/build/ffi/libtim2tox_ffi.dylib \\n   <client-project>/build/macos/Build/Products/Debug/<app>.app/Contents/MacOS/
+cp tim2tox/build/ffi/libtim2tox_ffi.dylib \
+   <client-project>/build/macos/Build/Products/Debug/<app>.app/Contents/MacOS/
 ```
 
 **Linux**:
 ```bash
-cp tim2tox/build/ffi/libtim2tox_ffi.so \\n   <client-project>/build/linux/x64/debug/bundle/lib/
+cp tim2tox/build/ffi/libtim2tox_ffi.so \
+   <client-project>/build/linux/x64/debug/bundle/lib/
 ```
 
 ### 3. Dependency library processing

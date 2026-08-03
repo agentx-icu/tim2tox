@@ -17,7 +17,9 @@
 
 ```bash
 cd /Users/<you>/chat-uikit/toxee/third_party/tim2tox/auto_tests
-lldb -- flutter test test/scenarios/scenario_<name>_test.dart \\n  -o "settings set target.process.follow-fork-mode child" \\n  -o "run"
+lldb -- flutter test test/scenarios/scenario_<name>_test.dart \
+  -o "settings set target.process.follow-fork-mode child" \
+  -o "run"
 ```
 
 要点：
