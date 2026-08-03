@@ -1,1 +1,400 @@
-[简体中文](./API_REFERENCE_V2TIM.zh-CN.md)\n\n[简体中文](./API_REFERENCE_V2TIM.zh-CN.md)\n\n# Tim2Tox API Reference — V2TIM C++\n\n> Language: **English** | [简体中文](API_REFERENCE_V2TIM.zh-CN.md)\n\nThis document is the V2TIM C++ sub-volume of [API_REFERENCE.md](API_REFERENCE.md). All signatures are authoritative against `include/V2TIM*.h`; only the commonly used surface is listed. Methods marked "Not covered" should be looked up directly in the header.\n\n## V2TIM C++ API\n\nTim2Tox implements the V2TIM core methods in C++ (see `source/V2TIMManagerImpl.*` and friends), keeping binary/semantic compatibility with the Tencent Cloud IM SDK contract.\n\n### V2TIMManager\n\nCore manager: SDK init, login/logout, and access to sub-managers.\n\n**Header**: `include/V2TIMManager.h`\n\n#### Initialization and version\n\n```cpp\n// Singleton\nstatic V2TIMManager* GetInstance();\n\n// Init / uninit\nvirtual bool InitSDK(uint32_t sdkAppID, const V2TIMSDKConfig& config) = 0;\nvirtual void UnInitSDK() = 0;\n\n// Version and server time\nvirtual V2TIMString GetVersion() = 0;\nvirtual int64_t     GetServerTime() = 0;\n```\n\n#### Listeners\n\n```cpp\nvirtual void AddSDKListener(V2TIMSDKListener* listener) = 0;\nvirtual void RemoveSDKListener(V2TIMSDKListener* listener) = 0;\n```\n\n#### Login / logout\n\n```cpp\nvirtual void        Login(const V2TIMString& userID, const V2TIMString& userSig, V2TIMCallback* callback) = 0;\nvirtual void        Logout(V2TIMCallback* callback) = 0;\nvirtual V2TIMString GetLoginUser() = 0;\n```\n\n#### Authentication & login semantics (read this)\n\nTim2Tox runs over the Tox P2P network and has no authentication server like Tencent Cloud IM. Login semantics therefore differ fundamentally from V2TIM:\n\n- **`Login(userID, userSig)` does NOT verify `userSig`.** `userSig` is accepted only for V2TIM call-signature compatibility and is ignored. Login actually means **open/bind the LOCAL Tox identity/profile**, NOT server-side authentication. Integrators must **NOT** treat a successful `Login` as "the user is authenticated."\n- **`GetLoginStatus()` reflects local login state, not network connectivity.** It returns `LOGINED` as soon as a local alias is set — that only means the local profile is open; it does **NOT** mean the client is connected to the Tox DHT / online. For actual connectivity, observe the connection-status listener/callback; do not rely on `GetLoginStatus()`.\n\nFor the per-API status see the "Authentication / Login" section of [API_SUPPORT_MATRIX.md](API_SUPPORT_MATRIX.md).\n\n#### Sub-manager accessors\n\n```cpp\nvirtual V2TIMMessageManager*      GetMessageManager() = 0;\nvirtual V2TIMGroupManager*        GetGroupManager() = 0;\nvirtual V2TIMConversationManager* GetConversationManager() = 0;\nvirtual V2TIMFriendshipManager*   GetFriendshipManager() = 0;\nvirtual V2TIMSignalingManager*    GetSignalingManager() = 0;\nvirtual V2TIMCommunityManager*    GetCommunityManager() = 0;\nvirtual V2TIMOfflinePushManager*  GetOfflinePushManager() = 0;\n```\n\n#### Group shortcuts (hung directly on V2TIMManager)\n\n```cpp\nvirtual void JoinGroup(const V2TIMString& groupID, const V2TIMString& message, V2TIMCallback* callback) = 0;\nvirtual void QuitGroup(const V2TIMString& groupID, V2TIMCallback* callback) = 0;\nvirtual void DismissGroup(const V2TIMString& groupID, V2TIMCallback* callback) = 0;\n```\n\n> `JoinGroup` / `QuitGroup` / `DismissGroup` live on `V2TIMManager`, **not** on `V2TIMGroupManager`.\n\n### V2TIMMessageManager\n\nMessage manager: build, send, query, read-mark, revoke.\n\n**Header**: `include/V2TIMMessageManager.h`\n\n#### Listeners\n\n```cpp\nvirtual void AddAdvancedMsgListener(V2TIMAdvancedMsgListener* listener) = 0;\nvirtual void RemoveAdvancedMsgListener(V2TIMAdvancedMsgListener* listener) = 0;\n```\n\n#### Create message\n\n```cpp\nvirtual V2TIMMessage CreateTextMessage(const V2TIMString& text) = 0;\nvirtual V2TIMMessage CreateCustomMessage(const V2TIMBuffer& data) = 0;\nvirtual V2TIMMessage CreateCustomMessage(const V2TIMBuffer& data,\n                                         const V2TIMString& description,\n                                         const V2TIMString& extension) = 0;\nvirtual V2TIMMessage CreateImageMessage(const V2TIMString& imagePath) = 0;\nvirtual V2TIMMessage CreateSoundMessage(const V2TIMString& soundPath, uint32_t duration) = 0;\nvirtual V2TIMMessage CreateVideoMessage(const V2TIMString& videoFilePath,\n                                        const V2TIMString& type,\n                                        uint32_t duration,\n                                        const V2TIMString& snapshotPath) = 0;\nvirtual V2TIMMessage CreateFileMessage(const V2TIMString& filePath, const V2TIMString& fileName) = 0;\nvirtual V2TIMMessage CreateLocationMessage(const V2TIMString& desc, double longitude, double latitude) = 0;\nvirtual V2TIMMessage CreateFaceMessage(uint32_t index, const V2TIMBuffer& data) = 0;\nvirtual V2TIMMessage CreateMergerMessage(const V2TIMMessageVector& messageList,\n                                         const V2TIMString& title,\n                                         const V2TIMStringVector& abstractList,\n                                         const V2TIMStringVector& compatibleText) = 0;\n```\n\n> **Media message caveat (read this)**: `CreateImageMessage` / `CreateSoundMessage` / `CreateVideoMessage` are **NOT implemented** — calling them sets the message status to `SEND_FAIL` (nothing is sent). `CreateFileMessage`, and the LOCATION / FACE and other media/location/face types, are **degraded to a plain text description on send** (e.g. `[转发文件]` "forwarded file"); the recipient receives text, **not** a structured message. For real file transfer use the `FfiChatService` file APIs (`tim2tox_ffi_send_file` / `tim2tox_ffi_file_control`). For the per-API real status see [API_SUPPORT_MATRIX.md](API_SUPPORT_MATRIX.md).\n\n#### Send message\n\n```cpp\n// Real signature: returns V2TIMString (msgID); parameters are\n// receiver, groupID, priority, onlineUserOnly, offlinePushInfo, callback.\n// Header location: include/V2TIMMessageManager.h:235\nvirtual V2TIMString SendMessage(V2TIMMessage& message,\n                                const V2TIMString& receiver,\n                                const V2TIMString& groupID,\n                                V2TIMMessagePriority priority,\n                                bool onlineUserOnly,\n                                const V2TIMOfflinePushInfo& offlinePushInfo,\n                                V2TIMSendCallback* callback) = 0;\n```\n\n> For **C2C** pass `receiver=<peer userID>`, `groupID=V2TIMString()`. For **group** messages pass `receiver=V2TIMString()`, `groupID=<group ID>`. There is no separate "with cloudCustomData" overload — set `message.cloudCustomData` on the message itself.\n\n#### Query\n\n```cpp\nvirtual void FindMessages(const V2TIMStringVector& messageIDList,\n                          V2TIMValueCallback<V2TIMMessageVector>* callback) = 0;\n\n// Real signature: a single option struct carries all parameters; the callback yields a V2TIMMessageVector.\nvirtual void GetHistoryMessageList(const V2TIMMessageListGetOption& option,\n                                   V2TIMValueCallback<V2TIMMessageVector>* callback) = 0;\n```\n\n> `V2TIMMessageListGetOption` lives in `include/V2TIMMessage.h` (fields include `userID` / `groupID` / `lastMsg` / `getType` / `count` / ...). In tim2tox, history reads are intercepted by the Platform / `FfiChatService` and served from the Dart-side `MessageHistoryPersistence`.\n\n#### Operations\n\n```cpp\nvirtual void RevokeMessage(const V2TIMMessage& message, V2TIMCallback* callback) = 0;\n\n// Read-mark: there is **no** unified MarkMessageAsRead — three separate methods:\nvirtual void MarkC2CMessageAsRead(const V2TIMString& userID, V2TIMCallback* callback) = 0;\nvirtual void MarkGroupMessageAsRead(const V2TIMString& groupID, V2TIMCallback* callback) = 0;\nvirtual void MarkAllMessageAsRead(V2TIMCallback* callback) = 0;\n\n// Delete: the parameter is a V2TIMMessageVector, not a V2TIMStringVector of IDs\nvirtual void DeleteMessages(const V2TIMMessageVector& messages, V2TIMCallback* callback) = 0;\n```\n\n#### Not covered\n\n`ModifyMessage`, `ClearC2CHistoryMessage`, `ClearGroupHistoryMessage`, `InsertC2CMessageToLocalStorage`, `InsertGroupMessageToLocalStorage`, `SendMessageReadReceipts`, `GetMessageReadReceipts`, `GetGroupMessageReadMemberList`, `SetC2CReceiveMessageOpt`, `GetC2CReceiveMessageOpt`, and the rest of the read-receipt / receive-option surface are not expanded here.\n\n### V2TIMFriendshipManager\n\nFriend manager.\n\n**Header**: `include/V2TIMFriendshipManager.h`\n\n#### Listeners\n\n```cpp\nvirtual void AddFriendListener(V2TIMFriendshipListener* listener) = 0;\nvirtual void RemoveFriendListener(V2TIMFriendshipListener* listener) = 0;\n```\n\n#### Friend list / info\n\n```cpp\nvirtual void GetFriendList(V2TIMValueCallback<V2TIMFriendInfoVector>* callback) = 0;\nvirtual void GetFriendsInfo(const V2TIMStringVector& userIDList,\n                            V2TIMValueCallback<V2TIMFriendInfoResultVector>* callback) = 0;\nvirtual void SetFriendInfo(const V2TIMFriendInfo& info, V2TIMCallback* callback) = 0;\n```\n\n#### Friend operations\n\n```cpp\nvirtual void AddFriend(const V2TIMFriendAddApplication& application,\n                       V2TIMValueCallback<V2TIMFriendOperationResult>* callback) = 0;\nvirtual void DeleteFromFriendList(const V2TIMStringVector& userIDList,\n                                  V2TIMFriendType deleteType,\n                                  V2TIMValueCallback<V2TIMFriendOperationResultVector>* callback) = 0;\nvirtual void CheckFriend(const V2TIMStringVector& userIDList,\n                         V2TIMFriendType checkType,\n                         V2TIMValueCallback<V2TIMFriendCheckResultVector>* callback) = 0;\n```\n\n#### Friend applications\n\n```cpp\nvirtual void GetFriendApplicationList(V2TIMValueCallback<V2TIMFriendApplicationResult>* callback) = 0;\n\n// The real enum is V2TIMFriendAcceptType (not V2TIMFriendResponseType).\n// Two overloads: with and without remark.\nvirtual void AcceptFriendApplication(const V2TIMFriendApplication& application,\n                                     V2TIMFriendAcceptType acceptType,\n                                     V2TIMValueCallback<V2TIMFriendOperationResult>* callback) = 0;\nvirtual void AcceptFriendApplication(const V2TIMFriendApplication& application,\n                                     V2TIMFriendAcceptType acceptType,\n                                     const V2TIMString& remark,\n                                     V2TIMValueCallback<V2TIMFriendOperationResult>* callback) = 0;\n\nvirtual void RefuseFriendApplication(const V2TIMFriendApplication& application,\n                                     V2TIMValueCallback<V2TIMFriendOperationResult>* callback) = 0;\n```\n\n#### Not covered\n\n`DeleteFriendApplication`, `SetFriendApplicationRead`, `AddToBlackList` / `DeleteFromBlackList` / `GetBlackList`, the `CreateFriendGroup` family.\n\n### V2TIMGroupManager\n\nGroup manager.\n\n**Header**: `include/V2TIMGroupManager.h`\n\n> Note: `JoinGroup` / `QuitGroup` / `DismissGroup` are not in this interface — they hang on [V2TIMManager](#v2timmanager).\n\n#### Listeners\n\n```cpp\nvirtual void AddGroupListener(V2TIMGroupListener* listener) = 0;\nvirtual void RemoveGroupListener(V2TIMGroupListener* listener) = 0;\n```\n\n#### Group operations\n\n```cpp\nvirtual void CreateGroup(const V2TIMGroupInfo& info,\n                         const V2TIMCreateGroupMemberInfoVector& memberList,\n                         V2TIMValueCallback<V2TIMString>* callback) = 0;\n\nvirtual void GetJoinedGroupList(V2TIMValueCallback<V2TIMGroupInfoVector>* callback) = 0;\nvirtual void GetGroupsInfo(const V2TIMStringVector& groupIDList,\n                           V2TIMValueCallback<V2TIMGroupInfoResultVector>* callback) = 0;\nvirtual void SetGroupInfo(const V2TIMGroupInfo& info, V2TIMCallback* callback) = 0;\n```\n\n**tim2tox behavior** (implemented in `V2TIMGroupManagerImpl.cpp`):\n\n- `info.groupType`: `"group"` (new API, `tox_group_new`, supports `chat_id` persistence — preferred) or `"conference"` (old API, `tox_conference_new`, savedata-only recovery — compatibility only). Defaults to `"group"` when omitted.\n- `info.groupID`: optional; auto-generated as `tox_<id>` when omitted.\n- `groupType` is always persisted; `"group"` type additionally persists the `chat_id`.\n- `GetGroupsInfo` returns `V2TIMGroupInfo.notification` from `tox_group_get_topic`, which is **Group-type only**.\n\n#### Group members\n\n```cpp\n// filter is uint32_t (V2TIMGroupMemberFilter bitmask or custom marker); nextSeq is uint64_t\nvirtual void GetGroupMemberList(const V2TIMString& groupID,\n                                uint32_t filter,\n                                uint64_t nextSeq,\n                                V2TIMValueCallback<V2TIMGroupMemberInfoResult>* callback) = 0;\n\n// memberList is passed by value (V2TIMStringVector), not by const reference\nvirtual void GetGroupMembersInfo(const V2TIMString& groupID,\n                                 V2TIMStringVector memberList,\n                                 V2TIMValueCallback<V2TIMGroupMemberFullInfoVector>* callback) = 0;\n\n// Mutate a member: the userID is carried inside info.userID (no separate parameter)\nvirtual void SetGroupMemberInfo(const V2TIMString& groupID,\n                                const V2TIMGroupMemberFullInfo& info,\n                                V2TIMCallback* callback) = 0;\n```\n\n#### Not covered\n\n`InviteUserToGroup`, `KickGroupMember`, `MuteGroupMember`, `MuteAllGroupMembers`, `TransferGroupOwner`, `SearchGroupMembers`, `SearchCloudGroupMembers`, `GetGroupApplicationList` and its Accept/Refuse, `MarkGroupMemberList`, `HandleGroupPendency`, `SearchCloudGroups`, etc.\n\n### V2TIMConversationManager\n\nConversation manager.\n\n**Header**: `include/V2TIMConversationManager.h`\n\n#### Listeners\n\n```cpp\nvirtual void AddConversationListener(V2TIMConversationListener* listener) = 0;\nvirtual void RemoveConversationListener(V2TIMConversationListener* listener) = 0;\n```\n\n#### Conversation operations\n\n```cpp\n// Two GetConversationList overloads (by seq / by ID list)\nvirtual void GetConversationList(uint64_t nextSeq,\n                                 uint32_t count,\n                                 V2TIMValueCallback<V2TIMConversationResult>* callback) = 0;\nvirtual void GetConversationList(const V2TIMStringVector& conversationIDList,\n                                 V2TIMValueCallback<V2TIMConversationOperationResultVector>* callback) = 0;\n\n// Filtered variant is GetConversationListByFilter; nextSeq is also uint64_t\nvirtual void GetConversationListByFilter(const V2TIMConversationListFilter& filter,\n                                         uint64_t nextSeq,\n                                         uint32_t count,\n                                         V2TIMValueCallback<V2TIMConversationResult>* callback) = 0;\n\n// Single-conversation ops: no conversationType parameter (the ID is self-prefixed)\nvirtual void GetConversation(const V2TIMString& conversationID,\n                             V2TIMValueCallback<V2TIMConversation>* callback) = 0;\nvirtual void DeleteConversation(const V2TIMString& conversationID, V2TIMCallback* callback) = 0;\nvirtual void DeleteConversationList(const V2TIMStringVector& conversationIDList,\n                                    bool clearMessage,\n                                    V2TIMValueCallback<V2TIMConversationOperationResultVector>* callback) = 0;\nvirtual void SetConversationDraft(const V2TIMString& conversationID,\n                                  const V2TIMString& draftText,\n                                  V2TIMCallback* callback) = 0;\n```\n\n#### Not covered\n\n`PinConversation` / `MarkConversation` / `GetTotalUnreadMessageCount` / `GetUnreadMessageCountByFilter` / `SetConversationCustomData`, plus the conversation-group subsystem (`GetConversationGroupList` / `DeleteConversationGroup` / `DeleteConversationsFromGroup` / ...).\n\n### V2TIMSignalingManager\n\nSignaling manager: invite / cancel / accept / reject (a generic mechanism that AV calling uses, but it is not AV-specific).\n\n**Header**: `include/V2TIMSignalingManager.h`\n\n#### Listeners\n\n```cpp\nvirtual void AddSignalingListener(V2TIMSignalingListener* listener) = 0;\nvirtual void RemoveSignalingListener(V2TIMSignalingListener* listener) = 0;\n```\n\n#### Signaling operations\n\n```cpp\n// Real return type is V2TIMString (inviteID); callback type is V2TIMCallback*, NOT V2TIMValueCallback.\n// Invite requires a V2TIMOfflinePushInfo argument.\nvirtual V2TIMString Invite(const V2TIMString& invitee,\n                           const V2TIMString& data,\n                           bool onlineUserOnly,\n                           const V2TIMOfflinePushInfo& offlinePushInfo,\n                           int timeout,\n                           V2TIMCallback* callback) = 0;\n\nvirtual V2TIMString InviteInGroup(const V2TIMString& groupID,\n                                  const V2TIMStringVector& inviteeList,\n                                  const V2TIMString& data,\n                                  bool onlineUserOnly,\n                                  int timeout,\n                                  V2TIMCallback* callback) = 0;\n\nvirtual void Cancel(const V2TIMString& inviteID, const V2TIMString& data, V2TIMCallback* callback) = 0;\nvirtual void Accept(const V2TIMString& inviteID, const V2TIMString& data, V2TIMCallback* callback) = 0;\nvirtual void Reject(const V2TIMString& inviteID, const V2TIMString& data, V2TIMCallback* callback) = 0;\n```\n\n#### Not covered\n\n`GetSignalingInfo`, `AddInvitedSignaling`, `ModifyInvitation`.\n\n### V2TIMCommunityManager\n\nCommunity manager (topics & permission groups).\n\n**Header**: `include/V2TIMCommunityManager.h`\n\n```cpp\nvirtual void AddCommunityListener(V2TIMCommunityListener* listener) = 0;\nvirtual void RemoveCommunityListener(V2TIMCommunityListener* listener) = 0;\n\nvirtual void CreateTopicInCommunity(const V2TIMString& groupID,\n                                    const V2TIMTopicInfo& topicInfo,\n                                    V2TIMValueCallback<V2TIMString>* callback) = 0;\nvirtual void DeleteTopicFromCommunity(const V2TIMString& groupID,\n                                      const V2TIMStringVector& topicIDList,\n                                      V2TIMValueCallback<V2TIMTopicOperationResultVector>* callback) = 0;\nvirtual void SetTopicInfo(const V2TIMTopicInfo& topicInfo, V2TIMCallback* callback) = 0;\nvirtual void GetTopicInfoList(const V2TIMString& groupID,\n                              const V2TIMStringVector& topicIDList,\n                              V2TIMValueCallback<V2TIMTopicInfoResultVector>* callback) = 0;\n```\n\n> Permission-group APIs (`CreatePermissionGroupInCommunity`, etc.) exist in the header but are not expanded here.\n\n### V2TIMOfflinePushManager\n\nOffline-push manager (`include/V2TIMOfflinePushManager.h`). tim2tox provides only placeholder implementations because the Tox network has no cloud push service; calls typically succeed but are no-ops. Refer to the header for the surface.\n\n## Related documents\n\n- [API_SUPPORT_MATRIX.md](API_SUPPORT_MATRIX.md) — **per-API real support-status matrix** (native / dart-only / local-only / text-degraded / no-op-success / unsupported)\n- [API_REFERENCE.md](API_REFERENCE.md) — index, data types, error codes, examples\n- [API_REFERENCE_FFI.md](API_REFERENCE_FFI.md) — C FFI interface\n- [API_REFERENCE_DART.md](API_REFERENCE_DART.md) — Dart package API\n
+[简体中文](./API_REFERENCE_V2TIM.zh-CN.md)
+
+# Tim2Tox API Reference — V2TIM C++
+
+This document is the V2TIM C++ sub-volume of [API_REFERENCE.md](API_REFERENCE.md). All signatures are authoritative against `include/V2TIM*.h`; only the commonly used surface is listed. Methods marked "Not covered" should be looked up directly in the header.
+
+## V2TIM C++ API
+
+Tim2Tox implements the V2TIM core methods in C++ (see `source/V2TIMManagerImpl.*` and friends), keeping binary/semantic compatibility with the Tencent Cloud IM SDK contract.
+
+### V2TIMManager
+
+Core manager: SDK init, login/logout, and access to sub-managers.
+
+**Header**: `include/V2TIMManager.h`
+
+#### Initialization and version
+
+```cpp
+// Singleton
+static V2TIMManager* GetInstance();
+
+// Init / uninit
+virtual bool InitSDK(uint32_t sdkAppID, const V2TIMSDKConfig& config) = 0;
+virtual void UnInitSDK() = 0;
+
+// Version and server time
+virtual V2TIMString GetVersion() = 0;
+virtual int64_t     GetServerTime() = 0;
+```
+
+#### Listeners
+
+```cpp
+virtual void AddSDKListener(V2TIMSDKListener* listener) = 0;
+virtual void RemoveSDKListener(V2TIMSDKListener* listener) = 0;
+```
+
+#### Login / logout
+
+```cpp
+virtual void        Login(const V2TIMString& userID, const V2TIMString& userSig, V2TIMCallback* callback) = 0;
+virtual void        Logout(V2TIMCallback* callback) = 0;
+virtual V2TIMString GetLoginUser() = 0;
+```
+
+#### Authentication & login semantics (read this)
+
+Tim2Tox runs over the Tox P2P network and has no authentication server like Tencent Cloud IM. Login semantics therefore differ fundamentally from V2TIM:
+
+- **`Login(userID, userSig)` does NOT verify `userSig`.** `userSig` is accepted only for V2TIM call-signature compatibility and is ignored. Login actually means **open/bind the LOCAL Tox identity/profile**, NOT server-side authentication. Integrators must **NOT** treat a successful `Login` as "the user is authenticated."
+- **`GetLoginStatus()` reflects local login state, not network connectivity.** It returns `LOGINED` as soon as a local alias is set — that only means the local profile is open; it does **NOT** mean the client is connected to the Tox DHT / online. For actual connectivity, observe the connection-status listener/callback; do not rely on `GetLoginStatus()`.
+
+For the per-API status see the "Authentication / Login" section of [API_SUPPORT_MATRIX.md](API_SUPPORT_MATRIX.md).
+
+#### Sub-manager accessors
+
+```cpp
+virtual V2TIMMessageManager*      GetMessageManager() = 0;
+virtual V2TIMGroupManager*        GetGroupManager() = 0;
+virtual V2TIMConversationManager* GetConversationManager() = 0;
+virtual V2TIMFriendshipManager*   GetFriendshipManager() = 0;
+virtual V2TIMSignalingManager*    GetSignalingManager() = 0;
+virtual V2TIMCommunityManager*    GetCommunityManager() = 0;
+virtual V2TIMOfflinePushManager*  GetOfflinePushManager() = 0;
+```
+
+#### Group shortcuts (hung directly on V2TIMManager)
+
+```cpp
+virtual void JoinGroup(const V2TIMString& groupID, const V2TIMString& message, V2TIMCallback* callback) = 0;
+virtual void QuitGroup(const V2TIMString& groupID, V2TIMCallback* callback) = 0;
+virtual void DismissGroup(const V2TIMString& groupID, V2TIMCallback* callback) = 0;
+```
+
+> `JoinGroup` / `QuitGroup` / `DismissGroup` live on `V2TIMManager`, **not** on `V2TIMGroupManager`.
+
+### V2TIMMessageManager
+
+Message manager: build, send, query, read-mark, revoke.
+
+**Header**: `include/V2TIMMessageManager.h`
+
+#### Listeners
+
+```cpp
+virtual void AddAdvancedMsgListener(V2TIMAdvancedMsgListener* listener) = 0;
+virtual void RemoveAdvancedMsgListener(V2TIMAdvancedMsgListener* listener) = 0;
+```
+
+#### Create message
+
+```cpp
+virtual V2TIMMessage CreateTextMessage(const V2TIMString& text) = 0;
+virtual V2TIMMessage CreateCustomMessage(const V2TIMBuffer& data) = 0;
+virtual V2TIMMessage CreateCustomMessage(const V2TIMBuffer& data,
+                                         const V2TIMString& description,
+                                         const V2TIMString& extension) = 0;
+virtual V2TIMMessage CreateImageMessage(const V2TIMString& imagePath) = 0;
+virtual V2TIMMessage CreateSoundMessage(const V2TIMString& soundPath, uint32_t duration) = 0;
+virtual V2TIMMessage CreateVideoMessage(const V2TIMString& videoFilePath,
+                                        const V2TIMString& type,
+                                        uint32_t duration,
+                                        const V2TIMString& snapshotPath) = 0;
+virtual V2TIMMessage CreateFileMessage(const V2TIMString& filePath, const V2TIMString& fileName) = 0;
+virtual V2TIMMessage CreateLocationMessage(const V2TIMString& desc, double longitude, double latitude) = 0;
+virtual V2TIMMessage CreateFaceMessage(uint32_t index, const V2TIMBuffer& data) = 0;
+virtual V2TIMMessage CreateMergerMessage(const V2TIMMessageVector& messageList,
+                                         const V2TIMString& title,
+                                         const V2TIMStringVector& abstractList,
+                                         const V2TIMStringVector& compatibleText) = 0;
+```
+
+> **Media message caveat (read this)**: `CreateImageMessage` / `CreateSoundMessage` / `CreateVideoMessage` are **NOT implemented** — calling them sets the message status to `SEND_FAIL` (nothing is sent). `CreateFileMessage`, and the LOCATION / FACE and other media/location/face types, are **degraded to a plain text description on send** (e.g. `[转发文件]` "forwarded file"); the recipient receives text, **not** a structured message. For real file transfer use the `FfiChatService` file APIs (`tim2tox_ffi_send_file` / `tim2tox_ffi_file_control`). For the per-API real status see [API_SUPPORT_MATRIX.md](API_SUPPORT_MATRIX.md).
+
+#### Send message
+
+```cpp
+// Real signature: returns V2TIMString (msgID); parameters are
+// receiver, groupID, priority, onlineUserOnly, offlinePushInfo, callback.
+// Header location: include/V2TIMMessageManager.h:235
+virtual V2TIMString SendMessage(V2TIMMessage& message,
+                                const V2TIMString& receiver,
+                                const V2TIMString& groupID,
+                                V2TIMMessagePriority priority,
+                                bool onlineUserOnly,
+                                const V2TIMOfflinePushInfo& offlinePushInfo,
+                                V2TIMSendCallback* callback) = 0;
+```
+
+> For **C2C** pass `receiver=<peer userID>`, `groupID=V2TIMString()`. For **group** messages pass `receiver=V2TIMString()`, `groupID=<group ID>`. There is no separate "with cloudCustomData" overload — set `message.cloudCustomData` on the message itself.
+
+#### Query
+
+```cpp
+virtual void FindMessages(const V2TIMStringVector& messageIDList,
+                          V2TIMValueCallback<V2TIMMessageVector>* callback) = 0;
+
+// Real signature: a single option struct carries all parameters; the callback yields a V2TIMMessageVector.
+virtual void GetHistoryMessageList(const V2TIMMessageListGetOption& option,
+                                   V2TIMValueCallback<V2TIMMessageVector>* callback) = 0;
+```
+
+> `V2TIMMessageListGetOption` lives in `include/V2TIMMessage.h` (fields include `userID` / `groupID` / `lastMsg` / `getType` / `count` / ...). In tim2tox, history reads are intercepted by the Platform / `FfiChatService` and served from the Dart-side `MessageHistoryPersistence`.
+
+#### Operations
+
+```cpp
+virtual void RevokeMessage(const V2TIMMessage& message, V2TIMCallback* callback) = 0;
+
+// Read-mark: there is **no** unified MarkMessageAsRead — three separate methods:
+virtual void MarkC2CMessageAsRead(const V2TIMString& userID, V2TIMCallback* callback) = 0;
+virtual void MarkGroupMessageAsRead(const V2TIMString& groupID, V2TIMCallback* callback) = 0;
+virtual void MarkAllMessageAsRead(V2TIMCallback* callback) = 0;
+
+// Delete: the parameter is a V2TIMMessageVector, not a V2TIMStringVector of IDs
+virtual void DeleteMessages(const V2TIMMessageVector& messages, V2TIMCallback* callback) = 0;
+```
+
+#### Not covered
+
+`ModifyMessage`, `ClearC2CHistoryMessage`, `ClearGroupHistoryMessage`, `InsertC2CMessageToLocalStorage`, `InsertGroupMessageToLocalStorage`, `SendMessageReadReceipts`, `GetMessageReadReceipts`, `GetGroupMessageReadMemberList`, `SetC2CReceiveMessageOpt`, `GetC2CReceiveMessageOpt`, and the rest of the read-receipt / receive-option surface are not expanded here.
+
+### V2TIMFriendshipManager
+
+Friend manager.
+
+**Header**: `include/V2TIMFriendshipManager.h`
+
+#### Listeners
+
+```cpp
+virtual void AddFriendListener(V2TIMFriendshipListener* listener) = 0;
+virtual void RemoveFriendListener(V2TIMFriendshipListener* listener) = 0;
+```
+
+#### Friend list / info
+
+```cpp
+virtual void GetFriendList(V2TIMValueCallback<V2TIMFriendInfoVector>* callback) = 0;
+virtual void GetFriendsInfo(const V2TIMStringVector& userIDList,
+                            V2TIMValueCallback<V2TIMFriendInfoResultVector>* callback) = 0;
+virtual void SetFriendInfo(const V2TIMFriendInfo& info, V2TIMCallback* callback) = 0;
+```
+
+#### Friend operations
+
+```cpp
+virtual void AddFriend(const V2TIMFriendAddApplication& application,
+                       V2TIMValueCallback<V2TIMFriendOperationResult>* callback) = 0;
+virtual void DeleteFromFriendList(const V2TIMStringVector& userIDList,
+                                  V2TIMFriendType deleteType,
+                                  V2TIMValueCallback<V2TIMFriendOperationResultVector>* callback) = 0;
+virtual void CheckFriend(const V2TIMStringVector& userIDList,
+                         V2TIMFriendType checkType,
+                         V2TIMValueCallback<V2TIMFriendCheckResultVector>* callback) = 0;
+```
+
+#### Friend applications
+
+```cpp
+virtual void GetFriendApplicationList(V2TIMValueCallback<V2TIMFriendApplicationResult>* callback) = 0;
+
+// The real enum is V2TIMFriendAcceptType (not V2TIMFriendResponseType).
+// Two overloads: with and without remark.
+virtual void AcceptFriendApplication(const V2TIMFriendApplication& application,
+                                     V2TIMFriendAcceptType acceptType,
+                                     V2TIMValueCallback<V2TIMFriendOperationResult>* callback) = 0;
+virtual void AcceptFriendApplication(const V2TIMFriendApplication& application,
+                                     V2TIMFriendAcceptType acceptType,
+                                     const V2TIMString& remark,
+                                     V2TIMValueCallback<V2TIMFriendOperationResult>* callback) = 0;
+
+virtual void RefuseFriendApplication(const V2TIMFriendApplication& application,
+                                     V2TIMValueCallback<V2TIMFriendOperationResult>* callback) = 0;
+```
+
+#### Not covered
+
+`DeleteFriendApplication`, `SetFriendApplicationRead`, `AddToBlackList` / `DeleteFromBlackList` / `GetBlackList`, the `CreateFriendGroup` family.
+
+### V2TIMGroupManager
+
+Group manager.
+
+**Header**: `include/V2TIMGroupManager.h`
+
+> Note: `JoinGroup` / `QuitGroup` / `DismissGroup` are not in this interface — they hang on [V2TIMManager](#v2timmanager).
+
+#### Listeners
+
+```cpp
+virtual void AddGroupListener(V2TIMGroupListener* listener) = 0;
+virtual void RemoveGroupListener(V2TIMGroupListener* listener) = 0;
+```
+
+#### Group operations
+
+```cpp
+virtual void CreateGroup(const V2TIMGroupInfo& info,
+                         const V2TIMCreateGroupMemberInfoVector& memberList,
+                         V2TIMValueCallback<V2TIMString>* callback) = 0;
+
+virtual void GetJoinedGroupList(V2TIMValueCallback<V2TIMGroupInfoVector>* callback) = 0;
+virtual void GetGroupsInfo(const V2TIMStringVector& groupIDList,
+                           V2TIMValueCallback<V2TIMGroupInfoResultVector>* callback) = 0;
+virtual void SetGroupInfo(const V2TIMGroupInfo& info, V2TIMCallback* callback) = 0;
+```
+
+**tim2tox behavior** (implemented in `V2TIMGroupManagerImpl.cpp`):
+
+- `info.groupType`: `"group"` (new API, `tox_group_new`, supports `chat_id` persistence — preferred) or `"conference"` (old API, `tox_conference_new`, savedata-only recovery — compatibility only). Defaults to `"group"` when omitted.
+- `info.groupID`: optional; auto-generated as `tox_<id>` when omitted.
+- `groupType` is always persisted; `"group"` type additionally persists the `chat_id`.
+- `GetGroupsInfo` returns `V2TIMGroupInfo.notification` from `tox_group_get_topic`, which is **Group-type only**.
+
+#### Group members
+
+```cpp
+// filter is uint32_t (V2TIMGroupMemberFilter bitmask or custom marker); nextSeq is uint64_t
+virtual void GetGroupMemberList(const V2TIMString& groupID,
+                                uint32_t filter,
+                                uint64_t nextSeq,
+                                V2TIMValueCallback<V2TIMGroupMemberInfoResult>* callback) = 0;
+
+// memberList is passed by value (V2TIMStringVector), not by const reference
+virtual void GetGroupMembersInfo(const V2TIMString& groupID,
+                                 V2TIMStringVector memberList,
+                                 V2TIMValueCallback<V2TIMGroupMemberFullInfoVector>* callback) = 0;
+
+// Mutate a member: the userID is carried inside info.userID (no separate parameter)
+virtual void SetGroupMemberInfo(const V2TIMString& groupID,
+                                const V2TIMGroupMemberFullInfo& info,
+                                V2TIMCallback* callback) = 0;
+```
+
+#### Not covered
+
+`InviteUserToGroup`, `KickGroupMember`, `MuteGroupMember`, `MuteAllGroupMembers`, `TransferGroupOwner`, `SearchGroupMembers`, `SearchCloudGroupMembers`, `GetGroupApplicationList` and its Accept/Refuse, `MarkGroupMemberList`, `HandleGroupPendency`, `SearchCloudGroups`, etc.
+
+### V2TIMConversationManager
+
+Conversation manager.
+
+**Header**: `include/V2TIMConversationManager.h`
+
+#### Listeners
+
+```cpp
+virtual void AddConversationListener(V2TIMConversationListener* listener) = 0;
+virtual void RemoveConversationListener(V2TIMConversationListener* listener) = 0;
+```
+
+#### Conversation operations
+
+```cpp
+// Two GetConversationList overloads (by seq / by ID list)
+virtual void GetConversationList(uint64_t nextSeq,
+                                 uint32_t count,
+                                 V2TIMValueCallback<V2TIMConversationResult>* callback) = 0;
+virtual void GetConversationList(const V2TIMStringVector& conversationIDList,
+                                 V2TIMValueCallback<V2TIMConversationOperationResultVector>* callback) = 0;
+
+// Filtered variant is GetConversationListByFilter; nextSeq is also uint64_t
+virtual void GetConversationListByFilter(const V2TIMConversationListFilter& filter,
+                                         uint64_t nextSeq,
+                                         uint32_t count,
+                                         V2TIMValueCallback<V2TIMConversationResult>* callback) = 0;
+
+// Single-conversation ops: no conversationType parameter (the ID is self-prefixed)
+virtual void GetConversation(const V2TIMString& conversationID,
+                             V2TIMValueCallback<V2TIMConversation>* callback) = 0;
+virtual void DeleteConversation(const V2TIMString& conversationID, V2TIMCallback* callback) = 0;
+virtual void DeleteConversationList(const V2TIMStringVector& conversationIDList,
+                                    bool clearMessage,
+                                    V2TIMValueCallback<V2TIMConversationOperationResultVector>* callback) = 0;
+virtual void SetConversationDraft(const V2TIMString& conversationID,
+                                  const V2TIMString& draftText,
+                                  V2TIMCallback* callback) = 0;
+```
+
+#### Not covered
+
+`PinConversation` / `MarkConversation` / `GetTotalUnreadMessageCount` / `GetUnreadMessageCountByFilter` / `SetConversationCustomData`, plus the conversation-group subsystem (`GetConversationGroupList` / `DeleteConversationGroup` / `DeleteConversationsFromGroup` / ...).
+
+### V2TIMSignalingManager
+
+Signaling manager: invite / cancel / accept / reject (a generic mechanism that AV calling uses, but it is not AV-specific).
+
+**Header**: `include/V2TIMSignalingManager.h`
+
+#### Listeners
+
+```cpp
+virtual void AddSignalingListener(V2TIMSignalingListener* listener) = 0;
+virtual void RemoveSignalingListener(V2TIMSignalingListener* listener) = 0;
+```
+
+#### Signaling operations
+
+```cpp
+// Real return type is V2TIMString (inviteID); callback type is V2TIMCallback*, NOT V2TIMValueCallback.
+// Invite requires a V2TIMOfflinePushInfo argument.
+virtual V2TIMString Invite(const V2TIMString& invitee,
+                           const V2TIMString& data,
+                           bool onlineUserOnly,
+                           const V2TIMOfflinePushInfo& offlinePushInfo,
+                           int timeout,
+                           V2TIMCallback* callback) = 0;
+
+virtual V2TIMString InviteInGroup(const V2TIMString& groupID,
+                                  const V2TIMStringVector& inviteeList,
+                                  const V2TIMString& data,
+                                  bool onlineUserOnly,
+                                  int timeout,
+                                  V2TIMCallback* callback) = 0;
+
+virtual void Cancel(const V2TIMString& inviteID, const V2TIMString& data, V2TIMCallback* callback) = 0;
+virtual void Accept(const V2TIMString& inviteID, const V2TIMString& data, V2TIMCallback* callback) = 0;
+virtual void Reject(const V2TIMString& inviteID, const V2TIMString& data, V2TIMCallback* callback) = 0;
+```
+
+#### Not covered
+
+`GetSignalingInfo`, `AddInvitedSignaling`, `ModifyInvitation`.
+
+### V2TIMCommunityManager
+
+Community manager (topics & permission groups).
+
+**Header**: `include/V2TIMCommunityManager.h`
+
+```cpp
+virtual void AddCommunityListener(V2TIMCommunityListener* listener) = 0;
+virtual void RemoveCommunityListener(V2TIMCommunityListener* listener) = 0;
+
+virtual void CreateTopicInCommunity(const V2TIMString& groupID,
+                                    const V2TIMTopicInfo& topicInfo,
+                                    V2TIMValueCallback<V2TIMString>* callback) = 0;
+virtual void DeleteTopicFromCommunity(const V2TIMString& groupID,
+                                      const V2TIMStringVector& topicIDList,
+                                      V2TIMValueCallback<V2TIMTopicOperationResultVector>* callback) = 0;
+virtual void SetTopicInfo(const V2TIMTopicInfo& topicInfo, V2TIMCallback* callback) = 0;
+virtual void GetTopicInfoList(const V2TIMString& groupID,
+                              const V2TIMStringVector& topicIDList,
+                              V2TIMValueCallback<V2TIMTopicInfoResultVector>* callback) = 0;
+```
+
+> Permission-group APIs (`CreatePermissionGroupInCommunity`, etc.) exist in the header but are not expanded here.
+
+### V2TIMOfflinePushManager
+
+Offline-push manager (`include/V2TIMOfflinePushManager.h`). tim2tox provides only placeholder implementations because the Tox network has no cloud push service; calls typically succeed but are no-ops. Refer to the header for the surface.
+
+## Related documents
+
+- [API_SUPPORT_MATRIX.md](API_SUPPORT_MATRIX.md) — **per-API real support-status matrix** (native / dart-only / local-only / text-degraded / no-op-success / unsupported)
+- [API_REFERENCE.md](API_REFERENCE.md) — index, data types, error codes, examples
+- [API_REFERENCE_FFI.md](API_REFERENCE_FFI.md) — C FFI interface
+- [API_REFERENCE_DART.md](API_REFERENCE_DART.md) — Dart package API

@@ -1,1 +1,170 @@
-[简体中文](./README.zh-CN.md)\n\n[简体中文](./README.zh-CN.md)\n\n# Tim2Tox Dart Package\n\n> Language: **English** | [简体中文](README.zh-CN.md)\n\nThe Tim2Tox Dart package provides Dart bindings and the SDK Platform implementation for the Tim2Tox framework. Package name: `tim2tox_dart`.\n\n> **Full integration entry points** are at the repo root:\n>\n> - Project positioning, two integration paths, five integration steps: [`../README.md`](../README.md)\n> - In-depth documentation and recommended reading paths: [`../doc/README.md`](../doc/README.md)\n> - Build guide: [`../README_BUILD.md`](../README_BUILD.md)\n> - **Full API reference**: [`../doc/api/API_REFERENCE_DART.md`](../doc/api/API_REFERENCE_DART.md)\n\n## Layout\n\n```\ndart/\n├── lib/\n│   ├── tim2tox_dart.dart           # Public barrel\n│   ├── ffi/\n│   │   └── tim2tox_ffi.dart        # Low-level dart:ffi bindings (Tim2ToxFfi)\n│   ├── service/\n│   │   ├── ffi_chat_service.dart   # Service layer — main app entry point\n│   │   ├── call_bridge_service.dart\n│   │   ├── toxav_service.dart\n│   │   ├── av_codec_service.dart\n│   │   ├── call_av_backend.dart\n│   │   ├── tuicallkit_adapter.dart\n│   │   ├── tuicallkit_integration.dart\n│   │   ├── tuicallkit_interceptor.dart\n│   │   ├── tuicallkit_patch.dart\n│   │   └── tuicallkit_tuicore_integration.dart\n│   ├── sdk/\n│   │   ├── tim2tox_sdk_platform.dart            # TencentCloudChatSdkPlatform implementation\n│   │   ├── tim2tox_sdk_platform_callbacks.dart\n│   │   └── tim2tox_sdk_platform_converters.dart\n│   ├── interfaces/                  # Injection interfaces the client implements\n│   │   ├── preferences_service.dart\n│   │   ├── extended_preferences_service.dart\n│   │   ├── logger_service.dart\n│   │   ├── bootstrap_service.dart\n│   │   ├── event_bus.dart\n│   │   ├── event_bus_provider.dart\n│   │   └── conversation_manager_provider.dart\n│   ├── instance/\n│   │   └── tim2tox_instance.dart    # Multi-instance context\n│   ├── models/\n│   │   ├── chat_message.dart\n│   │   └── fake_models.dart         # Fake models used to bridge to UIKit\n│   └── utils/\n│       ├── message_history_persistence.dart\n│       ├── binary_replacement_history_hook.dart\n│       ├── message_converter.dart\n│       ├── conversation_id_utils.dart\n│       ├── message_id_generator.dart\n│       ├── offline_message_queue_persistence.dart\n│       └── tim2tox_failed_message_persistence.dart\n├── pubspec.yaml\n└── README.md\n```\n\n## Usage\n\n### 1. Add the dependency (path example)\n\n```yaml\ndependencies:\n  tim2tox_dart:\n    path: ../tim2tox/dart       # under toxee: third_party/tim2tox/dart\n```\n\n### 2. Implement the injection interfaces\n\n**Both `FfiChatService` and `Tim2ToxSdkPlatform` require an `ExtendedPreferencesService`, not just `PreferencesService`.** `PreferencesService` has 7 basic key/value methods; `ExtendedPreferencesService` extends it with ~40 domain methods (groups, friend metadata, Bootstrap, avatars, blacklist, ...).\n\n```dart\nimport 'package:tim2tox_dart/tim2tox_dart.dart';   // re-exports every interface\nimport 'package:shared_preferences/shared_preferences.dart';\n\nclass MyPreferencesService implements ExtendedPreferencesService {\n  final SharedPreferences _prefs;\n  MyPreferencesService(this._prefs);\n\n  // ---- Base PreferencesService ----\n  @override\n  Future<String?> getString(String key) async => _prefs.getString(key);\n  @override\n  Future<void>    setString(String key, String value) async {\n    await _prefs.setString(key, value);\n  }\n  @override\n  Future<bool?>   getBool(String key)  async => _prefs.getBool(key);\n  @override\n  Future<void>    setBool(String key, bool value) async {\n    await _prefs.setBool(key, value);\n  }\n  @override\n  Future<int?>    getInt(String key)   async => _prefs.getInt(key);\n  @override\n  Future<void>    setInt(String key, int value) async {\n    await _prefs.setInt(key, value);\n  }\n  @override\n  Future<void>    remove(String key) async {\n    await _prefs.remove(key);\n  }\n\n  // ---- ExtendedPreferencesService extension (~40 methods) ----\n  // Groups / friend metadata / Bootstrap / avatars / blacklist / ...\n  // Full method list: dart/lib/interfaces/extended_preferences_service.dart\n  // or doc/api/API_REFERENCE_DART.md\n  @override\n  Future<Set<String>> getGroups() async {\n    final json = _prefs.getStringList('groups') ?? const [];\n    return json.toSet();\n  }\n  @override\n  Future<void> setGroups(Set<String> groups) async {\n    await _prefs.setStringList('groups', groups.toList());\n  }\n  // ... etc.\n}\n```\n\n> Recommended: copy the abstract method signatures from `dart/lib/interfaces/extended_preferences_service.dart` as the initial skeleton and wire each one to your storage backend.\n\n### 3. Initialize `FfiChatService`\n\n```dart\nimport 'package:tim2tox_dart/tim2tox_dart.dart';\nimport 'package:shared_preferences/shared_preferences.dart';\n\nfinal prefsService     = MyPreferencesService(await SharedPreferences.getInstance());\nfinal loggerService    = MyLoggerService();\nfinal bootstrapService = MyBootstrapService();          // optional\n\nfinal ffiService = FfiChatService(\n  preferencesService: prefsService,\n  loggerService:      loggerService,\n  bootstrapService:   bootstrapService,\n  // Optional injections: messageHistoryPersistence, offlineMessageQueuePersistence,\n  //                      historyDirectory, queueFilePath, fileRecvPath, avatarsPath,\n  //                      eventBusProvider, conversationManagerProvider, ...\n);\n\nawait ffiService.init();\n// After login, call ffiService.startPolling() explicitly — without it, no events reach Dart.\n```\n\nFor the full constructor parameter list, see `dart/lib/service/ffi_chat_service.dart` and [API_REFERENCE_DART.md](../doc/api/API_REFERENCE_DART.md).\n\n### 4. Install the SDK Platform (Platform path)\n\n```dart\nimport 'package:tim2tox_dart/tim2tox_dart.dart';\nimport 'package:tencent_cloud_chat_sdk/tencent_cloud_chat_sdk_platform_interface.dart';\n\nTencentCloudChatSdkPlatform.instance = Tim2ToxSdkPlatform(\n  ffiService: ffiService,\n);\n```\n\n## Notes\n\n- Do not confuse `FfiChatService` and `Tim2ToxSdkPlatform` method names:\n  - `FfiChatService` uses lower-level names (`sendText` / `sendTyping` / `sendC2CCustom` / `sendGroupText` / ...).\n  - `Tim2ToxSdkPlatform` uses V2TIM-style names (`sendMessage` / `setTyping` / ...).\n- **`startPolling()` is explicit**: you must call it once after `login()` finishes; otherwise no events flow back from native into Dart.\n- History is persisted on the Dart side (`MessageHistoryPersistence`); C++ does not store history. In hybrid mode, don't let both paths write history at once (see `BinaryReplacementHistoryHook`).\n- This README only covers the package layout and the minimal skeleton. For the full integration story and decisions, defer to the root README and the doc index.\n
+[简体中文](./README.zh-CN.md)
+
+# Tim2Tox Dart Package
+
+The Tim2Tox Dart package provides Dart bindings and the SDK Platform implementation for the Tim2Tox framework. Package name: `tim2tox_dart`.
+
+> **Full integration entry points** are at the repo root:
+>
+> - Project positioning, two integration paths, five integration steps: [`../README.md`](../README.md)
+> - In-depth documentation and recommended reading paths: [`../doc/README.md`](../doc/README.md)
+> - Build guide: [`../README_BUILD.md`](../README_BUILD.md)
+> - **Full API reference**: [`../doc/api/API_REFERENCE_DART.md`](../doc/api/API_REFERENCE_DART.md)
+
+## Layout
+
+```
+dart/
+├── lib/
+│   ├── tim2tox_dart.dart           # Public barrel
+│   ├── ffi/
+│   │   └── tim2tox_ffi.dart        # Low-level dart:ffi bindings (Tim2ToxFfi)
+│   ├── service/
+│   │   ├── ffi_chat_service.dart   # Service layer — main app entry point
+│   │   ├── call_bridge_service.dart
+│   │   ├── toxav_service.dart
+│   │   ├── av_codec_service.dart
+│   │   ├── call_av_backend.dart
+│   │   ├── tuicallkit_adapter.dart
+│   │   ├── tuicallkit_integration.dart
+│   │   ├── tuicallkit_interceptor.dart
+│   │   ├── tuicallkit_patch.dart
+│   │   └── tuicallkit_tuicore_integration.dart
+│   ├── sdk/
+│   │   ├── tim2tox_sdk_platform.dart            # TencentCloudChatSdkPlatform implementation
+│   │   ├── tim2tox_sdk_platform_callbacks.dart
+│   │   └── tim2tox_sdk_platform_converters.dart
+│   ├── interfaces/                  # Injection interfaces the client implements
+│   │   ├── preferences_service.dart
+│   │   ├── extended_preferences_service.dart
+│   │   ├── logger_service.dart
+│   │   ├── bootstrap_service.dart
+│   │   ├── event_bus.dart
+│   │   ├── event_bus_provider.dart
+│   │   └── conversation_manager_provider.dart
+│   ├── instance/
+│   │   └── tim2tox_instance.dart    # Multi-instance context
+│   ├── models/
+│   │   ├── chat_message.dart
+│   │   └── fake_models.dart         # Fake models used to bridge to UIKit
+│   └── utils/
+│       ├── message_history_persistence.dart
+│       ├── binary_replacement_history_hook.dart
+│       ├── message_converter.dart
+│       ├── conversation_id_utils.dart
+│       ├── message_id_generator.dart
+│       ├── offline_message_queue_persistence.dart
+│       └── tim2tox_failed_message_persistence.dart
+├── pubspec.yaml
+└── README.md
+```
+
+## Usage
+
+### 1. Add the dependency (path example)
+
+```yaml
+dependencies:
+  tim2tox_dart:
+    path: ../tim2tox/dart       # under toxee: third_party/tim2tox/dart
+```
+
+### 2. Implement the injection interfaces
+
+**Both `FfiChatService` and `Tim2ToxSdkPlatform` require an `ExtendedPreferencesService`, not just `PreferencesService`.** `PreferencesService` has 7 basic key/value methods; `ExtendedPreferencesService` extends it with ~40 domain methods (groups, friend metadata, Bootstrap, avatars, blacklist, ...).
+
+```dart
+import 'package:tim2tox_dart/tim2tox_dart.dart';   // re-exports every interface
+import 'package:shared_preferences/shared_preferences.dart';
+
+class MyPreferencesService implements ExtendedPreferencesService {
+  final SharedPreferences _prefs;
+  MyPreferencesService(this._prefs);
+
+  // ---- Base PreferencesService ----
+  @override
+  Future<String?> getString(String key) async => _prefs.getString(key);
+  @override
+  Future<void>    setString(String key, String value) async {
+    await _prefs.setString(key, value);
+  }
+  @override
+  Future<bool?>   getBool(String key)  async => _prefs.getBool(key);
+  @override
+  Future<void>    setBool(String key, bool value) async {
+    await _prefs.setBool(key, value);
+  }
+  @override
+  Future<int?>    getInt(String key)   async => _prefs.getInt(key);
+  @override
+  Future<void>    setInt(String key, int value) async {
+    await _prefs.setInt(key, value);
+  }
+  @override
+  Future<void>    remove(String key) async {
+    await _prefs.remove(key);
+  }
+
+  // ---- ExtendedPreferencesService extension (~40 methods) ----
+  // Groups / friend metadata / Bootstrap / avatars / blacklist / ...
+  // Full method list: dart/lib/interfaces/extended_preferences_service.dart
+  // or doc/api/API_REFERENCE_DART.md
+  @override
+  Future<Set<String>> getGroups() async {
+    final json = _prefs.getStringList('groups') ?? const [];
+    return json.toSet();
+  }
+  @override
+  Future<void> setGroups(Set<String> groups) async {
+    await _prefs.setStringList('groups', groups.toList());
+  }
+  // ... etc.
+}
+```
+
+> Recommended: copy the abstract method signatures from `dart/lib/interfaces/extended_preferences_service.dart` as the initial skeleton and wire each one to your storage backend.
+
+### 3. Initialize `FfiChatService`
+
+```dart
+import 'package:tim2tox_dart/tim2tox_dart.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+
+final prefsService     = MyPreferencesService(await SharedPreferences.getInstance());
+final loggerService    = MyLoggerService();
+final bootstrapService = MyBootstrapService();          // optional
+
+final ffiService = FfiChatService(
+  preferencesService: prefsService,
+  loggerService:      loggerService,
+  bootstrapService:   bootstrapService,
+  // Optional injections: messageHistoryPersistence, offlineMessageQueuePersistence,
+  //                      historyDirectory, queueFilePath, fileRecvPath, avatarsPath,
+  //                      eventBusProvider, conversationManagerProvider, ...
+);
+
+await ffiService.init();
+// After login, call ffiService.startPolling() explicitly — without it, no events reach Dart.
+```
+
+For the full constructor parameter list, see `dart/lib/service/ffi_chat_service.dart` and [API_REFERENCE_DART.md](../doc/api/API_REFERENCE_DART.md).
+
+### 4. Install the SDK Platform (Platform path)
+
+```dart
+import 'package:tim2tox_dart/tim2tox_dart.dart';
+import 'package:tencent_cloud_chat_sdk/tencent_cloud_chat_sdk_platform_interface.dart';
+
+TencentCloudChatSdkPlatform.instance = Tim2ToxSdkPlatform(
+  ffiService: ffiService,
+);
+```
+
+## Notes
+
+- Do not confuse `FfiChatService` and `Tim2ToxSdkPlatform` method names:
+  - `FfiChatService` uses lower-level names (`sendText` / `sendTyping` / `sendC2CCustom` / `sendGroupText` / ...).
+  - `Tim2ToxSdkPlatform` uses V2TIM-style names (`sendMessage` / `setTyping` / ...).
+- **`startPolling()` is explicit**: you must call it once after `login()` finishes; otherwise no events flow back from native into Dart.
+- History is persisted on the Dart side (`MessageHistoryPersistence`); C++ does not store history. In hybrid mode, don't let both paths write history at once (see `BinaryReplacementHistoryHook`).
+- This README only covers the package layout and the minimal skeleton. For the full integration story and decisions, defer to the root README and the doc index.

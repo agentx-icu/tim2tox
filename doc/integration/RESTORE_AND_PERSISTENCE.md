@@ -1,1 +1,287 @@
-[简体中文](./RESTORE_AND_PERSISTENCE.zh-CN.md)\n\n[简体中文](./RESTORE_AND_PERSISTENCE.zh-CN.md)\n\n# Tim2Tox Restore and Persistence\n\n> Language: **English** | [简体中文](RESTORE_AND_PERSISTENCE.zh-CN.md)\n\nThis document details the persistence and recovery mechanism of group chat in Tim2Tox, including two types of processing methods: Group and Conference.\n\n## Overview\n\nTim2Tox needs to persist the following information to ensure that the group can be restored correctly after the client restarts:\n\n1. **groupType**: group type ("group" or "conference")\n2. **chat_id**: Unique identifier of Group type (Group type only)\n3. **group_id**: Application layer group identifier\n4. **savedata**: Tox’s savedata (including Conference information)\n\n## Persistent data\n\n### 1. groupType\n\n**Storage location**: `SharedPreferences` (via FFI callback)\n\n**Storage format**: String "group" or "conference"\n\n**Storage Timing**: When creating a group\n\n**Storage**:\n```cpp\n// C++ side (multi-instance: first arg is int64_t instance_id; pass 0 for the production singleton)\nextern "C" int tim2tox_ffi_set_group_type(int64_t instance_id,\n                                          const char* group_id,\n                                          const char* group_type);\ntim2tox_ffi_set_group_type(/*instance=*/0, groupID, "group");  // or "conference"\n```\n\nDart side: the current `Tim2ToxSdkPlatform` customCallback only handles `groupChatIdStored`, `clearHistoryMessage`, and `groupQuitNotification`. `groupType` is persisted by the C++ side directly through the injected `ExtendedPreferencesService.setGroupType(...)` — there is no separate `case "groupTypeStored"` on the Dart side.\n\n**Reading**:\n```cpp\nextern "C" int tim2tox_ffi_get_group_type_from_storage(int64_t instance_id,\n                                                       const char* group_id,\n                                                       char* out_group_type,\n                                                       int out_len);\nchar stored_type[16];\nif (tim2tox_ffi_get_group_type_from_storage(/*instance=*/0, group_id,\n                                            stored_type, sizeof(stored_type)) == 1) {\n    std::string group_type = std::string(stored_type);\n}\n```\n\n### 2. chat_id (Group type only)\n\n**Storage location**: `SharedPreferences` (via FFI callback)\n\n**Storage Format**: 64-character hexadecimal string (32 bytes)\n\n**Storage Timing**: When creating or joining a Group type group\n\n**Storage**:\n```cpp\nextern "C" int tim2tox_ffi_set_group_chat_id(int64_t instance_id,\n                                             const char* group_id,\n                                             const char* chat_id);\ntim2tox_ffi_set_group_chat_id(/*instance=*/0, groupID, chat_id_hex);\n\n// Dart side: Tim2ToxSdkPlatform's customCallback handles "groupChatIdStored"\n// (see tim2tox_sdk_platform.dart)\ncase "groupChatIdStored":\n    await preferencesService.setGroupChatId(groupId, chatId);\n    break;\n```\n\n**Reading**:\n```cpp\nextern "C" int tim2tox_ffi_get_group_chat_id_from_storage(int64_t instance_id,\n                                                          const char* group_id,\n                                                          char* out_chat_id,\n                                                          int out_len);\nchar stored_chat_id[65];\nif (tim2tox_ffi_get_group_chat_id_from_storage(/*instance=*/0, group_id,\n                                               stored_chat_id, sizeof(stored_chat_id)) == 1) {\n    // use stored_chat_id\n}\n```\n\n### 3. savedata (Conference type)\n\n**Storage location**: Tox automatically managed (via `tox_get_savedata` / `tox_new`)\n\n**Storage format**: Binary data\n\n**Storage timing**: Tox is saved regularly (through `tox_save` callback)\n\n**Recovery method**: Load savedata through `tox_new` during Tox initialization\n\n## Recovery process\n\n### Recovery when InitSDK\n\nIn `V2TIMManagerImpl::InitSDK()`:\n\n1. **Load savedata**: Tox is automatically loaded during initialization, and conferences will be automatically restored.\n2. **Query restored groups**: Call `tox_manager_->getGroupListSize()` and `getGroupList()`\n3. **Manual trigger callback**: Call `HandleGroupSelfJoin()` to rebuild the mapping for each restored group\n4. **Query resumed conferences**: Call `tox_conference_get_chatlist_size()` and `tox_conference_get_chatlist()`\n5. **Call RejoinKnownGroups()**: Start the recovery process\n\n### RejoinKnownGroups recovery process\n\n**File**: `tim2tox/source/V2TIMManagerImpl.cpp::RejoinKnownGroups()`\n\n#### Group type recovery\n\n```\n1. Get all knownGroups from Dart layer\n   ↓\n2. For each group_id:\n   a. Check if mapped (skip)\n   b. Read groupType\n   c. If it is "group" type:\n      - Read chat_id\n      - Convert hex string to binary\n      - Call tox_group_join(chat_id)\n      - Wait for onGroupSelfJoin callback\n      - Rebuild mapping in HandleGroupSelfJoin\n```\n\n#### Conference type recovery\n\n```\n1. Query tox_conference_get_chatlist() to obtain restored conferences\n   ↓\n2. For each known group_id:\n   a. Check groupType\n   b. If it is "conference" type:\n      - Find unmapped conference_number\n      - Map conference_number to group_id\n      - Rebuild mapping relationship\n```\n\n### Recovery after connection establishment\n\nWhen the network connection is established (`HandleSelfConnectionStatus`), `RejoinKnownGroups()` will be called again:\n\n```cpp\nvoid V2TIMManagerImpl::HandleSelfConnectionStatus(...) {\n    if (status == TOX_CONNECTION_UDP || status == TOX_CONNECTION_TCP) {\n        // The connection is established, and recovery is triggered after a delay (to ensure a stable connection)\n        std::thread([this]() {\n            std::this_thread::sleep_for(std::chrono::milliseconds(500));\n            if (this->IsRunning()) {\n                this->RejoinKnownGroups();\n            }\n        }).detach();\n    }\n}\n```\n\n## Mapping relationship reconstruction\n\n### Group type mapping reconstruction\n\n**Trigger timing**: `onGroupSelfJoin` callback\n\n**Process**:\n```cpp\nvoid V2TIMManagerImpl::HandleGroupSelfJoin(Tox_Group_Number group_number) {\n    // 1. Get chat_id\n    uint8_t chat_id[TOX_GROUP_CHAT_ID_SIZE];\n    tox_manager_->getGroupChatId(group_number, chat_id, ...);\n\n    // 2. Convert to hex string\n    std::string chat_id_hex = chatIdToHexString(chat_id);\n\n    // 3. Find the corresponding group_id (through the stored chat_id)\n    V2TIMString groupID;\n    if (tim2tox_ffi_get_group_chat_id_from_storage(...)) {\n        // Find matching group_id\n        groupID = V2TIMString(found_group_id);\n    }\n\n    // 4. Rebuild mapping\n    group_id_to_group_number_[groupID] = group_number;\n    group_number_to_group_id_[group_number] = groupID;\n    group_id_to_chat_id_[groupID] = std::vector<uint8_t>(chat_id, chat_id + TOX_GROUP_CHAT_ID_SIZE);\n    chat_id_to_group_id_[chat_id_hex] = groupID;\n}\n```\n\n### Conference type mapping reconstruction\n\n**Trigger Timing**: `RejoinKnownGroups()` Medium\n\n**Process**:\n```cpp\nvoid V2TIMManagerImpl::RejoinKnownGroups() {\n    // 1. Query restored conferences\n    size_t conference_count = tox_conference_get_chatlist_size(tox);\n    std::vector<Tox_Conference_Number> conference_list(conference_count);\n    tox_conference_get_chatlist(tox, conference_list.data());\n\n    // 2. For each known group_id (conference type)\n    for (each group_id) {\n        if (group_type == "conference") {\n            // 3. Find unmapped conference_number\n            for (Tox_Conference_Number conf_num : conference_list) {\n                if (!conf_num mapped) {\n                    // 4. Map to group_id\n                    group_id_to_group_number_[groupID] = conf_num;\n                    group_number_to_group_id_[conf_num] = groupID;\n                    break;\n                }\n            }\n        }\n    }\n}\n```\n\n## Data consistency\n\n### Ensure data consistency\n\n1. **Store immediately upon creation**: Store `groupType` and `chat_id` immediately after creating the group (if applicable)\n2. **Verification during recovery**: Check whether `groupType` matches during recovery\n3. **Default value processing**: If `groupType` is missing, the "group" type will be used by default\n\n### Data migration\n\nFor old data (no `groupType` information):\n- Default assumes type "group"\n- If `chat_id` is not found, it may be of type "conference"\n- The type can be inferred by checking if there is `chat_id`\n\n## Troubleshooting\n\n### Group recovery failed\n\n**Symptoms**: Groups of type Group cannot be restored after restarting\n\n**CHECKLIST**:\n1. ✅ Is `groupType` correctly stored as "group"\n2. ✅ Is `chat_id` stored correctly?\n3. ✅ Is the network connection established?\n4. ✅ Are there other online peers in the group?\n\n**Log check**:\n```\nRejoinKnownGroups: Attempting to rejoin group <group_id> using chat_id <chat_id>\nRejoinKnownGroups: Successfully rejoined group <group_id>, group_number=<number>\n```\n\n### Conference recovery failed\n\n**Symptom**: Conference type groups cannot be restored after restarting\n\n**CHECKLIST**:\n1. ✅ Is `groupType` correctly stored as "conference"\n2. ✅ Whether the savedata file exists and is valid?\n3. ✅ Is `conference_number` successfully matched to `group_id`?\n\n**Log check**:\n```\nRejoinKnownGroups: Found <count> conferences restored from savedata\nRejoinKnownGroups: Matched conference_number=<number> to groupID=<group_id>\n```\n\n### Type information is lost\n\n**Symptoms**: Unable to distinguish between group and conference types\n\n**Solution**:\n1. Check whether `groupType` storage is successful\n2. If lost, infer the type based on whether there is `chat_id`\n3. For newly created groups, make sure `groupType` is stored correctly\n\n## Best Practices\n\n1. **Group type is preferred**: more complete functions and more reliable recovery\n2. **Ensure type information is stored**: Immediately after creating the group, verify whether `groupType` is stored successfully\n3. **Regular backup savedata**: Ensure that the Conference type can be restored\n4. **Monitor recovery log**: Discover recovery problems in time\n5. **Network connection check**: Make sure the network connection is established and then check the recovery status\n\n## Related documents\n\n- [ARCHITECTURE.md](../architecture/ARCHITECTURE.md) - Tim2Tox architecture (including group-chat implementation notes)\n- [API_REFERENCE.md](../api/API_REFERENCE.md) - API reference documentation\n- For client-side group chat and UI, see each client project’s documentation (e.g. when Tim2Tox is used as a submodule, the parent repo’s doc).\n
+[简体中文](./RESTORE_AND_PERSISTENCE.zh-CN.md)
+
+# Tim2Tox Restore and Persistence
+
+This document details the persistence and recovery mechanism of group chat in Tim2Tox, including two types of processing methods: Group and Conference.
+
+## Overview
+
+Tim2Tox needs to persist the following information to ensure that the group can be restored correctly after the client restarts:
+
+1. **groupType**: group type ("group" or "conference")
+2. **chat_id**: Unique identifier of Group type (Group type only)
+3. **group_id**: Application layer group identifier
+4. **savedata**: Tox’s savedata (including Conference information)
+
+## Persistent data
+
+### 1. groupType
+
+**Storage location**: `SharedPreferences` (via FFI callback)
+
+**Storage format**: String "group" or "conference"
+
+**Storage Timing**: When creating a group
+
+**Storage**:
+```cpp
+// C++ side (multi-instance: first arg is int64_t instance_id; pass 0 for the production singleton)
+extern "C" int tim2tox_ffi_set_group_type(int64_t instance_id,
+                                          const char* group_id,
+                                          const char* group_type);
+tim2tox_ffi_set_group_type(/*instance=*/0, groupID, "group");  // or "conference"
+```
+
+Dart side: the current `Tim2ToxSdkPlatform` customCallback only handles `groupChatIdStored`, `clearHistoryMessage`, and `groupQuitNotification`. `groupType` is persisted by the C++ side directly through the injected `ExtendedPreferencesService.setGroupType(...)` — there is no separate `case "groupTypeStored"` on the Dart side.
+
+**Reading**:
+```cpp
+extern "C" int tim2tox_ffi_get_group_type_from_storage(int64_t instance_id,
+                                                       const char* group_id,
+                                                       char* out_group_type,
+                                                       int out_len);
+char stored_type[16];
+if (tim2tox_ffi_get_group_type_from_storage(/*instance=*/0, group_id,
+                                            stored_type, sizeof(stored_type)) == 1) {
+    std::string group_type = std::string(stored_type);
+}
+```
+
+### 2. chat_id (Group type only)
+
+**Storage location**: `SharedPreferences` (via FFI callback)
+
+**Storage Format**: 64-character hexadecimal string (32 bytes)
+
+**Storage Timing**: When creating or joining a Group type group
+
+**Storage**:
+```cpp
+extern "C" int tim2tox_ffi_set_group_chat_id(int64_t instance_id,
+                                             const char* group_id,
+                                             const char* chat_id);
+tim2tox_ffi_set_group_chat_id(/*instance=*/0, groupID, chat_id_hex);
+
+// Dart side: Tim2ToxSdkPlatform's customCallback handles "groupChatIdStored"
+// (see tim2tox_sdk_platform.dart)
+case "groupChatIdStored":
+    await preferencesService.setGroupChatId(groupId, chatId);
+    break;
+```
+
+**Reading**:
+```cpp
+extern "C" int tim2tox_ffi_get_group_chat_id_from_storage(int64_t instance_id,
+                                                          const char* group_id,
+                                                          char* out_chat_id,
+                                                          int out_len);
+char stored_chat_id[65];
+if (tim2tox_ffi_get_group_chat_id_from_storage(/*instance=*/0, group_id,
+                                               stored_chat_id, sizeof(stored_chat_id)) == 1) {
+    // use stored_chat_id
+}
+```
+
+### 3. savedata (Conference type)
+
+**Storage location**: Tox automatically managed (via `tox_get_savedata` / `tox_new`)
+
+**Storage format**: Binary data
+
+**Storage timing**: Tox is saved regularly (through `tox_save` callback)
+
+**Recovery method**: Load savedata through `tox_new` during Tox initialization
+
+## Recovery process
+
+### Recovery when InitSDK
+
+In `V2TIMManagerImpl::InitSDK()`:
+
+1. **Load savedata**: Tox is automatically loaded during initialization, and conferences will be automatically restored.
+2. **Query restored groups**: Call `tox_manager_->getGroupListSize()` and `getGroupList()`
+3. **Manual trigger callback**: Call `HandleGroupSelfJoin()` to rebuild the mapping for each restored group
+4. **Query resumed conferences**: Call `tox_conference_get_chatlist_size()` and `tox_conference_get_chatlist()`
+5. **Call RejoinKnownGroups()**: Start the recovery process
+
+### RejoinKnownGroups recovery process
+
+**File**: `tim2tox/source/V2TIMManagerImpl.cpp::RejoinKnownGroups()`
+
+#### Group type recovery
+
+```
+1. Get all knownGroups from Dart layer
+   ↓
+2. For each group_id:
+   a. Check if mapped (skip)
+   b. Read groupType
+   c. If it is "group" type:
+      - Read chat_id
+      - Convert hex string to binary
+      - Call tox_group_join(chat_id)
+      - Wait for onGroupSelfJoin callback
+      - Rebuild mapping in HandleGroupSelfJoin
+```
+
+#### Conference type recovery
+
+```
+1. Query tox_conference_get_chatlist() to obtain restored conferences
+   ↓
+2. For each known group_id:
+   a. Check groupType
+   b. If it is "conference" type:
+      - Find unmapped conference_number
+      - Map conference_number to group_id
+      - Rebuild mapping relationship
+```
+
+### Recovery after connection establishment
+
+When the network connection is established (`HandleSelfConnectionStatus`), `RejoinKnownGroups()` will be called again:
+
+```cpp
+void V2TIMManagerImpl::HandleSelfConnectionStatus(...) {
+    if (status == TOX_CONNECTION_UDP || status == TOX_CONNECTION_TCP) {
+        // The connection is established, and recovery is triggered after a delay (to ensure a stable connection)
+        std::thread([this]() {
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            if (this->IsRunning()) {
+                this->RejoinKnownGroups();
+            }
+        }).detach();
+    }
+}
+```
+
+## Mapping relationship reconstruction
+
+### Group type mapping reconstruction
+
+**Trigger timing**: `onGroupSelfJoin` callback
+
+**Process**:
+```cpp
+void V2TIMManagerImpl::HandleGroupSelfJoin(Tox_Group_Number group_number) {
+    // 1. Get chat_id
+    uint8_t chat_id[TOX_GROUP_CHAT_ID_SIZE];
+    tox_manager_->getGroupChatId(group_number, chat_id, ...);
+
+    // 2. Convert to hex string
+    std::string chat_id_hex = chatIdToHexString(chat_id);
+
+    // 3. Find the corresponding group_id (through the stored chat_id)
+    V2TIMString groupID;
+    if (tim2tox_ffi_get_group_chat_id_from_storage(...)) {
+        // Find matching group_id
+        groupID = V2TIMString(found_group_id);
+    }
+
+    // 4. Rebuild mapping
+    group_id_to_group_number_[groupID] = group_number;
+    group_number_to_group_id_[group_number] = groupID;
+    group_id_to_chat_id_[groupID] = std::vector<uint8_t>(chat_id, chat_id + TOX_GROUP_CHAT_ID_SIZE);
+    chat_id_to_group_id_[chat_id_hex] = groupID;
+}
+```
+
+### Conference type mapping reconstruction
+
+**Trigger Timing**: `RejoinKnownGroups()` Medium
+
+**Process**:
+```cpp
+void V2TIMManagerImpl::RejoinKnownGroups() {
+    // 1. Query restored conferences
+    size_t conference_count = tox_conference_get_chatlist_size(tox);
+    std::vector<Tox_Conference_Number> conference_list(conference_count);
+    tox_conference_get_chatlist(tox, conference_list.data());
+
+    // 2. For each known group_id (conference type)
+    for (each group_id) {
+        if (group_type == "conference") {
+            // 3. Find unmapped conference_number
+            for (Tox_Conference_Number conf_num : conference_list) {
+                if (!conf_num mapped) {
+                    // 4. Map to group_id
+                    group_id_to_group_number_[groupID] = conf_num;
+                    group_number_to_group_id_[conf_num] = groupID;
+                    break;
+                }
+            }
+        }
+    }
+}
+```
+
+## Data consistency
+
+### Ensure data consistency
+
+1. **Store immediately upon creation**: Store `groupType` and `chat_id` immediately after creating the group (if applicable)
+2. **Verification during recovery**: Check whether `groupType` matches during recovery
+3. **Default value processing**: If `groupType` is missing, the "group" type will be used by default
+
+### Data migration
+
+For old data (no `groupType` information):
+- Default assumes type "group"
+- If `chat_id` is not found, it may be of type "conference"
+- The type can be inferred by checking if there is `chat_id`
+
+## Troubleshooting
+
+### Group recovery failed
+
+**Symptoms**: Groups of type Group cannot be restored after restarting
+
+**CHECKLIST**:
+1. ✅ Is `groupType` correctly stored as "group"
+2. ✅ Is `chat_id` stored correctly?
+3. ✅ Is the network connection established?
+4. ✅ Are there other online peers in the group?
+
+**Log check**:
+```
+RejoinKnownGroups: Attempting to rejoin group <group_id> using chat_id <chat_id>
+RejoinKnownGroups: Successfully rejoined group <group_id>, group_number=<number>
+```
+
+### Conference recovery failed
+
+**Symptom**: Conference type groups cannot be restored after restarting
+
+**CHECKLIST**:
+1. ✅ Is `groupType` correctly stored as "conference"
+2. ✅ Whether the savedata file exists and is valid?
+3. ✅ Is `conference_number` successfully matched to `group_id`?
+
+**Log check**:
+```
+RejoinKnownGroups: Found <count> conferences restored from savedata
+RejoinKnownGroups: Matched conference_number=<number> to groupID=<group_id>
+```
+
+### Type information is lost
+
+**Symptoms**: Unable to distinguish between group and conference types
+
+**Solution**:
+1. Check whether `groupType` storage is successful
+2. If lost, infer the type based on whether there is `chat_id`
+3. For newly created groups, make sure `groupType` is stored correctly
+
+## Best Practices
+
+1. **Group type is preferred**: more complete functions and more reliable recovery
+2. **Ensure type information is stored**: Immediately after creating the group, verify whether `groupType` is stored successfully
+3. **Regular backup savedata**: Ensure that the Conference type can be restored
+4. **Monitor recovery log**: Discover recovery problems in time
+5. **Network connection check**: Make sure the network connection is established and then check the recovery status
+
+## Related documents
+
+- [ARCHITECTURE.md](../architecture/ARCHITECTURE.md) - Tim2Tox architecture (including group-chat implementation notes)
+- [API_REFERENCE.md](../api/API_REFERENCE.md) - API reference documentation
+- For client-side group chat and UI, see each client project’s documentation (e.g. when Tim2Tox is used as a submodule, the parent repo’s doc).

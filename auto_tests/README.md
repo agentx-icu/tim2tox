@@ -1,1 +1,390 @@
-[简体中文](./README.zh-CN.md)\n\n[简体中文](./README.zh-CN.md)\n\n# Tim2Tox Auto Tests\n\n> Language: **English** | [简体中文](README.zh-CN.md)\n\nAutomated test suite covering UIKit / V2TIM-style APIs against both the Platform and the Binary Replacement paths.\n\n**Index**: [Overview](#overview) · [Layout](#layout) · [Test framework](#test-framework) · [Virtual clock](#virtual-clock-mode) · [Running tests](#running-tests) · [Troubleshooting](#troubleshooting) · [Best practices](#best-practices)\n\n## Overview\n\nThis suite borrows the scenario-style approach from `c-toxcore/auto_tests` and uses Dart / Flutter's `test` / `flutter_test` framework. Each scenario simulates a real usage path with one or more `TestNode` peers.\n\n### Design principles\n\n- **Scenario-style tests**: each `.dart` file maps to a functional path.\n- **Multi-node tests**: build with multiple `TestNode` instances to simulate multi-peer flows.\n- **Auto-accept**: mirrors `c-toxcore`'s `tox_friend_add_norequest()` — auto-accepts friend requests, group invites, and file transfers.\n- **Local bootstrap**: optional in-test bootstrap to accelerate peer discovery.\n\n## Layout\n\n```\ntim2tox/auto_tests/\n├── pubspec.yaml                    # Package config and dependencies\n├── run_tests.sh                    # Basic runner (supports name filter)\n├── run_tests_verbose.sh            # Verbose output\n├── run_tests_ordered.sh            # **Recommended**: run Phase 1-14 in order, 180 s per-test timeout\n├── run_all_tests.sh                # Compatibility entry; delegates to run_tests_ordered.sh\n├── run_group_tests.sh              # Alias for group-related phases\n├── run_tests_with_lib.sh           # Variant that explicitly sets DYLD_LIBRARY_PATH\n├── check_test_assertions.sh        # Static check that prevents trivially-true asserts or empty catches\n├── test/\n│   ├── test_helper.dart            # Test helpers (TestNode, waitUntil, TestScenario)\n│   ├── test_fixtures.dart          # Test data / mocks\n│   ├── scenarios/                  # Business scenarios (74 files: 73 mode-aware + 1 virtual-clock smoke)\n│   │   ├── scenario_sdk_init_test.dart               # Each scenario is a single mode-aware file:\n│   │   ├── scenario_login_test.dart                  # runs wall-clock by default, virtual under\n│   │   ├── scenario_message_test.dart                # RUN_VIRTUAL=1 (no separate *_virtual_test.dart)\n│   │   ├── scenario_virtual_clock_smoke_test.dart    # Smoke test for the virtual-clock plumbing\n│   │   └── ... (one file per scenario)\n│   ├── scenarios_binary/           # Binary-replacement path scenarios (Phase 13, 3 files)\n│   │   ├── scenario_native_callback_dispatch_test.dart  # NativeLibraryManager static listener dispatch\n│   │   ├── scenario_custom_callback_handler_test.dart   # customCallbackHandler registration + dispatch\n│   │   └── scenario_library_loading_test.dart           # setNativeLibraryName loading verification\n│   └── unit_tests/                 # Pure unit tests (Phase 14 currently only runs test_listeners.dart)\n│       ├── test_listeners.dart                          # Listener interface tests\n│       ├── ffi_chat_service_avatar_detection_test.dart  # Avatar change detection\n│       └── ffi_chat_service_avatar_sync_test.dart       # Avatar sync\n├── VIRTUAL_CLOCK.md                # Virtual-clock design, usage, and performance\n├── DEBUG_NATIVE_CRASH.md           # lldb walkthrough for native stacks\n└── README.md                       # This file\n```\n\n## Test framework\n\n### `TestNode`\n\n`TestNode` represents one user peer in a scenario.\n\n#### Lifecycle\n\n- **`initSDK()`** — Initialize SDK, create an isolated test instance\n- **`login()`** — Log in; auto-accept is enabled implicitly\n- **`logout()`** — Log out\n- **`unInitSDK()`** — Tear down the SDK and free resources\n\n#### Instance context (must read for multi-instance)\n\nIn scenarios with multiple nodes (alice, bob, ...), **every** call into a `TIM*Manager` must be made while the matching node's instance is active. Otherwise the call lands on the wrong instance (or the default) and you'll see `ToxManager not initialized` or similar.\n\n- **`runWithInstance(action)`** — Run `action` synchronously with this node as the current instance\n- **`runWithInstanceAsync(action)`** — Run `action` asynchronously with this node as the current instance\n\n**Rule**: any call to `TIMConversationManager.instance.*`, `TIMMessageManager.instance.*`, `TIMFriendshipManager.instance.*`, `TIMGroupManager.instance.*` (etc.) must be wrapped in the corresponding node's `runWithInstanceAsync` / `runWithInstance`. The receiver / listener registration should be wrapped in the receiver's instance. For example: Alice sending — `alice.runWithInstanceAsync(() => TIMMessageManager.instance.sendMessage(...))`; Bob registering a listener — `bob.runWithInstance(() => TIMMessageManager.instance.addAdvancedMsgListener(...))`. **Use `bob.getToxId()` (the 76-char Tox ID), not `bob.userId`, as the C2C receiver.**\n\n- **`getFriendListResultWithInstance()`** — Fetch the friend-list result (with code) under this node's instance for assertions\n- **`getConversationListWithInstance(nextSeq, count)`** — Fetch the conversation list under this node's instance\n\n#### Waiting and synchronization\n\n- **`waitForConnection()`** — Wait for the node to come online\n- **`waitForFriendConnection(userId)`** — Wait for a specific friend connection\n- **`waitForCallback(callbackName)`** — Wait for a specific callback\n- **`waitForCondition(condition)`** — Wait for a generic predicate\n\n#### Queries\n\n- **`getToxId()`** — Tox ID (76 hex chars)\n- **`getPublicKey()`** — Public key (64 hex chars)\n- **`getFriendList()`** — Cached friend list\n- **`isFriend(userId)`** — Friend check\n\n#### Auto-accept\n\nAfter login, `TestNode` auto-accepts friend requests, group invites, and file transfer requests — similar to `c-toxcore`'s `tox_friend_add_norequest()`.\n\n### `TestScenario`\n\n`TestScenario` orchestrates multiple nodes:\n\n```dart\nfinal scenario = await createTestScenario(['alice', 'bob']);\nfinal alice = scenario.getNode('alice')!;\nfinal bob = scenario.getNode('bob')!;\n\nawait scenario.initAllNodes();\nawait scenario.loginAllNodes();\nawait configureLocalBootstrap(scenario);\n```\n\n### Helpers\n\n#### `waitUntil(condition, {timeout, description})`\n\nEquivalent of `c-toxcore`'s `WAIT_UNTIL` macro:\n\n```dart\nawait waitUntil(\n  () => alice.loggedIn && bob.loggedIn,\n  timeout: const Duration(seconds: 10),\n  description: 'both nodes logged in',\n);\n```\n\n#### `establishFriendship(alice, bob)`\n\nEstablishes a bidirectional friendship:\n\n```dart\nawait establishFriendship(alice, bob);\n// alice and bob are now mutual friends\n```\n\n#### `configureLocalBootstrap(scenario)`\n\nUses the first node as a local bootstrap source for the others; speeds up tests significantly.\n\n## Virtual clock mode\n\nVirtual clock is an optional acceleration mechanism: each test instance's `event_thread` is suspended on the C++ side, and Tox's internal `mono_time` reads from a **process-wide shared virtual clock**. Tests drive time manually with `pumpTestTick(scenario, ...)`. A "virtual advance 60 s" finishes within milliseconds of wall time, bypassing Tox protocol timers (60 s ping, 122 s BAD_NODE, 10 s onion path, ...).\n\n### Why it exists\n\nTox protocol constants run in seconds (DHT heartbeat, friend reconnect, group announce). On wall-clock, multi-instance `setUpAll` phases get pinned by those timers for tens of seconds to minutes. Virtual clock decouples protocol time from wall time: protocol time can be compressed arbitrarily; UDP loopback still uses real wall time (`pumpTestTick` inserts small `wallSleep` to let loopback packets land).\n\n### Core model\n\n- **Shared virtual `mono_time`**: maintained on the Dart side by `VirtualClock`; mirrored into C++ via `tim2tox_ffi_set_virtual_time_ms()`.\n- **Manual iteration**: each `pumpTestTick(scenario, ...)` advances the virtual clock and calls `tim2tox_ffi_iterate_instance()` on every instance.\n- **Synchronous `task_queue` drain**: under test mode `tim2tox_ffi_iterate_instance` also drains the task queue, so signaling dispatch via `PostToEventThread` still runs.\n- **Inline `RunOnEventThread`**: test mode runs it inline, avoiding the deadlock from waiting on `event_thread`.\n\n### Usage\n\n```bash\n# Run every phase with the virtual clock.\nRUN_VIRTUAL=1 ./run_tests_ordered.sh\n\n# Single phase / range / list work the same way\nRUN_VIRTUAL=1 ./run_tests_ordered.sh 4\nRUN_VIRTUAL=1 ./run_tests_ordered.sh 10-12\n```\n\n`RUN_VIRTUAL=0` (default) keeps wall-clock behavior.\n\nEach scenario is a **single mode-aware file** — there are no separate\n`*_virtual_test.dart` siblings. `RUN_VIRTUAL` is exported into the test process,\nand the file reads it via `shouldRunVirtual` (`test_helper.dart`): in virtual\nmode it calls `VirtualClock.enableEarly()` / `enableForScenario()` before\ncreating instances; in wall mode it skips them and the event_thread runs as\nusual. The body helpers (`pumpTestTick`, `waitUntilWithVirtualPump`,\n`establishFriendshipVirtual`, `waitForConnectionVirtual`, …) all fall back to\nreal-time behavior when the clock is disabled, so one body works in both modes.\n\n### Parallel execution (PARALLEL_WORKERS)\n\n```bash\n# Run 2 tests concurrently (each worker spawns its own flutter_tester)\nPARALLEL_WORKERS=2 ./run_tests_ordered.sh\n\n# 3 workers, restricted to specific phases\nPARALLEL_WORKERS=3 ./run_tests_ordered.sh 4 10\n```\n\n`PARALLEL_WORKERS=N` flattens all selected tests into a single queue and dispatches them across N concurrent `flutter test` processes. Default is 1 (sequential). Rule of thumb on a developer Mac: 2–3 workers stay reliable, 4+ tends to trip Tox DHT timeouts and friend P2P handshake failures under CPU pressure. Each test file already has its own `setUpAll` so no cross-phase ordering is assumed; results are still printed grouped by phase after the parallel batch completes.\n\n#### Opting tests out of parallel mode\n\nSome tests are fundamentally incompatible with concurrent execution (cross-process state, sole-occupancy network resources, etc.). Mark such a file by adding a comment line near the top — anywhere in the first ~40 lines, typically right after the docstring and before `void main()`:\n\n```dart\n// SKIP_IN_PARALLEL: <one-line reason>\n```\n\nWhen `PARALLEL_WORKERS>=2`, the runner greps for that marker and drops matching files from every phase array before dispatch, regardless of which path (bundle, parallel-xargs, or sequential-inside-an-N>=2-invocation) would have run them. Skipped files show up in the runner's "Skipped Tests" summary section with the declared reason.\n\nCurrent users of the marker:\n\n- `scenario_lan_discovery_test.dart` — Tox LAN multicast on the loopback 33445-33545 port range needs sole occupancy; with other parallel test processes broadcasting on the same range, discovery becomes ambiguous and the assertion fails.\n\n### Phase coverage\n\nAll scenario files run under both modes — wall-clock by default, virtual under `RUN_VIRTUAL=1`. Phase 13 (Binary Replacement) and Phase 14 (unit_tests) do not depend on Tox protocol timers, so virtual mode is a no-op for them.\n\n### About flakes\n\nVirtual-mode stability matches wall-clock — it does **not** fix Tox-protocol-level flakes (DHT jitter, friend P2P handshake timing, group announce convergence). If a test is flaky in wall-clock mode, virtual mode won't make it stable; you have to find the root cause in the test logic or the protocol layer.\n\n### Full guide\n\nSee [VIRTUAL_CLOCK.md](VIRTUAL_CLOCK.md) (core API, `*Virtual` replacement table, canonical `setUpAll` template, group-invite retry pattern, performance numbers, C++ internals).\n\n## Running tests\n\n### All tests\n\n```bash\n# Basic (all tests)\n./run_tests.sh\n\n# Run in order to reduce concurrency contention (recommended)\n./run_tests_ordered.sh\n\n# Skip the assertion lint guard (it normally runs ./check_test_assertions.sh first)\nASSERTION_GUARD=0 ./run_tests_ordered.sh\n\n# Phase 11 includes scenario_dht_nodes_response_api_test by default (previously gated\n# behind a flag because of a native trampoline crash). To skip it locally:\nRUN_NATIVE_CRASH_TESTS=0 ./run_tests_ordered.sh 11\n\n# Run only PHASE5_TOXAV + PHASE6_PROFILE, no early-exit on failure, summarize results\n./run_tests_ordered.sh 5,6\n# or: ./run_tests_ordered.sh PHASE5_TOXAV,PHASE6_PROFILE\n\n# Phases 7–9 (conversation / file / conference)\n./run_tests_ordered.sh 7-9\n# or: ./run_tests_ordered.sh 7,8,9   or   ./run_tests_ordered.sh 7 9\n\n# Compatibility entry — equivalent to run_tests_ordered.sh\n./run_all_tests.sh\n\n# Run the assertion lint by itself\n./check_test_assertions.sh\n\n# Verbose output\n./run_tests_verbose.sh\n```\n\n### Running specific phases\n\n```bash\n# Phases 10/11/12 (group ext / network / other)\n./run_tests_ordered.sh 10 11 12\n\n# Phase 13 (Binary Replacement)\n./run_tests_ordered.sh 13\n./run_tests_ordered.sh BINARY\n\n# Phase 14 (unit_tests)\n./run_tests_ordered.sh 14\n./run_tests_ordered.sh UNIT\n```\n\n### A single test\n\n```bash\nflutter test test/scenarios/scenario_login_test.dart\nflutter test --name "login"                # by test name\n```\n\n### Environment variables\n\n- `RUN_VIRTUAL=1` — run scenarios under the virtual clock; each mode-aware file self-selects via `shouldRunVirtual` (see [Virtual clock mode](#virtual-clock-mode)).\n- `PARALLEL_WORKERS=N` — flatten selected tests into one queue and run N concurrently (see above).\n- `ASSERTION_GUARD=0` — skip the `check_test_assertions.sh` pre-flight.\n- `RUN_NATIVE_CRASH_TESTS=0` — exclude `scenario_dht_nodes_response_api_test` from Phase 11.\n- `RETRY_COUNT=N` — re-run each failed test up to N times before declaring failure. Tests that pass on retry are still counted as passing but are listed separately in a "Flaky" section of the summary. Used by Tier 2 CI (`RETRY_COUNT=1`).\n- `SKIP_PHASES=N1,N2,...` — drop these phases from the run even if they were otherwise selected (or implied by "all phases"). Used by Tier 3 nightly to skip Phase 11 (which is reserved for Tier 4).\n\n## Local smoke (Tier 1)\n\nRecommended before every `git push`. Runs Phases 1 (basic), 3 (message), 12 (other), and 14 (unit tests) under the virtual clock:\n\n```bash\nRUN_VIRTUAL=1 ./run_tests_ordered.sh 1,3,12 14\n# ~25 tests, ≤2 min on M-series. No CI workflow — this is the dev pre-push gate.\n```\n\n## CI pipeline (Tier 2 / 3 / 4)\n\nThree GitHub Actions workflows live in `toxee/.github/workflows/`. Virtual-clock tiers (2) give fast PR feedback; wall-clock tiers (3, 4) catch real-timing protocol regressions that the virtual clock can hide.\n\n| Tier | Workflow                  | Trigger                                                       | Mode                  | Phases             | Runner               | Budget |\n|------|---------------------------|---------------------------------------------------------------|-----------------------|--------------------|----------------------|--------|\n| 2    | `auto_tests.yml`          | every PR + push to `main` / `master`                          | virtual, `RETRY_COUNT=1` | 1–8, 10, 12–14   | ubuntu               | 30 min |\n| 3    | `auto_tests_nightly.yml`  | cron `02:00 UTC` + `workflow_dispatch`                        | wall-clock            | 1–10, 12–14 (Phase 11 skipped via `SKIP_PHASES=11`) | ubuntu | 90 min |\n| 4    | `auto_tests_full.yml`     | `workflow_dispatch`, PR label `ci:full`, push to `release/**` | wall-clock            | 1–14 (full, incl. 11) | ubuntu + macOS matrix | 120 min |\n\nTier 4 is the only path that exercises Phase 11 (`scenario_dht_nodes_response_api_test`, real-DHT bootstrap, LAN discovery) — keep large protocol-layer changes behind a `ci:full`-labeled PR. `tool/ci/build_tim2tox.sh` builds the FFI lib for each tier; Tiers 2/3/4 pass `--toxav --dht-bootstrap` so the suite has the same feature surface as a developer build (production app builds keep both flags off).\n\n## Troubleshooting\n\n### Native crash (SIGSEGV / exit 139)\n\n**Symptom**: process exits 139, or log shows `[callback_bridge] FATAL: end backtrace`.\n\n**Steps**:\n1. **Capture the native stack**: follow [DEBUG_NATIVE_CRASH.md](DEBUG_NATIVE_CRASH.md) — the `run_conversation_test_with_lldb.sh` / `run_pin_test_with_lldb.sh` scripts already wrap lldb. On a stop, run `bt` and `frame variable`.\n2. **Common causes**: dangling `lastMessage` in conversation callbacks; cross-thread use of `user_data`; missing `instance_id` propagation in multi-instance; `Dart_PostCObject_DL` after the isolate is destroyed. Check recent commits in `ffi/callback_bridge.cpp` and `ffi/dart_compat_listeners.cpp`.\n\n### Native libraries not found\n\n**Symptom**: test fails to load the native library.\n\n**Steps**:\n1. `flutter pub get`\n2. Build the native library (auto_tests is already inside `tim2tox/`, so just go up one level):\n   ```bash\n   cd ..\n   ./build_ffi.sh\n   ```\n3. Verify library path config.\n\n### Environment-dependent failures\n\n**Symptom**: tests behave inconsistently across machines.\n\n**Steps**:\n1. `flutter doctor`\n2. Dart >= 3.0.0\n3. Make sure the test data directory is writable.\n\n## Best practices\n\n### 1. Test structure\n\n```dart\nvoid main() {\n  group('Test Group', () {\n    late TestScenario scenario;\n    late TestNode alice;\n    late TestNode bob;\n\n    setUp(() async {\n      await setupTestEnvironment();\n      scenario = await createTestScenario(['alice', 'bob']);\n      alice = scenario.getNode('alice')!;\n      bob = scenario.getNode('bob')!;\n\n      await scenario.initAllNodes();\n      await scenario.loginAllNodes();\n      await configureLocalBootstrap(scenario);\n    });\n\n    tearDown(() async {\n      await scenario.dispose();\n      await teardownTestEnvironment();\n    });\n\n    test('test case', () async {\n      // test code\n    }, timeout: const Timeout(Duration(seconds: 30)));\n  });\n}\n```\n\n### 2. Waiting / sync\n\n- Use `waitUntil()` for predicate-based waits\n- Use `waitForConnection()` for network readiness\n- Use `waitForFriendConnection()` for friend handshake completion\n- Set explicit timeouts on async operations\n\n### 3. Error handling\n\n- Always check the return code and error message\n- Provide assertion messages that are useful when something fails\n- On timeout, include diagnostic information\n\n### 4. Resource cleanup\n\n- Tear down in `tearDown()`\n- `scenario.dispose()` cleans up every node\n- `teardownTestEnvironment()` cleans the global env\n\n## Build & test status\n\n- ✅ **Compile**: All compile errors resolved; tests build cleanly.\n- ✅ **Phase 13 Binary Replacement**: 15/15 passing (2026-02-10 baseline).\n- **Native crash debugging**: see [DEBUG_NATIVE_CRASH.md](DEBUG_NATIVE_CRASH.md).\n
+[简体中文](./README.zh-CN.md)
+
+# Tim2Tox Auto Tests
+
+Automated test suite covering UIKit / V2TIM-style APIs against both the Platform and the Binary Replacement paths.
+
+**Index**: [Overview](#overview) · [Layout](#layout) · [Test framework](#test-framework) · [Virtual clock](#virtual-clock-mode) · [Running tests](#running-tests) · [Troubleshooting](#troubleshooting) · [Best practices](#best-practices)
+
+## Overview
+
+This suite borrows the scenario-style approach from `c-toxcore/auto_tests` and uses Dart / Flutter's `test` / `flutter_test` framework. Each scenario simulates a real usage path with one or more `TestNode` peers.
+
+### Design principles
+
+- **Scenario-style tests**: each `.dart` file maps to a functional path.
+- **Multi-node tests**: build with multiple `TestNode` instances to simulate multi-peer flows.
+- **Auto-accept**: mirrors `c-toxcore`'s `tox_friend_add_norequest()` — auto-accepts friend requests, group invites, and file transfers.
+- **Local bootstrap**: optional in-test bootstrap to accelerate peer discovery.
+
+## Layout
+
+```
+tim2tox/auto_tests/
+├── pubspec.yaml                    # Package config and dependencies
+├── run_tests.sh                    # Basic runner (supports name filter)
+├── run_tests_verbose.sh            # Verbose output
+├── run_tests_ordered.sh            # **Recommended**: run Phase 1-14 in order, 180 s per-test timeout
+├── run_all_tests.sh                # Compatibility entry; delegates to run_tests_ordered.sh
+├── run_group_tests.sh              # Alias for group-related phases
+├── run_tests_with_lib.sh           # Variant that explicitly sets DYLD_LIBRARY_PATH
+├── check_test_assertions.sh        # Static check that prevents trivially-true asserts or empty catches
+├── test/
+│   ├── test_helper.dart            # Test helpers (TestNode, waitUntil, TestScenario)
+│   ├── test_fixtures.dart          # Test data / mocks
+│   ├── scenarios/                  # Business scenarios (74 files: 73 mode-aware + 1 virtual-clock smoke)
+│   │   ├── scenario_sdk_init_test.dart               # Each scenario is a single mode-aware file:
+│   │   ├── scenario_login_test.dart                  # runs wall-clock by default, virtual under
+│   │   ├── scenario_message_test.dart                # RUN_VIRTUAL=1 (no separate *_virtual_test.dart)
+│   │   ├── scenario_virtual_clock_smoke_test.dart    # Smoke test for the virtual-clock plumbing
+│   │   └── ... (one file per scenario)
+│   ├── scenarios_binary/           # Binary-replacement path scenarios (Phase 13, 3 files)
+│   │   ├── scenario_native_callback_dispatch_test.dart  # NativeLibraryManager static listener dispatch
+│   │   ├── scenario_custom_callback_handler_test.dart   # customCallbackHandler registration + dispatch
+│   │   └── scenario_library_loading_test.dart           # setNativeLibraryName loading verification
+│   └── unit_tests/                 # Pure unit tests (Phase 14 currently only runs test_listeners.dart)
+│       ├── test_listeners.dart                          # Listener interface tests
+│       ├── ffi_chat_service_avatar_detection_test.dart  # Avatar change detection
+│       └── ffi_chat_service_avatar_sync_test.dart       # Avatar sync
+├── VIRTUAL_CLOCK.md                # Virtual-clock design, usage, and performance
+├── DEBUG_NATIVE_CRASH.md           # lldb walkthrough for native stacks
+└── README.md                       # This file
+```
+
+## Test framework
+
+### `TestNode`
+
+`TestNode` represents one user peer in a scenario.
+
+#### Lifecycle
+
+- **`initSDK()`** — Initialize SDK, create an isolated test instance
+- **`login()`** — Log in; auto-accept is enabled implicitly
+- **`logout()`** — Log out
+- **`unInitSDK()`** — Tear down the SDK and free resources
+
+#### Instance context (must read for multi-instance)
+
+In scenarios with multiple nodes (alice, bob, ...), **every** call into a `TIM*Manager` must be made while the matching node's instance is active. Otherwise the call lands on the wrong instance (or the default) and you'll see `ToxManager not initialized` or similar.
+
+- **`runWithInstance(action)`** — Run `action` synchronously with this node as the current instance
+- **`runWithInstanceAsync(action)`** — Run `action` asynchronously with this node as the current instance
+
+**Rule**: any call to `TIMConversationManager.instance.*`, `TIMMessageManager.instance.*`, `TIMFriendshipManager.instance.*`, `TIMGroupManager.instance.*` (etc.) must be wrapped in the corresponding node's `runWithInstanceAsync` / `runWithInstance`. The receiver / listener registration should be wrapped in the receiver's instance. For example: Alice sending — `alice.runWithInstanceAsync(() => TIMMessageManager.instance.sendMessage(...))`; Bob registering a listener — `bob.runWithInstance(() => TIMMessageManager.instance.addAdvancedMsgListener(...))`. **Use `bob.getToxId()` (the 76-char Tox ID), not `bob.userId`, as the C2C receiver.**
+
+- **`getFriendListResultWithInstance()`** — Fetch the friend-list result (with code) under this node's instance for assertions
+- **`getConversationListWithInstance(nextSeq, count)`** — Fetch the conversation list under this node's instance
+
+#### Waiting and synchronization
+
+- **`waitForConnection()`** — Wait for the node to come online
+- **`waitForFriendConnection(userId)`** — Wait for a specific friend connection
+- **`waitForCallback(callbackName)`** — Wait for a specific callback
+- **`waitForCondition(condition)`** — Wait for a generic predicate
+
+#### Queries
+
+- **`getToxId()`** — Tox ID (76 hex chars)
+- **`getPublicKey()`** — Public key (64 hex chars)
+- **`getFriendList()`** — Cached friend list
+- **`isFriend(userId)`** — Friend check
+
+#### Auto-accept
+
+After login, `TestNode` auto-accepts friend requests, group invites, and file transfer requests — similar to `c-toxcore`'s `tox_friend_add_norequest()`.
+
+### `TestScenario`
+
+`TestScenario` orchestrates multiple nodes:
+
+```dart
+final scenario = await createTestScenario(['alice', 'bob']);
+final alice = scenario.getNode('alice')!;
+final bob = scenario.getNode('bob')!;
+
+await scenario.initAllNodes();
+await scenario.loginAllNodes();
+await configureLocalBootstrap(scenario);
+```
+
+### Helpers
+
+#### `waitUntil(condition, {timeout, description})`
+
+Equivalent of `c-toxcore`'s `WAIT_UNTIL` macro:
+
+```dart
+await waitUntil(
+  () => alice.loggedIn && bob.loggedIn,
+  timeout: const Duration(seconds: 10),
+  description: 'both nodes logged in',
+);
+```
+
+#### `establishFriendship(alice, bob)`
+
+Establishes a bidirectional friendship:
+
+```dart
+await establishFriendship(alice, bob);
+// alice and bob are now mutual friends
+```
+
+#### `configureLocalBootstrap(scenario)`
+
+Uses the first node as a local bootstrap source for the others; speeds up tests significantly.
+
+## Virtual clock mode
+
+Virtual clock is an optional acceleration mechanism: each test instance's `event_thread` is suspended on the C++ side, and Tox's internal `mono_time` reads from a **process-wide shared virtual clock**. Tests drive time manually with `pumpTestTick(scenario, ...)`. A "virtual advance 60 s" finishes within milliseconds of wall time, bypassing Tox protocol timers (60 s ping, 122 s BAD_NODE, 10 s onion path, ...).
+
+### Why it exists
+
+Tox protocol constants run in seconds (DHT heartbeat, friend reconnect, group announce). On wall-clock, multi-instance `setUpAll` phases get pinned by those timers for tens of seconds to minutes. Virtual clock decouples protocol time from wall time: protocol time can be compressed arbitrarily; UDP loopback still uses real wall time (`pumpTestTick` inserts small `wallSleep` to let loopback packets land).
+
+### Core model
+
+- **Shared virtual `mono_time`**: maintained on the Dart side by `VirtualClock`; mirrored into C++ via `tim2tox_ffi_set_virtual_time_ms()`.
+- **Manual iteration**: each `pumpTestTick(scenario, ...)` advances the virtual clock and calls `tim2tox_ffi_iterate_instance()` on every instance.
+- **Synchronous `task_queue` drain**: under test mode `tim2tox_ffi_iterate_instance` also drains the task queue, so signaling dispatch via `PostToEventThread` still runs.
+- **Inline `RunOnEventThread`**: test mode runs it inline, avoiding the deadlock from waiting on `event_thread`.
+
+### Usage
+
+```bash
+# Run every phase with the virtual clock.
+RUN_VIRTUAL=1 ./run_tests_ordered.sh
+
+# Single phase / range / list work the same way
+RUN_VIRTUAL=1 ./run_tests_ordered.sh 4
+RUN_VIRTUAL=1 ./run_tests_ordered.sh 10-12
+```
+
+`RUN_VIRTUAL=0` (default) keeps wall-clock behavior.
+
+Each scenario is a **single mode-aware file** — there are no separate
+`*_virtual_test.dart` siblings. `RUN_VIRTUAL` is exported into the test process,
+and the file reads it via `shouldRunVirtual` (`test_helper.dart`): in virtual
+mode it calls `VirtualClock.enableEarly()` / `enableForScenario()` before
+creating instances; in wall mode it skips them and the event_thread runs as
+usual. The body helpers (`pumpTestTick`, `waitUntilWithVirtualPump`,
+`establishFriendshipVirtual`, `waitForConnectionVirtual`, …) all fall back to
+real-time behavior when the clock is disabled, so one body works in both modes.
+
+### Parallel execution (PARALLEL_WORKERS)
+
+```bash
+# Run 2 tests concurrently (each worker spawns its own flutter_tester)
+PARALLEL_WORKERS=2 ./run_tests_ordered.sh
+
+# 3 workers, restricted to specific phases
+PARALLEL_WORKERS=3 ./run_tests_ordered.sh 4 10
+```
+
+`PARALLEL_WORKERS=N` flattens all selected tests into a single queue and dispatches them across N concurrent `flutter test` processes. Default is 1 (sequential). Rule of thumb on a developer Mac: 2–3 workers stay reliable, 4+ tends to trip Tox DHT timeouts and friend P2P handshake failures under CPU pressure. Each test file already has its own `setUpAll` so no cross-phase ordering is assumed; results are still printed grouped by phase after the parallel batch completes.
+
+#### Opting tests out of parallel mode
+
+Some tests are fundamentally incompatible with concurrent execution (cross-process state, sole-occupancy network resources, etc.). Mark such a file by adding a comment line near the top — anywhere in the first ~40 lines, typically right after the docstring and before `void main()`:
+
+```dart
+// SKIP_IN_PARALLEL: <one-line reason>
+```
+
+When `PARALLEL_WORKERS>=2`, the runner greps for that marker and drops matching files from every phase array before dispatch, regardless of which path (bundle, parallel-xargs, or sequential-inside-an-N>=2-invocation) would have run them. Skipped files show up in the runner's "Skipped Tests" summary section with the declared reason.
+
+Current users of the marker:
+
+- `scenario_lan_discovery_test.dart` — Tox LAN multicast on the loopback 33445-33545 port range needs sole occupancy; with other parallel test processes broadcasting on the same range, discovery becomes ambiguous and the assertion fails.
+
+### Phase coverage
+
+All scenario files run under both modes — wall-clock by default, virtual under `RUN_VIRTUAL=1`. Phase 13 (Binary Replacement) and Phase 14 (unit_tests) do not depend on Tox protocol timers, so virtual mode is a no-op for them.
+
+### About flakes
+
+Virtual-mode stability matches wall-clock — it does **not** fix Tox-protocol-level flakes (DHT jitter, friend P2P handshake timing, group announce convergence). If a test is flaky in wall-clock mode, virtual mode won't make it stable; you have to find the root cause in the test logic or the protocol layer.
+
+### Full guide
+
+See [VIRTUAL_CLOCK.md](VIRTUAL_CLOCK.md) (core API, `*Virtual` replacement table, canonical `setUpAll` template, group-invite retry pattern, performance numbers, C++ internals).
+
+## Running tests
+
+### All tests
+
+```bash
+# Basic (all tests)
+./run_tests.sh
+
+# Run in order to reduce concurrency contention (recommended)
+./run_tests_ordered.sh
+
+# Skip the assertion lint guard (it normally runs ./check_test_assertions.sh first)
+ASSERTION_GUARD=0 ./run_tests_ordered.sh
+
+# Phase 11 includes scenario_dht_nodes_response_api_test by default (previously gated
+# behind a flag because of a native trampoline crash). To skip it locally:
+RUN_NATIVE_CRASH_TESTS=0 ./run_tests_ordered.sh 11
+
+# Run only PHASE5_TOXAV + PHASE6_PROFILE, no early-exit on failure, summarize results
+./run_tests_ordered.sh 5,6
+# or: ./run_tests_ordered.sh PHASE5_TOXAV,PHASE6_PROFILE
+
+# Phases 7–9 (conversation / file / conference)
+./run_tests_ordered.sh 7-9
+# or: ./run_tests_ordered.sh 7,8,9   or   ./run_tests_ordered.sh 7 9
+
+# Compatibility entry — equivalent to run_tests_ordered.sh
+./run_all_tests.sh
+
+# Run the assertion lint by itself
+./check_test_assertions.sh
+
+# Verbose output
+./run_tests_verbose.sh
+```
+
+### Running specific phases
+
+```bash
+# Phases 10/11/12 (group ext / network / other)
+./run_tests_ordered.sh 10 11 12
+
+# Phase 13 (Binary Replacement)
+./run_tests_ordered.sh 13
+./run_tests_ordered.sh BINARY
+
+# Phase 14 (unit_tests)
+./run_tests_ordered.sh 14
+./run_tests_ordered.sh UNIT
+```
+
+### A single test
+
+```bash
+flutter test test/scenarios/scenario_login_test.dart
+flutter test --name "login"                # by test name
+```
+
+### Environment variables
+
+- `RUN_VIRTUAL=1` — run scenarios under the virtual clock; each mode-aware file self-selects via `shouldRunVirtual` (see [Virtual clock mode](#virtual-clock-mode)).
+- `PARALLEL_WORKERS=N` — flatten selected tests into one queue and run N concurrently (see above).
+- `ASSERTION_GUARD=0` — skip the `check_test_assertions.sh` pre-flight.
+- `RUN_NATIVE_CRASH_TESTS=0` — exclude `scenario_dht_nodes_response_api_test` from Phase 11.
+- `RETRY_COUNT=N` — re-run each failed test up to N times before declaring failure. Tests that pass on retry are still counted as passing but are listed separately in a "Flaky" section of the summary. Used by Tier 2 CI (`RETRY_COUNT=1`).
+- `SKIP_PHASES=N1,N2,...` — drop these phases from the run even if they were otherwise selected (or implied by "all phases"). Used by Tier 3 nightly to skip Phase 11 (which is reserved for Tier 4).
+
+## Local smoke (Tier 1)
+
+Recommended before every `git push`. Runs Phases 1 (basic), 3 (message), 12 (other), and 14 (unit tests) under the virtual clock:
+
+```bash
+RUN_VIRTUAL=1 ./run_tests_ordered.sh 1,3,12 14
+# ~25 tests, ≤2 min on M-series. No CI workflow — this is the dev pre-push gate.
+```
+
+## CI pipeline (Tier 2 / 3 / 4)
+
+Three GitHub Actions workflows live in `toxee/.github/workflows/`. Virtual-clock tiers (2) give fast PR feedback; wall-clock tiers (3, 4) catch real-timing protocol regressions that the virtual clock can hide.
+
+| Tier | Workflow                  | Trigger                                                       | Mode                  | Phases             | Runner               | Budget |
+|------|---------------------------|---------------------------------------------------------------|-----------------------|--------------------|----------------------|--------|
+| 2    | `auto_tests.yml`          | every PR + push to `main` / `master`                          | virtual, `RETRY_COUNT=1` | 1–8, 10, 12–14   | ubuntu               | 30 min |
+| 3    | `auto_tests_nightly.yml`  | cron `02:00 UTC` + `workflow_dispatch`                        | wall-clock            | 1–10, 12–14 (Phase 11 skipped via `SKIP_PHASES=11`) | ubuntu | 90 min |
+| 4    | `auto_tests_full.yml`     | `workflow_dispatch`, PR label `ci:full`, push to `release/**` | wall-clock            | 1–14 (full, incl. 11) | ubuntu + macOS matrix | 120 min |
+
+Tier 4 is the only path that exercises Phase 11 (`scenario_dht_nodes_response_api_test`, real-DHT bootstrap, LAN discovery) — keep large protocol-layer changes behind a `ci:full`-labeled PR. `tool/ci/build_tim2tox.sh` builds the FFI lib for each tier; Tiers 2/3/4 pass `--toxav --dht-bootstrap` so the suite has the same feature surface as a developer build (production app builds keep both flags off).
+
+## Troubleshooting
+
+### Native crash (SIGSEGV / exit 139)
+
+**Symptom**: process exits 139, or log shows `[callback_bridge] FATAL: end backtrace`.
+
+**Steps**:
+1. **Capture the native stack**: follow [DEBUG_NATIVE_CRASH.md](DEBUG_NATIVE_CRASH.md) — the `run_conversation_test_with_lldb.sh` / `run_pin_test_with_lldb.sh` scripts already wrap lldb. On a stop, run `bt` and `frame variable`.
+2. **Common causes**: dangling `lastMessage` in conversation callbacks; cross-thread use of `user_data`; missing `instance_id` propagation in multi-instance; `Dart_PostCObject_DL` after the isolate is destroyed. Check recent commits in `ffi/callback_bridge.cpp` and `ffi/dart_compat_listeners.cpp`.
+
+### Native libraries not found
+
+**Symptom**: test fails to load the native library.
+
+**Steps**:
+1. `flutter pub get`
+2. Build the native library (auto_tests is already inside `tim2tox/`, so just go up one level):
+   ```bash
+   cd ..
+   ./build_ffi.sh
+   ```
+3. Verify library path config.
+
+### Environment-dependent failures
+
+**Symptom**: tests behave inconsistently across machines.
+
+**Steps**:
+1. `flutter doctor`
+2. Dart >= 3.0.0
+3. Make sure the test data directory is writable.
+
+## Best practices
+
+### 1. Test structure
+
+```dart
+void main() {
+  group('Test Group', () {
+    late TestScenario scenario;
+    late TestNode alice;
+    late TestNode bob;
+
+    setUp(() async {
+      await setupTestEnvironment();
+      scenario = await createTestScenario(['alice', 'bob']);
+      alice = scenario.getNode('alice')!;
+      bob = scenario.getNode('bob')!;
+
+      await scenario.initAllNodes();
+      await scenario.loginAllNodes();
+      await configureLocalBootstrap(scenario);
+    });
+
+    tearDown(() async {
+      await scenario.dispose();
+      await teardownTestEnvironment();
+    });
+
+    test('test case', () async {
+      // test code
+    }, timeout: const Timeout(Duration(seconds: 30)));
+  });
+}
+```
+
+### 2. Waiting / sync
+
+- Use `waitUntil()` for predicate-based waits
+- Use `waitForConnection()` for network readiness
+- Use `waitForFriendConnection()` for friend handshake completion
+- Set explicit timeouts on async operations
+
+### 3. Error handling
+
+- Always check the return code and error message
+- Provide assertion messages that are useful when something fails
+- On timeout, include diagnostic information
+
+### 4. Resource cleanup
+
+- Tear down in `tearDown()`
+- `scenario.dispose()` cleans up every node
+- `teardownTestEnvironment()` cleans the global env
+
+## Build & test status
+
+- ✅ **Compile**: All compile errors resolved; tests build cleanly.
+- ✅ **Phase 13 Binary Replacement**: 15/15 passing (2026-02-10 baseline).
+- **Native crash debugging**: see [DEBUG_NATIVE_CRASH.md](DEBUG_NATIVE_CRASH.md).

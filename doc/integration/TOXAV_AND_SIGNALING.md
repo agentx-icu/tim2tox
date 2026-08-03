@@ -1,1 +1,112 @@
-[简体中文](./TOXAV_AND_SIGNALING.zh-CN.md)\n\n[简体中文](./TOXAV_AND_SIGNALING.zh-CN.md)\n\n# Tim2Tox ToxAV and Signaling\n\n> Language: **English** | [简体中文](TOXAV_AND_SIGNALING.zh-CN.md)\n\nThis document describes the current call link of tim2tox, focusing on `ToxAVService`, `CallBridgeService`, `TUICallKitAdapter` and multi-instance callback routing.\n\n## 1. Goal\n\ntim2tox currently supports two types of call entrances:\n\n- **UIKit signaling call**: Initiate/accept invitations through the signaling API exposed by `Tim2ToxSdkPlatform`\n- **Native ToxAV calls**: Directly handle incoming calls and status callbacks from ToxAV, used for interoperability scenarios such as qTox\n\nBoth paths ultimately end up on the same set of ToxAV instances and media callbacks.\n\n## 2. Core components\n\n### 2.1 `ToxAVService`\n\nLocation: `tim2tox/dart/lib/service/toxav_service.dart`\n\nResponsibilities:\n\n- Call `tim2tox_ffi_av_*` FFI interface\n- Maintain Dart side `ToxAVService` instance mapping by `instance_id`\n- Register call / state / audio / video four types of native callback\n- Provide high-level methods such as `startCall()`, `answerCall()`, `endCall()` to the outside world\n\n### 2.2 `CallBridgeService`\n\nLocation: `tim2tox/dart/lib/service/call_bridge_service.dart`\n\nResponsibilities:\n\n- Monitor `V2TimSignalingListener`\n- Map signaling invite / cancel / accept / reject / timeout as call state machine\n- Drive `ToxAVService` on accept / reject / timeout and other nodes\n\n### 2.3 `TUICallKitAdapter`\n\nLocation: `tim2tox/dart/lib/service/tuicallkit_adapter.dart`\n\nResponsibilities:\n\n- As the adaptation layer of `TUICallingService` in TUICore\n- Translate UIKit's call request into signaling invite\n- If `friendNumber` can be parsed out, `ToxAVService.startCall()` will be triggered simultaneously\n\n### 2.4 TUICore Registration\n\nLocation: `tim2tox/dart/lib/service/tuicallkit_tuicore_integration.dart`\n\nResponsibilities:\n\n- Exposing `TUICallKitAdapter` to TUICore via `registerToxAVWithTUICore(adapter)`\n- This is the only registration point for UIKit call buttons and the tim2tox call stack\n\n## 3. Call link\n\n### 3.1 Initiate a call (UIKit)\n\n1. UIKit calls TUICore’s `TUICallingService.call`\n2. `ToxAVCallService.onCall()` forwards the request to `TUICallKitAdapter.handleCall()`\n3. `TUICallKitAdapter` calls `Tim2ToxSdkPlatform.invite()`\n4. If invite is successful, `onOutgoingCallInitiated` will be thrown to the UI\n5. If you find friend `friendNumber`, continue to call `ToxAVService.startCall()`\n\n### 3.2 Receive signaling invitation\n\n1. `Tim2ToxSdkPlatform` receives signaling listener callback\n2. `CallBridgeService` structure `CallInfo`\n3. The upper-layer UI decides accept/reject\n4. `CallBridgeService.acceptInvitation()` first calls signaling accept, then calls `ToxAVService.answerCall()`\n\n### 3.3 Receiving native ToxAV calls\n\n1. C++/FFI callback into `ToxAVService` trampoline\n2. Press `instance_id` to find the target `ToxAVService`\n3. The upper layer maps it to native call, usually using inviteID in the form of `native_av_<friendNumber>`\n\n## 4. Multi-instance routing\n\nCurrently all ToxAV FFI interfaces explicitly receive `instance_id`:\n\n- `tim2tox_ffi_av_initialize(int64_t instance_id)`\n- `tim2tox_ffi_av_start_call(int64_t instance_id, ...)`\n- `tim2tox_ffi_av_set_*_callback(int64_t instance_id, ...)`\n\nDesign reasons:\n\n- Multiple Tox instances run simultaneously in automated tests\n- The Dart side must ensure that the callback returns the correct `ToxAVService`\n- So `ToxAVService` is constructed to read `getCurrentInstanceId()` and maintain `_instanceServices[instanceId]`\n\nThe last hop from native callback to Dart is completed by trampoline; it reads `instance_id` from `userData` and then delivers it to the corresponding service instance.\n\n## 5. Relationship with the client\n\nThe client must create and initialize the call-related components (e.g. CallServiceManager) after setting `Tim2ToxSdkPlatform`, and wire ToxAVService, CallBridgeService, TUICallKit adapter, etc. If Platform is not set first, the signaling path will be incomplete. For concrete integration and UI, see each client project’s documentation.\n\n## 6. Current Limitations\n\n- `TUICallKitAdapter` currently only supports 1-to-1 calls, group calls have not been completed yet\n- When signaling invite is successful but `friendNumber` cannot be found, it will degrade to signaling-only state.\n- The native ToxAV path and the signaling path coexist, so the upper-layer UI must be able to handle both inviteID forms\n\n## 7. Related documents\n\n- [ARCHITECTURE.md](../architecture/ARCHITECTURE.md)\n- [API Reference](../api/API_REFERENCE.md)\n- [MULTI_INSTANCE_SUPPORT.md](../development/MULTI_INSTANCE_SUPPORT.md)\n- For client-side calling and extensions implementation, see each client project’s documentation (e.g. when Tim2Tox is used as a submodule, the parent repo’s doc).\n
+[简体中文](./TOXAV_AND_SIGNALING.zh-CN.md)
+
+# Tim2Tox ToxAV and Signaling
+
+This document describes the current call link of tim2tox, focusing on `ToxAVService`, `CallBridgeService`, `TUICallKitAdapter` and multi-instance callback routing.
+
+## 1. Goal
+
+tim2tox currently supports two types of call entrances:
+
+- **UIKit signaling call**: Initiate/accept invitations through the signaling API exposed by `Tim2ToxSdkPlatform`
+- **Native ToxAV calls**: Directly handle incoming calls and status callbacks from ToxAV, used for interoperability scenarios such as qTox
+
+Both paths ultimately end up on the same set of ToxAV instances and media callbacks.
+
+## 2. Core components
+
+### 2.1 `ToxAVService`
+
+Location: `tim2tox/dart/lib/service/toxav_service.dart`
+
+Responsibilities:
+
+- Call `tim2tox_ffi_av_*` FFI interface
+- Maintain Dart side `ToxAVService` instance mapping by `instance_id`
+- Register call / state / audio / video four types of native callback
+- Provide high-level methods such as `startCall()`, `answerCall()`, `endCall()` to the outside world
+
+### 2.2 `CallBridgeService`
+
+Location: `tim2tox/dart/lib/service/call_bridge_service.dart`
+
+Responsibilities:
+
+- Monitor `V2TimSignalingListener`
+- Map signaling invite / cancel / accept / reject / timeout as call state machine
+- Drive `ToxAVService` on accept / reject / timeout and other nodes
+
+### 2.3 `TUICallKitAdapter`
+
+Location: `tim2tox/dart/lib/service/tuicallkit_adapter.dart`
+
+Responsibilities:
+
+- As the adaptation layer of `TUICallingService` in TUICore
+- Translate UIKit's call request into signaling invite
+- If `friendNumber` can be parsed out, `ToxAVService.startCall()` will be triggered simultaneously
+
+### 2.4 TUICore Registration
+
+Location: `tim2tox/dart/lib/service/tuicallkit_tuicore_integration.dart`
+
+Responsibilities:
+
+- Exposing `TUICallKitAdapter` to TUICore via `registerToxAVWithTUICore(adapter)`
+- This is the only registration point for UIKit call buttons and the tim2tox call stack
+
+## 3. Call link
+
+### 3.1 Initiate a call (UIKit)
+
+1. UIKit calls TUICore’s `TUICallingService.call`
+2. `ToxAVCallService.onCall()` forwards the request to `TUICallKitAdapter.handleCall()`
+3. `TUICallKitAdapter` calls `Tim2ToxSdkPlatform.invite()`
+4. If invite is successful, `onOutgoingCallInitiated` will be thrown to the UI
+5. If you find friend `friendNumber`, continue to call `ToxAVService.startCall()`
+
+### 3.2 Receive signaling invitation
+
+1. `Tim2ToxSdkPlatform` receives signaling listener callback
+2. `CallBridgeService` structure `CallInfo`
+3. The upper-layer UI decides accept/reject
+4. `CallBridgeService.acceptInvitation()` first calls signaling accept, then calls `ToxAVService.answerCall()`
+
+### 3.3 Receiving native ToxAV calls
+
+1. C++/FFI callback into `ToxAVService` trampoline
+2. Press `instance_id` to find the target `ToxAVService`
+3. The upper layer maps it to native call, usually using inviteID in the form of `native_av_<friendNumber>`
+
+## 4. Multi-instance routing
+
+Currently all ToxAV FFI interfaces explicitly receive `instance_id`:
+
+- `tim2tox_ffi_av_initialize(int64_t instance_id)`
+- `tim2tox_ffi_av_start_call(int64_t instance_id, ...)`
+- `tim2tox_ffi_av_set_*_callback(int64_t instance_id, ...)`
+
+Design reasons:
+
+- Multiple Tox instances run simultaneously in automated tests
+- The Dart side must ensure that the callback returns the correct `ToxAVService`
+- So `ToxAVService` is constructed to read `getCurrentInstanceId()` and maintain `_instanceServices[instanceId]`
+
+The last hop from native callback to Dart is completed by trampoline; it reads `instance_id` from `userData` and then delivers it to the corresponding service instance.
+
+## 5. Relationship with the client
+
+The client must create and initialize the call-related components (e.g. CallServiceManager) after setting `Tim2ToxSdkPlatform`, and wire ToxAVService, CallBridgeService, TUICallKit adapter, etc. If Platform is not set first, the signaling path will be incomplete. For concrete integration and UI, see each client project’s documentation.
+
+## 6. Current Limitations
+
+- `TUICallKitAdapter` currently only supports 1-to-1 calls, group calls have not been completed yet
+- When signaling invite is successful but `friendNumber` cannot be found, it will degrade to signaling-only state.
+- The native ToxAV path and the signaling path coexist, so the upper-layer UI must be able to handle both inviteID forms
+
+## 7. Related documents
+
+- [ARCHITECTURE.md](../architecture/ARCHITECTURE.md)
+- [API Reference](../api/API_REFERENCE.md)
+- [MULTI_INSTANCE_SUPPORT.md](../development/MULTI_INSTANCE_SUPPORT.md)
+- For client-side calling and extensions implementation, see each client project’s documentation (e.g. when Tim2Tox is used as a submodule, the parent repo’s doc).

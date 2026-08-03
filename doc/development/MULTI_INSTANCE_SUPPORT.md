@@ -1,1 +1,418 @@
-[简体中文](./MULTI_INSTANCE_SUPPORT.zh-CN.md)\n\n[简体中文](./MULTI_INSTANCE_SUPPORT.zh-CN.md)\n\n# Tim2Tox Multi-Instance Support\n\n> Language: **English** | [简体中文](MULTI_INSTANCE_SUPPORT.zh-CN.md)\n\n## Overview\n\nTim2Tox now supports the creation of multiple independent Tox instances, each with independent network ports, DHT IDs and persistence paths. This is particularly useful for testing scenarios, allowing multiple nodes to be run in the same process for interoperability testing.\n\n## Architecture changes\n\n### Before (singleton mode)\n\n- `ToxManager` and `V2TIMManagerImpl` are singletons\n- All test nodes share the same Tox instance\n- No true multi-node interoperability testing possible\n- All nodes use the same network port and DHT ID\n\n### Now (multi-instance support)\n\n- `ToxManager` and `V2TIMManagerImpl` are instantiable classes\n- Preserved backward compatibility of default instances (via `GetInstance()` method)\n- Supports the creation of independent test instances, each instance has independent network configuration\n- Use independent persistence paths for each instance\n\n## Usage scenarios\n\n### Production environment (default instance)\n\nFor production applications, use the default instance:\n\n```dart\n// Production environment: use the default instance directly\nawait TIMManager.instance.initSDK(...);\nawait TIMManager.instance.login(...);\n```\n\n**Features**:\n- No special configuration required\n- Use `V2TIMManagerImpl::GetInstance()` to get the default instance\n- Fully backwards compatible\n\n### Test environment (multiple instances)\n\nFor automated testing (such as `tim2tox/auto_tests`), multiple independent instances can be created:\n\n```dart\nimport 'package:tim2tox_dart/ffi/tim2tox_ffi.dart' as ffi_lib;\n\n// Create test instance\nfinal ffiInstance = ffi_lib.Tim2ToxFfi.open();\nfinal initPathPtr = '/path/to/instance/data'.toNativeUtf8();\nfinal instanceHandle = ffiInstance.createTestInstanceNative(initPathPtr);\n\n// Sets the current instance (subsequent FFI calls will use this instance)\nffiInstance.setCurrentInstance(instanceHandle);\n\n// Use examples for SDK operations\nawait TIMManager.instance.initSDK(...);\nawait TIMManager.instance.login(...);\n\n// Destroy test instance\nffiInstance.destroyTestInstance(instanceHandle);\n```\n\n**Features**:\n- Each test node has an independent instance\n- Separate network port and DHT ID\n- Independent persistence path to ensure test isolation\n- Support local bootstrap configuration to speed up node connection\n\n## API Reference\n\n### FFI function\n\n#### `tim2tox_ffi_create_test_instance`\n\nCreate a new test instance.\n\n**Function signature**:\n```c\nint64_t tim2tox_ffi_create_test_instance(const char* init_path);\n```\n\n**Parameters**:\n- `init_path`: Initialization path of the instance (for persistent storage)\n\n**Return Value**:\n- Success: Returns instance handle (> 0)\n- Failure: return 0\n\n**Dart binding**:\n```dart\nfinal ffiInstance = ffi_lib.Tim2ToxFfi.open();\nfinal initPathPtr = '/path/to/data'.toNativeUtf8();\nfinal handle = ffiInstance.createTestInstanceNative(initPathPtr);\n```\n\n#### `tim2tox_ffi_set_current_instance`\n\nSets the currently active instance. All subsequent FFI calls will use this instance.\n\n**Function signature**:\n```c\nint tim2tox_ffi_set_current_instance(int64_t instance_handle);\n```\n\n**Parameters**:\n- `instance_handle`: instance handle (0 means use the default instance)\n\n**Return Value**:\n- Success: Return 1\n- Failure: return 0\n\n**Dart binding**:\n```dart\nffiInstance.setCurrentInstance(handle);\n```\n\n**Recommendation**: In multi-instance scenarios, please use `Tim2ToxInstance.runWithInstance` / `runWithInstanceAsync` to wrap calls to `TIMManager`, `TIMFriendshipManager`, `TIMGroupManager`, etc. to avoid frequent handwriting of `setCurrentInstance` in test or business code. See the "Instance scope (recommended)" section.\n\n#### `tim2tox_ffi_destroy_test_instance`\n\nDestroy the test instance.\n\n**Function signature**:\n```c\nint tim2tox_ffi_destroy_test_instance(int64_t instance_handle);\n```\n\n**Parameters**:\n- `instance_handle`: Instance handle to be destroyed (cannot be 0)\n\n**Return Value**:\n- Success: Return 1\n- Failure: return 0\n\n**Dart binding**:\n```dart\nffiInstance.destroyTestInstance(handle);\n```\n\n### Instance scope (recommended)\n\nIn multi-instance scenarios, you should try to use **instance scope** to wrap calls to `TIMManager`, `TIMFriendshipManager`, `TIMGroupManager`, etc. instead of handwriting `setCurrentInstance` everywhere before calling.\n\n- **Tim2ToxInstance** (`package:tim2tox_dart/instance/tim2tox_instance.dart`): An encapsulation of an instance handle, providing:\n  - `runWithInstance<R>(R Function() action)`: Execute synchronization logic under the premise that the "current instance" is set to this instance, and restore the original current instance after execution.\n  - `runWithInstanceAsync<R>(Future<R> Function() action)`: Same as above, used for asynchronous logic.\n- **TestNode** (`test_helper.dart`) provides `runWithInstance` / `runWithInstanceAsync` and delegates internally to `Tim2ToxInstance.fromHandle(testInstanceHandle)`. When performing SDK operations on this node during testing, use `node.runWithInstance(() => ...)` or `await node.runWithInstanceAsync(() async => ...)` to avoid explicit `setCurrentInstance(node.testInstanceHandle!)`.\n\nExample:\n\n```dart\n// Execute a piece of logic based on an instance\nfinal instance = Tim2ToxInstance(instanceHandle);\nawait instance.runWithInstanceAsync(() async {\n  await TIMManager.instance.login(...);\n});\ninstance.runWithInstance(() => TIMManager.instance.someSyncCall());\n\n// on TestNode\nawait alice.runWithInstanceAsync(() async => TIMGroupManager.instance.createGroup(...));\nbob.runWithInstance(() => TIMMessageManager.instance.addAdvancedMsgListener(listener));\n```\n\n**Call by instance registration**: Any registration that relies on the "current instance" (such as `getCurrentInstanceId()`, `addFriendListener` / `addGroupListener` used in the construction of `setDhtNodesResponseCallback`, `ToxAVService`) should be executed within the `runWithInstance` / `runWithInstanceAsync` of the corresponding instance, so that `getCurrentInstanceId()` is the instance of the instance at the time of registration. handle, routing and lifecycle will be correct. `enableAutoAccept` in `test_helper` has registered listener in `runWithInstance`; if other scenarios need to be registered by instance, they should also be included in `node.runWithInstance`.\n\n## Implementation details\n\n### C++ layer\n\n**ToxManager**:\n- Changed from singleton to instantiable class\n- Each instance manages its own Tox object\n- Callback processing: Use the global `Tox* -> ToxManager*` mapping to handle callbacks that do not support `user_data`\n\n**V2TIMManagerImpl**:\n- Changed from singleton to instantiable class\n- Each instance has its own `ToxManager`\n- Retained `GetInstance()` method for backward compatibility\n\n**Key code**:\n```cpp\n// ToxManager.h\nclass ToxManager {\npublic:\n    ToxManager();  // public constructor\n    ~ToxManager();\n\n    // Backward compatibility: Get the default instance\n    static ToxManager* getDefaultInstance();\n};\n\n// V2TIMManagerImpl.h\nclass V2TIMManagerImpl : public V2TIMManager {\npublic:\n    V2TIMManagerImpl();  // public constructor\n    ~V2TIMManagerImpl();\n\n    // Backward compatibility: Get the default instance\n    static V2TIMManagerImpl* GetInstance();\n\n    // Get the ToxManager for this instance\n    ToxManager* GetToxManager() { return tox_manager_.get(); }\n\nprivate:\n    std::unique_ptr<ToxManager> tox_manager_;\n};\n```\n\n### FFI layer\n\n**Test instance management**:\n- Instance mapping: `std::unordered_map<int64_t, V2TIMManagerImpl*>`\n- Current instance tracking: `g_current_instance_id` (0 means use the default instance)\n- All FFI functions get the correct instance via `GetCurrentInstance()`\n\n**Key code**:\n```cpp\n// Test instance management\nstatic std::mutex g_test_instances_mutex;\nstatic std::unordered_map<int64_t, V2TIMManagerImpl*> g_test_instances;\nstatic int64_t g_next_instance_id = 1;\nstatic int64_t g_current_instance_id = 0; // 0 = default instance\n\n// Get the current instance\nstatic V2TIMManagerImpl* GetCurrentInstance() {\n    std::lock_guard<std::mutex> lock(g_test_instances_mutex);\n    if (g_current_instance_id == 0) {\n        return V2TIMManagerImpl::GetInstance();  // default instance\n    }\n    auto it = g_test_instances.find(g_current_instance_id);\n    if (it != g_test_instances.end()) {\n        return it->second;\n    }\n    return V2TIMManagerImpl::GetInstance();  // Fallback to default instance\n}\n```\n\n### Dart layer\n\n**TestNode class** (`tim2tox/auto_tests/test/test_helper.dart`):\n- Each `TestNode` creates an independent C++ instance at `initSDK`\n- Set current instance before `login` and FFI calls\n- Destroy test instance at `dispose`\n\n**Key code**:\n```dart\nclass TestNode {\n  int? _testInstanceHandle;\n\n  int? get testInstanceHandle => _testInstanceHandle;\n\n  Future<void> initSDK({String? initPath, String? logPath}) async {\n    // Create test instance\n    final ffiInstance = ffi_lib.Tim2ToxFfi.open();\n    final initPathPtr = testInitPath.toNativeUtf8();\n    try {\n      final instanceHandle = ffiInstance.createTestInstanceNative(initPathPtr);\n      _testInstanceHandle = instanceHandle;\n\n      // Set current instance\n      ffiInstance.setCurrentInstance(instanceHandle);\n    } finally {\n      pkgffi.malloc.free(initPathPtr);\n    }\n\n    // Initialize SDK (using current instance)\n    await timManager!.initSDK(...);\n  }\n\n  Future<void> login({Duration? timeout}) async {\n    // Set current instance\n    if (testInstanceHandle != null) {\n      final ffiInstance = ffi_lib.Tim2ToxFfi.open();\n      ffiInstance.setCurrentInstance(testInstanceHandle!);\n    }\n\n    // Log in (using current instance)\n    await timManager!.login(...);\n  }\n\n  Future<void> dispose() async {\n    // Destroy test instance\n    if (_testInstanceHandle != null) {\n      final ffiInstance = ffi_lib.Tim2ToxFfi.open();\n      ffiInstance.destroyTestInstance(_testInstanceHandle!);\n      _testInstanceHandle = null;\n    }\n  }\n}\n```\n\n## Test verification\n\n### Multiple instance testing\n\nRun a multi-instance test to verify functionality:\n\n```bash\ncd tim2tox/auto_tests\nflutter test test/scenarios/scenario_multi_instance_test.dart\n```\n\n**Test content**:\n1. Verify that each node has an independent instance handle\n2. Verify that each node has a different UDP port\n3. Verify that each node has a different DHT ID\n4. Verify that nodes can connect to each other through 127.0.0.1 bootstrap\n\n### Test result example\n\n```\n[Test] Node alice: instance=1, port=33445, dhtId=F81861944932B2C3B46AA3AC3BEDF59C40A8E063AB6BC9D471305524DAC65343\n[Test] Node bob: instance=2, port=33448, dhtId=6BFF8910CA9DA8645CEFCA10BA4BC07FF9AA3F1DF2A1D078E09AD5E47213910D\n[Test] Node charlie: instance=3, port=33449, dhtId=BAE1C11998FC010680A59A5C4D8E2D4D250B2AB04B4FA62DD0DE678F59F04F3F\n[Test] ✅ All nodes have independent instances, ports, and DHT IDs\n```\n\n## Backward compatibility\n\n### Production environment application\n\n**No modifications required**: Production applications continue to use the default instance without any code modifications.\n\n**Call path**:\n```\nTIMManager.instance.initSDK()\n  ↓\nNativeLibraryManager.bindings.DartInitSDK()\n  ↓\ndart_compat_sdk.cpp::DartInitSDK()\n  ↓\nV2TIMManagerImpl::GetInstance()->InitSDK()  // Use default instance\n  ↓\nToxManager::getDefaultInstance()->initialize()  // Use default ToxManager\n```\n\n### Test environment\n\n**MODIFICATION REQUIRED**: The test environment needs to use the new test instance management API.\n\n**Call path**:\n```\nTestNode.initSDK()\n  ↓\nffiInstance.createTestInstanceNative()  // Create new instance\n  ↓\nffiInstance.setCurrentInstance()  // Set current instance\n  ↓\nTIMManager.instance.initSDK()\n  ↓\nGetCurrentInstance()->InitSDK()  // Use current test instance\n```\n\n## Notes\n\n1. **Instance lifecycle**: The test instance must be destroyed after the test is completed to avoid resource leakage\n2. **Instance switching**: Before calling FFI/SDK, you must ensure that the "current instance" is correct. **Recommended** Use `Tim2ToxInstance.runWithInstance` / `runWithInstanceAsync` or TestNode's `runWithInstance` / `runWithInstanceAsync` to wrap multi-instance calls to avoid handwriting `setCurrentInstance` everywhere in business or testing.\n3. **Default instance**: The production environment always uses the default instance, no need to create a test instance\n4. **Persistence path**: Each test instance uses an independent persistence path to ensure data isolation### V2TIMFriendshipManagerImpl caching and multiple instances (subsequent processing)\n\n- **friend_id_map_**: Declared in `V2TIMFriendshipManagerImpl.h`, it is not used in the current .cpp and can be regarded as dead code; if it is enabled in the future and there are multiple instances, it needs to be isolated by instance or cleared with instance switching.\n- **friend_info_db_**, **friend_groups_**, **pending_applications_**: V2TIMFrendshipManagerImpl is a singleton and **does not** SetManagerImpl. Tox is obtained through GetCurrentInstance(); the above caches will be mixed in multiple instances. If it is agreed that "there is only one current instance at the same time" (single isolate + runWithInstance serial), you can leave it unchanged for now; if strict multi-instance isolation is required in the future, SetManagerImpl or "current instance" abstraction should be introduced in the Friendship layer, and these structures should be cleared or isolated by instance key when switching instances.\n\n### Multithreading and setCurrentInstance\n\n- **setCurrentInstance is not multi-thread safe**: `g_current_instance_id` is an in-process global variable. If multiple threads call `setCurrentInstance` at the same time, or after A calls `setCurrentInstance(alice)` but before its subsequent `GetCurrentInstance()`, another thread calls `setCurrentInstance(bob)`, then A may get an error instance.\n- **Recommendation**: When using multiple instances, the logic on each instance should be executed in **single isolate** through `runWithInstance` / `runWithInstanceAsync` **serial**, and do not rely on the global state of the "current instance" in multi-threads.\n- If multi-thread safety is required in the future, consider changing the "current instance" to thread local (such as `thread_local`) on the C++ side, or let all entries explicitly pass instance_id; the current document convention is "single isolate + runWithInstance serial".\n\n### Tox callback routing under multiple instances\n\nConclusion: **Only some callbacks can guarantee correct routing by instance**; the instance_id filled in in C++ via SendCallbackToDart's globalCallback mostly relies on the "current instance" and may be misplaced when the Tox asynchronous thread is triggered, and the Dart side is not currently distributed by instance_id.\n\n#### Correctly routed callbacks per instance\n\n1. **DHT node response** (`tim2tox_ffi.cpp`)\n   - In `on_dht_nodes_response_internal(Tox* tox, ...)`, check the instance_id in `g_test_instances` based on **Tox***, then press instance_id to get `g_instance_dht_callbacks[instance_id]` and user_data, and bring instance_id to Dart during callback.\n   - Dart side `_dhtNodesResponseTrampoline` reads the instance_id from userData and delivers it to the corresponding FfiChatService using `_instanceServices[instanceId]`.\n\n2. **ToxAV callback** (on_call, on_call_state, audio/video receive)\n   - C++ uses the instance_id captured by the closure in `tim2tox_ffi_av_initialize` to register to ToxAVManager, and gets the callback and user_data from `g_instance_av_callbacks[captured_instance_id]` when triggered.\n   - The trampoline of ToxAVService on the Dart side reads the instance_id from userData and delivers it to the corresponding ToxAVService using `_instanceServices[instanceId]`.\n\n3. **Friend application list added** (OnFriendApplicationListAdded)\n   - In `dart_compat_listeners.cpp`'s `DartFriendshipListenerImpl::OnFriendApplicationListAdded`, instead of using `GetCurrentInstanceId()`, traverse `g_friendship_listeners`, use `this` to check the instance_id it belongs to, and then use this instance_id to call `BuildGlobalCallbackJson(..., instance_id)` and SendCallbackToDart.\n\n#### There is an error or the callback is not routed by instance\n\n1. **C++ side: The source of instance_id of most globalCallbacks is wrong**\n   - All other OnXxx in `dart_compat_listeners.cpp` (such as OnConnectSuccess, OnRecvNewMessage, OnFriendListAdded, OnMessageRevoke, each ConvEvent, each Group callback, etc.) use `GetCurrentInstanceId()` to get the instance_id when triggered, and then write it to JSON.\n   - These callbacks are often triggered by the thread or asynchronous path where **Tox is located** (such as network events, friend/message/group changes). When triggered, the "current instance" comes from the last `setCurrentInstance` of the main thread, which is not necessarily equal to the instance of the Tox that generated the event, so the instance_id in JSON may correspond to the wrong instance.\n\n2. **Dart side: not distributed by instance_id**\n   - `tencent_cloud_chat_sdk`'s `NativeLibraryManager._handleGlobalCallback` will parse and print `instance_id`, but will not use it to select the listener; always calling the same set of `_sdkListener`, `_advancedMsgListener`, `_friendshipListener`, etc.\n   - Even if C++ writes the instance_id correctly in the future, Dart currently still has a "single set of global listeners", and it is impossible to deliver callbacks only to the listeners of the "corresponding instance" in multiple instances.\n\n#### Suggestions (can be done later)\n\n- **C++**: For all globalCallbacks issued through dart_compat, **do not** use `GetCurrentInstanceId()` to fill in the instance_id in OnXxx. Change it to the same as OnFriendApplicationListAdded: push the instance_id from the listener identity (for example, use `this` in `g_sdk_listeners` / `g_advanced_msg_listeners` / `g_group_listeners`, etc. to check back instance_id), and then pass in `BuildGlobalCallbackJson(..., instance_id)`.\n- **Dart/SDK**: If you want to implement strict multi-instance, you need to maintain "instance_id → the SDK/AdvancedMsg/Friendship/Group and other listener collections of the instance" in NativeLibraryManager (or the upper layer). In `_handleGlobalCallback`, only the listener of the corresponding instance is notified according to JSON's `instance_id`; otherwise, even if C++ fills in the correct instance_id, it will still be broadcast to the listeners of all instances.\n\nUnder the agreement of **single isolate + serial switching of "current instance" only through runWithInstance/runWithInstanceAsync**, if the registration and business of all listeners are included in the `runWithInstance` of the corresponding instance, and the main thread will not happen to be in the runWithInstance of "another instance" when the Tox callback is triggered, it may still work in most scenarios, but there is no guarantee** that "whose event will be sent to whom"; Strict multi-instance still requires the above C++ and Dart has two changes.\n\n## Related documents\n\n- **C++ implementation**:\n  - `tim2tox/source/ToxManager.h/cpp`\n  - `tim2tox/source/V2TIMManagerImpl.h/cpp`\n- **FFI interface**:\n  - `tim2tox/ffi/tim2tox_ffi.h/cpp`\n- **Dart Bindings**:\n  - `tim2tox/dart/lib/ffi/tim2tox_ffi.dart`\n  - `tim2tox/dart/lib/instance/tim2tox_instance.dart` (instance scope)\n- **Test Code**:\n  - `tim2tox/auto_tests/test/test_helper.dart`\n  - `tim2tox/auto_tests/test/scenarios/scenario_multi_instance_test.dart`\n
+[简体中文](./MULTI_INSTANCE_SUPPORT.zh-CN.md)
+
+# Tim2Tox Multi-Instance Support
+
+## Overview
+
+Tim2Tox now supports the creation of multiple independent Tox instances, each with independent network ports, DHT IDs and persistence paths. This is particularly useful for testing scenarios, allowing multiple nodes to be run in the same process for interoperability testing.
+
+## Architecture changes
+
+### Before (singleton mode)
+
+- `ToxManager` and `V2TIMManagerImpl` are singletons
+- All test nodes share the same Tox instance
+- No true multi-node interoperability testing possible
+- All nodes use the same network port and DHT ID
+
+### Now (multi-instance support)
+
+- `ToxManager` and `V2TIMManagerImpl` are instantiable classes
+- Preserved backward compatibility of default instances (via `GetInstance()` method)
+- Supports the creation of independent test instances, each instance has independent network configuration
+- Use independent persistence paths for each instance
+
+## Usage scenarios
+
+### Production environment (default instance)
+
+For production applications, use the default instance:
+
+```dart
+// Production environment: use the default instance directly
+await TIMManager.instance.initSDK(...);
+await TIMManager.instance.login(...);
+```
+
+**Features**:
+- No special configuration required
+- Use `V2TIMManagerImpl::GetInstance()` to get the default instance
+- Fully backwards compatible
+
+### Test environment (multiple instances)
+
+For automated testing (such as `tim2tox/auto_tests`), multiple independent instances can be created:
+
+```dart
+import 'package:tim2tox_dart/ffi/tim2tox_ffi.dart' as ffi_lib;
+
+// Create test instance
+final ffiInstance = ffi_lib.Tim2ToxFfi.open();
+final initPathPtr = '/path/to/instance/data'.toNativeUtf8();
+final instanceHandle = ffiInstance.createTestInstanceNative(initPathPtr);
+
+// Sets the current instance (subsequent FFI calls will use this instance)
+ffiInstance.setCurrentInstance(instanceHandle);
+
+// Use examples for SDK operations
+await TIMManager.instance.initSDK(...);
+await TIMManager.instance.login(...);
+
+// Destroy test instance
+ffiInstance.destroyTestInstance(instanceHandle);
+```
+
+**Features**:
+- Each test node has an independent instance
+- Separate network port and DHT ID
+- Independent persistence path to ensure test isolation
+- Support local bootstrap configuration to speed up node connection
+
+## API Reference
+
+### FFI function
+
+#### `tim2tox_ffi_create_test_instance`
+
+Create a new test instance.
+
+**Function signature**:
+```c
+int64_t tim2tox_ffi_create_test_instance(const char* init_path);
+```
+
+**Parameters**:
+- `init_path`: Initialization path of the instance (for persistent storage)
+
+**Return Value**:
+- Success: Returns instance handle (> 0)
+- Failure: return 0
+
+**Dart binding**:
+```dart
+final ffiInstance = ffi_lib.Tim2ToxFfi.open();
+final initPathPtr = '/path/to/data'.toNativeUtf8();
+final handle = ffiInstance.createTestInstanceNative(initPathPtr);
+```
+
+#### `tim2tox_ffi_set_current_instance`
+
+Sets the currently active instance. All subsequent FFI calls will use this instance.
+
+**Function signature**:
+```c
+int tim2tox_ffi_set_current_instance(int64_t instance_handle);
+```
+
+**Parameters**:
+- `instance_handle`: instance handle (0 means use the default instance)
+
+**Return Value**:
+- Success: Return 1
+- Failure: return 0
+
+**Dart binding**:
+```dart
+ffiInstance.setCurrentInstance(handle);
+```
+
+**Recommendation**: In multi-instance scenarios, please use `Tim2ToxInstance.runWithInstance` / `runWithInstanceAsync` to wrap calls to `TIMManager`, `TIMFriendshipManager`, `TIMGroupManager`, etc. to avoid frequent handwriting of `setCurrentInstance` in test or business code. See the "Instance scope (recommended)" section.
+
+#### `tim2tox_ffi_destroy_test_instance`
+
+Destroy the test instance.
+
+**Function signature**:
+```c
+int tim2tox_ffi_destroy_test_instance(int64_t instance_handle);
+```
+
+**Parameters**:
+- `instance_handle`: Instance handle to be destroyed (cannot be 0)
+
+**Return Value**:
+- Success: Return 1
+- Failure: return 0
+
+**Dart binding**:
+```dart
+ffiInstance.destroyTestInstance(handle);
+```
+
+### Instance scope (recommended)
+
+In multi-instance scenarios, you should try to use **instance scope** to wrap calls to `TIMManager`, `TIMFriendshipManager`, `TIMGroupManager`, etc. instead of handwriting `setCurrentInstance` everywhere before calling.
+
+- **Tim2ToxInstance** (`package:tim2tox_dart/instance/tim2tox_instance.dart`): An encapsulation of an instance handle, providing:
+  - `runWithInstance<R>(R Function() action)`: Execute synchronization logic under the premise that the "current instance" is set to this instance, and restore the original current instance after execution.
+  - `runWithInstanceAsync<R>(Future<R> Function() action)`: Same as above, used for asynchronous logic.
+- **TestNode** (`test_helper.dart`) provides `runWithInstance` / `runWithInstanceAsync` and delegates internally to `Tim2ToxInstance.fromHandle(testInstanceHandle)`. When performing SDK operations on this node during testing, use `node.runWithInstance(() => ...)` or `await node.runWithInstanceAsync(() async => ...)` to avoid explicit `setCurrentInstance(node.testInstanceHandle!)`.
+
+Example:
+
+```dart
+// Execute a piece of logic based on an instance
+final instance = Tim2ToxInstance(instanceHandle);
+await instance.runWithInstanceAsync(() async {
+  await TIMManager.instance.login(...);
+});
+instance.runWithInstance(() => TIMManager.instance.someSyncCall());
+
+// on TestNode
+await alice.runWithInstanceAsync(() async => TIMGroupManager.instance.createGroup(...));
+bob.runWithInstance(() => TIMMessageManager.instance.addAdvancedMsgListener(listener));
+```
+
+**Call by instance registration**: Any registration that relies on the "current instance" (such as `getCurrentInstanceId()`, `addFriendListener` / `addGroupListener` used in the construction of `setDhtNodesResponseCallback`, `ToxAVService`) should be executed within the `runWithInstance` / `runWithInstanceAsync` of the corresponding instance, so that `getCurrentInstanceId()` is the instance of the instance at the time of registration. handle, routing and lifecycle will be correct. `enableAutoAccept` in `test_helper` has registered listener in `runWithInstance`; if other scenarios need to be registered by instance, they should also be included in `node.runWithInstance`.
+
+## Implementation details
+
+### C++ layer
+
+**ToxManager**:
+- Changed from singleton to instantiable class
+- Each instance manages its own Tox object
+- Callback processing: Use the global `Tox* -> ToxManager*` mapping to handle callbacks that do not support `user_data`
+
+**V2TIMManagerImpl**:
+- Changed from singleton to instantiable class
+- Each instance has its own `ToxManager`
+- Retained `GetInstance()` method for backward compatibility
+
+**Key code**:
+```cpp
+// ToxManager.h
+class ToxManager {
+public:
+    ToxManager();  // public constructor
+    ~ToxManager();
+
+    // Backward compatibility: Get the default instance
+    static ToxManager* getDefaultInstance();
+};
+
+// V2TIMManagerImpl.h
+class V2TIMManagerImpl : public V2TIMManager {
+public:
+    V2TIMManagerImpl();  // public constructor
+    ~V2TIMManagerImpl();
+
+    // Backward compatibility: Get the default instance
+    static V2TIMManagerImpl* GetInstance();
+
+    // Get the ToxManager for this instance
+    ToxManager* GetToxManager() { return tox_manager_.get(); }
+
+private:
+    std::unique_ptr<ToxManager> tox_manager_;
+};
+```
+
+### FFI layer
+
+**Test instance management**:
+- Instance mapping: `std::unordered_map<int64_t, V2TIMManagerImpl*>`
+- Current instance tracking: `g_current_instance_id` (0 means use the default instance)
+- All FFI functions get the correct instance via `GetCurrentInstance()`
+
+**Key code**:
+```cpp
+// Test instance management
+static std::mutex g_test_instances_mutex;
+static std::unordered_map<int64_t, V2TIMManagerImpl*> g_test_instances;
+static int64_t g_next_instance_id = 1;
+static int64_t g_current_instance_id = 0; // 0 = default instance
+
+// Get the current instance
+static V2TIMManagerImpl* GetCurrentInstance() {
+    std::lock_guard<std::mutex> lock(g_test_instances_mutex);
+    if (g_current_instance_id == 0) {
+        return V2TIMManagerImpl::GetInstance();  // default instance
+    }
+    auto it = g_test_instances.find(g_current_instance_id);
+    if (it != g_test_instances.end()) {
+        return it->second;
+    }
+    return V2TIMManagerImpl::GetInstance();  // Fallback to default instance
+}
+```
+
+### Dart layer
+
+**TestNode class** (`tim2tox/auto_tests/test/test_helper.dart`):
+- Each `TestNode` creates an independent C++ instance at `initSDK`
+- Set current instance before `login` and FFI calls
+- Destroy test instance at `dispose`
+
+**Key code**:
+```dart
+class TestNode {
+  int? _testInstanceHandle;
+
+  int? get testInstanceHandle => _testInstanceHandle;
+
+  Future<void> initSDK({String? initPath, String? logPath}) async {
+    // Create test instance
+    final ffiInstance = ffi_lib.Tim2ToxFfi.open();
+    final initPathPtr = testInitPath.toNativeUtf8();
+    try {
+      final instanceHandle = ffiInstance.createTestInstanceNative(initPathPtr);
+      _testInstanceHandle = instanceHandle;
+
+      // Set current instance
+      ffiInstance.setCurrentInstance(instanceHandle);
+    } finally {
+      pkgffi.malloc.free(initPathPtr);
+    }
+
+    // Initialize SDK (using current instance)
+    await timManager!.initSDK(...);
+  }
+
+  Future<void> login({Duration? timeout}) async {
+    // Set current instance
+    if (testInstanceHandle != null) {
+      final ffiInstance = ffi_lib.Tim2ToxFfi.open();
+      ffiInstance.setCurrentInstance(testInstanceHandle!);
+    }
+
+    // Log in (using current instance)
+    await timManager!.login(...);
+  }
+
+  Future<void> dispose() async {
+    // Destroy test instance
+    if (_testInstanceHandle != null) {
+      final ffiInstance = ffi_lib.Tim2ToxFfi.open();
+      ffiInstance.destroyTestInstance(_testInstanceHandle!);
+      _testInstanceHandle = null;
+    }
+  }
+}
+```
+
+## Test verification
+
+### Multiple instance testing
+
+Run a multi-instance test to verify functionality:
+
+```bash
+cd tim2tox/auto_tests
+flutter test test/scenarios/scenario_multi_instance_test.dart
+```
+
+**Test content**:
+1. Verify that each node has an independent instance handle
+2. Verify that each node has a different UDP port
+3. Verify that each node has a different DHT ID
+4. Verify that nodes can connect to each other through 127.0.0.1 bootstrap
+
+### Test result example
+
+```
+[Test] Node alice: instance=1, port=33445, dhtId=F81861944932B2C3B46AA3AC3BEDF59C40A8E063AB6BC9D471305524DAC65343
+[Test] Node bob: instance=2, port=33448, dhtId=6BFF8910CA9DA8645CEFCA10BA4BC07FF9AA3F1DF2A1D078E09AD5E47213910D
+[Test] Node charlie: instance=3, port=33449, dhtId=BAE1C11998FC010680A59A5C4D8E2D4D250B2AB04B4FA62DD0DE678F59F04F3F
+[Test] ✅ All nodes have independent instances, ports, and DHT IDs
+```
+
+## Backward compatibility
+
+### Production environment application
+
+**No modifications required**: Production applications continue to use the default instance without any code modifications.
+
+**Call path**:
+```
+TIMManager.instance.initSDK()
+  ↓
+NativeLibraryManager.bindings.DartInitSDK()
+  ↓
+dart_compat_sdk.cpp::DartInitSDK()
+  ↓
+V2TIMManagerImpl::GetInstance()->InitSDK()  // Use default instance
+  ↓
+ToxManager::getDefaultInstance()->initialize()  // Use default ToxManager
+```
+
+### Test environment
+
+**MODIFICATION REQUIRED**: The test environment needs to use the new test instance management API.
+
+**Call path**:
+```
+TestNode.initSDK()
+  ↓
+ffiInstance.createTestInstanceNative()  // Create new instance
+  ↓
+ffiInstance.setCurrentInstance()  // Set current instance
+  ↓
+TIMManager.instance.initSDK()
+  ↓
+GetCurrentInstance()->InitSDK()  // Use current test instance
+```
+
+## Notes
+
+1. **Instance lifecycle**: The test instance must be destroyed after the test is completed to avoid resource leakage
+2. **Instance switching**: Before calling FFI/SDK, you must ensure that the "current instance" is correct. **Recommended** Use `Tim2ToxInstance.runWithInstance` / `runWithInstanceAsync` or TestNode's `runWithInstance` / `runWithInstanceAsync` to wrap multi-instance calls to avoid handwriting `setCurrentInstance` everywhere in business or testing.
+3. **Default instance**: The production environment always uses the default instance, no need to create a test instance
+4. **Persistence path**: Each test instance uses an independent persistence path to ensure data isolation### V2TIMFriendshipManagerImpl caching and multiple instances (subsequent processing)
+
+- **friend_id_map_**: Declared in `V2TIMFriendshipManagerImpl.h`, it is not used in the current .cpp and can be regarded as dead code; if it is enabled in the future and there are multiple instances, it needs to be isolated by instance or cleared with instance switching.
+- **friend_info_db_**, **friend_groups_**, **pending_applications_**: V2TIMFrendshipManagerImpl is a singleton and **does not** SetManagerImpl. Tox is obtained through GetCurrentInstance(); the above caches will be mixed in multiple instances. If it is agreed that "there is only one current instance at the same time" (single isolate + runWithInstance serial), you can leave it unchanged for now; if strict multi-instance isolation is required in the future, SetManagerImpl or "current instance" abstraction should be introduced in the Friendship layer, and these structures should be cleared or isolated by instance key when switching instances.
+
+### Multithreading and setCurrentInstance
+
+- **setCurrentInstance is not multi-thread safe**: `g_current_instance_id` is an in-process global variable. If multiple threads call `setCurrentInstance` at the same time, or after A calls `setCurrentInstance(alice)` but before its subsequent `GetCurrentInstance()`, another thread calls `setCurrentInstance(bob)`, then A may get an error instance.
+- **Recommendation**: When using multiple instances, the logic on each instance should be executed in **single isolate** through `runWithInstance` / `runWithInstanceAsync` **serial**, and do not rely on the global state of the "current instance" in multi-threads.
+- If multi-thread safety is required in the future, consider changing the "current instance" to thread local (such as `thread_local`) on the C++ side, or let all entries explicitly pass instance_id; the current document convention is "single isolate + runWithInstance serial".
+
+### Tox callback routing under multiple instances
+
+Conclusion: **Only some callbacks can guarantee correct routing by instance**; the instance_id filled in in C++ via SendCallbackToDart's globalCallback mostly relies on the "current instance" and may be misplaced when the Tox asynchronous thread is triggered, and the Dart side is not currently distributed by instance_id.
+
+#### Correctly routed callbacks per instance
+
+1. **DHT node response** (`tim2tox_ffi.cpp`)
+   - In `on_dht_nodes_response_internal(Tox* tox, ...)`, check the instance_id in `g_test_instances` based on **Tox***, then press instance_id to get `g_instance_dht_callbacks[instance_id]` and user_data, and bring instance_id to Dart during callback.
+   - Dart side `_dhtNodesResponseTrampoline` reads the instance_id from userData and delivers it to the corresponding FfiChatService using `_instanceServices[instanceId]`.
+
+2. **ToxAV callback** (on_call, on_call_state, audio/video receive)
+   - C++ uses the instance_id captured by the closure in `tim2tox_ffi_av_initialize` to register to ToxAVManager, and gets the callback and user_data from `g_instance_av_callbacks[captured_instance_id]` when triggered.
+   - The trampoline of ToxAVService on the Dart side reads the instance_id from userData and delivers it to the corresponding ToxAVService using `_instanceServices[instanceId]`.
+
+3. **Friend application list added** (OnFriendApplicationListAdded)
+   - In `dart_compat_listeners.cpp`'s `DartFriendshipListenerImpl::OnFriendApplicationListAdded`, instead of using `GetCurrentInstanceId()`, traverse `g_friendship_listeners`, use `this` to check the instance_id it belongs to, and then use this instance_id to call `BuildGlobalCallbackJson(..., instance_id)` and SendCallbackToDart.
+
+#### There is an error or the callback is not routed by instance
+
+1. **C++ side: The source of instance_id of most globalCallbacks is wrong**
+   - All other OnXxx in `dart_compat_listeners.cpp` (such as OnConnectSuccess, OnRecvNewMessage, OnFriendListAdded, OnMessageRevoke, each ConvEvent, each Group callback, etc.) use `GetCurrentInstanceId()` to get the instance_id when triggered, and then write it to JSON.
+   - These callbacks are often triggered by the thread or asynchronous path where **Tox is located** (such as network events, friend/message/group changes). When triggered, the "current instance" comes from the last `setCurrentInstance` of the main thread, which is not necessarily equal to the instance of the Tox that generated the event, so the instance_id in JSON may correspond to the wrong instance.
+
+2. **Dart side: not distributed by instance_id**
+   - `tencent_cloud_chat_sdk`'s `NativeLibraryManager._handleGlobalCallback` will parse and print `instance_id`, but will not use it to select the listener; always calling the same set of `_sdkListener`, `_advancedMsgListener`, `_friendshipListener`, etc.
+   - Even if C++ writes the instance_id correctly in the future, Dart currently still has a "single set of global listeners", and it is impossible to deliver callbacks only to the listeners of the "corresponding instance" in multiple instances.
+
+#### Suggestions (can be done later)
+
+- **C++**: For all globalCallbacks issued through dart_compat, **do not** use `GetCurrentInstanceId()` to fill in the instance_id in OnXxx. Change it to the same as OnFriendApplicationListAdded: push the instance_id from the listener identity (for example, use `this` in `g_sdk_listeners` / `g_advanced_msg_listeners` / `g_group_listeners`, etc. to check back instance_id), and then pass in `BuildGlobalCallbackJson(..., instance_id)`.
+- **Dart/SDK**: If you want to implement strict multi-instance, you need to maintain "instance_id → the SDK/AdvancedMsg/Friendship/Group and other listener collections of the instance" in NativeLibraryManager (or the upper layer). In `_handleGlobalCallback`, only the listener of the corresponding instance is notified according to JSON's `instance_id`; otherwise, even if C++ fills in the correct instance_id, it will still be broadcast to the listeners of all instances.
+
+Under the agreement of **single isolate + serial switching of "current instance" only through runWithInstance/runWithInstanceAsync**, if the registration and business of all listeners are included in the `runWithInstance` of the corresponding instance, and the main thread will not happen to be in the runWithInstance of "another instance" when the Tox callback is triggered, it may still work in most scenarios, but there is no guarantee** that "whose event will be sent to whom"; Strict multi-instance still requires the above C++ and Dart has two changes.
+
+## Related documents
+
+- **C++ implementation**:
+  - `tim2tox/source/ToxManager.h/cpp`
+  - `tim2tox/source/V2TIMManagerImpl.h/cpp`
+- **FFI interface**:
+  - `tim2tox/ffi/tim2tox_ffi.h/cpp`
+- **Dart Bindings**:
+  - `tim2tox/dart/lib/ffi/tim2tox_ffi.dart`
+  - `tim2tox/dart/lib/instance/tim2tox_instance.dart` (instance scope)
+- **Test Code**:
+  - `tim2tox/auto_tests/test/test_helper.dart`
+  - `tim2tox/auto_tests/test/scenarios/scenario_multi_instance_test.dart`
