@@ -8,7 +8,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 The canonical integrating client is [`toxee`](https://github.com/agentx-icu/toxee), which vendors this repo at `third_party/tim2tox`. **Tim2Tox does not depend on toxee.** Anything client-specific (account model, UI, FakeUIKit, persistence wiring) belongs in toxee, not here.
 
-Authoritative architecture deep-dive: `doc/architecture/ARCHITECTURE.en.md`. FFI/binary-replacement boundary: `doc/architecture/FFI_COMPAT_LAYER.en.md` and `doc/architecture/BINARY_REPLACEMENT.en.md`. Build doc: `README_BUILD.md`.
+Authoritative architecture deep-dive: `doc/architecture/ARCHITECTURE.md`. FFI/binary-replacement boundary: `doc/architecture/FFI_COMPAT_LAYER.md` and `doc/architecture/BINARY_REPLACEMENT.md`. Build doc: `README_BUILD.md`.
 
 ## Architecture — the one thing to internalize
 
@@ -42,7 +42,7 @@ C++ does **not** persist message history. Persistence lives entirely on the Dart
 
 - `source/` — C++ core. `V2TIMManagerImpl`, `V2TIMMessageManagerImpl`, `V2TIMFriendshipManagerImpl`, `V2TIMGroupManagerImpl`, `V2TIMConversationManagerImpl`, `V2TIMSignalingManagerImpl`, `ToxManager`, `ToxAVManager`. Knows nothing about Dart or Platform.
 - `include/` — V2TIM-style C++ headers (public API surface of the C++ core).
-- `ffi/` — C FFI. `tim2tox_ffi.{h,cpp}` is the high-level C API used by the Platform path; `dart_compat_layer.cpp` + `dart_compat_*.cpp` are the `Dart*` symbols used by the binary-replacement path. `callback_bridge.{h,cpp}` and `json_parser.{h,cpp}` are shared by both. The compat layer was split out of a 3200-line file into 13 modules (see `doc/architecture/MODULARIZATION.en.md`) — keep that split when adding new categories.
+- `ffi/` — C FFI. `tim2tox_ffi.{h,cpp}` is the high-level C API used by the Platform path; `dart_compat_layer.cpp` + `dart_compat_*.cpp` are the `Dart*` symbols used by the binary-replacement path. `callback_bridge.{h,cpp}` and `json_parser.{h,cpp}` are shared by both. The compat layer was split out of a 3200-line file into 13 modules (see `doc/architecture/MODULARIZATION.md`) — keep that split when adding new categories.
 - `dart/lib/` — Dart package `tim2tox_dart` (path-dep'd by integrators).
   - `ffi/tim2tox_ffi.dart` — raw `dart:ffi` bindings (`Tim2ToxFfi`).
   - `service/ffi_chat_service.dart` — `FfiChatService`, the Platform-path callee. Owns init, login, polling, send, history, streams, instance registration.
@@ -57,7 +57,7 @@ C++ does **not** persist message history. Persistence lives entirely on the Dart
 - `auto_tests/` — Dart/Flutter scenario suite. 74 scenario files (73 mode-aware + 1 virtual-clock smoke). Each scenario is a **single file** that runs wall-clock by default and virtual-clock under `RUN_VIRTUAL=1` (it reads `shouldRunVirtual` and gates `VirtualClock.enableEarly/enableForScenario`; the `*Virtual` body helpers fall back to real-time when the clock is off). There are no `*_virtual_test.dart` siblings. Borrows test-case design from `c-toxcore/auto_tests/`. See `auto_tests/README.md` and `auto_tests/VIRTUAL_CLOCK.md`.
 - `test/` — small C++ unit tests (`ToxUtilTest.cpp`, `V2TIMMessageTest.cpp`, `V2TIMStringTest.cpp`), gated by `-DTIM2TOX_BUILD_TESTS=ON`.
 - `example/` — standalone C/C++ usage examples (echo bot, client). Not part of the Flutter integration path.
-- `doc/` — canonical documentation; new design docs go here. Most pages are bilingual (`*.md` Chinese + `*.en.md` English).
+- `doc/` — canonical documentation; new design docs go here. Most pages are bilingual (`*.md` English + `*.zh-CN.md` Chinese).
 - `patches/tencent_cloud_chat_sdk/` — patches the integrator applies to a vendored copy of the Tencent SDK. Used by toxee's `bootstrap_deps.dart`. **Editing a patch here is a cross-repo change** — verify the resulting patched SDK still compiles and still matches the `Dart*` signatures Tim2Tox implements.
 - `tool/apply_sdk_patches.dart` + `tool/tencent_cloud_chat_sdk.lock.json` — pins the SDK version the patches are written against.
 
@@ -156,6 +156,6 @@ In multi-node scenarios (alice, bob, …) **every** call into a `TIM*Manager` mu
 - **No C++ leaks across the FFI boundary** — if a C function returns memory, document who frees it and how. `pkgffi.Utf8` strings allocated by Dart must be freed by Dart; buffers passed in by Dart must not be retained past the call.
 - **C++ has no history store** — see "History ownership" above. Don't add one.
 - **Single CMake graph** — `third_party/c-toxcore` is added with a `TARGET` guard. Don't re-`add_subdirectory()` it from inside `source/` or `ffi/`.
-- **Bilingual docs** — the canonical document is `doc/.../X.md` (Chinese); `X.en.md` is the English mirror. When editing one, update the other or note divergence at the top.
+- **Bilingual docs** — the canonical document is `doc/.../X.md` (English); `X.zh-CN.md` is the Chinese mirror. When editing one, update the other or note divergence at the top.
 - **macOS / desktop first** — iOS/Android FFI loading paths are the integrator's problem (toxee handles them in `build_all.sh`). Don't assume mobile-specific build glue here.
 - **`build_ffi.sh` toggles options that `build.sh` doesn't** — if you ran `build.sh` first and then `build_ffi.sh` complains about a stale `CMakeCache.txt`, that's by design: `build_ffi.sh` detects the missing `BUILD_TOXAV=ON` / `DHT_BOOTSTRAP=ON` and reconfigures. Don't paper over it by deleting checks in the script.
