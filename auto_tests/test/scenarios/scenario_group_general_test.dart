@@ -531,9 +531,9 @@ void main() {
       );
 
       // Step 6: Founder rejoins the group via peer1 invite.
-      // tim2tox clears the stored chat_id mapping on quitGroup, so a direct
-      // joinGroup by the original groupID would return 6017. peer1 is still
-      // in the group — invite founder back from peer1's side.
+      // quitGroup removes the active membership but preserves the canonical
+      // chat_id mapping, so the portable peer invite can restore the original
+      // public group ID instead of publishing a temporary invite alias.
       final founderPubKeyForRejoin = founder.getPublicKey();
       var rejoinInviteArrived = false;
       for (var attempt = 0; !rejoinInviteArrived && attempt < 3; attempt++) {

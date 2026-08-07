@@ -400,6 +400,7 @@ PHASE3_MESSAGE=(
   "test/scenarios/scenario_send_message_test.dart"
   "test/scenarios/scenario_message_overflow_test.dart"
   "test/scenarios/scenario_typing_test.dart"
+  "test/scenarios/scenario_qtox_action_and_splitting_test.dart"
 )
 
 PHASE4_GROUP=(
@@ -504,8 +505,12 @@ PHASE13_BINARY_REPLACEMENT=(
 PHASE14_UNIT=(
   "test/unit_tests/test_listeners.dart"
   "test/unit_tests/ffi_chat_service_group_cleanup_test.dart"
+  "test/unit_tests/ffi_chat_service_polling_ownership_test.dart"
   "test/unit_tests/conversation_draft_persistence_test.dart"
   "test/unit_tests/ffi_chat_service_scratch_test.dart"
+  "test/unit_tests/qtox_action_and_splitting_state_test.dart"
+  "test/unit_tests/ffi_chat_service_c2c_binary_event_test.dart"
+  "test/unit_tests/message_history_persistence_test.dart"
 )
 
 # Initialize counters

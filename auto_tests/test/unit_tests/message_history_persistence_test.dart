@@ -22,10 +22,8 @@ void main() {
     }
   });
 
-  bool dirHasJson(Directory dir) => dir
-      .listSync()
-      .whereType<File>()
-      .any((f) => f.path.endsWith('.json'));
+  bool dirHasJson(Directory dir) =>
+      dir.listSync().whereType<File>().any((f) => f.path.endsWith('.json'));
 
   group('CR-05: empty conversation deletes the on-disk file', () {
     test('clearHistory removes the file and prevents resurrection', () async {
@@ -54,8 +52,7 @@ void main() {
           reason: 'clearHistory must delete the JSON (and .bak) file');
 
       // A fresh instance pointed at the same dir must not resurrect anything.
-      final fresh =
-          MessageHistoryPersistence(historyDirectory: tempDir.path);
+      final fresh = MessageHistoryPersistence(historyDirectory: tempDir.path);
       final reloaded = await fresh.loadHistory(conversationId);
       expect(reloaded, isEmpty,
           reason: 'no on-disk file means no resurrection on restart');
@@ -276,6 +273,71 @@ void main() {
   });
 
   group('Cross-path dedup: same inbound message via both hybrid paths', () {
+    test('ACTION and NORMAL with identical text remain distinct', () async {
+      const conversationId = 'qtox-kind-distinct';
+      final persistence =
+          MessageHistoryPersistence(historyDirectory: tempDir.path);
+      final timestamp = DateTime.fromMillisecondsSinceEpoch(9000000);
+
+      await persistence.appendHistory(
+        conversationId,
+        ChatMessage(
+          text: 'waves',
+          fromUserId: conversationId,
+          isSelf: false,
+          timestamp: timestamp,
+          msgID: 'normal-waves',
+        ),
+      );
+      await persistence.appendHistory(
+        conversationId,
+        ChatMessage(
+          text: 'waves',
+          fromUserId: conversationId,
+          isSelf: false,
+          timestamp: timestamp.add(const Duration(milliseconds: 100)),
+          msgID: 'action-waves',
+          contentKind: ChatMessageContentKind.action,
+        ),
+      );
+
+      expect(persistence.getHistory(conversationId), hasLength(2));
+    });
+
+    test('same identity upgrades NORMAL to ACTION and survives reload',
+        () async {
+      const conversationId = 'qtox-kind-upgrade';
+      final persistence =
+          MessageHistoryPersistence(historyDirectory: tempDir.path);
+      final timestamp = DateTime.fromMillisecondsSinceEpoch(9100000);
+      final normal = ChatMessage(
+        text: 'waves',
+        fromUserId: conversationId,
+        isSelf: false,
+        timestamp: timestamp,
+        msgID: 'same-action-id',
+      );
+      await persistence.appendHistory(conversationId, normal);
+      await persistence.appendHistory(
+        conversationId,
+        ChatMessage(
+          text: normal.text,
+          fromUserId: normal.fromUserId,
+          isSelf: normal.isSelf,
+          timestamp: timestamp.add(const Duration(milliseconds: 50)),
+          msgID: normal.msgID,
+          contentKind: ChatMessageContentKind.action,
+        ),
+      );
+      await persistence.flushPendingSaves();
+
+      final restarted =
+          MessageHistoryPersistence(historyDirectory: tempDir.path);
+      final reloaded = await restarted.loadHistory(conversationId);
+      expect(reloaded, hasLength(1));
+      expect(reloaded.single.contentKind, ChatMessageContentKind.action);
+    });
+
     // Regression for the toxee hybrid double-delivery. An inbound message
     // arrives through BOTH the binary-replacement V2TimAdvancedMsgListener
     // (native `msg_<n>_<nanos>_<seq>` id) and the FfiChatService poll path
@@ -378,11 +440,11 @@ void main() {
       );
 
       expect(persistence.getHistory(conversationId).length, 2,
-          reason:
-              'identical text >2s apart is a real repeat, not a duplicate');
+          reason: 'identical text >2s apart is a real repeat, not a duplicate');
     });
 
-    test('dropped msgID stays resolvable via alias for removeMessage', () async {
+    test('dropped msgID stays resolvable via alias for removeMessage',
+        () async {
       // codex P1: dedup collapses two ids into one row, keeping the LATER id.
       // The dropped (first) id must remain resolvable, or every consumer that
       // still holds it (revoke/modify via the binary-replacement path, a delete
@@ -391,7 +453,8 @@ void main() {
       final persistence =
           MessageHistoryPersistence(historyDirectory: tempDir.path);
 
-      const nativeId = 'msg_0_5000000000000_2'; // arrives first → its id is dropped
+      const nativeId =
+          'msg_0_5000000000000_2'; // arrives first → its id is dropped
       await persistence.appendHistory(
         conversationId,
         ChatMessage(
@@ -421,7 +484,8 @@ void main() {
       expect(persistence.getHistory(conversationId), isEmpty);
     });
 
-    test('dropped msgID stays resolvable via alias for updateMessage', () async {
+    test('dropped msgID stays resolvable via alias for updateMessage',
+        () async {
       const conversationId = 'xpathaliasupd';
       final persistence =
           MessageHistoryPersistence(historyDirectory: tempDir.path);
@@ -481,8 +545,7 @@ void main() {
       // instance, and delete by the dropped native id.
       const conversationId = 'xpathreload';
       const nativeId = 'msg_0_5200000000000_2';
-      final writer =
-          MessageHistoryPersistence(historyDirectory: tempDir.path);
+      final writer = MessageHistoryPersistence(historyDirectory: tempDir.path);
       await writer.appendHistory(
         conversationId,
         ChatMessage(
@@ -511,14 +574,14 @@ void main() {
       final reloaded = await restarted.loadHistory(conversationId);
       expect(reloaded.length, 1,
           reason: 'the deduped row persists as a single message');
-      final removed =
-          await restarted.removeMessage(conversationId, nativeId);
+      final removed = await restarted.removeMessage(conversationId, nativeId);
       expect(removed, isTrue,
           reason:
               'the dropped id must resolve after reload (alias is on the row)');
     });
 
-    test('Bug F regression: identical self text within 2s is KEPT '
+    test(
+        'Bug F regression: identical self text within 2s is KEPT '
         '(not collapsed)', () async {
       // Bug F: the content-dedup fallback used to run for ALL messages, so a
       // single sender repeating the EXACT same text inside the 2s window lost
@@ -560,7 +623,8 @@ void main() {
               'not content-deduped and must both persist');
     });
 
-    test('inbound duplicate (different ids, same content <2s) still collapses '
+    test(
+        'inbound duplicate (different ids, same content <2s) still collapses '
         'to one', () async {
       // The complement of Bug F: the content-dedup fallback is deliberately
       // preserved for INCOMING messages. An inbound message genuinely
@@ -637,14 +701,16 @@ void main() {
         'text': 'old',
         'fromUserId': 'A',
         'isSelf': true,
-        'timestamp': DateTime.fromMillisecondsSinceEpoch(1000).toIso8601String(),
+        'timestamp':
+            DateTime.fromMillisecondsSinceEpoch(1000).toIso8601String(),
         'msgID': 'm0',
         'version': 1,
       };
       expect(ChatMessage.fromJson(legacy).cloudCustomData, isNull);
     });
 
-    test('a reply survives flush + reload (fresh instance) with the quote intact',
+    test(
+        'a reply survives flush + reload (fresh instance) with the quote intact',
         () async {
       final persistence =
           MessageHistoryPersistence(historyDirectory: tempDir.path);
@@ -664,13 +730,11 @@ void main() {
       );
       await persistence.flushPendingSaves();
       // Fresh instance → true on-disk read, not the in-memory cache.
-      final fresh =
-          MessageHistoryPersistence(historyDirectory: tempDir.path);
+      final fresh = MessageHistoryPersistence(historyDirectory: tempDir.path);
       final reloaded = await fresh.loadHistory(conversationId);
       expect(reloaded.length, 1);
       expect(reloaded.first.cloudCustomData, cloud,
-          reason:
-              'cloudCustomData (reply quote) must survive the on-disk '
+          reason: 'cloudCustomData (reply quote) must survive the on-disk '
               'toJson/fromJson round-trip — the S18 sender-side persistence fix');
     });
   });

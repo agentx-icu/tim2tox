@@ -227,6 +227,8 @@ void main() {
       alice.runWithInstance(() =>
           TIMFriendshipManager.instance.addFriendListener(listener: listener1));
       final aliceToxId = alice.getToxId();
+      final bobPublicKey = bob.getPublicKey();
+      final bobToxId = bob.getToxId();
       final addResult = await bob.runWithInstanceAsync(
           () async => TIMFriendshipManager.instance.addFriend(
                 userID: aliceToxId,
@@ -234,43 +236,46 @@ void main() {
                 addWording: 'Hi',
               ));
 
-      try {
-        await waitUntilWithVirtualPump(
-          scenario,
-          () => completer1.isCompleted,
-          timeout: const Duration(seconds: 180),
-          description: 'Alice received friend request (initial)',
-          advanceMs: 50,
-          iterationsPerInstance: 1,
-        );
-      } on TimeoutException catch (e) {
-        // Best-effort wait: proceed regardless, but keep the timeout visible.
-        // A non-timeout error is a real bug and propagates.
-        print('[Test] Continuing after timeout: $e');
-      }
+      V2TimFriendApplication? application1;
+      final spamDeadline = VirtualClock.nowMs + 180000;
+      while (VirtualClock.nowMs < spamDeadline) {
+        if (completer1.isCompleted) {
+          request1Received = true;
+          break;
+        }
 
-      var applications = await alice.runWithInstanceAsync(() async {
-        final p = TencentCloudChatSdkPlatform.instance;
-        if (p is Tim2ToxSdkPlatform) return await p.getFriendApplicationList();
-        return await TIMFriendshipManager.instance.getFriendApplicationList();
-      });
-      var appCount1 = applications.data?.friendApplicationList?.length ?? 0;
-      for (int poll = 0; poll < 5 && appCount1 == 0; poll++) {
-        await pumpTestTick(scenario, advanceMs: 2000, iterationsPerInstance: 1);
-        applications = await alice.runWithInstanceAsync(() async {
+        final appListResult = await alice.runWithInstanceAsync(() async {
           final p = TencentCloudChatSdkPlatform.instance;
           if (p is Tim2ToxSdkPlatform) {
             return await p.getFriendApplicationList();
           }
           return await TIMFriendshipManager.instance.getFriendApplicationList();
         });
-        appCount1 = applications.data?.friendApplicationList?.length ?? 0;
-        if (appCount1 > 0 && !request1Received) {
-          request1Received = true;
+        final list = appListResult.data?.friendApplicationList;
+        if (appListResult.code == 0 && list != null) {
+          for (final app in list) {
+            if (app != null &&
+                (app.userID == bobPublicKey ||
+                    app.userID == bobToxId ||
+                    (app.userID.length >= 64 &&
+                        app.userID.startsWith(bobPublicKey)))) {
+              application1 = app;
+              request1Received = true;
+              if (!completer1.isCompleted) {
+                completer1.complete(application1);
+              }
+              break;
+            }
+          }
+          if (application1 != null) {
+            break;
+          }
         }
+
+        await pumpTestTick(scenario, advanceMs: 50, iterationsPerInstance: 1);
       }
-      if (appCount1 > 0 && !request1Received) {
-        request1Received = true;
+      if (application1 == null && completer1.isCompleted) {
+        application1 = await completer1.future as V2TimFriendApplication;
       }
       // Note: addResult is referenced for parity with the wall-clock test;
       // outcome may be ALREADY_SENT in tight test cycles.
@@ -278,20 +283,15 @@ void main() {
       print(
           '[Nospam] Nospam change invalidates: addResult.code=${addResult.code}');
 
-      if (applications.data?.friendApplicationList != null &&
-          applications.data!.friendApplicationList!.isNotEmpty) {
-        final application = applications.data!.friendApplicationList!.first;
-
-        if (application != null) {
-          final acceptResult = await alice.runWithInstanceAsync(
-              () async => TIMFriendshipManager.instance.acceptFriendApplication(
-                    userID: application.userID,
-                    responseType: FriendResponseTypeEnum
-                        .V2TIM_FRIEND_ACCEPT_AGREE_AND_ADD,
-                  ));
-          expect(acceptResult.code, equals(0),
-              reason: 'Friend request should be accepted');
-        }
+      if (application1 != null) {
+        final acceptResult = await alice.runWithInstanceAsync(
+            () async => TIMFriendshipManager.instance.acceptFriendApplication(
+                  userID: application1!.userID,
+                  responseType:
+                      FriendResponseTypeEnum.V2TIM_FRIEND_ACCEPT_AGREE_AND_ADD,
+                ));
+        expect(acceptResult.code, equals(0),
+            reason: 'Friend request should be accepted');
       }
 
       alice.runWithInstance(() => TIMFriendshipManager.instance
@@ -392,15 +392,33 @@ void main() {
       test('Multiple friend requests handling', () async {
         final completer = Completer<dynamic>();
         bool requestReceived = false;
+        final bobPublicKey = bobIso.getPublicKey();
+        final bobToxId = bobIso.getToxId();
+
+        bool isBobUserId(String? userId) {
+          return userId != null &&
+              (userId == bobPublicKey ||
+                  userId == bobToxId ||
+                  (userId.length >= bobPublicKey.length &&
+                      userId.startsWith(bobPublicKey)));
+        }
+
+        bool isBobApplication(V2TimFriendApplication? application) {
+          return isBobUserId(application?.userID);
+        }
 
         final listener = V2TimFriendshipListener(
           onFriendApplicationListAdded:
               (List<V2TimFriendApplication> applicationList) {
-            if (applicationList.isNotEmpty) {
+            final bobApplications = applicationList
+                .whereType<V2TimFriendApplication>()
+                .where(isBobApplication)
+                .toList();
+            if (bobApplications.isNotEmpty) {
               requestReceived = true;
               aliceIso.markCallbackReceived('onFriendApplicationListAdded');
               if (!completer.isCompleted) {
-                completer.complete(applicationList.first);
+                completer.complete(bobApplications.first);
               }
             }
           },
@@ -429,6 +447,18 @@ void main() {
                     ));
           }
           try {
+            final applications = await aliceIso.runWithInstanceAsync(() async =>
+                TIMFriendshipManager.instance.getFriendApplicationList());
+            final bobApplications = applications.data?.friendApplicationList
+                ?.whereType<V2TimFriendApplication>()
+                .where(isBobApplication)
+                .toList();
+            if (applications.code == 0 && bobApplications?.isNotEmpty == true) {
+              requestReceived = true;
+              if (!completer.isCompleted) {
+                completer.complete(bobApplications!.first);
+              }
+            }
             await waitUntilWithVirtualPump(
               scenarioIso,
               () => completer.isCompleted,
@@ -452,21 +482,31 @@ void main() {
         final applications = await aliceIso.runWithInstanceAsync(() async =>
             TIMFriendshipManager.instance.getFriendApplicationList());
 
+        expect(applications.code, equals(0),
+            reason: 'Friend application query should succeed');
         expect(applications.data?.friendApplicationList, isNotNull,
             reason: 'Should have friend application list');
-        expect(applications.data!.friendApplicationList!.length,
-            greaterThanOrEqualTo(0),
-            reason: 'Should have at least one friend application');
 
-        final bobPublicKey = bobIso.getPublicKey();
-        final bobApplication =
-            applications.data!.friendApplicationList!.firstWhere(
-          (app) => app?.userID == bobPublicKey,
-          orElse: () => null,
+        final bobApplications = applications.data!.friendApplicationList!
+            .whereType<V2TimFriendApplication>()
+            .where(isBobApplication)
+            .toList();
+        final friendList = await aliceIso.runWithInstanceAsync(
+            () async => TIMFriendshipManager.instance.getFriendList());
+        expect(friendList.code, equals(0),
+            reason: 'Friend list query should succeed');
+        final bobAccepted = friendList.data?.any(
+              (friend) => isBobUserId(friend.userID),
+            ) ??
+            false;
+        expect(
+          bobApplications.isNotEmpty || bobAccepted,
+          isTrue,
+          reason:
+              'Bob must remain pending or be present after auto-accept consumes the application',
         );
-
-        if (bobApplication != null) {
-          expect(bobApplication.userID, equals(bobPublicKey),
+        if (bobApplications.isNotEmpty) {
+          expect(isBobApplication(bobApplications.first), isTrue,
               reason: 'Application should be from Bob');
         }
 

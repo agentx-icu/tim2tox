@@ -13,10 +13,12 @@ class _SpyFfiChatService extends FfiChatService {
   });
 
   bool sendAvatarToAllFriendsCalled = false;
+  String? avatarPathOverride;
 
   @override
-  Future<void> sendAvatarToAllFriends() async {
+  Future<void> sendAvatarToAllFriends({String? avatarPathOverride}) async {
     sendAvatarToAllFriendsCalled = true;
+    this.avatarPathOverride = avatarPathOverride;
   }
 }
 
@@ -62,11 +64,34 @@ void main() {
           reason:
               'Updating self avatar should trigger avatar sync dispatch to friends.',
         );
+        expect(service.avatarPathOverride, avatarFile.path);
         expect(
           await prefs.getSelfAvatarHash(),
           isNotNull,
           reason: 'Local avatar hash should still be updated.',
         );
+      } finally {
+        if (await avatarFile.exists()) {
+          await avatarFile.delete();
+        }
+      }
+    });
+
+    test('deleting avatar clears local state and fans out deletion', () async {
+      final testDir = await getTestDataDir('avatar_delete_sync_unit');
+      final avatarFile = File(
+          '$testDir/avatar_delete_sync_${DateTime.now().microsecondsSinceEpoch}.png');
+      await avatarFile.writeAsBytes(<int>[9, 8, 7, 6]);
+      await prefs.setAvatarPath(avatarFile.path);
+      await prefs.setSelfAvatarHash('old-hash');
+
+      try {
+        await service.updateAvatar(null);
+
+        expect(await prefs.getAvatarPath(), isNull);
+        expect(await prefs.getSelfAvatarHash(), isNull);
+        expect(service.sendAvatarToAllFriendsCalled, isTrue);
+        expect(service.avatarPathOverride, isNull);
       } finally {
         if (await avatarFile.exists()) {
           await avatarFile.delete();
