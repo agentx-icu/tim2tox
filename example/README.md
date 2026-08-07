@@ -18,7 +18,7 @@ Minimal examples that exercise the Tim2Tox library: one echo bot server plus two
 ## Build requirements
 
 - CMake 3.10+
-- C++17 compiler
+- C++20 compiler
 - libsodium, OpenSSL (macOS: `brew install libsodium openssl`)
 - Optional: run `./build.sh` in the repo root first to produce `build/source/libtim2tox.a` — otherwise CMake will skip the `tim2tox_client` target and emit a warning
 

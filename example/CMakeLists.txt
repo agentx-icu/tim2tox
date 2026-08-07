@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.10)
 project(tim2tox_examples)
 
-set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # Ensure version.h is available for the embedded tim2tox build in this example tree.
