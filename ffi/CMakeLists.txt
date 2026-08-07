@@ -1,74 +1,19 @@
 cmake_minimum_required(VERSION 3.4.1)
 
-# Add nlohmann/json library (header-only)
-#
-# We avoid CMake FetchContent here because the generated ExternalProject build
-# step can fail on some toolchain/CMake combinations (the logs show `gmake &&`).
-# Since nlohmann/json is header-only, we only need to download+extract once and
-# provide include directories.
-set(NLOHMANN_JSON_VERSION "3.12.0")
-set(NLOHMANN_JSON_URL
-    "https://github.com/nlohmann/json/releases/download/v${NLOHMANN_JSON_VERSION}/json.tar.xz"
-)
-
-set(_json_deps_dir "${CMAKE_BINARY_DIR}/_deps")
-set(_json_tar "${_json_deps_dir}/nlohmann_json_${NLOHMANN_JSON_VERSION}.tar.xz")
-set(_json_src_dir "${_json_deps_dir}/nlohmann_json-src")
-set(_json_include_dir "${_json_src_dir}/single_include")
-
-if(NOT EXISTS "${_json_include_dir}/nlohmann/json.hpp")
-    file(MAKE_DIRECTORY "${_json_deps_dir}")
-
-    if(NOT EXISTS "${_json_tar}")
-        message(STATUS "Downloading nlohmann/json ${NLOHMANN_JSON_VERSION} ...")
-        file(DOWNLOAD
-            "${NLOHMANN_JSON_URL}"
-            "${_json_tar}"
-            SHOW_PROGRESS
-            STATUS status
-            LOG log
-        )
-        list(GET status 0 _json_download_status)
-        if(NOT _json_download_status EQUAL 0)
-            message(FATAL_ERROR "Failed to download nlohmann/json: ${log}")
-        endif()
+if(NOT TARGET nlohmann_json::nlohmann_json)
+    set(_json_include_dir
+        "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/nlohmann_json/single_include")
+    if(NOT EXISTS "${_json_include_dir}/nlohmann/json.hpp")
+        message(FATAL_ERROR
+            "Vendored nlohmann/json header is missing: "
+            "${_json_include_dir}/nlohmann/json.hpp")
     endif()
 
-    # Extract into a temp directory, then rename the single top-level folder.
-    set(i 1234)
-    while(EXISTS "${_json_deps_dir}/ex-nlohmann-json${i}")
-        math(EXPR i "${i} + 1")
-    endwhile()
-    set(ut_dir "${_json_deps_dir}/ex-nlohmann-json${i}")
-    file(MAKE_DIRECTORY "${ut_dir}")
-
-    message(STATUS "Extracting nlohmann/json ...")
-    execute_process(
-        COMMAND ${CMAKE_COMMAND} -E tar xfz "${_json_tar}"
-        WORKING_DIRECTORY "${ut_dir}"
-        RESULT_VARIABLE rv
+    add_library(nlohmann_json::nlohmann_json INTERFACE IMPORTED)
+    set_target_properties(nlohmann_json::nlohmann_json PROPERTIES
+        INTERFACE_INCLUDE_DIRECTORIES "${_json_include_dir}"
     )
-    if(NOT rv EQUAL 0)
-        file(REMOVE_RECURSE "${ut_dir}")
-        message(FATAL_ERROR "Failed to extract nlohmann/json tarball (rv=${rv})")
-    endif()
-
-    file(GLOB contents "${ut_dir}/*")
-    list(REMOVE_ITEM contents "${ut_dir}/.DS_Store")
-    list(LENGTH contents n)
-    if(NOT n EQUAL 1 OR NOT IS_DIRECTORY "${contents}")
-        set(contents "${ut_dir}")
-    endif()
-
-    file(REMOVE_RECURSE "${_json_src_dir}")
-    file(RENAME ${contents} "${_json_src_dir}")
-    file(REMOVE_RECURSE "${ut_dir}")
 endif()
-
-add_library(nlohmann_json::nlohmann_json INTERFACE IMPORTED)
-set_target_properties(nlohmann_json::nlohmann_json PROPERTIES
-    INTERFACE_INCLUDE_DIRECTORIES "${_json_include_dir}"
-)
 
 # FFI shared library for Flutter/Dart bindings
 # Note: dart_api_dl.c will be added after we find it

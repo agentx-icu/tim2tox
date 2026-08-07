@@ -812,6 +812,42 @@ public:
         std::string json_msg = BuildGlobalCallbackJson(GlobalCallbackType::ReceiveNewMessage, fields, user_data, instance_id);
         SendCallbackToDart("globalCallback", json_msg, GetCallbackUserData(instance_id, "ReceiveNewMessage"));
     }
+
+    void OnRecvMessageReadReceipts(
+        const V2TIMMessageReceiptVector& receipt_list) override {
+        int64_t instance_id = GetInstanceIdForListener(this);
+        if (instance_id == 0) instance_id = GetCurrentInstanceId();
+
+        std::ostringstream receipts;
+        receipts << "[";
+        for (size_t i = 0; i < receipt_list.Size(); ++i) {
+            if (i != 0) receipts << ",";
+            const V2TIMMessageReceipt& receipt = receipt_list[i];
+            receipts << "{"
+                     << "\"msg_receipt_conv_type\":1,"
+                     << "\"msg_receipt_conv_id\":\""
+                     << EscapeJsonString(receipt.userID.CString()) << "\","
+                     << "\"msg_receipt_time_stamp\":" << receipt.timestamp << ","
+                     << "\"msg_receipt_msg_id\":\""
+                     << EscapeJsonString(receipt.msgID.CString()) << "\","
+                     << "\"msg_receipt_read_count\":" << receipt.readCount << ","
+                     << "\"msg_receipt_unread_count\":" << receipt.unreadCount << ","
+                     << "\"msg_receipt_is_peer_read\":"
+                     << (receipt.isPeerRead ? "true" : "false")
+                     << "}";
+        }
+        receipts << "]";
+
+        std::map<std::string, std::string> fields;
+        fields["json_msg_read_receipt_array"] = receipts.str();
+        void* user_data = GetCallbackUserData(instance_id, "MessageReadReceipt");
+        std::string json_msg = BuildGlobalCallbackJson(
+            GlobalCallbackType::MessageReadReceipt,
+            fields,
+            UserDataToString(user_data),
+            instance_id);
+        SendCallbackToDart("globalCallback", json_msg, user_data);
+    }
     
     void OnRecvMessageModified(const V2TIMMessage& message) override {
         int64_t instance_id = GetInstanceIdForListener(this);

@@ -14,6 +14,9 @@ TEST(EventLineParserTest, ParsesAllRoutedEventPrefixes) {
     EXPECT_EQ(tim2tox::event_line::ParseInstanceIdFromLine(
                   "file_request:9223372036854775807:user:1:2:0:name"),
               INT64_MAX);
+    EXPECT_EQ(tim2tox::event_line::ParseInstanceIdFromLine(
+                  "avatar_request:73:user:1:2:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"),
+              73);
 }
 
 TEST(EventLineParserTest, ParsesIdAfterTheCompletePrefixDelimiter) {
@@ -26,6 +29,9 @@ TEST(EventLineParserTest, ParsesIdAfterTheCompletePrefixDelimiter) {
     EXPECT_EQ(tim2tox::event_line::ParseInstanceIdFromLine(
                   "file_request:95:user:1:2:0:name"),
               95);
+    EXPECT_EQ(tim2tox::event_line::ParseInstanceIdFromLine(
+                  "avatar_request:106:user:1:2:file-id"),
+              106);
 }
 
 TEST(EventLineParserTest, RejectsMalformedAndBroadcastIds) {
@@ -50,5 +56,18 @@ TEST(EventLineParserTest, RejectsMalformedAndBroadcastIds) {
               0);
     EXPECT_EQ(tim2tox::event_line::ParseInstanceIdFromLine(
                   "file_request:0:x"),
+              0);
+}
+
+TEST(EventLineParserTest,
+     RejectsPeerFileControlLifecycleLinesFromTheGenericRouteParser) {
+    EXPECT_EQ(tim2tox::event_line::ParseInstanceIdFromLine(
+                  "file_canceled:42:peer:7"),
+              0);
+    EXPECT_EQ(tim2tox::event_line::ParseInstanceIdFromLine(
+                  "file_paused:42:peer:7"),
+              0);
+    EXPECT_EQ(tim2tox::event_line::ParseInstanceIdFromLine(
+                  "file_resumed:42:peer:7"),
               0);
 }

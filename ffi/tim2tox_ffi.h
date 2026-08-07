@@ -119,10 +119,17 @@ int tim2tox_ffi_add_friend(const char* user_id, const char* wording);
 // Send C2C text; returns 1 if submitted
 int tim2tox_ffi_send_c2c_text(const char* user_id, const char* text);
 
+// Send C2C action; returns 1 if every fragment was submitted
+int tim2tox_ffi_send_c2c_action(const char* user_id, const char* text);
+
 // Send C2C custom message; returns 1 if submitted
 // data: raw bytes of custom data
 // data_len: length of data in bytes
 int tim2tox_ffi_send_c2c_custom(const char* user_id, const unsigned char* data, int data_len);
+
+// Send a typed C2C control message; control_type must be 1 (receipt) or 2 (reaction).
+// Returns 1 if submitted, or 0 for invalid input or immediate send failure.
+int tim2tox_ffi_send_c2c_control(const char* user_id, const unsigned char* data, int data_len, int control_type);
 
 // Send group custom message; returns 1 if submitted
 // data: raw bytes of custom data
@@ -194,6 +201,10 @@ int tim2tox_ffi_set_typing(const char* user_id, int typing_on);
 int tim2tox_ffi_create_group(const char* group_name, const char* group_type, char* out_group_id, int out_len);
 int tim2tox_ffi_join_group(const char* group_id, const char* request_msg);
 int tim2tox_ffi_send_group_text(const char* group_id, const char* text);
+int tim2tox_ffi_send_group_action(const char* group_id, const char* text);
+// Dismiss a group through the exact instance's V2TIMManagerImpl.
+// Returns 1 only when the native callback reports one successful terminal result.
+int32_t tim2tox_ffi_dismiss_group(int64_t instance_id, const char* group_id);
 // Update known groups list from Dart layer
 // groups_str: newline-separated list of group IDs (e.g., "tox_0\ntox_1\ntox_2\n")
 // This should be called by Dart layer whenever knownGroups changes
@@ -266,6 +277,14 @@ int tim2tox_ffi_get_auto_accept_group_invites(int64_t instance_id);
 
 // File transfer (peer to peer): send a file to a friend
 int tim2tox_ffi_send_file(int64_t instance_id, const char* user_id, const char* file_path);
+
+// Send a qTox-compatible avatar from caller-owned bytes. The bytes are copied
+// before this function returns. avatar_size must be in the range 1..10 MiB.
+// Returns -8 only when avatar_size exceeds 10 MiB; null/empty input returns -1.
+int tim2tox_ffi_send_avatar(int64_t instance_id, const char* user_id, const uint8_t* avatar_data, size_t avatar_size);
+
+// Announce avatar deletion using a zero-size TOX_FILE_KIND_AVATAR transfer.
+int tim2tox_ffi_delete_avatar(int64_t instance_id, const char* user_id);
 
 // File transfer control: control a file transfer
 // user_id: friend's user ID (hex string)
@@ -559,6 +578,10 @@ typedef void (*tim2tox_av_video_receive_callback_t)(uint32_t friend_number, uint
 // media has been disabled (audio or video off).
 typedef void (*tim2tox_av_audio_bitrate_callback_t)(uint32_t friend_number, uint32_t audio_bit_rate, void* user_data);
 typedef void (*tim2tox_av_video_bitrate_callback_t)(uint32_t friend_number, uint32_t video_bit_rate, void* user_data);
+typedef void (*tim2tox_av_conference_audio_receive_callback_t)(
+    const char* group_id, uint32_t conference_number, uint32_t peer_number,
+    const int16_t* pcm, size_t sample_count, uint8_t channels,
+    uint32_t sampling_rate, void* user_data);
 
 // Set AV callbacks
 // Pass NULL to disable a callback
@@ -568,6 +591,15 @@ void tim2tox_ffi_av_set_audio_receive_callback(int64_t instance_id, tim2tox_av_a
 void tim2tox_ffi_av_set_video_receive_callback(int64_t instance_id, tim2tox_av_video_receive_callback_t callback, void* user_data);
 void tim2tox_ffi_av_set_audio_bitrate_callback(int64_t instance_id, tim2tox_av_audio_bitrate_callback_t callback, void* user_data);
 void tim2tox_ffi_av_set_video_bitrate_callback(int64_t instance_id, tim2tox_av_video_bitrate_callback_t callback, void* user_data);
+void tim2tox_ffi_av_conference_set_audio_receive_callback(
+    int64_t instance_id, tim2tox_av_conference_audio_receive_callback_t callback,
+    void* user_data);
+int tim2tox_ffi_av_conference_send_audio_frame(
+    int64_t instance_id, const char* group_id, const int16_t* pcm,
+    size_t sample_count, uint8_t channels, uint32_t sampling_rate);
+int tim2tox_ffi_av_conference_enable(int64_t instance_id, const char* group_id);
+int tim2tox_ffi_av_conference_disable(int64_t instance_id, const char* group_id);
+int tim2tox_ffi_av_conference_mute(int64_t instance_id, const char* group_id, int mute);
 
 // Helper: Get friend number by user ID
 // user_id: user ID (hex string)

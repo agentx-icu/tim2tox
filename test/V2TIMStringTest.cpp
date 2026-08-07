@@ -53,20 +53,15 @@ TEST(V2TIMStringTest, Comparison) {
     // Less than
     EXPECT_TRUE(str1 < str3);
     EXPECT_FALSE(str3 < str1);
-    
-    // Greater than
-    EXPECT_FALSE(str1 > str3);
-    EXPECT_TRUE(str3 > str1);
-    
-    // Less than or equal
-    EXPECT_TRUE(str1 <= str2);
-    EXPECT_TRUE(str1 <= str3);
-    EXPECT_FALSE(str3 <= str1);
-    
-    // Greater than or equal
-    EXPECT_TRUE(str1 >= str2);
-    EXPECT_FALSE(str1 >= str3);
-    EXPECT_TRUE(str3 >= str1);
+
+    EXPECT_FALSE(str1 < str2);
+    EXPECT_FALSE(str2 < str1);
+    EXPECT_TRUE(str1 == str2);
+    EXPECT_FALSE(str1 != str2);
+
+    EXPECT_TRUE(str1 < str3);
+    EXPECT_FALSE(str3 < str2);
+    EXPECT_TRUE(str1 != str3);
 }
 
 // Test hash function for V2TIMString
@@ -101,7 +96,7 @@ TEST(V2TIMStringTest, UtilityMethods) {
     
     // Test Empty and Length
     EXPECT_FALSE(str.Empty());
-    EXPECT_EQ(str.Length(), 14);
+    EXPECT_EQ(str.Length(), 15);
     
     // Test CString 
     EXPECT_STREQ(str.CString(), "  Hello World  ");

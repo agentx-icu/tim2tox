@@ -58,6 +58,65 @@ TEST(FileTransferSecuritySourceRegressionTest,
 }
 
 TEST(FileTransferSecuritySourceRegressionTest,
+     PeerFileControlLifecycleEventsUseExplicitInstanceRoutingAndNoPayloadLeaks) {
+    const std::string ffi_source = ReadSource(TIM2TOX_FFI_SOURCE_PATH);
+    const std::string manager_source = ReadSource(TIM2TOX_MANAGER_SOURCE_PATH);
+
+    const size_t callback_start =
+        ffi_source.find("const auto previous_file_control_callback =");
+    ASSERT_NE(callback_start, std::string::npos);
+    const size_t callback_end = ffi_source.find(
+        "tox_manager->setFileChunkRequestCallback(", callback_start);
+    ASSERT_NE(callback_end, std::string::npos);
+    const std::string callback =
+        ffi_source.substr(callback_start, callback_end - callback_start);
+
+    EXPECT_NE(callback.find("GetInstanceIdFromManager(manager_impl)"),
+              std::string::npos);
+    EXPECT_NE(callback.find("tox_friend_get_public_key(tox, friend_number"),
+              std::string::npos);
+    EXPECT_NE(callback.find("ToxUtil::tox_bytes_to_hex(pubkey, TOX_PUBLIC_KEY_SIZE)"),
+              std::string::npos);
+    EXPECT_NE(callback.find("enqueue_text_line_for_instance("),
+              std::string::npos);
+    EXPECT_NE(callback.find(
+                  "std::string line = std::string(event_name) + \":\" + sender_hex + \":\" +"),
+              std::string::npos);
+    EXPECT_NE(callback.find("std::to_string(file_number)"), std::string::npos);
+    EXPECT_NE(callback.find("file_canceled"), std::string::npos);
+    EXPECT_NE(callback.find("file_paused"), std::string::npos);
+    EXPECT_NE(callback.find("file_resumed"), std::string::npos);
+    EXPECT_NE(callback.find("previous_file_control_callback"),
+              std::string::npos);
+    EXPECT_NE(callback.find("EraseSendContext(instance_id, key)"),
+              std::string::npos);
+    EXPECT_EQ(callback.find("ParseInstanceIdFromLine"), std::string::npos);
+    EXPECT_EQ(callback.find("GetReceiverInstanceOverride"), std::string::npos);
+
+    for (const char* leak : {
+             "path",
+             "filename",
+             "payload",
+             "exception",
+             "file_id",
+         }) {
+        EXPECT_EQ(callback.find(leak), std::string::npos) << leak;
+    }
+
+    const size_t manager_start =
+        manager_source.find("void ToxManager::onFileControl(Tox*");
+    ASSERT_NE(manager_start, std::string::npos);
+    const size_t manager_end = manager_source.find(
+        "void ToxManager::onFileChunkRequest(", manager_start);
+    ASSERT_NE(manager_end, std::string::npos);
+    const std::string manager_control =
+        manager_source.substr(manager_start, manager_end - manager_start);
+
+    EXPECT_NE(manager_control.find("file_control_cb_("), std::string::npos);
+    EXPECT_EQ(manager_control.find("V2TIM_LOG"), std::string::npos);
+}
+
+TEST(FileTransferSecuritySourceRegressionTest,
      ProductionDiagnosticsExcludeKnownBodiesIdentifiersAndPaths) {
     const std::string ffi_source = ReadSource(TIM2TOX_FFI_SOURCE_PATH);
     const std::string manager_source = ReadSource(TIM2TOX_MANAGER_SOURCE_PATH);

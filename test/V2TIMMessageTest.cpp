@@ -16,11 +16,9 @@ TEST(V2TIMMessageTest, BasicProperties) {
     EXPECT_TRUE(msg.userID.Empty());
     EXPECT_EQ(msg.elemList.Size(), 0);
     EXPECT_FALSE(msg.isSelf);
-    EXPECT_FALSE(msg.isRead);
-    EXPECT_FALSE(msg.isPeerRead);
     EXPECT_FALSE(msg.needReadReceipt);
     EXPECT_FALSE(msg.isBroadcastMessage);
-    EXPECT_EQ(msg.status, V2TIM_MSG_STATUS_SENDING);
+    EXPECT_EQ(msg.status, static_cast<V2TIMMessageStatus>(0));
     
     // Set some properties
     msg.msgID = "test_message_id";
@@ -69,11 +67,8 @@ TEST(V2TIMMessageTest, CustomMessage) {
     
     // Create custom data
     const char* customData = "Custom data content";
-    size_t dataSize = strlen(customData);
-    V2TIMBuffer buffer;
-    buffer.size = dataSize;
-    buffer.data = new uint8_t[dataSize];
-    memcpy(buffer.data, customData, dataSize);
+    size_t dataSize = std::char_traits<char>::length(customData);
+    V2TIMBuffer buffer(reinterpret_cast<const uint8_t*>(customData), dataSize);
     
     // Create a custom element
     V2TIMCustomElem* customElem = new V2TIMCustomElem();
@@ -92,13 +87,10 @@ TEST(V2TIMMessageTest, CustomMessage) {
     
     // Cast to proper type and check content
     V2TIMCustomElem* retrievedElem = static_cast<V2TIMCustomElem*>(msg.elemList[0]);
-    EXPECT_EQ(retrievedElem->data.size, dataSize);
-    EXPECT_EQ(memcmp(retrievedElem->data.data, customData, dataSize), 0);
+    EXPECT_EQ(retrievedElem->data.Size(), dataSize);
+    EXPECT_EQ(std::string(reinterpret_cast<const char*>(retrievedElem->data.Data()), retrievedElem->data.Size()), customData);
     EXPECT_EQ(retrievedElem->desc, "Test custom message");
     EXPECT_EQ(retrievedElem->extension, "ext data");
-    
-    // Clean up
-    delete[] buffer.data;
 }
 
 // Test V2TIMMessage copy constructor and assignment operator
