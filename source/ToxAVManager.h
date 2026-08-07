@@ -5,8 +5,8 @@
 #include <memory>
 #include <mutex>
 #include <functional>
+#include "toxav/toxav.h"
 
-struct ToxAV;
 class V2TIMManagerImpl;
 
 class ToxAVManager {
@@ -23,6 +23,12 @@ public:
     
     // 初始化 toxav（传入 manager_impl 避免在内部再次调用 GetCurrentInstance，防止多实例竞态/段错误）
     void initialize(V2TIMManagerImpl* manager_impl);
+
+    // Retain the legacy conference receive context for disable/enable cycles.
+    // The owning V2TIMManagerImpl outlives this manager and is cleared on shutdown.
+    bool setConferenceAudioCallbackContext(
+        toxav_audio_data_cb* conference_audio_callback,
+        V2TIMManagerImpl* manager_impl);
     
     // 关闭 toxav
     void shutdown();
@@ -48,6 +54,12 @@ public:
     // 发送音频帧
     bool sendAudioFrame(uint32_t friend_number, const int16_t* pcm, size_t sample_count, 
                        uint8_t channels, uint32_t sampling_rate);
+    bool sendConferenceAudioFrame(uint32_t conference_number, const int16_t* pcm,
+                                  size_t sample_count, uint8_t channels,
+                                  uint32_t sampling_rate);
+    bool enableConferenceAudio(uint32_t conference_number);
+    bool disableConferenceAudio(uint32_t conference_number);
+    bool isConferenceAudioEnabled(uint32_t conference_number) const;
     
     // 发送视频帧
     bool sendVideoFrame(uint32_t friend_number, uint16_t width, uint16_t height,
@@ -94,6 +106,9 @@ private:
     
     // ToxAV 实例
     std::unique_ptr<ToxAV, ToxAVDeleter> toxav_;
+    Tox* tox_ = nullptr;
+    V2TIMManagerImpl* manager_impl_ = nullptr;
+    toxav_audio_data_cb* conference_audio_callback_ = nullptr;
     
     // 互斥锁
     mutable std::mutex mutex_;

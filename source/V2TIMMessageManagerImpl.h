@@ -34,6 +34,7 @@ public:
     
     // Internal notification methods
     void NotifyMessageRevoked(const V2TIMString& msgID, const V2TIMString& revoker, const V2TIMString& reason);
+    void NotifyMessageDeliveryReceipt(const V2TIMMessageReceipt& receipt);
 
     // Listener Management
     void AddAdvancedMsgListener(V2TIMAdvancedMsgListener* listener) override;

@@ -72,12 +72,12 @@ void V2TIMGroupManagerImpl::CreateGroup(const V2TIMGroupInfo& info,
              info.groupName.CString() ? info.groupName.CString() : "null");
     V2TIM_LOG(kInfo, "CreateGroup: Starting for groupID={}, groupName={}",
              info.groupID.CString(), info.groupName.CString());
-    
+
     if (!callback) {
         V2TIM_LOG(kError, "CreateGroup: callback is null");
         return;
     }
-    
+
     Tox* tox = GetToxManagerFromImpl(manager_impl_)->getTox();
     if (!tox) {
         V2TIM_LOG(kError, "CreateGroup: Tox not initialized");
@@ -140,9 +140,13 @@ void V2TIMGroupManagerImpl::CreateGroup(const V2TIMGroupInfo& info,
             V2TIM_LOG(kInfo, "CreateGroup: Stored conference mapping: groupID={} <-> conference_number={}",
                      finalGroupID.CString(), conference_number);
         }
-        
-        // Note: Conference doesn't support chat_id, so we don't store it
-        // Conference will be restored from savedata automatically
+
+        if (manager_impl_ &&
+            !manager_impl_->StoreConferenceIdentity(finalGroupID,
+                                                     conference_number)) {
+            V2TIM_LOG(kWarning,
+                      "CreateGroup: Failed to persist stable conference identity");
+        }
     } else {
         // Create group using tox_group_new (new API)
         V2TIM_LOG(kInfo, "CreateGroup: Creating group (new API)");
@@ -642,9 +646,27 @@ void V2TIMGroupManagerImpl::QuitGroup(const V2TIMString& groupID, V2TIMCallback*
             V2TIM_LOG(kInfo, "V2TIMGroupManagerImpl::QuitGroup: Found group_number={} from local groups_ map", group_number);
         }
     }
+
+    std::string group_type;
+    {
+        std::lock_guard<std::mutex> lock(group_mutex_);
+        auto it = group_info_.find(groupID.CString());
+        if (it != group_info_.end() && !it->second.groupType.Empty()) {
+            group_type = it->second.groupType.CString();
+        }
+    }
+    if (manager_impl_) {
+        char stored_type[16];
+        if (manager_impl_->GetGroupTypeFromStorage(
+                groupID.CString(), stored_type, sizeof(stored_type))) {
+            group_type = stored_type;
+        }
+    }
+    if (group_type.empty()) {
+        group_type = "group";
+    }
     
     // Recovery mechanism: try to rebuild mapping if not found (e.g., after client restart)
-    // This is critical for groups that were created before restart but mapping was lost
     if (group_number == UINT32_MAX && manager_impl_) {
         std::string groupID_str = groupID.CString();
         V2TIM_LOG(kInfo, "V2TIMGroupManagerImpl::QuitGroup: Group {} not found in mappings, attempting recovery via stored chat_id", groupID_str);
@@ -655,179 +677,122 @@ void V2TIMGroupManagerImpl::QuitGroup(const V2TIMString& groupID, V2TIMCallback*
         bool has_stored_chat_id = manager_impl_->GetGroupChatIdFromStorage(groupID_str, stored_chat_id, sizeof(stored_chat_id));
         
         if (has_stored_chat_id) {
-            V2TIM_LOG(kInfo, "V2TIMGroupManagerImpl::QuitGroup: Found stored chat_id for groupID={}: {}…", groupID_str, std::string(stored_chat_id).substr(0, 8));
-            
-            // Convert hex string to binary chat_id
-            uint8_t target_chat_id[TOX_GROUP_CHAT_ID_SIZE];
-            if (hexStringToChatId(std::string(stored_chat_id), target_chat_id)) {
-                // Try to find group by chat_id
-                Tox_Group_Number matched_group_number = GetToxManagerFromImpl(manager_impl_)->getGroupByChatId(target_chat_id);
-                if (matched_group_number != UINT32_MAX) {
-                    // Rebuild the mapping
-                    {
-                        std::lock_guard<std::mutex> lock(manager_impl_->mutex_);
-                        manager_impl_->group_id_to_group_number_[groupID] = matched_group_number;
-                        manager_impl_->group_number_to_group_id_[matched_group_number] = groupID;
+            V2TIM_LOG(kInfo, "V2TIMGroupManagerImpl::QuitGroup: Found stored native identity");
+
+            Tox_Group_Number matched_group_number = UINT32_MAX;
+            const bool is_conference = group_type == "conference" ||
+                                       group_type == "av_conference";
+            if (is_conference) {
+                const std::size_t identity_length = std::strlen(stored_chat_id);
+                uint8_t conference_id[TOX_CONFERENCE_ID_SIZE];
+                if (identity_length == TOX_CONFERENCE_ID_SIZE * 2 &&
+                    ToxUtil::tox_hex_to_bytes(
+                        stored_chat_id, identity_length, conference_id,
+                        TOX_CONFERENCE_ID_SIZE)) {
+                    Tox_Err_Conference_By_Id lookup_error;
+                    ToxManager* tox_manager =
+                        GetToxManagerFromImpl(manager_impl_);
+                    const Tox_Conference_Number conference_number =
+                        tox_manager->getConferenceById(conference_id,
+                                                       &lookup_error);
+                    if (lookup_error == TOX_ERR_CONFERENCE_BY_ID_OK &&
+                        conference_number != UINT32_MAX) {
+                        Tox_Err_Conference_Get_Type type_error;
+                        const Tox_Conference_Type native_type =
+                            tox_manager->getConferenceType(conference_number,
+                                                           &type_error);
+                        const bool type_matches =
+                            type_error == TOX_ERR_CONFERENCE_GET_TYPE_OK &&
+                            ((group_type == "av_conference" &&
+                              native_type == TOX_CONFERENCE_TYPE_AV) ||
+                             (group_type == "conference" &&
+                              native_type == TOX_CONFERENCE_TYPE_TEXT));
+                        if (type_matches) {
+                            matched_group_number = conference_number;
+                        }
                     }
-                    group_number = matched_group_number;
-                    V2TIM_LOG(kInfo, "V2TIMGroupManagerImpl::QuitGroup: Rebuilt mapping: groupID={} <-> group_number={}", groupID_str, group_number);
-                } else {
-                    V2TIM_LOG(kWarning, "V2TIMGroupManagerImpl::QuitGroup: Stored chat_id not found in Tox, group may not be restored yet");
                 }
+            } else {
+                uint8_t target_chat_id[TOX_GROUP_CHAT_ID_SIZE];
+                if (hexStringToChatId(std::string(stored_chat_id),
+                                      target_chat_id)) {
+                    matched_group_number =
+                        GetToxManagerFromImpl(manager_impl_)
+                            ->getGroupByChatId(target_chat_id);
+                }
+            }
+
+            if (matched_group_number != UINT32_MAX) {
+                {
+                    std::lock_guard<std::mutex> lock(manager_impl_->mutex_);
+                    manager_impl_->group_id_to_group_number_[groupID] =
+                        matched_group_number;
+                    manager_impl_->group_number_to_group_id_[
+                        matched_group_number] = groupID;
+                }
+                group_number = matched_group_number;
+                V2TIM_LOG(kInfo, "V2TIMGroupManagerImpl::QuitGroup: Rebuilt mapping: groupID={} <-> group_number={}", groupID_str, group_number);
+            } else {
+                V2TIM_LOG(kWarning, "V2TIMGroupManagerImpl::QuitGroup: Stored identity not found in Tox, group may not be restored yet");
             }
         } else {
             V2TIM_LOG(kInfo, "V2TIMGroupManagerImpl::QuitGroup: No stored chat_id found for groupID={}, trying fallback matching", groupID_str);
-            
-            // Fallback: If no stored chat_id, try to match by group count (R-07: use Core metadata)
-            size_t group_count = GetToxManagerFromImpl(manager_impl_)->getGroupListSize();
-            if (group_count > 0 && manager_impl_) {
-                std::vector<std::string> known = manager_impl_->GetKnownGroupIDs();
-                bool found_in_known = false;
-                for (const auto& line : known) {
-                    if (line == groupID_str) { found_in_known = true; break; }
-                }
-                
-                    // If this group is in known groups, and there's exactly one group in Tox
-                    // and no other groups are mapped, we can try to match it
-                    if (found_in_known && group_count == 1) {
-                        std::lock_guard<std::mutex> lock(manager_impl_->mutex_);
-                        // Check if the only group in Tox is already mapped
-                        bool already_mapped = false;
-                        for (const auto& pair : manager_impl_->group_number_to_group_id_) {
-                            if (pair.second.CString() == groupID_str) {
-                                // Already mapped to this groupID, use it
-                                group_number = pair.first;
-                                already_mapped = true;
-                                V2TIM_LOG(kInfo, "V2TIMGroupManagerImpl::QuitGroup: Found existing mapping for groupID={} <-> group_number={}", groupID_str, group_number);
-                                break;
-                            }
-                        }
-                        
-                        if (!already_mapped) {
-                            // Only one group in Tox, and it's not mapped yet, assume it's this group
-                            Tox_Group_Number single_group_number = 0; // Assuming sequential numbering
-                            
-                            // Verify: check if this group_number is already mapped to a different groupID
-                            auto it = manager_impl_->group_number_to_group_id_.find(single_group_number);
-                            if (it == manager_impl_->group_number_to_group_id_.end()) {
-                                // Not mapped, safe to assume it's this group
-                                group_number = single_group_number;
-                                manager_impl_->group_id_to_group_number_[groupID] = group_number;
-                                manager_impl_->group_number_to_group_id_[group_number] = groupID;
-                                V2TIM_LOG(kWarning, "V2TIMGroupManagerImpl::QuitGroup: Fallback match - assuming groupID={} <-> group_number={} (only one group in Tox, no chat_id)",
-                                          groupID_str, group_number);
-                                
-                                // Try to get and store chat_id for future use
-                                uint8_t chat_id[TOX_GROUP_CHAT_ID_SIZE];
-                                Tox_Err_Group_State_Query err_chat_id;
-                                if (GetToxManagerFromImpl(manager_impl_)->getGroupChatId(group_number, chat_id, &err_chat_id) &&
-                                    err_chat_id == TOX_ERR_GROUP_STATE_QUERY_OK) {
-                                    std::ostringstream oss;
-                                    for (size_t i = 0; i < TOX_GROUP_CHAT_ID_SIZE; ++i) {
-                                        oss << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(chat_id[i]);
-                                    }
-                                    std::string chat_id_hex = oss.str();
-                                    
-                                    // Store chat_id for future use. *Locked variant:
-                                    // this scope holds mutex_ (the map reads/writes
-                                    // above are bare), so the plain variant would
-                                    // self-deadlock (non-recursive mutex_).
-                                    manager_impl_->SetGroupChatIdInStorageLocked(groupID_str, chat_id_hex);
-                                    V2TIM_LOG(kInfo, "V2TIMGroupManagerImpl::QuitGroup: Stored chat_id={}… for groupID={} for future use",
-                                              chat_id_hex.substr(0, 8), groupID_str);
-                                }
-                            } else {
-                                V2TIM_LOG(kWarning, "V2TIMGroupManagerImpl::QuitGroup: Cannot use fallback - group_number={} already mapped to groupID={}",
-                                         single_group_number, it->second.CString());
-                            }
-                        }
-                    } else if (found_in_known && group_count > 1) {
-                        V2TIM_LOG(kWarning, "V2TIMGroupManagerImpl::QuitGroup: Cannot use fallback - multiple groups in Tox ({}), need chat_id to match", group_count);
-                    }
-            }
         }
     }
     
     if (group_number == UINT32_MAX) {
-        V2TIM_LOG(kWarning, "V2TIMGroupManagerImpl::QuitGroup: Group {} not found in mappings after recovery attempt, proceeding with cleanup anyway", groupID.CString());
-    }
-    
-    // Get group type to determine which API to use.
-    // P0-B2: previously this checked the in-memory `group_info_` cache and
-    // only fell back to persistent storage when the cached value happened
-    // to equal the default sentinel "group". That meant if the cache was
-    // empty (cold start before any group info had been observed) the
-    // storage fallback worked, but if the cache had been populated with
-    // a stale value the storage entry was ignored — producing a
-    // conference/group API mismatch when QuitGroup picked the wrong leg.
-    //
-    // InviteUserToGroup uses storage as an unconditional fallback (see
-    // GetGroupTypeFromStorage call further down the file). Mirror that
-    // here so the two code paths always agree on which Tox API to call
-    // for a given group.
-    std::string group_type;
-    bool found_in_cache = false;
-    {
-        std::lock_guard<std::mutex> lock(group_mutex_);
-        auto it = group_info_.find(groupID.CString());
-        if (it != group_info_.end() && !it->second.groupType.Empty()) {
-            group_type = it->second.groupType.CString();
-            found_in_cache = true;
+        V2TIM_LOG(kError, "V2TIMGroupManagerImpl::QuitGroup: Group {} not found in mappings after recovery attempt", groupID.CString());
+        if (callback) {
+            callback->OnError(ERR_INVALID_PARAMETERS, "Group number not found");
         }
+        return;
     }
 
-    if (!found_in_cache && manager_impl_) {
-        char stored_type[16];
-        if (manager_impl_->GetGroupTypeFromStorage(groupID.CString(), stored_type, sizeof(stored_type))) {
-            group_type = std::string(stored_type);
-            V2TIM_LOG(kInfo, "V2TIMGroupManagerImpl::QuitGroup: Loaded group_type='{}' from persistent storage for groupID={}",
-                      group_type, groupID.CString());
+    Tox* tox = GetToxManagerFromImpl(manager_impl_)->getTox();
+    if (!tox) {
+        V2TIM_LOG(kError, "V2TIMGroupManagerImpl::QuitGroup: Tox instance not available");
+        if (callback) {
+            callback->OnError(ERR_SDK_NOT_INITIALIZED, "Tox not initialized");
         }
+        return;
     }
 
-    if (group_type.empty()) {
-        group_type = "group"; // Last-resort default: new-API group
-        V2TIM_LOG(kWarning, "V2TIMGroupManagerImpl::QuitGroup: No group_type found in cache or storage for groupID={}, defaulting to '{}'",
-                  groupID.CString(), group_type);
-    }
-    
-    // Leave the group from Tox if found
-    if (group_number != UINT32_MAX) {
-        Tox* tox = GetToxManagerFromImpl(manager_impl_)->getTox();
-        if (!tox) {
-            V2TIM_LOG(kError, "V2TIMGroupManagerImpl::QuitGroup: Tox instance not available");
-            if (callback) {
-                callback->OnError(ERR_SDK_NOT_INITIALIZED, "Tox not initialized");
-            }
-            return;
+    bool deleted = false;
+    if (group_type == "av_conference") {
+        Tox_Err_Conference_Delete error;
+        deleted = tox_conference_delete(
+            tox, static_cast<Tox_Conference_Number>(group_number), &error);
+        if (!deleted) {
+            V2TIM_LOG(kWarning, "V2TIMGroupManagerImpl::QuitGroup: Failed to delete AV conference from Tox, error: {}", error);
         }
-        
-        bool deleted = false;
-        if (group_type == "conference") {
-            // Use tox_conference_delete for conference type
-            V2TIM_LOG(kInfo, "V2TIMGroupManagerImpl::QuitGroup: Calling tox_conference_delete for conference_number={}", group_number);
-            Tox_Err_Conference_Delete error;
-            deleted = tox_conference_delete(tox, static_cast<Tox_Conference_Number>(group_number), &error);
-            if (!deleted) {
-                V2TIM_LOG(kWarning, "V2TIMGroupManagerImpl::QuitGroup: Failed to delete conference from Tox, error: {}", error);
-            } else {
-                V2TIM_LOG(kInfo, "V2TIMGroupManagerImpl::QuitGroup: Successfully called tox_conference_delete for group {} (conference_number {})", groupID.CString(), group_number);
-            }
+    } else if (group_type == "conference") {
+        V2TIM_LOG(kInfo, "V2TIMGroupManagerImpl::QuitGroup: Calling tox_conference_delete for conference_number={}", group_number);
+        Tox_Err_Conference_Delete error;
+        deleted = tox_conference_delete(tox, static_cast<Tox_Conference_Number>(group_number), &error);
+        if (!deleted) {
+            V2TIM_LOG(kWarning, "V2TIMGroupManagerImpl::QuitGroup: Failed to delete conference from Tox, error: {}", error);
         } else {
-            // Use tox_group_leave for group type
-            V2TIM_LOG(kInfo, "V2TIMGroupManagerImpl::QuitGroup: Calling ToxManager::deleteGroup for group_number={}", group_number);
-            Tox_Err_Group_Leave error;
-            deleted = GetToxManagerFromImpl(manager_impl_)->deleteGroup(group_number, &error);
-            if (!deleted) {
-                V2TIM_LOG(kWarning, "V2TIMGroupManagerImpl::QuitGroup: Failed to leave group from Tox, error: {}", error);
-            } else {
-                V2TIM_LOG(kInfo, "V2TIMGroupManagerImpl::QuitGroup: Successfully called tox_group_leave for group {} (group_number {})", groupID.CString(), group_number);
-            }
+            V2TIM_LOG(kInfo, "V2TIMGroupManagerImpl::QuitGroup: Successfully called tox_conference_delete for group {} (conference_number {})", groupID.CString(), group_number);
         }
     } else {
-        V2TIM_LOG(kInfo, "V2TIMGroupManagerImpl::QuitGroup: Skipping leave/delete (group_number not found)");
+        V2TIM_LOG(kInfo, "V2TIMGroupManagerImpl::QuitGroup: Calling ToxManager::deleteGroup for group_number={}", group_number);
+        Tox_Err_Group_Leave error;
+        deleted = GetToxManagerFromImpl(manager_impl_)->deleteGroup(group_number, &error);
+        if (!deleted) {
+            V2TIM_LOG(kWarning, "V2TIMGroupManagerImpl::QuitGroup: Failed to leave group from Tox, error: {}", error);
+        } else {
+            V2TIM_LOG(kInfo, "V2TIMGroupManagerImpl::QuitGroup: Successfully called tox_group_leave for group {} (group_number {})", groupID.CString(), group_number);
+        }
     }
-    
+
+    if (!deleted) {
+        V2TIM_LOG(kError, "V2TIMGroupManagerImpl::QuitGroup: Native delete failed for group {}", groupID.CString());
+        if (callback) {
+            callback->OnError(ERR_INVALID_PARAMETERS, "Failed to delete group from Tox");
+        }
+        return;
+    }
+
     // Remove from local group members map if exists
     {
         std::lock_guard<std::mutex> lock(member_mutex_);
@@ -904,8 +869,6 @@ void V2TIMGroupManagerImpl::DismissGroup(const V2TIMString& groupID, V2TIMCallba
         if (it != groups_.end()) {
             group_number = it->second;
             V2TIM_LOG(kInfo, "DismissGroup: Found group_number={} in local groups_ map", group_number);
-        } else {
-            V2TIM_LOG(kInfo, "DismissGroup: groupID={} not found in local groups_ map (size={})", group_id_str, groups_.size());
         }
     }
 
@@ -933,38 +896,55 @@ void V2TIMGroupManagerImpl::DismissGroup(const V2TIMString& groupID, V2TIMCallba
 
     V2TIM_LOG(kInfo, "DismissGroup: group_number={} (UINT32_MAX={}), group_type={}", group_number, UINT32_MAX, group_type);
 
-    if (group_number != UINT32_MAX) {
-        Tox* tox = GetToxManagerFromImpl(manager_impl_)->getTox();
-        if (!tox) {
-            V2TIM_LOG(kError, "DismissGroup: Tox instance not available");
-            if (callback) callback->OnError(ERR_SDK_NOT_INITIALIZED, "Tox not initialized");
-            return;
+    if (group_number == UINT32_MAX) {
+        V2TIM_LOG(kError, "DismissGroup: group_number not found for groupID={}", group_id_str);
+        if (callback) {
+            callback->OnError(ERR_INVALID_PARAMETERS, "Group number not found");
         }
+        return;
+    }
 
-        bool deleted = false;
-        if (group_type == "conference" || group_type == "Meeting") {
-            V2TIM_LOG(kInfo, "DismissGroup: Calling tox_conference_delete for conference_number={}", group_number);
-            Tox_Err_Conference_Delete error;
-            deleted = tox_conference_delete(tox, static_cast<Tox_Conference_Number>(group_number), &error);
-            if (!deleted) {
-                V2TIM_LOG(kWarning, "DismissGroup: Failed to delete conference from Tox, error: {}", error);
-            } else {
-                V2TIM_LOG(kInfo, "DismissGroup: Successfully called tox_conference_delete for group {} (conference_number {})",
-                          group_id_str, group_number);
-            }
+    Tox* tox = GetToxManagerFromImpl(manager_impl_)->getTox();
+    if (!tox) {
+        V2TIM_LOG(kError, "DismissGroup: Tox instance not available");
+        if (callback) callback->OnError(ERR_SDK_NOT_INITIALIZED, "Tox not initialized");
+        return;
+    }
+
+    bool deleted = false;
+    if (group_type == "av_conference") {
+        Tox_Err_Conference_Delete error;
+        deleted = tox_conference_delete(tox, static_cast<Tox_Conference_Number>(group_number), &error);
+        if (!deleted) {
+            V2TIM_LOG(kWarning, "DismissGroup: Failed to delete AV conference from Tox, error: {}", error);
+        }
+    } else if (group_type == "conference") {
+        V2TIM_LOG(kInfo, "DismissGroup: Calling tox_conference_delete for conference_number={}", group_number);
+        Tox_Err_Conference_Delete error;
+        deleted = tox_conference_delete(tox, static_cast<Tox_Conference_Number>(group_number), &error);
+        if (!deleted) {
+            V2TIM_LOG(kWarning, "DismissGroup: Failed to delete conference from Tox, error: {}", error);
         } else {
-            V2TIM_LOG(kInfo, "DismissGroup: Calling ToxManager::deleteGroup for group_number={}", group_number);
-            Tox_Err_Group_Leave error;
-            deleted = GetToxManagerFromImpl(manager_impl_)->deleteGroup(group_number, &error);
-            if (!deleted) {
-                V2TIM_LOG(kWarning, "DismissGroup: Failed to dismiss group from Tox, error: {}", error);
-            } else {
-                V2TIM_LOG(kInfo, "DismissGroup: Successfully dismissed group {} (group_number {}) from Tox",
-                          group_id_str, group_number);
-            }
+            V2TIM_LOG(kInfo, "DismissGroup: Successfully called tox_conference_delete for group {} (conference_number {})",
+                      group_id_str, group_number);
         }
     } else {
-        V2TIM_LOG(kWarning, "DismissGroup: group_number not found (UINT32_MAX), will only clean up local state");
+        V2TIM_LOG(kInfo, "DismissGroup: Calling ToxManager::deleteGroup for group_number={}", group_number);
+        Tox_Err_Group_Leave error;
+        deleted = GetToxManagerFromImpl(manager_impl_)->deleteGroup(group_number, &error);
+        if (!deleted) {
+            V2TIM_LOG(kWarning, "DismissGroup: Failed to dismiss group from Tox, error: {}", error);
+        } else {
+            V2TIM_LOG(kInfo, "DismissGroup: Successfully dismissed group {} (group_number {}) from Tox",
+                      group_id_str, group_number);
+        }
+    }
+
+    if (!deleted) {
+        if (callback) {
+            callback->OnError(ERR_INVALID_PARAMETERS, "Failed to delete group from Tox");
+        }
+        return;
     }
 
     {
@@ -973,8 +953,6 @@ void V2TIMGroupManagerImpl::DismissGroup(const V2TIMString& groupID, V2TIMCallba
         if (it != group_members_.end()) {
             group_members_.erase(it);
             V2TIM_LOG(kInfo, "DismissGroup: Removed group {} from group_members_ map", group_id_str);
-        } else {
-            V2TIM_LOG(kInfo, "DismissGroup: groupID={} not found in group_members_ map", group_id_str);
         }
         member_name_card_overrides_.erase(group_id_str);
     }
@@ -989,8 +967,6 @@ void V2TIMGroupManagerImpl::DismissGroup(const V2TIMString& groupID, V2TIMCallba
     if (callback) {
         callback->OnSuccess();
         V2TIM_LOG(kInfo, "DismissGroup: EXIT completed for groupID={}", group_id_str);
-    } else {
-        V2TIM_LOG(kWarning, "DismissGroup: callback is null, cannot notify success");
     }
 }
 
@@ -2810,14 +2786,16 @@ void V2TIMGroupManagerImpl::InviteUserToGroup(
             std::lock_guard<std::mutex> lock(manager_impl_->mutex_);
             auto type_it = manager_impl_->group_id_to_type_.find(V2TIMString(group_id_str.c_str()));
             if (type_it != manager_impl_->group_id_to_type_.end()) {
-                is_conference_group = (type_it->second == "conference");
+                is_conference_group = type_it->second == "conference" ||
+                                      type_it->second == "av_conference";
             }
         }
         // Fallback: check persistent storage if not in memory map
         if (!is_conference_group) {
             char stored_type[32];
             if (manager_impl_->GetGroupTypeFromStorage(group_id_str, stored_type, sizeof(stored_type))) {
-                is_conference_group = (std::string(stored_type) == "conference");
+                is_conference_group = std::string(stored_type) == "conference" ||
+                                      std::string(stored_type) == "av_conference";
             }
         }
 
@@ -3488,4 +3466,3 @@ bool V2TIMGroupManagerImpl::hexStringToChatId(const std::string& hex_str, uint8_
     }
     return true;
 }
-

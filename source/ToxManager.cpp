@@ -259,6 +259,9 @@ void ToxManager::initialize(const Tox_Options* options,
     if (group_message_group_cb_) {
         tox_callback_group_message(tox_.get(), onGroupMessageGroup);
     }
+    if (group_custom_packet_cb_) {
+        tox_callback_group_custom_packet(tox_.get(), onGroupCustomPacket);
+    }
     if (group_private_message_group_cb_) {
         tox_callback_group_private_message(tox_.get(), onGroupPrivateMessage);
     }
@@ -460,6 +463,8 @@ void ToxManager::onFriendConnectionStatus(Tox* tox, uint32_t friend_number, TOX_
 
 void ToxManager::onFriendReadReceipt(Tox* tox, uint32_t friend_number, uint32_t message_id, void* user_data) {
     ToxManager* manager = static_cast<ToxManager*>(user_data);
+    V2TIM_LOG(kInfo, "Toxcore delivery receipt callback available={}",
+              manager && manager->friend_read_receipt_cb_ ? 1 : 0);
     if (manager && manager->friend_read_receipt_cb_) {
         manager->friend_read_receipt_cb_(friend_number, message_id);
     }
@@ -473,9 +478,12 @@ void ToxManager::onFriendTyping(Tox* tox, uint32_t friend_number, bool typing, v
 }
 
 void ToxManager::onFileRecv(Tox* tox, uint32_t friend_number, uint32_t file_number, uint32_t kind, uint64_t file_size, const uint8_t* filename, size_t filename_length, void* user_data) {
-    V2TIM_LOG(kDebug, "[ToxManager] onFileRecv: ENTRY tox={} friend={} file={} kind={} size={} manager={} has_cb={}",
-            (void*)tox, friend_number, file_number, kind, (unsigned long long)file_size, (void*)user_data,
-            (user_data && static_cast<ToxManager*>(user_data)->file_recv_cb_) ? 1 : 0);
+    V2TIM_LOG(kDebug,
+              "[ToxManager] onFileRecv: type=file status=received kind={} size={} has_cb={}",
+              kind, (unsigned long long)file_size,
+              (user_data && static_cast<ToxManager*>(user_data)->file_recv_cb_)
+                  ? 1
+                  : 0);
     ToxManager* manager = static_cast<ToxManager*>(user_data);
     if (manager && manager->file_recv_cb_) {
         manager->file_recv_cb_(friend_number, file_number, kind, file_size, filename, filename_length);
@@ -622,6 +630,8 @@ void ToxManager::setFriendReadReceiptCallback(FriendReadReceiptCallback cb) {
     std::lock_guard<std::mutex> lock(mutex_);
     friend_read_receipt_cb_ = std::move(cb);
     if (tox_) tox_callback_friend_read_receipt(tox_.get(), onFriendReadReceipt);
+    V2TIM_LOG(kInfo, "Toxcore delivery receipt callback registered={}",
+              friend_read_receipt_cb_ ? 1 : 0);
 }
 
 void ToxManager::setFriendTypingCallback(FriendTypingCallback cb) {
@@ -1707,6 +1717,19 @@ void ToxManager::onGroupMessageGroup(Tox* tox, Tox_Group_Number group_number, To
     }
 }
 
+void ToxManager::onGroupCustomPacket(
+    Tox* tox,
+    Tox_Group_Number group_number,
+    Tox_Group_Peer_Number peer_id,
+    const uint8_t* data,
+    size_t length,
+    void* user_data) {
+    ToxManager* manager = getManagerFromTox(tox);
+    if (manager && manager->group_custom_packet_cb_) {
+        manager->group_custom_packet_cb_(group_number, peer_id, data, length);
+    }
+}
+
 void ToxManager::onGroupPrivateMessage(Tox* tox, Tox_Group_Number group_number, Tox_Group_Peer_Number peer_id, TOX_MESSAGE_TYPE type, const uint8_t* message, size_t message_length, Tox_Group_Message_Id message_id, void* user_data) {
     V2TIM_LOG(kDebug, "[ToxManager] onGroupPrivateMessage: group_number={} peer_id={} type={} len={}", group_number, peer_id, type, message_length);
     ToxManager* manager = getManagerFromTox(tox);
@@ -1843,6 +1866,14 @@ void ToxManager::setGroupMessageGroupCallback(GroupMessageGroupCallback cb) {
         V2TIM_LOG(kDebug, "[ToxManager] setGroupMessageGroupCallback: tox_callback_group_message registered");
     } else {
         V2TIM_LOG(kWarning, "[ToxManager] setGroupMessageGroupCallback: WARNING - tox_ is null, callback will be registered when tox_ is created");
+    }
+}
+
+void ToxManager::setGroupCustomPacketCallback(GroupCustomPacketCallback cb) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    group_custom_packet_cb_ = std::move(cb);
+    if (tox_) {
+        tox_callback_group_custom_packet(tox_.get(), onGroupCustomPacket);
     }
 }
 

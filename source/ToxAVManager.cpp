@@ -39,8 +39,15 @@ void ToxAVManager::initialize(V2TIMManagerImpl* manager_impl) {
     std::lock_guard<std::mutex> lock(mutex_);
     V2TIMLog::getInstance().Info("[ToxAVManager] initialize() called");
     if (toxav_) {
-        V2TIMLog::getInstance().Error("[ToxAVManager] ToxAV instance already initialized");
-        throw std::runtime_error("ToxAV instance already initialized");
+        if (manager_impl_ == manager_impl) {
+            V2TIMLog::getInstance().Info(
+                "[ToxAVManager] ToxAV instance already initialized for this owner");
+            return;
+        }
+        V2TIMLog::getInstance().Error(
+            "[ToxAVManager] ToxAV instance belongs to a different V2TIMManagerImpl");
+        throw std::runtime_error(
+            "ToxAV instance belongs to a different V2TIMManagerImpl");
     }
 
     TOXAV_ERR_NEW error;
@@ -59,11 +66,13 @@ void ToxAVManager::initialize(V2TIMManagerImpl* manager_impl) {
         V2TIMLog::getInstance().Error("[ToxAVManager] Tox instance is null");
         throw std::runtime_error("Tox instance is null");
     }
+    this->tox_ = tox;
     toxav_.reset(toxav_new(tox, &error));
     if (!toxav_ || error != TOXAV_ERR_NEW_OK) {
         V2TIMLog::getInstance().Error("[ToxAVManager] ToxAV initialization failed with error: {}", (int)error);
         throw std::runtime_error("ToxAV initialization failed: " + std::to_string(error));
     }
+    manager_impl_ = manager_impl;
     V2TIMLog::getInstance().Info("[ToxAVManager] ToxAV initialized successfully");
 
     // 设置回调
@@ -137,7 +146,22 @@ void ToxAVManager::shutdown() {
     std::lock_guard<std::mutex> lock(mutex_);
     V2TIMLog::getInstance().Info("[ToxAVManager] shutdown() called");
     toxav_.reset();
+    tox_ = nullptr;
+    manager_impl_ = nullptr;
+    conference_audio_callback_ = nullptr;
     V2TIMLog::getInstance().Info("[ToxAVManager] shutdown() completed");
+}
+
+bool ToxAVManager::setConferenceAudioCallbackContext(
+    toxav_audio_data_cb* conference_audio_callback,
+    V2TIMManagerImpl* manager_impl) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!toxav_ || !conference_audio_callback || !manager_impl ||
+        manager_impl != manager_impl_) {
+        return false;
+    }
+    conference_audio_callback_ = conference_audio_callback;
+    return true;
 }
 
 // 迭代实现
@@ -250,6 +274,37 @@ bool ToxAVManager::sendAudioFrame(uint32_t friend_number, const int16_t* pcm,
                                 &error) && error == TOXAV_ERR_SEND_FRAME_OK;
 }
 
+bool ToxAVManager::sendConferenceAudioFrame(
+    uint32_t conference_number, const int16_t* pcm, size_t sample_count,
+    uint8_t channels, uint32_t sampling_rate) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!toxav_ || !pcm || sample_count == 0 || sample_count > UINT32_MAX) {
+        return false;
+    }
+    return toxav_group_send_audio(tox_, conference_number, pcm,
+                                  static_cast<uint32_t>(sample_count), channels,
+                                  sampling_rate) == 0;
+}
+
+bool ToxAVManager::enableConferenceAudio(uint32_t conference_number) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!toxav_ || !manager_impl_ || !conference_audio_callback_) return false;
+    return toxav_groupchat_enable_av(tox_, conference_number,
+                                     conference_audio_callback_,
+                                     manager_impl_) == 0;
+}
+
+bool ToxAVManager::disableConferenceAudio(uint32_t conference_number) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!toxav_) return false;
+    return toxav_groupchat_disable_av(tox_, conference_number) == 0;
+}
+
+bool ToxAVManager::isConferenceAudioEnabled(uint32_t conference_number) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return tox_ && toxav_groupchat_av_enabled(tox_, conference_number);
+}
+
 bool ToxAVManager::sendVideoFrame(uint32_t friend_number, uint16_t width,
                                 uint16_t height, const uint8_t* y,
                                 const uint8_t* u, const uint8_t* v) {
@@ -310,4 +365,4 @@ void ToxAVManager::setVideoReceiveFrameCallback(VideoReceiveFrameCallback cb) {
 ToxAV* ToxAVManager::getToxAV() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return toxav_.get();
-} 
+}

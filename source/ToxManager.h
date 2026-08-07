@@ -167,6 +167,7 @@ public:
     // Tox group callbacks
     using GroupInviteGroupCallback = std::function<void(Tox_Friend_Number, const uint8_t*, size_t)>;
     using GroupMessageGroupCallback = std::function<void(Tox_Group_Number, Tox_Group_Peer_Number, TOX_MESSAGE_TYPE, const uint8_t*, size_t, Tox_Group_Message_Id)>;
+    using GroupCustomPacketCallback = std::function<void(Tox_Group_Number, Tox_Group_Peer_Number, const uint8_t*, size_t)>;
     using GroupPrivateMessageGroupCallback = std::function<void(Tox_Group_Number, Tox_Group_Peer_Number, TOX_MESSAGE_TYPE, const uint8_t*, size_t, Tox_Group_Message_Id)>;
     using GroupTopicCallback = std::function<void(Tox_Group_Number, Tox_Group_Peer_Number, const uint8_t*, size_t)>;
     using GroupPeerNameGroupCallback = std::function<void(Tox_Group_Number, Tox_Group_Peer_Number, const uint8_t*, size_t)>;
@@ -207,6 +208,7 @@ public:
     // Tox group callback setters
     void setGroupInviteGroupCallback(GroupInviteGroupCallback cb);
     void setGroupMessageGroupCallback(GroupMessageGroupCallback cb);
+    void setGroupCustomPacketCallback(GroupCustomPacketCallback cb);
     void setGroupPrivateMessageGroupCallback(GroupPrivateMessageGroupCallback cb);
     void setGroupTopicCallback(GroupTopicCallback cb);
     void setGroupPeerNameGroupCallback(GroupPeerNameGroupCallback cb);
@@ -246,6 +248,7 @@ public:
     // Tox group static callbacks
     static void onGroupInviteGroup(Tox* tox, Tox_Friend_Number friend_number, const uint8_t* invite_data, size_t invite_data_length, const uint8_t* group_name, size_t group_name_length, void* user_data);
     static void onGroupMessageGroup(Tox* tox, Tox_Group_Number group_number, Tox_Group_Peer_Number peer_id, TOX_MESSAGE_TYPE type, const uint8_t* message, size_t length, Tox_Group_Message_Id message_id, void* user_data);
+    static void onGroupCustomPacket(Tox* tox, Tox_Group_Number group_number, Tox_Group_Peer_Number peer_id, const uint8_t* data, size_t length, void* user_data);
     static void onGroupPrivateMessage(Tox* tox, Tox_Group_Number group_number, Tox_Group_Peer_Number peer_id, TOX_MESSAGE_TYPE type, const uint8_t* message, size_t message_length, Tox_Group_Message_Id message_id, void* user_data);
     static void onGroupTopic(Tox* tox, Tox_Group_Number group_number, Tox_Group_Peer_Number peer_id, const uint8_t* topic, size_t length, void* user_data);
     static void onGroupPeerNameGroup(Tox* tox, Tox_Group_Number group_number, Tox_Group_Peer_Number peer_id, const uint8_t* name, size_t length, void* user_data);
@@ -319,6 +322,7 @@ private:
     // Tox group callbacks
     GroupInviteGroupCallback group_invite_group_cb_;
     GroupMessageGroupCallback group_message_group_cb_;
+    GroupCustomPacketCallback group_custom_packet_cb_;
     GroupPrivateMessageGroupCallback group_private_message_group_cb_;
     GroupTopicCallback group_topic_cb_;
     GroupPeerNameGroupCallback group_peer_name_group_cb_;

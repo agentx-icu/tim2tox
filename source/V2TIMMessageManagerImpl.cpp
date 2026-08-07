@@ -131,7 +131,7 @@ V2TIMMessage V2TIMMessageManagerImpl::CreateCustomMessage(const V2TIMBuffer& dat
     customElem->elemType = V2TIM_ELEM_TYPE_CUSTOM;
     customElem->data = data;
     msg.elemList.PushBack(customElem);
-    V2TIM_LOG(kInfo, "Created Custom Message: {}", msg.msgID.CString());
+    V2TIM_LOG(kInfo, "Created custom message");
     return msg;
 }
 
@@ -416,9 +416,8 @@ V2TIMString V2TIMMessageManagerImpl::SendMessage(
     const V2TIMOfflinePushInfo& offlinePushInfo, 
     V2TIMSendCallback* callback) 
 {
-    V2TIM_LOG(kInfo, "[V2TIMMessageManagerImpl::SendMessage] ========== ENTRY ==========");
-    V2TIM_LOG(kInfo, "[V2TIMMessageManagerImpl::SendMessage] msgID={}, receiver={}, groupID={}", 
-             message.msgID.CString(), receiver.CString(), groupID.CString());
+    V2TIM_LOG(kInfo, "[V2TIMMessageManagerImpl::SendMessage] element_count={}",
+              message.elemList.Size());
     
     // --- Validate Destination ---
     bool isC2C = !receiver.Empty();
@@ -490,16 +489,16 @@ V2TIMString V2TIMMessageManagerImpl::SendMessage(
             V2TIM_LOG(kInfo, "[V2TIMMessageManagerImpl::SendMessage] Sending TEXT message, isGroupPrivate={}, isGroup={}, text_length={}", 
                      isGroupPrivate, isGroup, textElem->text.Length());
             if (isGroupPrivate) {
-                V2TIM_LOG(kInfo, "[V2TIMMessageManagerImpl::SendMessage] Calling SendGroupPrivateTextMessage groupID={}, receiver={}", groupID.CString(), receiver.CString());
+                V2TIM_LOG(kInfo, "[V2TIMMessageManagerImpl::SendMessage] Calling SendGroupPrivateTextMessage");
                 sentMsgID = manager->SendGroupPrivateTextMessage(groupID, receiver, textElem->text, callback);
-                V2TIM_LOG(kInfo, "[V2TIMMessageManagerImpl::SendMessage] SendGroupPrivateTextMessage returned msgID={}", sentMsgID.CString());
+                V2TIM_LOG(kInfo, "[V2TIMMessageManagerImpl::SendMessage] SendGroupPrivateTextMessage completed success={}", !sentMsgID.Empty());
             } else if (isC2C) {
                 V2TIM_LOG(kInfo, "[V2TIMMessageManagerImpl::SendMessage] Calling SendC2CTextMessage");
                 sentMsgID = manager->SendC2CTextMessage(textElem->text, receiver, message.cloudCustomData, callback);
             } else { // isGroup
-                V2TIM_LOG(kInfo, "[V2TIMMessageManagerImpl::SendMessage] Calling SendGroupTextMessage for groupID={}", groupID.CString());
+                V2TIM_LOG(kInfo, "[V2TIMMessageManagerImpl::SendMessage] Calling SendGroupTextMessage");
                 sentMsgID = manager->SendGroupTextMessage(textElem->text, groupID, priority, message.cloudCustomData, callback);
-                V2TIM_LOG(kInfo, "[V2TIMMessageManagerImpl::SendMessage] SendGroupTextMessage returned msgID={}", sentMsgID.CString());
+                V2TIM_LOG(kInfo, "[V2TIMMessageManagerImpl::SendMessage] SendGroupTextMessage completed success={}", !sentMsgID.Empty());
             }
             break;
         }
@@ -1235,31 +1234,47 @@ void V2TIMMessageManagerImpl::DownloadMergerMessage(const V2TIMMessage &message,
 
 // --- Internal method to notify listeners ---
 void V2TIMMessageManagerImpl::NotifyAdvancedListenersReceivedMessage(const V2TIMMessage& message) {
-    V2TIM_LOG(kInfo, "[V2TIMMessageManagerImpl::NotifyAdvancedListenersReceivedMessage] ========== ENTRY ==========");
-    V2TIM_LOG(kInfo, "[V2TIMMessageManagerImpl::NotifyAdvancedListenersReceivedMessage] msgID={}, groupID={}, sender={}", 
-             message.msgID.CString(), message.groupID.CString(), message.sender.CString());
-    
     std::vector<V2TIMAdvancedMsgListener*> listeners_to_notify;
     {
         std::lock_guard<std::mutex> lock(listener_mutex_);
         listeners_to_notify.assign(listeners_.begin(), listeners_.end());
-        V2TIM_LOG(kInfo, "[V2TIMMessageManagerImpl::NotifyAdvancedListenersReceivedMessage] Found {} listeners to notify", 
-                 listeners_to_notify.size());
     }
+    V2TIM_LOG(kInfo, "NotifyAdvancedListenersReceivedMessage notifying {} listeners",
+              listeners_to_notify.size());
 
     for (V2TIMAdvancedMsgListener* listener : listeners_to_notify) {
         if (listener) {
-            V2TIM_LOG(kInfo, "[V2TIMMessageManagerImpl::NotifyAdvancedListenersReceivedMessage] Calling OnRecvNewMessage on listener={}", 
-                     (void*)listener);
-            // TODO: Add more checks/details if needed
-            listener->OnRecvNewMessage(message);
-            V2TIM_LOG(kInfo, "[V2TIMMessageManagerImpl::NotifyAdvancedListenersReceivedMessage] OnRecvNewMessage completed");
-        } else {
-            V2TIM_LOG(kWarning, "[V2TIMMessageManagerImpl::NotifyAdvancedListenersReceivedMessage] Found null listener, skipping");
+            try {
+                listener->OnRecvNewMessage(message);
+            } catch (...) {
+                V2TIM_LOG(
+                    kWarning,
+                    "[Callback] category=advanced-message status=threw");
+            }
         }
     }
-    
-    V2TIM_LOG(kInfo, "[V2TIMMessageManagerImpl::NotifyAdvancedListenersReceivedMessage] ========== EXIT ==========");
+}
+
+void V2TIMMessageManagerImpl::NotifyMessageDeliveryReceipt(
+    const V2TIMMessageReceipt& receipt) {
+    std::vector<V2TIMAdvancedMsgListener*> listeners_to_notify;
+    {
+        std::lock_guard<std::mutex> lock(listener_mutex_);
+        listeners_to_notify.assign(listeners_.begin(), listeners_.end());
+    }
+    V2TIMMessageReceiptVector receipts;
+    receipts.PushBack(receipt);
+    for (V2TIMAdvancedMsgListener* listener : listeners_to_notify) {
+        if (listener) {
+            try {
+                listener->OnRecvMessageReadReceipts(receipts);
+            } catch (...) {
+                V2TIM_LOG(
+                    kWarning,
+                    "[Callback] category=delivery-receipt status=threw");
+            }
+        }
+    }
 }
 
 void V2TIMMessageManagerImpl::NotifyMessageRevoked(const V2TIMString& msgID, const V2TIMString& revoker, const V2TIMString& reason) {
