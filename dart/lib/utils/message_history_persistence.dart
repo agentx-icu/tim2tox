@@ -1,8 +1,8 @@
 /// Unified message history persistence service
-/// 
+///
 /// This service provides a unified interface for persisting message history
 /// that can be used by both Platform interface scheme and binary replacement scheme.
-/// 
+///
 /// Storage location: `<appDir>/chat_history/<conversationId>.json`
 /// Data format: JSON with conversationId and messages array
 import 'dart:async';
@@ -124,9 +124,9 @@ class MessageHistoryPersistence {
     }
     return historyDir;
   }
-  
+
   /// Get the file path for a conversation's history
-  /// 
+  ///
   /// Uses ConversationIdUtils to normalize and sanitize the ID for consistent file naming.
   Future<File> _getHistoryFile(String id) async {
     final dir = await _getHistoryDirectory();
@@ -136,17 +136,20 @@ class MessageHistoryPersistence {
     final filePath = '${dir.path}/$safeId.json';
     return File(filePath);
   }
-  
+
   /// Get backup file path for a conversation's history
   Future<File> _getBackupFile(String id) async {
     final file = await _getHistoryFile(id);
     return File('${file.path}.bak');
   }
-  
+
   /// Cached per-process storage-root lookup so we don't hit
   /// path_provider on every load/save.
-  ({String? appSupport, String? documents, String? userDownloads})?
-      _storageRootsCache;
+  ({
+    String? appSupport,
+    String? documents,
+    String? userDownloads
+  })? _storageRootsCache;
 
   /// P1-15 helper. Resolves and caches the storage roots we relativize
   /// against:
@@ -200,13 +203,13 @@ class MessageHistoryPersistence {
   /// P1-15: rewrite an absolute path under a well-known root to a
   /// placeholder token. Unknown paths are returned unchanged so legacy
   /// rows continue to round-trip.
-  String _relativizePath(
-      String absolutePath,
+  String _relativizePath(String absolutePath,
       ({String? appSupport, String? documents, String? userDownloads}) roots) {
     final appSupport = roots.appSupport;
     final documents = roots.documents;
     final userDownloads = roots.userDownloads;
-    if (appSupport != null && absolutePath.startsWith('$appSupport/file_recv/')) {
+    if (appSupport != null &&
+        absolutePath.startsWith('$appSupport/file_recv/')) {
       final tail = absolutePath.substring('$appSupport/file_recv/'.length);
       return '{{fileRecv}}/$tail';
     }
@@ -232,8 +235,7 @@ class MessageHistoryPersistence {
   /// P1-15: inverse of [_relativizePath]. Placeholder tokens are
   /// substituted with the current device's storage roots; absolute paths
   /// (legacy v1 entries) are returned unchanged.
-  String _resolvePath(
-      String storedPath,
+  String _resolvePath(String storedPath,
       ({String? appSupport, String? documents, String? userDownloads}) roots) {
     final appSupport = roots.appSupport;
     final documents = roots.documents;
@@ -261,17 +263,18 @@ class MessageHistoryPersistence {
     final file = await _getHistoryFile(id);
     return File('${file.path}.tmp');
   }
-  
+
   /// Save message history for a conversation
-  /// 
+  ///
   /// Thread-safe implementation with:
   /// - Write locks to prevent race conditions
   /// - Temporary file + atomic rename for data integrity
   /// - Backup mechanism for crash recovery
-  /// 
+  ///
   /// [conversationId] - Normalized conversation ID
   /// [messages] - List of messages to save
-  Future<void> saveHistory(String conversationId, List<ChatMessage> messages) async {
+  Future<void> saveHistory(
+      String conversationId, List<ChatMessage> messages) async {
     if (messages.isEmpty) return;
 
     // Normalize conversation ID for consistent storage
@@ -364,33 +367,34 @@ class MessageHistoryPersistence {
       }
     }
   }
-  
+
   /// Load message history for a conversation
-  /// 
+  ///
   /// Returns the loaded messages and updates the in-memory cache.
   /// Marks all pending messages as not pending (failed) to prevent resending on startup.
-  /// 
+  ///
   /// Includes file integrity checks and backup recovery.
-  /// 
+  ///
   /// [id] - Conversation ID (will be normalized)
   /// [quitGroups] - Set of quit group IDs to filter out
-  Future<List<ChatMessage>> loadHistory(String id, {Set<String>? quitGroups}) async {
+  Future<List<ChatMessage>> loadHistory(String id,
+      {Set<String>? quitGroups}) async {
     // Normalize conversation ID
     final normalizedId = ConversationIdUtils.normalize(id);
-    
+
     try {
       final file = await _getHistoryFile(normalizedId);
       if (!await file.exists()) {
         // Try to load from backup
         return await _loadFromBackup(normalizedId, quitGroups: quitGroups);
       }
-      
+
       // Check file size (empty or corrupted file)
       final fileSize = await file.length();
       if (fileSize == 0) {
         return await _loadFromBackup(normalizedId, quitGroups: quitGroups);
       }
-      
+
       String jsonString;
       try {
         jsonString = await file.readAsString();
@@ -398,18 +402,19 @@ class MessageHistoryPersistence {
         // File read failed, try backup
         return await _loadFromBackup(normalizedId, quitGroups: quitGroups);
       }
-      
+
       dynamic decoded;
       try {
         decoded = jsonDecode(jsonString);
       } catch (e) {
         // JSON parse failed, try to recover from backup
-        return await _recoverCorruptedFile(file, normalizedId, quitGroups: quitGroups);
+        return await _recoverCorruptedFile(file, normalizedId,
+            quitGroups: quitGroups);
       }
-      
+
       List<ChatMessage> messages;
       String? actualId;
-      
+
       // P1-15: resolve storage roots once per load so we can rehydrate
       // placeholder filePaths into absolute device paths.
       final storageRoots = await _resolveStorageRoots();
@@ -444,21 +449,25 @@ class MessageHistoryPersistence {
         // Try to infer ID from messages
         if (messages.isNotEmpty) {
           final firstMsg = messages.first;
-          actualId = firstMsg.groupId ?? id; // Use groupId if available, otherwise use provided id
+          actualId = firstMsg.groupId ??
+              id; // Use groupId if available, otherwise use provided id
         } else {
           actualId = id;
         }
       } else {
         return [];
       }
-      
+
       // Normalize the actual ID from file
-      final targetId = actualId != null ? ConversationIdUtils.normalize(actualId) : normalizedId;
-      
+      final targetId = actualId != null
+          ? ConversationIdUtils.normalize(actualId)
+          : normalizedId;
+
       // Check if this is a quit group (if quitGroups is provided)
       if (quitGroups != null && messages.isNotEmpty) {
         final firstMsg = messages.first;
-        final isGroupConversation = firstMsg.groupId != null && firstMsg.groupId!.isNotEmpty;
+        final isGroupConversation =
+            firstMsg.groupId != null && firstMsg.groupId!.isNotEmpty;
         if (isGroupConversation) {
           final groupId = firstMsg.groupId!;
           if (quitGroups.contains(groupId)) {
@@ -473,7 +482,7 @@ class MessageHistoryPersistence {
           }
         }
       }
-      
+
       // Mark all historical messages as not pending (they're from previous sessions)
       // This prevents old pending messages from being resent on startup
       final updatedMessages = messages.map((msg) {
@@ -488,7 +497,7 @@ class MessageHistoryPersistence {
         }
         return msg;
       }).toList();
-      
+
       // CRITICAL: Remove duplicate messages by msgID
       // If multiple messages have the same msgID, keep the one with:
       // 1. Non-temp filePath (final path) if available
@@ -507,30 +516,55 @@ class MessageHistoryPersistence {
             // Use the new isTempPath property for better detection
             final existingIsTemp = existing.isTempPath;
             final msgIsTemp = msg.isTempPath;
-            
+
             if (msgIsTemp && !existingIsTemp) {
               // Existing has final path, keep it
+              if (msg.contentKind == ChatMessageContentKind.action &&
+                  existing.contentKind == ChatMessageContentKind.normal) {
+                deduplicatedMessages[msg.msgID!] = existing.copyWith(
+                  contentKind: ChatMessageContentKind.action,
+                );
+              }
               continue;
             } else if (!msgIsTemp && existingIsTemp) {
               // New message has final path, replace existing
-              deduplicatedMessages[msg.msgID!] = msg;
+              deduplicatedMessages[msg.msgID!] =
+                  msg.contentKind == ChatMessageContentKind.action ||
+                          existing.contentKind == ChatMessageContentKind.normal
+                      ? msg
+                      : msg.copyWith(
+                          contentKind: ChatMessageContentKind.action,
+                        );
             } else {
               // Both have same type of path, keep the one with more recent timestamp
               if (msg.timestamp.isAfter(existing.timestamp)) {
-                deduplicatedMessages[msg.msgID!] = msg;
+                deduplicatedMessages[msg.msgID!] = msg.contentKind ==
+                            ChatMessageContentKind.action ||
+                        existing.contentKind == ChatMessageContentKind.normal
+                    ? msg
+                    : msg.copyWith(
+                        contentKind: ChatMessageContentKind.action,
+                      );
+              } else if (msg.contentKind == ChatMessageContentKind.action &&
+                  existing.contentKind == ChatMessageContentKind.normal) {
+                deduplicatedMessages[msg.msgID!] = existing.copyWith(
+                  contentKind: ChatMessageContentKind.action,
+                );
               }
             }
           }
         } else {
           // Message without msgID, add it (shouldn't happen, but handle gracefully)
-          deduplicatedMessages['${msg.timestamp.millisecondsSinceEpoch}_${msg.fromUserId}'] = msg;
+          deduplicatedMessages[
+                  '${msg.timestamp.millisecondsSinceEpoch}_${msg.fromUserId}'] =
+              msg;
         }
       }
-      
+
       // Convert back to list and sort by timestamp
       final deduplicatedList = deduplicatedMessages.values.toList();
       deduplicatedList.sort((a, b) => a.timestamp.compareTo(b.timestamp));
-      
+
       // Update in-memory cache
       _historyById[targetId] = deduplicatedList;
 
@@ -558,7 +592,7 @@ class MessageHistoryPersistence {
           }
         }
       }
-      
+
       // Save the updated history (with isPending=false and deduplicated) to disk if any changes were made.
       // The save is fire-and-forget so a slow disk write doesn't block load,
       // but we wrap with catchError so a serialization or I/O failure surfaces
@@ -571,28 +605,30 @@ class MessageHistoryPersistence {
       // `loadAllHistories` flush them serially after the batch completes.
       // The old behaviour spawned 16+ concurrent saveHistory futures from
       // each cold-start batch, all racing on the per-conversation fence.
-      if (deduplicatedList.length != messages.length || updatedMessages != messages) {
+      if (deduplicatedList.length != messages.length ||
+          updatedMessages != messages) {
         _dirtyAfterLoad.add(targetId);
       }
-      
+
       return deduplicatedList;
     } catch (e) {
       // Try to load from backup on any error
       return await _loadFromBackup(normalizedId, quitGroups: quitGroups);
     }
   }
-  
+
   /// Load history from backup file
-  Future<List<ChatMessage>> _loadFromBackup(String normalizedId, {Set<String>? quitGroups}) async {
+  Future<List<ChatMessage>> _loadFromBackup(String normalizedId,
+      {Set<String>? quitGroups}) async {
     try {
       final backupFile = await _getBackupFile(normalizedId);
       if (!await backupFile.exists()) {
         return [];
       }
-      
+
       final jsonString = await backupFile.readAsString();
       final decoded = jsonDecode(jsonString);
-      
+
       // Use the same loading logic as loadHistory
       // This is a simplified version - in production, consider refactoring
       if (decoded is Map<String, dynamic>) {
@@ -609,28 +645,32 @@ class MessageHistoryPersistence {
           }
           return ChatMessage.fromJson(m);
         }).toList();
-        
+
         // Check quit groups
         if (quitGroups != null && messages.isNotEmpty) {
           final firstMsg = messages.first;
-          if (firstMsg.groupId != null && quitGroups.contains(firstMsg.groupId)) {
+          if (firstMsg.groupId != null &&
+              quitGroups.contains(firstMsg.groupId)) {
             return [];
           }
         }
-        
+
         return messages;
       }
-      
+
       return [];
     } catch (e) {
       return [];
     }
   }
-  
+
   /// Recover from corrupted file
-  Future<List<ChatMessage>> _recoverCorruptedFile(File corruptedFile, String normalizedId, {Set<String>? quitGroups}) async {
+  Future<List<ChatMessage>> _recoverCorruptedFile(
+      File corruptedFile, String normalizedId,
+      {Set<String>? quitGroups}) async {
     // Try backup first
-    final backupMessages = await _loadFromBackup(normalizedId, quitGroups: quitGroups);
+    final backupMessages =
+        await _loadFromBackup(normalizedId, quitGroups: quitGroups);
     if (backupMessages.isNotEmpty) {
       // M2: restore via read→tmp+fsync→rename, not `backup.copy(primary)`.
       // A direct copy is not crash-safe — if killed mid-copy the primary is
@@ -660,7 +700,7 @@ class MessageHistoryPersistence {
     // For now, return empty list - can be enhanced later
     return [];
   }
-  
+
   /// Load all message histories from disk.
   ///
   /// Scans the chat_history directory and loads all conversation histories.
@@ -672,7 +712,8 @@ class MessageHistoryPersistence {
   /// 500-conversation install). Per-file errors are swallowed so a single bad
   /// file can't block the rest of the boot — same semantics as the previous
   /// sequential loop, just concurrent within each batch.
-  Future<Map<String, List<ChatMessage>>> loadAllHistories({Set<String>? quitGroups}) async {
+  Future<Map<String, List<ChatMessage>>> loadAllHistories(
+      {Set<String>? quitGroups}) async {
     final result = <String, List<ChatMessage>>{};
 
     try {
@@ -751,9 +792,8 @@ class MessageHistoryPersistence {
       final filename = file.path.split(Platform.pathSeparator).last;
       // On POSIX the previous code split on '/'; preserve that fallback for
       // paths that may use forward slashes regardless of platform separator.
-      final canonicalFilename = filename.contains('/')
-          ? filename.split('/').last
-          : filename;
+      final canonicalFilename =
+          filename.contains('/') ? filename.split('/').last : filename;
       final sanitizedId = canonicalFilename.replaceAll('.json', '');
 
       final messages = await loadHistory(sanitizedId, quitGroups: quitGroups);
@@ -768,7 +808,7 @@ class MessageHistoryPersistence {
       return null;
     }
   }
-  
+
   /// Append a message to the history for a conversation.
   ///
   /// Updates the in-memory cache synchronously and returns a Future that
@@ -846,6 +886,7 @@ class MessageHistoryPersistence {
       final contentMatch = list.indexWhere((msg) =>
           msg.text == message.text &&
           msg.fromUserId == message.fromUserId &&
+          msg.contentKind == message.contentKind &&
           !msg.isSelf &&
           msg.timestamp.difference(message.timestamp).abs() <= dedupWindow);
       if (contentMatch >= 0) {
@@ -976,7 +1017,7 @@ class MessageHistoryPersistence {
     }
     _appendDebouncePending.clear();
   }
-  
+
   /// Whether [msg] is identified by [id] — either its current primary
   /// [ChatMessage.msgID] or a cross-path duplicate id it absorbed during
   /// content dedup ([ChatMessage.altMsgIds]). Every exact-id lookup in this
@@ -998,8 +1039,8 @@ class MessageHistoryPersistence {
   ChatMessage _mergeMessages(ChatMessage existing, ChatMessage updated) {
     // Prefer final path over temp path
     final filePath = updated.isTempPath && !existing.isTempPath
-      ? existing.filePath
-      : (!updated.isTempPath ? updated.filePath : existing.filePath);
+        ? existing.filePath
+        : (!updated.isTempPath ? updated.filePath : existing.filePath);
 
     // Merge file metadata
     final fileSize = updated.fileSize ?? existing.fileSize;
@@ -1030,11 +1071,17 @@ class MessageHistoryPersistence {
       text: updated.text.isNotEmpty ? updated.text : existing.text,
       fromUserId: updated.fromUserId,
       isSelf: updated.isSelf,
-      timestamp: updated.timestamp.isAfter(existing.timestamp) ? updated.timestamp : existing.timestamp,
+      timestamp: updated.timestamp.isAfter(existing.timestamp)
+          ? updated.timestamp
+          : existing.timestamp,
       groupId: updated.groupId ?? existing.groupId,
       filePath: filePath,
       fileName: updated.fileName ?? existing.fileName,
       mediaKind: updated.mediaKind ?? existing.mediaKind,
+      contentKind: updated.contentKind == ChatMessageContentKind.action ||
+              existing.contentKind == ChatMessageContentKind.action
+          ? ChatMessageContentKind.action
+          : ChatMessageContentKind.normal,
       isPending: isPending,
       isReceived: isReceived,
       isRead: isRead,
@@ -1054,21 +1101,21 @@ class MessageHistoryPersistence {
       cloudCustomData: updated.cloudCustomData ?? existing.cloudCustomData,
     );
   }
-  
+
   /// Get message history for a conversation (from memory cache)
-  /// 
+  ///
   /// Returns the cached messages. If not in cache, returns empty list.
   /// Use loadHistory() to load from disk if needed.
-  /// 
+  ///
   /// [conversationId] - Will be normalized before lookup
   List<ChatMessage> getHistory(String conversationId) {
     final normalizedId = ConversationIdUtils.normalize(conversationId);
     return List<ChatMessage>.from(_historyById[normalizedId] ?? []);
   }
-  
+
   /// Check if history file exists for a conversation
   /// Returns true if the file exists, false otherwise
-  /// 
+  ///
   /// [conversationId] - Will be normalized before check
   Future<bool> historyFileExists(String conversationId) async {
     try {
@@ -1079,27 +1126,28 @@ class MessageHistoryPersistence {
       return false;
     }
   }
-  
+
   /// Get all conversation IDs that have history
   Set<String> getConversationIds() {
     return _historyById.keys.toSet();
   }
-  
+
   /// Clear history for a specific conversation
   /// This deletes the JSON history file but does NOT delete actual media files
   /// (images, videos, audio, documents) referenced in the messages
-  /// 
+  ///
   /// Also clears all cache entries that might match this conversation ID
   /// (e.g., original ID and normalized ID variants)
-  /// 
+  ///
   /// CRITICAL: This method scans all history files to find and delete any file
   /// that contains messages for this conversation, even if the filename doesn't match
   /// (e.g., due to ID normalization or sanitization differences)
-  /// 
+  ///
   /// [conversationId] - Will be normalized before clearing
   Future<void> clearHistory(String conversationId) async {
     // Normalize conversationId for comparison
-    final normalizedConversationId = ConversationIdUtils.normalize(conversationId);
+    final normalizedConversationId =
+        ConversationIdUtils.normalize(conversationId);
 
     // Cancel any in-flight debounced saves for this conversation — otherwise
     // a queued save could resurrect the in-memory list we are about to clear.
@@ -1109,21 +1157,22 @@ class MessageHistoryPersistence {
     if (pendingDirect != null && !pendingDirect.isCompleted) {
       pendingDirect.complete();
     }
-    final pendingNormalized = _appendDebouncePending.remove(normalizedConversationId);
+    final pendingNormalized =
+        _appendDebouncePending.remove(normalizedConversationId);
     if (pendingNormalized != null && !pendingNormalized.isCompleted) {
       pendingNormalized.complete();
     }
 
     // Clear in-memory cache for this ID and all variants
     _historyById.remove(conversationId);
-    
+
     // Also clear any cache entries that might match this conversation
     // (e.g., if there are multiple ID variants stored)
     final keysToRemove = <String>[];
     for (final key in _historyById.keys) {
       // Normalize key for comparison
       final normalizedKey = ConversationIdUtils.normalize(key);
-      
+
       // Check if key matches conversationId using normalized comparison
       if (ConversationIdUtils.equals(key, conversationId) ||
           ConversationIdUtils.equals(normalizedKey, normalizedConversationId)) {
@@ -1133,7 +1182,7 @@ class MessageHistoryPersistence {
     for (final key in keysToRemove) {
       _historyById.remove(key);
     }
-    
+
     // Await any in-flight write for this conversation before deleting. A
     // debounced `saveHistory` whose timer already FIRED (so the cancel above
     // was a no-op) may be mid `tempFile.rename(file.path)` holding a
@@ -1188,7 +1237,7 @@ class MessageHistoryPersistence {
       // The file may not exist or may be locked, but we've cleared memory cache
     }
   }
-  
+
   /// Clear all message histories
   Future<void> clearAllHistories() async {
     // Cancel any in-flight debounced saves so they don't recreate files we
@@ -1213,17 +1262,18 @@ class MessageHistoryPersistence {
       // Ignore errors
     }
   }
-  
+
   /// Update a message in the history
-  /// 
+  ///
   /// Finds the message by msgID and updates it, then saves to disk.
-  /// 
+  ///
   /// [conversationId] - Will be normalized before update
-  Future<bool> updateMessage(String conversationId, String msgID, ChatMessage updatedMessage) async {
+  Future<bool> updateMessage(
+      String conversationId, String msgID, ChatMessage updatedMessage) async {
     final normalizedId = ConversationIdUtils.normalize(conversationId);
     final list = _historyById[normalizedId];
     if (list == null) return false;
-    
+
     final index = list.indexWhere((msg) => _idMatches(msg, msgID));
     if (index == -1) return false;
 
@@ -1234,16 +1284,16 @@ class MessageHistoryPersistence {
     await saveHistory(normalizedId, list);
     return true;
   }
-  
+
   /// Safely update file path for a message
-  /// 
+  ///
   /// This method ensures atomic file path updates with integrity checks:
   /// 1. Verifies the new file exists (refuses the update otherwise unless
   ///    [allowMissing] is set)
   /// 2. Gets file metadata (size, etc.)
   /// 3. Updates the message atomically
   /// 4. Optionally deletes the old temporary file after successful update
-  /// 
+  ///
   /// [conversationId] - Will be normalized before update
   /// [msgID] - Message ID to update
   /// [newFilePath] - New file path (must exist unless [allowMissing] is true)
@@ -1263,13 +1313,13 @@ class MessageHistoryPersistence {
     final normalizedId = ConversationIdUtils.normalize(conversationId);
     final list = _historyById[normalizedId];
     if (list == null) return false;
-    
+
     final index = list.indexWhere((msg) => _idMatches(msg, msgID));
     if (index == -1) return false;
 
     final existing = list[index];
     final oldFilePath = existing.filePath;
-    
+
     // 1. Verify the new file exists. CR-06: the documented contract is that
     // the new path must exist; refuse to repoint history at a dangling path
     // (and do NOT delete the old temp below) unless the caller explicitly
@@ -1289,13 +1339,13 @@ class MessageHistoryPersistence {
         // Ignore errors getting file size.
       }
     }
-    
+
     // 3. Create updated message
     final updated = existing.copyWith(
       filePath: newFilePath,
       fileSize: fileSize,
     );
-    
+
     // 4. Update message atomically. M4: the previous "verify by re-reading
     // the same in-memory list we just wrote into" was dead code (the check
     // could never trip) and swallowed real disk-write failures. Wrap the
@@ -1329,20 +1379,20 @@ class MessageHistoryPersistence {
         }
       });
     }
-    
+
     return true;
   }
-  
+
   /// Remove a message from the history
-  /// 
+  ///
   /// Finds the message by msgID and removes it, then saves to disk.
-  /// 
+  ///
   /// [conversationId] - Will be normalized before removal
   Future<bool> removeMessage(String conversationId, String msgID) async {
     final normalizedId = ConversationIdUtils.normalize(conversationId);
     final list = _historyById[normalizedId];
     if (list == null) return false;
-    
+
     final initialLength = list.length;
     list.removeWhere((msg) => _idMatches(msg, msgID));
 
@@ -1350,10 +1400,10 @@ class MessageHistoryPersistence {
       await saveHistory(normalizedId, list);
       return true;
     }
-    
+
     return false;
   }
-  
+
   /// Get the in-memory cache (for direct access if needed)
   Map<String, List<ChatMessage>> get cache => Map.unmodifiable(_historyById);
 
@@ -1424,8 +1474,7 @@ class MessageHistoryPersistence {
   /// [saveHistory] (or use [updateMessage] for the merge-aware path).
   ///
   /// [conversationId] - Will be normalized before lookup.
-  void replaceInCache(
-      String conversationId, int index, ChatMessage message) {
+  void replaceInCache(String conversationId, int index, ChatMessage message) {
     final normalizedId = ConversationIdUtils.normalize(conversationId);
     final list = _historyById[normalizedId];
     if (list == null || index < 0 || index >= list.length) return;
@@ -1452,14 +1501,15 @@ class MessageHistoryPersistence {
   void clearAllCached() {
     _historyById.clear();
   }
-  
+
   /// Update the last view timestamp for a conversation
-  /// 
+  ///
   /// Updates the timestamp when the user last viewed the conversation.
   /// This is used to calculate unread message count.
-  /// 
+  ///
   /// [conversationId] - Will be normalized before update
-  Future<void> updateLastViewTimestamp(String conversationId, int timestamp) async {
+  Future<void> updateLastViewTimestamp(
+      String conversationId, int timestamp) async {
     final normalizedId = ConversationIdUtils.normalize(conversationId);
     _lastViewTimestampById[normalizedId] = timestamp;
     // Save the updated history to persist the new timestamp
@@ -1468,18 +1518,18 @@ class MessageHistoryPersistence {
       await saveHistory(normalizedId, messages);
     }
   }
-  
+
   /// Get the last view timestamp for a conversation
-  /// 
+  ///
   /// Returns the timestamp when the user last viewed the conversation.
   /// Returns 0 if the conversation has never been viewed.
-  /// 
+  ///
   /// [conversationId] - Will be normalized before lookup
   int getLastViewTimestamp(String conversationId) {
     final normalizedId = ConversationIdUtils.normalize(conversationId);
     return _lastViewTimestampById[normalizedId] ?? 0;
   }
-  
+
   /// Get the unread message count for a conversation
   ///
   /// Calculates the number of unread messages based on:
@@ -1506,7 +1556,7 @@ class MessageHistoryPersistence {
     if (messages == null || messages.isEmpty) {
       return 0;
     }
-    
+
     int count = 0;
 
     for (final msg in messages) {
@@ -1523,12 +1573,12 @@ class MessageHistoryPersistence {
 
     return count;
   }
-  
+
   /// Mark all unread messages as read for a conversation
-  /// 
+  ///
   /// Marks all messages with timestamp > lastViewTimestamp and !isSelf as read.
   /// This is called when the user opens a conversation.
-  /// 
+  ///
   /// [conversationId] - Will be normalized before update
   Future<void> markUnreadMessagesAsRead(String conversationId) async {
     final normalizedId = ConversationIdUtils.normalize(conversationId);
@@ -1536,10 +1586,10 @@ class MessageHistoryPersistence {
     if (messages == null || messages.isEmpty) {
       return;
     }
-    
+
     final lastViewTimestamp = _lastViewTimestampById[normalizedId] ?? 0;
     bool updated = false;
-    
+
     for (int i = 0; i < messages.length; i++) {
       final msg = messages[i];
       final msgTimestamp = msg.timestamp.millisecondsSinceEpoch;
@@ -1552,7 +1602,7 @@ class MessageHistoryPersistence {
         updated = true;
       }
     }
-    
+
     if (updated) {
       await saveHistory(normalizedId, messages);
     }
@@ -1617,16 +1667,16 @@ class MessageHistoryPersistence {
   }
 
   /// Clean up temporary files on startup
-  /// 
+  ///
   /// Removes temporary files and old backups that are no longer needed.
   Future<void> cleanupTempFiles() async {
     try {
       final dir = await _getHistoryDirectory();
       if (!await dir.exists()) return;
-      
+
       final files = dir.listSync();
       final now = DateTime.now();
-      
+
       for (final fileEntry in files) {
         if (fileEntry is File) {
           try {
@@ -1639,7 +1689,7 @@ class MessageHistoryPersistence {
                 await fileEntry.delete();
               }
             }
-            
+
             // Clean up old backup files (.bak) - keep only recent ones
             if (fileEntry.path.endsWith('.bak')) {
               final stat = await fileEntry.stat();

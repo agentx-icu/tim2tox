@@ -8,6 +8,8 @@ import 'dart:io';
 
 import 'package:path_provider/path_provider.dart';
 
+import '../models/chat_message.dart';
+
 part '_offline_message_queue_file_store.dart';
 
 /// Offline message queue item.
@@ -30,6 +32,7 @@ typedef OfflineMessageItem = ({
   DateTime timestamp,
   String? msgID,
   String? cloudCustomData,
+  ChatMessageContentKind contentKind,
 });
 
 /// Raised when the primary queue file cannot be parsed and no valid backup can

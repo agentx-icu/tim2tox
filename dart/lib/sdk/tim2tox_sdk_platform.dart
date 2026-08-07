@@ -84,6 +84,7 @@ import 'package:tencent_cloud_chat_sdk/models/v2_tim_merger_elem.dart';
 import 'package:tencent_cloud_chat_sdk/models/v2_tim_image.dart';
 import 'package:tencent_cloud_chat_sdk/models/v2_tim_message_online_url.dart';
 import 'package:tencent_cloud_chat_sdk/enum/image_types.dart';
+import 'package:tencent_cloud_chat_sdk/enum/utils.dart';
 import '../service/ffi_chat_service.dart';
 import '../models/chat_message.dart';
 import '../utils/control_message_envelope.dart';
@@ -309,6 +310,26 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
 
   String _nextClientMessageID(String senderID) =>
       '${DateTime.now().microsecondsSinceEpoch}_${_clientMessageIDSequence++}_${_clientMessageIDProcessNonce}-$senderID';
+
+  bool _sameContentKind(V2TimMessage first, V2TimMessage second) {
+    return chatMessageContentKindFromLocalCustomData(first.localCustomData) ==
+        chatMessageContentKindFromLocalCustomData(second.localCustomData);
+  }
+
+  void _applyOutgoingActionSemantics(
+    V2TimMessage message,
+    ({String text, ChatMessageContentKind contentKind}) outgoing,
+  ) {
+    if (outgoing.contentKind != ChatMessageContentKind.action) return;
+    message.elemType = MessageElemType.V2TIM_ELEM_TYPE_TEXT;
+    message.textElem ??= V2TimTextElem();
+    message.textElem!.text = outgoing.text;
+    message.customElem = null;
+    message.localCustomData = mergeChatMessageContentKindLocalCustomData(
+      message.localCustomData,
+      ChatMessageContentKind.action,
+    );
+  }
 
   Future<ChatMessageSendResult?> _sendProviderText(
     ChatMessageProvider provider, {
@@ -1226,7 +1247,9 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
                     '';
                 final msgText =
                     msg.textElem?.text ?? msg.mergerElem?.compatibleText ?? '';
-                if (v2Text.isNotEmpty && msgText == v2Text) {
+                if (v2Text.isNotEmpty &&
+                    msgText == v2Text &&
+                    _sameContentKind(v2Msg, msg)) {
                   // Check timestamp match (within 5 seconds)
                   final timeDiff =
                       ((v2Msg.timestamp ?? 0) - (msg.timestamp ?? 0)).abs();
@@ -1283,9 +1306,12 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
               '[Tim2ToxSdkPlatform] WARNING: conversationID is null or empty, cannot check message existence. Skipping message existence check.');
           // Use default: notify as new message
           await _setFaceUrlForMsg(v2Msg);
-          _notifyAdvancedMsgListeners((listener) {
-            listener.onRecvNewMessage?.call(v2Msg);
-          });
+          _notifyAdvancedMsgListeners(
+            (listener) {
+              listener.onRecvNewMessage?.call(v2Msg);
+            },
+            dispatchInstanceId: chatMsg.sourceInstanceId,
+          );
           return;
         }
 
@@ -1366,7 +1392,9 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
             bool contentMatches = false;
 
             // For text messages, match by text content
-            if (v2Text.isNotEmpty && msgText == v2Text) {
+            if (v2Text.isNotEmpty &&
+                msgText == v2Text &&
+                _sameContentKind(v2Msg, msg)) {
               if (_debugLog)
                 print(
                     '[Tim2ToxSdkPlatform] Text matches, checking timestamp: timeDiff=$timeDiff seconds');
@@ -1509,15 +1537,21 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
                 '[Tim2ToxSdkPlatform] Persisted modified message: conversationId=$conversationId, msgID=${chatMsg.msgID}');
 
           await _setFaceUrlForMsg(v2Msg);
-          _notifyAdvancedMsgListeners((listener) {
-            listener.onRecvMessageModified?.call(v2Msg);
-          });
+          _notifyAdvancedMsgListeners(
+            (listener) {
+              listener.onRecvMessageModified?.call(v2Msg);
+            },
+            dispatchInstanceId: chatMsg.sourceInstanceId,
+          );
         } else {
           // Message doesn't exist, notify as new
           await _setFaceUrlForMsg(v2Msg);
-          _notifyAdvancedMsgListeners((listener) {
-            listener.onRecvNewMessage?.call(v2Msg);
-          });
+          _notifyAdvancedMsgListeners(
+            (listener) {
+              listener.onRecvNewMessage?.call(v2Msg);
+            },
+            dispatchInstanceId: chatMsg.sourceInstanceId,
+          );
         }
       } else {
         // New message or received message (including pending messages)
@@ -1612,7 +1646,9 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
               bool contentMatches = false;
 
               // For text messages, match by text content
-              if (v2Text.isNotEmpty && msgText == v2Text) {
+              if (v2Text.isNotEmpty &&
+                  msgText == v2Text &&
+                  _sameContentKind(v2Msg, msg)) {
                 if (_debugLog)
                   print(
                       '[Tim2ToxSdkPlatform] Text matches in else branch, checking timestamp: timeDiff=$timeDiff seconds');
@@ -1744,9 +1780,12 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
                     '[Tim2ToxSdkPlatform] Persisted modified message (else branch): conversationId=$conversationID, msgID=${chatMsg.msgID}');
 
               await _setFaceUrlForMsg(v2Msg);
-              _notifyAdvancedMsgListeners((listener) {
-                listener.onRecvMessageModified?.call(v2Msg);
-              });
+              _notifyAdvancedMsgListeners(
+                (listener) {
+                  listener.onRecvMessageModified?.call(v2Msg);
+                },
+                dispatchInstanceId: chatMsg.sourceInstanceId,
+              );
               return; // Skip the rest of the logic
             }
           }
@@ -1799,7 +1838,11 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
                     // Text message matching
                     final v2Text = v2Msg.textElem?.text ?? '';
                     final msgText = msg.textElem?.text ?? '';
-                    if (v2Text.isNotEmpty && msgText == v2Text) return true;
+                    if (v2Text.isNotEmpty &&
+                        msgText == v2Text &&
+                        _sameContentKind(v2Msg, msg)) {
+                      return true;
+                    }
 
                     // File message matching
                     if (v2Msg.fileElem != null && msg.fileElem != null) {
@@ -1848,9 +1891,12 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
               }
               // Notify as modified instead of new to update any changed fields
               await _setFaceUrlForMsg(v2Msg);
-              _notifyAdvancedMsgListeners((listener) {
-                listener.onRecvMessageModified?.call(v2Msg);
-              });
+              _notifyAdvancedMsgListeners(
+                (listener) {
+                  listener.onRecvMessageModified?.call(v2Msg);
+                },
+                dispatchInstanceId: chatMsg.sourceInstanceId,
+              );
               return;
             }
           }
@@ -1894,7 +1940,9 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
                     '';
                 final msgText =
                     msg.textElem?.text ?? msg.mergerElem?.compatibleText ?? '';
-                if (v2Text.isNotEmpty && msgText == v2Text) {
+                if (v2Text.isNotEmpty &&
+                    msgText == v2Text &&
+                    _sameContentKind(v2Msg, msg)) {
                   // Check timestamp match (within 5 seconds)
                   final timeDiff =
                       ((v2Msg.timestamp ?? 0) - (msg.timestamp ?? 0)).abs();
@@ -1924,9 +1972,12 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
                     '[Tim2ToxSdkPlatform] Persisted pending message in forward target: conversationId=$targetConversationID, msgID=${chatMsg.msgID}');
 
               await _setFaceUrlForMsg(v2Msg);
-              _notifyAdvancedMsgListeners((listener) {
-                listener.onRecvMessageModified?.call(v2Msg);
-              });
+              _notifyAdvancedMsgListeners(
+                (listener) {
+                  listener.onRecvMessageModified?.call(v2Msg);
+                },
+                dispatchInstanceId: chatMsg.sourceInstanceId,
+              );
               return; // Skip the rest of the logic
             } else {
               // Message doesn't exist in target conversation, notify as new
@@ -2033,9 +2084,12 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
           print(
               '[Tim2ToxSdkPlatform] Calling _notifyAdvancedMsgListeners with onRecvNewMessage callback');
         await _setFaceUrlForMsg(v2Msg);
-        _notifyAdvancedMsgListeners((listener) {
-          listener.onRecvNewMessage?.call(v2Msg);
-        });
+        _notifyAdvancedMsgListeners(
+          (listener) {
+            listener.onRecvNewMessage?.call(v2Msg);
+          },
+          dispatchInstanceId: chatMsg.sourceInstanceId,
+        );
         if (_debugLog)
           print('[Tim2ToxSdkPlatform] Finished notifying listeners');
 
@@ -2088,17 +2142,20 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
       // Check if message status changed (received/read) and notify listeners
       if (chatMsg.isSelf && chatMsg.isReceived) {
         // Message was received by peer
-        _notifyAdvancedMsgListeners((listener) {
-          // Create a receipt for C2C messages
-          if (chatMsg.groupId == null) {
-            final receipt = V2TimMessageReceipt(
-              userID: chatMsg.fromUserId,
-              msgID: chatMsg.msgID ?? '',
-              timestamp: chatMsg.timestamp.millisecondsSinceEpoch ~/ 1000,
-            );
-            listener.onRecvC2CReadReceipt?.call([receipt]);
-          }
-        });
+        _notifyAdvancedMsgListeners(
+          (listener) {
+            // Create a receipt for C2C messages
+            if (chatMsg.groupId == null) {
+              final receipt = V2TimMessageReceipt(
+                userID: chatMsg.fromUserId,
+                msgID: chatMsg.msgID ?? '',
+                timestamp: chatMsg.timestamp.millisecondsSinceEpoch ~/ 1000,
+              );
+              listener.onRecvC2CReadReceipt?.call([receipt]);
+            }
+          },
+          dispatchInstanceId: chatMsg.sourceInstanceId,
+        );
       }
     });
   }
@@ -3105,6 +3162,40 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
                 }
               });
             }
+          }
+        }
+        break;
+      case GlobalCallbackType.MessageReadReceipt:
+        {
+          final raw = dataFromNativeMap['json_msg_read_receipt_array'];
+          List<dynamic> receiptArray = const [];
+          try {
+            if (raw is String && raw.isNotEmpty) {
+              final decoded = json.decode(raw);
+              if (decoded is List) receiptArray = decoded;
+            } else if (raw is List) {
+              receiptArray = raw;
+            }
+          } catch (_) {
+            if (_debugLog) print('Dropped malformed message receipt payload');
+          }
+          final receipts = <V2TimMessageReceipt>[];
+          for (final item in receiptArray) {
+            if (item is Map) {
+              try {
+                receipts.add(V2TimMessageReceipt.fromJson(item));
+              } catch (_) {
+                if (_debugLog) print('Dropped malformed message receipt item');
+              }
+            }
+          }
+          if (receipts.isNotEmpty) {
+            _notifyAdvancedMsgListeners(
+              (listener) {
+                listener.onRecvMessageReadReceipts?.call(receipts);
+              },
+              dispatchInstanceId: instanceId,
+            );
           }
         }
         break;
@@ -5357,6 +5448,7 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
         if (messageToSend.textElem != null) {
           // Text message (including forward messages which are text)
           final text = messageToSend.textElem!.text ?? '';
+          final outgoing = parseOutgoingChatText(text);
           if (_debugLog)
             print(
                 '[Tim2ToxSdkPlatform] Sending text message: length=${text.length}');
@@ -5391,6 +5483,7 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
             // image/file send's successor. Always clear here so a real armed
             // value can never outlive the text branch. (codex review.)
             ffiService.armNextSendCloudCustomData(null);
+            _applyOutgoingActionSemantics(messageToSend, outgoing);
           }
           if (_debugLog)
             print('[Tim2ToxSdkPlatform] Text message sent successfully');
@@ -5549,8 +5642,8 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
             userID: userID,
             groupID: groupID.isNotEmpty ? groupID : null,
             filePath: pathToSend,
-            fileName: encodedName ??
-                soundFileNameForPath(pathToSend, durationMs: 0),
+            fileName:
+                encodedName ?? soundFileNameForPath(pathToSend, durationMs: 0),
           );
           if (_debugLog)
             print('[Tim2ToxSdkPlatform] Sound message sent successfully');
@@ -8602,6 +8695,88 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
   // Group Manager methods
   // ============================================================================
 
+  String _nativeGroupTypeForCreate(String groupType) {
+    switch (groupType) {
+      case GroupType.Work:
+      case 'work':
+      case 'private':
+      case 'privateGroup':
+        return 'Private';
+      case 'public':
+        return GroupType.Public;
+      case 'meeting':
+        return GroupType.Meeting;
+      case 'avchatroom':
+        return GroupType.AVChatRoom;
+      case 'community':
+        return GroupType.Community;
+      case 'conference':
+      case 'av_conference':
+      case 'group':
+      case 'Private':
+      case GroupType.Public:
+      case GroupType.Meeting:
+      case GroupType.AVChatRoom:
+      case GroupType.Community:
+        return groupType;
+      default:
+        return groupType;
+    }
+  }
+
+  String _normalizeStoredGroupType(String storedType) {
+    switch (storedType.toLowerCase()) {
+      case 'private':
+      case 'group':
+      case 'work':
+        return GroupType.Work;
+      case 'public':
+        return GroupType.Public;
+      case 'meeting':
+        return GroupType.Meeting;
+      case 'avchatroom':
+        return GroupType.AVChatRoom;
+      case 'community':
+        return GroupType.Community;
+      case 'conference':
+      case 'av_conference':
+        return storedType;
+      default:
+        return storedType;
+    }
+  }
+
+  String _groupTypeForGroupInfo(String groupID) {
+    final storedType = _storedGroupType(groupID) ?? GroupType.Work;
+    return _normalizeStoredGroupType(storedType);
+  }
+
+  String? _storedGroupType(String groupID) {
+    if (groupID.isEmpty) return null;
+    try {
+      final ffiLib = ffi_lib.Tim2ToxFfi.open();
+      final instanceId = ffiLib.getCurrentInstanceId();
+      final groupIdPtr = groupID.toNativeUtf8();
+      final outTypePtr = pkgffi.malloc.allocate<ffi.Int8>(64);
+      try {
+        final ok = ffiLib.getGroupTypeFromStorageNative(
+          instanceId,
+          groupIdPtr,
+          outTypePtr,
+          64,
+        );
+        if (ok <= 0) return null;
+        final stored = outTypePtr.cast<pkgffi.Utf8>().toDartString().trim();
+        return stored.isEmpty ? null : stored;
+      } finally {
+        pkgffi.malloc.free(groupIdPtr);
+        pkgffi.malloc.free(outTypePtr);
+      }
+    } catch (_) {
+      return null;
+    }
+  }
+
   @override
   Future<void> addGroupListener({
     required V2TimGroupListener listener,
@@ -8649,7 +8824,10 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
   }) async {
     try {
       // Create group via FfiChatService
-      final gid = await ffiService.createGroup(groupName);
+      final gid = await ffiService.createGroup(
+        groupName,
+        groupType: _nativeGroupTypeForCreate(groupType),
+      );
       if (gid == null) {
         return V2TimValueCallback<String>(
           code: -1,
@@ -8885,7 +9063,7 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
             0;
         final groupInfo = V2TimGroupInfo(
           groupID: groupID,
-          groupType: GroupType.Work,
+          groupType: _groupTypeForGroupInfo(groupID),
           groupName: groupName ?? groupID,
           faceUrl: groupAvatar,
           memberCount: memberCount,
@@ -9037,7 +9215,7 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
 
         final groupInfo = V2TimGroupInfo(
           groupID: groupID,
-          groupType: GroupType.Work,
+          groupType: _groupTypeForGroupInfo(groupID),
           groupName: groupName ?? groupID,
           faceUrl: groupAvatar,
           memberCount: memberCount,
@@ -9438,11 +9616,9 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
     required String userID,
     required int seconds,
   }) async {
-    // Tox doesn't support muting group members
-    // For now, return success
     return V2TimCallback(
-      code: 0,
-      desc: 'success',
+      code: TIMErrCode.ERR_SDK_INTERFACE_NOT_SUPPORT.value,
+      desc: 'Not supported',
     );
   }
 
@@ -9641,11 +9817,10 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
     required String userID,
     required int role,
   }) async {
-    // Tox doesn't support group member roles
-    // For now, return success
-    return V2TimCallback(
-      code: 0,
-      desc: 'success',
+    return TIMGroupManager.instance.setGroupMemberRole(
+      groupID: groupID,
+      userID: userID,
+      role: EnumUtils.convertGroupMemberRoleType(role),
     );
   }
 
@@ -9654,21 +9829,17 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
     required String groupID,
     required String userID,
   }) async {
-    // Tox doesn't support group owner transfer
-    // For now, return success
-    return V2TimCallback(
-      code: 0,
-      desc: 'success',
+    return TIMGroupManager.instance.transferGroupOwner(
+      groupID: groupID,
+      userID: userID,
     );
   }
 
   @override
   Future<V2TimCallback> setGroupApplicationRead() async {
-    // Tox doesn't have group application list
-    // For now, return success
     return V2TimCallback(
-      code: 0,
-      desc: 'success',
+      code: TIMErrCode.ERR_SDK_INTERFACE_NOT_SUPPORT.value,
+      desc: 'Not supported',
     );
   }
 

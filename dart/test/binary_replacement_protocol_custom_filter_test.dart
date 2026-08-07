@@ -5,6 +5,7 @@
 // Regression target: the product-screenshot pipeline found receipts in chat.
 
 import 'package:flutter_test/flutter_test.dart';
+import 'package:tim2tox_dart/models/chat_message.dart';
 import 'package:tim2tox_dart/utils/binary_replacement_history_hook.dart';
 
 void main() {
@@ -65,6 +66,69 @@ void main() {
       );
     });
 
+    test('ACTION JSON resembling a receipt but carrying peer content is kept',
+        () {
+      expect(
+        isProtocol(
+          '{"type":"receipt","msgID":"m_4","receiptType":"displayed",'
+          '"sender":"AABB","text":"waves"}',
+        ),
+        isFalse,
+      );
+    });
+
+    test('valid receipt fields plus peer content are kept', () {
+      expect(
+        isProtocol(
+          '{"type":"receipt","msgID":"m_4","receiptType":"read",'
+          '"sender":"AABB","text":"waves"}',
+        ),
+        isFalse,
+      );
+    });
+
+    test('ACTION JSON resembling a reaction with an unknown action is kept',
+        () {
+      expect(
+        isProtocol(
+          '{"type":"reaction","msgID":"m_5","reactionID":"wave",'
+          '"action":"animate","sender":"AABB","text":"waves"}',
+        ),
+        isFalse,
+      );
+    });
+
+    test('valid reaction fields plus peer content are kept', () {
+      expect(
+        isProtocol(
+          '{"type":"reaction","msgID":"m_5","reactionID":"wave",'
+          '"action":"add","sender":"AABB","text":"waves"}',
+        ),
+        isFalse,
+      );
+    });
+
+    test('legacy receipt without sender context is not hidden from history',
+        () {
+      expect(
+        isProtocol(
+          '{"type":"receipt","msgID":"m_6","receiptType":"received"}',
+        ),
+        isFalse,
+      );
+    });
+
+    test('legacy reaction without sender context is not hidden from history',
+        () {
+      expect(
+        isProtocol(
+          '{"type":"reaction","msgID":"m_7","reactionID":"wave",'
+          '"action":"add"}',
+        ),
+        isFalse,
+      );
+    });
+
     test('av_call signaling envelope is NOT protocol (call-record row)', () {
       expect(
         isProtocol('{"data":"{\\"businessID\\":\\"av_call\\"}","type":"x"}'),
@@ -77,6 +141,45 @@ void main() {
       expect(isProtocol(''), isFalse);
       expect(isProtocol('not json'), isFalse);
       expect(isProtocol('[1,2,3]'), isFalse);
+    });
+  });
+
+  group('history-aware legacy control consumption', () {
+    const peerId = 'AABB';
+    final history = [
+      ChatMessage(
+        text: 'existing',
+        fromUserId: 'SELF',
+        isSelf: true,
+        timestamp: DateTime.fromMillisecondsSinceEpoch(1),
+        msgID: 'known-message',
+      ),
+    ];
+
+    test('consumes exact control only when referenced message exists', () {
+      expect(
+        BinaryReplacementHistoryHook.shouldConsumeInternalProtocolCustomData(
+          data: '{"type":"receipt","msgID":"known-message",'
+              '"receiptType":"read","sender":"$peerId"}',
+          callbackSender: peerId,
+          conversationId: peerId,
+          history: history,
+        ),
+        isTrue,
+      );
+    });
+
+    test('preserves exact control when referenced message is absent', () {
+      expect(
+        BinaryReplacementHistoryHook.shouldConsumeInternalProtocolCustomData(
+          data: '{"type":"receipt","msgID":"missing-message",'
+              '"receiptType":"read","sender":"$peerId"}',
+          callbackSender: peerId,
+          conversationId: peerId,
+          history: history,
+        ),
+        isFalse,
+      );
     });
   });
 }

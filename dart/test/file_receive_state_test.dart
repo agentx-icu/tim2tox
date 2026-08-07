@@ -4,6 +4,18 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:tim2tox_dart/service/file_receive_cleanup.dart';
 import 'package:tim2tox_dart/service/ffi_chat_service.dart';
 
+File _tim2ToxFile(String packageRelativePath) {
+  final candidates = <String>[
+    packageRelativePath,
+    'third_party/tim2tox/dart/$packageRelativePath',
+  ];
+  for (final candidate in candidates) {
+    final file = File(candidate);
+    if (file.existsSync()) return file;
+  }
+  throw StateError('Tim2Tox test source was not found.');
+}
+
 void main() {
   test('failed regular accept marks pending before exact-instance cancel',
       () async {
@@ -37,7 +49,7 @@ void main() {
     expect(actions, ['cancel:7', 'cancel-error']);
   });
 
-  test('avatar auto-accept permits the 10 MiB boundary only', () {
+  test('avatar auto-accept permits the qTox 10 MiB boundary only', () {
     const cap = 10 * 1024 * 1024;
 
     expect(FfiChatService.isAvatarAutoAcceptSizeAllowed(-1), isFalse);
@@ -46,61 +58,36 @@ void main() {
     expect(FfiChatService.isAvatarAutoAcceptSizeAllowed(cap + 1), isFalse);
   });
 
-  test(
-      'file request branch cancels blocked and failed accepts by event instance',
-      () {
-    final source = File('lib/service/ffi_chat_service.dart').readAsStringSync();
-    final processing =
-        source.indexOf('[FfiChatService] Processing file_request event');
-    final start = source.lastIndexOf(
-        "else if (s.startsWith('file_request:'))", processing);
-    final end = source.indexOf("else if (s.startsWith('file_done:'))", start);
+  test('explicit avatar request branch cannot create generic file state', () {
+    final source =
+        _tim2ToxFile('lib/service/ffi_chat_service.dart').readAsStringSync();
+    final start = source.indexOf(
+      "else if (s.startsWith('avatar_request:'))",
+      source.indexOf('// Expected events via polling queue'),
+    );
+    final end = source.indexOf(
+      "else if (s.startsWith('progress_recv:'))",
+      start,
+    );
     expect(start, greaterThanOrEqualTo(0));
     expect(end, greaterThan(start));
     final branch = source.substring(start, end);
 
-    final blocked = branch.indexOf('if (senderBlocked)');
-    final avatarSizeGuard = branch.indexOf(
-        'if (isAvatarTransfer &&\n                      !FfiChatService.isAvatarAutoAcceptSizeAllowed(fileSize))');
-    final tracking = branch.indexOf('_fileReceiveProgress[');
-    expect(blocked, greaterThanOrEqualTo(0));
-    expect(avatarSizeGuard, greaterThan(blocked));
-    expect(tracking, greaterThan(avatarSizeGuard));
-    final blockedSection = branch.substring(blocked, avatarSizeGuard);
-    expect(blockedSection, contains('_cancelFileTransferBestEffort('));
-    expect(blockedSection, contains('instanceId: fileRequestInstanceId'));
-    expect(blockedSection, contains('continue;'));
-    expect(blockedSection, isNot(contains('acceptFileTransfer(')));
-    expect(blockedSection, isNot(contains('_appendHistory(')));
-    expect(blockedSection, isNot(contains('_fileRequestCtrl.add(')));
-
-    final oversizedAvatarSection =
-        branch.substring(avatarSizeGuard, tracking);
-    expect(oversizedAvatarSection,
-        contains('_cancelFileTransferBestEffort('));
-    expect(oversizedAvatarSection,
-        contains('instanceId: fileRequestInstanceId'));
-    expect(oversizedAvatarSection, contains("reason: 'avatar size limit'"));
-    expect(oversizedAvatarSection, contains('continue;'));
-    expect(oversizedAvatarSection, isNot(contains('acceptFileTransfer(')));
-    expect(oversizedAvatarSection, isNot(contains('_appendHistory(')));
-    expect(oversizedAvatarSection, isNot(contains('_fileRequestCtrl.add(')));
-
-    expect(branch, contains('_handleFileAcceptFailure('));
-    expect(branch, contains('hasPendingRow: false'));
-    expect(branch, contains('hasPendingRow: true'));
-    expect(branch, contains('instanceId: fileRequestInstanceId'));
+    expect(branch, contains('parseAvatarRequestEvent(s)'));
+    expect(branch, contains('await _handleAvatarRequest(request)'));
+    expect(branch, isNot(contains('_appendHistory(')));
+    expect(branch, isNot(contains('_fileRequestCtrl.add(')));
+    expect(branch, isNot(contains('_fileReceiveProgress[')));
   });
 
   test('manual and msgID receive paths retain and clean exact instance', () {
-    final source = File('lib/service/ffi_chat_service.dart').readAsStringSync();
+    final source =
+        _tim2ToxFile('lib/service/ffi_chat_service.dart').readAsStringSync();
 
     expect(source, contains('int? instanceId'));
-    expect(source, contains('instanceId: fileRequestInstanceId'));
-    expect(
-        source,
-        contains(
-            '_fileTransferInstanceByMsgID[msgID] = fileRequestInstanceId'));
+    expect(source, contains('instanceId: eventInstanceId'));
+    expect(source,
+        contains('_fileTransferInstanceByMsgID[msgID] = eventInstanceId'));
     expect(
         source, contains('(String?, int?, int?) getFileTransferInfoFromMsgID'));
     expect(source, contains('_fileTransferInstanceByMsgID[msgID]'));
@@ -112,12 +99,7 @@ void main() {
     expect(source, contains('void _removeFileTransferByMsgID(String msgID)'));
     expect(source, contains('_removeFileTransferByMsgID(existingMsgID)'));
     expect(source, contains('_removeFileTransferByMsgID(resolvedMsgID)'));
-    expect(source, contains('_removeFileTransferByMsgID(msgID)'));
     expect(source, contains('_fileTransferInstanceByMsgID.clear()'));
-
-    final appProvider =
-        File('../../../lib/sdk_fake/fake_msg_provider.dart').readAsStringSync();
-    expect(appProvider, contains('instanceId: req.instanceId'));
   });
 
   test('file_done parser keeps legacy uid and colon-bearing path intact', () {
@@ -142,6 +124,33 @@ void main() {
     expect(parsed?.uid, 'peer');
     expect(parsed?.fileKind, 0);
     expect(parsed?.path, '/tmp/archive:part.bin');
+  });
+
+  test('file_request parser keeps numeric instance prefix and colon tail', () {
+    final source =
+        _tim2ToxFile('lib/service/ffi_chat_service.dart').readAsStringSync();
+    final requestStart = source.indexOf(
+      "else if (s.startsWith('file_request:'))",
+      source.indexOf('// Expected events via polling queue'),
+    );
+    final requestEnd = source.indexOf(
+      "else if (s.startsWith('file_done:'))",
+      requestStart,
+    );
+    expect(requestStart, greaterThanOrEqualTo(0));
+    expect(requestEnd, greaterThan(requestStart));
+
+    final branch = source.substring(requestStart, requestEnd);
+    expect(
+      branch,
+      contains('if (parts.length >= 7 && int.tryParse(parts[1]) != null)'),
+    );
+    expect(
+        branch, contains('uidIdx = 2; // new format with instance_id first'));
+    expect(
+      branch,
+      contains("final fileName = parts.sublist(uidIdx + 4).join(':');"),
+    );
   });
 
   test('progress parser keeps legacy uid and colon-bearing path intact', () {
@@ -171,7 +180,8 @@ void main() {
   });
 
   test('file completion paths propagate the parsed exact instance', () {
-    final source = File('lib/service/ffi_chat_service.dart').readAsStringSync();
+    final source =
+        _tim2ToxFile('lib/service/ffi_chat_service.dart').readAsStringSync();
     final progressStart =
         source.indexOf("else if (s.startsWith('progress_recv:'))");
     final fileDoneStart =
@@ -212,7 +222,8 @@ void main() {
   });
 
   test('matched download progress dispatches per-instance listener once', () {
-    final source = File('lib/sdk/tim2tox_sdk_platform.dart').readAsStringSync();
+    final source =
+        _tim2ToxFile('lib/sdk/tim2tox_sdk_platform.dart').readAsStringSync();
     final listenerStart = source.indexOf('void _setupProgressListener()');
     final downloadStart = source.indexOf('// Download progress', listenerStart);
     final noTargetStart =
@@ -242,18 +253,19 @@ void main() {
   test('message and file diagnostics do not log payloads or absolute paths',
       () {
     final dartSource =
-        File('lib/service/ffi_chat_service.dart').readAsStringSync();
-    final nativeSource = File('../ffi/tim2tox_ffi.cpp').readAsStringSync();
+        _tim2ToxFile('lib/service/ffi_chat_service.dart').readAsStringSync();
+    final nativeSource =
+        _tim2ToxFile('../ffi/tim2tox_ffi.cpp').readAsStringSync();
     final managerSource =
-        File('../source/V2TIMManagerImpl.cpp').readAsStringSync();
+        _tim2ToxFile('../source/V2TIMManagerImpl.cpp').readAsStringSync();
     final platformSource =
-        File('lib/sdk/tim2tox_sdk_platform.dart').readAsStringSync();
+        _tim2ToxFile('lib/sdk/tim2tox_sdk_platform.dart').readAsStringSync();
     final compatSource =
-        File('../ffi/dart_compat_message.cpp').readAsStringSync();
+        _tim2ToxFile('../ffi/dart_compat_message.cpp').readAsStringSync();
     final groupCompatSource =
-        File('../ffi/dart_compat_group.cpp').readAsStringSync();
+        _tim2ToxFile('../ffi/dart_compat_group.cpp').readAsStringSync();
     final friendshipCompatSource =
-        File('../ffi/dart_compat_friendship.cpp').readAsStringSync();
+        _tim2ToxFile('../ffi/dart_compat_friendship.cpp').readAsStringSync();
 
     const dartLeaks = <String>[
       r'Polled file_done event (length=$n): $s',

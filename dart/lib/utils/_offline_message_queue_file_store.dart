@@ -146,6 +146,7 @@ class _OfflineMessageQueueFileStore {
       timestamp: DateTime.parse(_requiredString(raw, 'timestamp')),
       msgID: _optionalString(raw, 'msgID'),
       cloudCustomData: _optionalString(raw, 'cloudCustomData'),
+      contentKind: chatMessageContentKindFromJson(raw['contentKind']),
     );
   }
 
@@ -158,6 +159,7 @@ class _OfflineMessageQueueFileStore {
       'timestamp': item.timestamp.toIso8601String(),
       'msgID': item.msgID,
       if (item.cloudCustomData != null) 'cloudCustomData': item.cloudCustomData,
+      'contentKind': item.contentKind.name,
     };
   }
 

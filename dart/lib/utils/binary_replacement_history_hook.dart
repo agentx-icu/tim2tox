@@ -10,6 +10,7 @@ import 'package:tencent_cloud_chat_sdk/models/v2_tim_message.dart';
 import 'package:tencent_cloud_chat_sdk/enum/V2TimAdvancedMsgListener.dart';
 import 'package:tencent_cloud_chat_sdk/native_im/adapter/tim_message_manager.dart';
 import '../interfaces/logger_service.dart';
+import '../models/chat_message.dart';
 import 'message_history_persistence.dart';
 import 'message_converter.dart';
 
@@ -60,6 +61,11 @@ class BinaryReplacementHistoryHook {
   /// FFI-path copy). Drained by [updateSelfId] once selfId resolves.
   static final List<V2TimMessage> _pendingSelfIdBuffer = <V2TimMessage>[];
   static const int _maxPendingSelfIdBuffer = 1000;
+
+  /// Whether this hook currently owns persistence for advanced-listener
+  /// inbound messages. Read-only so the Platform poll path can avoid creating
+  /// a second row for the same generic custom event in hybrid integrations.
+  static bool get ownsInboundMessageHistory => _persistence != null;
 
   /// Initialize the hook with persistence service and self ID
   static void initialize(MessageHistoryPersistence persistence, String selfId,
@@ -150,23 +156,24 @@ class BinaryReplacementHistoryHook {
   /// Visible-for-tests: the current generation counter. Used by the X8
   /// regression test to assert re-init bumps the counter.
   static int get generation => _generation;
-  
+
   /// Wrap a V2TimAdvancedMsgListener to automatically save received messages
-  /// 
+  ///
   /// Returns a new listener that:
   /// 1. Calls the original listener's callbacks
   /// 2. Automatically saves received messages to persistence service
-  static V2TimAdvancedMsgListener wrapListener(V2TimAdvancedMsgListener original) {
+  static V2TimAdvancedMsgListener wrapListener(
+      V2TimAdvancedMsgListener original) {
     return _WrappedAdvancedMsgListener(original);
   }
-  
+
   /// Save a V2TimMessage to persistence (public for external use)
-  /// 
+  ///
   /// CRITICAL: For binary replacement scheme, FfiChatService already saves messages
   /// via _appendHistory when receiving/sending. This hook should only save messages
   /// that come through UIKit's listeners (onRecvNewMessage/onRecvMessageModified)
   /// and are NOT already saved by FfiChatService.
-  /// 
+  ///
   /// However, since we can't easily distinguish between messages from FfiChatService
   /// and messages from UIKit listeners, we check for duplicates before saving.
   static Future<void> saveMessage(V2TimMessage v2Msg) async {
@@ -194,8 +201,29 @@ class BinaryReplacementHistoryHook {
     // product-screenshot pipeline). Matched by exact payload signature so a
     // peer app's legitimate custom message is never dropped (see
     // [_isInternalProtocolCustom]).
-    if (_isInternalProtocolCustom(v2Msg)) {
-      return;
+    final callbackContentKind =
+        chatMessageContentKindFromLocalCustomData(v2Msg.localCustomData);
+    final protocolCandidate = v2Msg.customElem?.data ??
+        (callbackContentKind == ChatMessageContentKind.action
+            ? v2Msg.textElem?.text
+            : null);
+    final internalProtocol =
+        _decodeInternalProtocolCustomData(protocolCandidate);
+    if (internalProtocol != null) {
+      final groupId = v2Msg.groupID ?? '';
+      final payloadGroupId = internalProtocol['groupID'] ?? '';
+      final conversationId = payloadGroupId.isNotEmpty
+          ? payloadGroupId
+          : (groupId.isNotEmpty ? groupId : (v2Msg.userID ?? ''));
+      final callbackSender = v2Msg.sender ?? v2Msg.userID ?? '';
+      if (_shouldConsumeInternalProtocol(
+        internalProtocol,
+        callbackSender: callbackSender,
+        conversationId: conversationId,
+        history: capturedPersistence.getHistory(conversationId),
+      )) {
+        return;
+      }
     }
 
     // CR-04: selfId not yet resolved. Buffer instead of persisting with an
@@ -211,8 +239,7 @@ class BinaryReplacementHistoryHook {
       if (_pendingSelfIdBuffer.length >= _maxPendingSelfIdBuffer) {
         // Safety valve so a selfId that never resolves can't grow this
         // unbounded; drop the oldest buffered message.
-        _logFallback(
-            'BinaryReplacementHistoryHook: pending selfId buffer full '
+        _logFallback('BinaryReplacementHistoryHook: pending selfId buffer full '
             '($_maxPendingSelfIdBuffer) — dropping oldest buffered message');
         _pendingSelfIdBuffer.removeAt(0);
       }
@@ -260,15 +287,16 @@ class BinaryReplacementHistoryHook {
         if (msg.text != chatMsg.text) return false;
         if (msg.fromUserId != chatMsg.fromUserId) return false;
         if (msg.isSelf != chatMsg.isSelf) return false;
+        if (msg.contentKind != chatMsg.contentKind) return false;
         final timeDiff = chatMsg.timestamp.difference(msg.timestamp).abs();
         return timeDiff <= dedupWindow;
       });
-      
+
       if (messageExists) {
         // Message already exists, skip saving to avoid duplicate
         return;
       }
-      
+
       // X8: final generation check before touching disk. The dedup scan
       // above is sync, but `appendHistory` schedules a debounced save and
       // may not complete until well after the next event loop turn. If the
@@ -291,9 +319,8 @@ class BinaryReplacementHistoryHook {
       // save inside the try block so disk-quota / permission failures land in
       // the catch path instead of becoming silent uncaught Future errors.
       await capturedPersistence.appendHistory(conversationId, chatMsg);
-    } catch (e, st) {
-      _logFallback(
-          'BinaryReplacementHistoryHook.saveMessage failed: $e\n$st');
+    } catch (_) {
+      _logFallback('BinaryReplacementHistoryHook.saveMessage failed');
     }
   }
 
@@ -314,34 +341,110 @@ class BinaryReplacementHistoryHook {
   /// NOT filtered — they are the persistent call-record rows the chat renders.
   /// Conservative: anything unparseable, or missing a companion field, is
   /// treated as content.
-  static bool _isInternalProtocolCustom(V2TimMessage m) =>
-      isInternalProtocolCustomData(m.customElem?.data);
-
   /// Pure classifier behind [_isInternalProtocolCustom], exposed for testing.
   /// Returns true only for tim2tox's own receipt / reaction packets matched
   /// by their full emitted signature (see [_isInternalProtocolCustom] doc).
   @visibleForTesting
   static bool isInternalProtocolCustomData(String? data) {
-    if (data == null || data.isEmpty) return false;
-    final trimmed = data.trimLeft();
-    if (!trimmed.startsWith('{')) return false;
-    try {
-      final j = jsonDecode(trimmed);
-      if (j is! Map) return false;
-      final type = j['type']?.toString();
-      if (type == 'receipt') {
-        return j['receiptType'] is String && j['msgID'] is String;
-      }
-      if (type == 'reaction') {
-        return j['reactionID'] is String &&
-            j['action'] is String &&
-            j['msgID'] is String;
-      }
-      return false;
-    } catch (_) {
+    return _decodeInternalProtocolCustomData(data) != null;
+  }
+
+  @visibleForTesting
+  static bool shouldConsumeInternalProtocolCustomData({
+    required String? data,
+    required String callbackSender,
+    required String conversationId,
+    required Iterable<ChatMessage> history,
+  }) {
+    final internalProtocol = _decodeInternalProtocolCustomData(data);
+    return internalProtocol != null &&
+        _shouldConsumeInternalProtocol(
+          internalProtocol,
+          callbackSender: callbackSender,
+          conversationId: conversationId,
+          history: history,
+        );
+  }
+
+  static bool _shouldConsumeInternalProtocol(
+    Map<String, String> internalProtocol, {
+    required String callbackSender,
+    required String conversationId,
+    required Iterable<ChatMessage> history,
+  }) {
+    if (conversationId.isEmpty ||
+        callbackSender.isEmpty ||
+        callbackSender != internalProtocol['sender']) {
       return false;
     }
+    final referencedMsgId = internalProtocol['msgID']!;
+    return history.any(
+      (message) =>
+          message.msgID == referencedMsgId ||
+          message.altMsgIds.contains(referencedMsgId),
+    );
   }
+
+  static Map<String, String>? _decodeInternalProtocolCustomData(String? data) {
+    if (data == null || data.isEmpty) return null;
+    final trimmed = data.trimLeft();
+    if (!trimmed.startsWith('{')) return null;
+    try {
+      final j = jsonDecode(trimmed);
+      if (j is! Map<String, dynamic>) return null;
+      final type = j['type'];
+      if (type == 'receipt') {
+        if (j.length != 4 && j.length != 5) return null;
+        if (!j.keys.every(
+          const {'type', 'msgID', 'receiptType', 'sender', 'groupID'}.contains,
+        )) {
+          return null;
+        }
+        final receiptType = j['receiptType'];
+        if (receiptType != 'received' && receiptType != 'read') return null;
+        if (!_hasNonEmptyString(j, 'msgID') ||
+            !_hasNonEmptyString(j, 'sender') ||
+            !_hasOptionalNonEmptyString(j, 'groupID')) {
+          return null;
+        }
+        return j.map((key, value) => MapEntry(key, value as String));
+      }
+      if (type == 'reaction') {
+        if (j.length != 5 && j.length != 6) return null;
+        if (!j.keys.every(
+          const {
+            'type',
+            'msgID',
+            'reactionID',
+            'action',
+            'sender',
+            'groupID',
+          }.contains,
+        )) {
+          return null;
+        }
+        final action = j['action'];
+        if (action != 'add' && action != 'remove') return null;
+        if (!_hasNonEmptyString(j, 'msgID') ||
+            !_hasNonEmptyString(j, 'reactionID') ||
+            !_hasNonEmptyString(j, 'sender') ||
+            !_hasOptionalNonEmptyString(j, 'groupID')) {
+          return null;
+        }
+        return j.map((key, value) => MapEntry(key, value as String));
+      }
+      return null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  static bool _hasNonEmptyString(Map<String, dynamic> data, String key) =>
+      data[key] is String && (data[key] as String).isNotEmpty;
+
+  static bool _hasOptionalNonEmptyString(
+          Map<String, dynamic> data, String key) =>
+      !data.containsKey(key) || _hasNonEmptyString(data, key);
 
   /// Route a log line through the injected [LoggerService] when available,
   /// falling back to stderr so failures still surface in test consoles and
@@ -360,30 +463,34 @@ class BinaryReplacementHistoryHook {
 /// Wrapped V2TimAdvancedMsgListener that automatically saves messages
 class _WrappedAdvancedMsgListener extends V2TimAdvancedMsgListener {
   final V2TimAdvancedMsgListener original;
-  
-  _WrappedAdvancedMsgListener(this.original) : super(
-    onRecvNewMessage: (V2TimMessage message) {
-      // Save message to persistence before calling original callback
-      BinaryReplacementHistoryHook.saveMessage(message);
-      // Call original callback
-      original.onRecvNewMessage(message);
-    },
-    onRecvMessageModified: (V2TimMessage message) {
-      // CRITICAL: Also save modified messages (e.g., sent messages that change from pending to sent)
-      // This ensures sent messages are persisted even if they're notified via onRecvMessageModified
-      BinaryReplacementHistoryHook.saveMessage(message);
-      // Call original callback
-      original.onRecvMessageModified(message);
-    },
-    onSendMessageProgress: original.onSendMessageProgress,
-    onRecvC2CReadReceipt: original.onRecvC2CReadReceipt,
-    onRecvMessageRevoked: original.onRecvMessageRevoked,
-    onRecvMessageReadReceipts: original.onRecvMessageReadReceipts,
-    onRecvMessageExtensionsChanged: original.onRecvMessageExtensionsChanged,
-    onRecvMessageExtensionsDeleted: original.onRecvMessageExtensionsDeleted,
-    onMessageDownloadProgressCallback: original.onMessageDownloadProgressCallback,
-    onRecvMessageReactionsChanged: original.onRecvMessageReactionsChanged,
-    onRecvMessageRevokedWithInfo: original.onRecvMessageRevokedWithInfo,
-    onGroupMessagePinned: original.onGroupMessagePinned,
-  );
+
+  _WrappedAdvancedMsgListener(this.original)
+      : super(
+          onRecvNewMessage: (V2TimMessage message) {
+            // Save message to persistence before calling original callback
+            BinaryReplacementHistoryHook.saveMessage(message);
+            // Call original callback
+            original.onRecvNewMessage(message);
+          },
+          onRecvMessageModified: (V2TimMessage message) {
+            // CRITICAL: Also save modified messages (e.g., sent messages that change from pending to sent)
+            // This ensures sent messages are persisted even if they're notified via onRecvMessageModified
+            BinaryReplacementHistoryHook.saveMessage(message);
+            // Call original callback
+            original.onRecvMessageModified(message);
+          },
+          onSendMessageProgress: original.onSendMessageProgress,
+          onRecvC2CReadReceipt: original.onRecvC2CReadReceipt,
+          onRecvMessageRevoked: original.onRecvMessageRevoked,
+          onRecvMessageReadReceipts: original.onRecvMessageReadReceipts,
+          onRecvMessageExtensionsChanged:
+              original.onRecvMessageExtensionsChanged,
+          onRecvMessageExtensionsDeleted:
+              original.onRecvMessageExtensionsDeleted,
+          onMessageDownloadProgressCallback:
+              original.onMessageDownloadProgressCallback,
+          onRecvMessageReactionsChanged: original.onRecvMessageReactionsChanged,
+          onRecvMessageRevokedWithInfo: original.onRecvMessageRevokedWithInfo,
+          onGroupMessagePinned: original.onGroupMessagePinned,
+        );
 }

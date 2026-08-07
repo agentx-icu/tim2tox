@@ -1,4 +1,66 @@
+import 'dart:convert';
 import 'dart:io';
+
+/// User-visible message transport semantics.
+enum ChatMessageContentKind { normal, action, custom }
+
+const String tim2ToxContentKindLocalCustomDataKey = 'tim2toxContentKind';
+
+ChatMessageContentKind chatMessageContentKindFromJson(Object? value) {
+  if (value == ChatMessageContentKind.action.name) {
+    return ChatMessageContentKind.action;
+  }
+  if (value == ChatMessageContentKind.custom.name) {
+    return ChatMessageContentKind.custom;
+  }
+  return ChatMessageContentKind.normal;
+}
+
+ChatMessageContentKind chatMessageContentKindFromLocalCustomData(String? data) {
+  if (data == null || data.isEmpty) return ChatMessageContentKind.normal;
+  try {
+    final decoded = jsonDecode(data);
+    if (decoded is Map<String, dynamic>) {
+      return chatMessageContentKindFromJson(
+        decoded[tim2ToxContentKindLocalCustomDataKey],
+      );
+    }
+  } on FormatException {
+    // Unknown local metadata is not an ACTION marker.
+  }
+  return ChatMessageContentKind.normal;
+}
+
+String mergeChatMessageContentKindLocalCustomData(
+  String? data,
+  ChatMessageContentKind contentKind,
+) {
+  if (contentKind == ChatMessageContentKind.normal) return data ?? '';
+  final merged = <String, dynamic>{};
+  if (data != null && data.isNotEmpty) {
+    try {
+      final decoded = jsonDecode(data);
+      if (decoded is Map<String, dynamic>) merged.addAll(decoded);
+    } on FormatException {
+      // V2TIM localCustomData is conventionally JSON. An opaque legacy value
+      // cannot be merged safely, so the typed marker takes precedence.
+    }
+  }
+  merged[tim2ToxContentKindLocalCustomDataKey] = contentKind.name;
+  return jsonEncode(merged);
+}
+
+({String text, ChatMessageContentKind contentKind}) parseOutgoingChatText(
+  String text,
+) {
+  if (text.length >= 4 && text.substring(0, 4).toLowerCase() == '/me ') {
+    return (
+      text: text.substring(4),
+      contentKind: ChatMessageContentKind.action,
+    );
+  }
+  return (text: text, contentKind: ChatMessageContentKind.normal);
+}
 
 /// Chat message model
 class ChatMessage {
@@ -21,6 +83,8 @@ class ChatMessage {
     this.fileHash, // SHA256 hash of file content (optional)
     this.altMsgIds = const [], // ids of cross-path duplicates absorbed here
     this.cloudCustomData, // structured reply/forward metadata (JSON string)
+    this.contentKind = ChatMessageContentKind.normal,
+    this.sourceInstanceId,
   });
 
   final String text;
@@ -62,6 +126,14 @@ class ChatMessage {
   /// wire-format change (out of scope). Null for plain messages.
   final String? cloudCustomData;
 
+  final ChatMessageContentKind contentKind;
+
+  /// Polling instance that produced this live event.
+  ///
+  /// This is dispatch-only metadata and is deliberately omitted from JSON so
+  /// persisted history remains instance-agnostic.
+  final int? sourceInstanceId;
+
   // New fields for enhanced data integrity
   final int version; // Message format version
   final int? fileSize; // File size in bytes
@@ -77,6 +149,7 @@ class ChatMessage {
         'filePath': filePath,
         'fileName': fileName,
         'mediaKind': mediaKind,
+        'contentKind': contentKind.name,
         'isPending': isPending,
         'isReceived': isReceived,
         'isRead': isRead,
@@ -100,6 +173,7 @@ class ChatMessage {
         filePath: json['filePath'] as String?,
         fileName: json['fileName'] as String?,
         mediaKind: json['mediaKind'] as String?,
+        contentKind: chatMessageContentKindFromJson(json['contentKind']),
         isPending: json['isPending'] as bool? ?? false,
         isReceived: json['isReceived'] as bool? ?? false,
         isRead: json['isRead'] as bool? ?? false,
@@ -128,6 +202,8 @@ class ChatMessage {
     String? fileHash,
     List<String>? altMsgIds,
     String? cloudCustomData,
+    ChatMessageContentKind? contentKind,
+    int? sourceInstanceId,
   }) {
     return ChatMessage(
       text: text,
@@ -148,6 +224,8 @@ class ChatMessage {
       fileHash: fileHash ?? this.fileHash,
       altMsgIds: altMsgIds ?? this.altMsgIds,
       cloudCustomData: cloudCustomData ?? this.cloudCustomData,
+      contentKind: contentKind ?? this.contentKind,
+      sourceInstanceId: sourceInstanceId ?? this.sourceInstanceId,
     );
   }
 

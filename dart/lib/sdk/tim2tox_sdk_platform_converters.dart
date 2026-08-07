@@ -118,12 +118,13 @@ extension Tim2ToxSdkPlatformConverters on Tim2ToxSdkPlatform {
   }) {
     // First, check for merger message or reply message in text (only for text messages)
     bool isTextMessage = chatMsg.mediaKind == null || chatMsg.mediaKind == '';
-    final controlEnvelope = isTextMessage
-        ? parseTextControlEnvelope(chatMsg.text)
-        : const PlainTextEnvelope('');
+    final controlEnvelope =
+        isTextMessage && chatMsg.contentKind == ChatMessageContentKind.normal
+            ? parseTextControlEnvelope(chatMsg.text)
+            : const PlainTextEnvelope('');
 
     // Check for merger message first (priority)
-    if (isTextMessage) {
+    if (isTextMessage && chatMsg.contentKind == ChatMessageContentKind.normal) {
       final mergerResult = parseMergerMessage(chatMsg.text);
       if (mergerResult.hasMerger) {
         try {
@@ -258,7 +259,8 @@ extension Tim2ToxSdkPlatformConverters on Tim2ToxSdkPlatform {
       elemType = MessageElemType.V2TIM_ELEM_TYPE_SOUND;
     } else if (chatMsg.mediaKind == 'file') {
       elemType = MessageElemType.V2TIM_ELEM_TYPE_FILE;
-    } else if (chatMsg.mediaKind == 'custom') {
+    } else if (chatMsg.mediaKind == 'custom' ||
+        chatMsg.contentKind == ChatMessageContentKind.custom) {
       elemType = MessageElemType.V2TIM_ELEM_TYPE_CUSTOM;
     }
 
@@ -469,6 +471,12 @@ extension Tim2ToxSdkPlatformConverters on Tim2ToxSdkPlatform {
     if (chatMsg.cloudCustomData != null &&
         chatMsg.cloudCustomData!.isNotEmpty) {
       msg.cloudCustomData = chatMsg.cloudCustomData;
+    }
+    if (chatMsg.contentKind == ChatMessageContentKind.action) {
+      msg.localCustomData = mergeChatMessageContentKindLocalCustomData(
+        msg.localCustomData,
+        ChatMessageContentKind.action,
+      );
     }
 
     return msg;

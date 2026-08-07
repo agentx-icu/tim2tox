@@ -2,12 +2,14 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter_test/flutter_test.dart';
+import 'package:tim2tox_dart/models/chat_message.dart';
 import 'package:tim2tox_dart/utils/offline_message_queue_persistence.dart';
 
 OfflineMessageItem textItem(
   String text, {
   required String id,
   String? cloudCustomData,
+  ChatMessageContentKind contentKind = ChatMessageContentKind.normal,
 }) {
   return (
     kind: 'text',
@@ -17,6 +19,7 @@ OfflineMessageItem textItem(
     timestamp: DateTime.utc(2026, 1, 1, 12, 0, int.parse(id.substring(1))),
     msgID: id,
     cloudCustomData: cloudCustomData,
+    contentKind: contentKind,
   );
 }
 
@@ -26,6 +29,7 @@ Map<String, Object?> itemJson(
   String? kind = 'text',
   String? filePath,
   String? cloudCustomData,
+  String? contentKind,
 }) {
   return {
     if (kind != null) 'kind': kind,
@@ -35,6 +39,7 @@ Map<String, Object?> itemJson(
     'timestamp': _timestampForId(id).toIso8601String(),
     'msgID': id,
     if (cloudCustomData != null) 'cloudCustomData': cloudCustomData,
+    if (contentKind != null) 'contentKind': contentKind,
   };
 }
 
@@ -182,6 +187,39 @@ void main() {
       final queue = await restarted.loadQueue();
 
       expect(queue['peer'], [first, second]);
+    });
+
+    test('ACTION content kind survives restart while unknown values are normal',
+        () async {
+      final action = textItem(
+        'waves',
+        id: 'm1',
+        contentKind: ChatMessageContentKind.action,
+      );
+      await persistence.addMessage('peer', action);
+
+      final restarted = OfflineMessageQueuePersistence(
+        queueFilePath: queueFile.path,
+      );
+      final queue = await restarted.loadQueue();
+      expect(queue['peer']?.single.contentKind, ChatMessageContentKind.action);
+      expect(
+          readStoredItems(queueFile, 'peer').single,
+          containsPair(
+            'contentKind',
+            'action',
+          ));
+
+      await writeRawQueue(queueFile, {
+        'peer': <Object?>[
+          itemJson('future', id: 'm2', contentKind: 'future-value'),
+        ],
+      });
+      final unknown = await OfflineMessageQueuePersistence(
+        queueFilePath: queueFile.path,
+      ).loadQueue();
+      expect(
+          unknown['peer']?.single.contentKind, ChatMessageContentKind.normal);
     });
 
     test('successful drain removal persists exactly the removed item',

@@ -122,6 +122,8 @@ class MessageConverter {
       isRead: isRead,
       msgID: v2Msg.msgID,
       cloudCustomData: v2Msg.cloudCustomData,
+      contentKind:
+          chatMessageContentKindFromLocalCustomData(v2Msg.localCustomData),
     );
   }
 }

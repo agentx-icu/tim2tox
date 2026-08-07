@@ -3,7 +3,7 @@
 /// Manages ToxAV lifecycle and audio/video frame processing.
 ///
 /// Threading & FFI safety:
-/// - The four receive-side trampolines are invoked from native code via
+/// - The receive-side trampolines are invoked from native code via
 ///   `Dart_PostCObject_DL` and execute on the Dart isolate that owns the
 ///   FFI library handle. Frame buffers (`pcm`, `y`, `u`, `v`) are owned by
 ///   c-toxcore and MUST NOT be retained past the synchronous trampoline
@@ -34,6 +34,14 @@ typedef AudioReceiveCallback = void Function(int friendNumber, List<int> pcm,
     int sampleCount, int channels, int samplingRate);
 typedef VideoReceiveCallback = void Function(int friendNumber, int width,
     int height, List<int> y, List<int> u, List<int> v);
+typedef ConferenceAudioReceiveCallback = void Function(
+    String groupId,
+    int conferenceNumber,
+    int peerNumber,
+    List<int> pcm,
+    int samples,
+    int channels,
+    int sampleRate);
 
 /// Peer-suggested audio bit rate change (toxav_audio_bit_rate_cb).
 /// `audioBitRate` is in kbit/sec; 0 means the peer disabled audio.
@@ -84,6 +92,16 @@ typedef _AvVideoBitrateChangedCallbackNative = ffi.Void Function(
   ffi.Uint32, // video_bit_rate
   ffi.Pointer<ffi.Void>, // user_data
 );
+typedef _AvConferenceAudioReceiveCallbackNative = ffi.Void Function(
+  ffi.Pointer<pkgffi.Utf8>, // group_id
+  ffi.Uint32, // conference_number
+  ffi.Uint32, // peer_number
+  ffi.Pointer<ffi.Int16>, // pcm
+  ffi.Size, // sample_count
+  ffi.Uint8, // channels
+  ffi.Uint32, // sampling_rate
+  ffi.Pointer<ffi.Void>, // user_data
+);
 
 /// ToxAV Service for managing audio/video calls
 class ToxAVService implements CallAvBackend {
@@ -118,6 +136,9 @@ class ToxAVService implements CallAvBackend {
   VideoReceiveCallback? _onVideoReceive;
   AudioBitrateChangedCallback? _onAudioBitrateChanged;
   VideoBitrateChangedCallback? _onVideoBitrateChanged;
+  ConferenceAudioReceiveCallback? _onConferenceAudioReceive;
+  final Set<String> _enabledConferenceAudioGroups = <String>{};
+  final Set<String> _mutedConferenceAudioGroups = <String>{};
 
   ToxAVService(this._ffi, {LoggerService? logger}) : _logger = logger {
     // First-wins: only adopt this logger statically if none has been set yet.
@@ -146,6 +167,8 @@ class ToxAVService implements CallAvBackend {
     }
   }
 
+  int get _capturedInstanceId => _instanceId ?? 0;
+
   /// Dispatches AV call callback from native (posted via SendCallbackToDart from tox thread).
   static void dispatchAvCall(
       int instanceId, int friendNumber, bool audioEnabled, bool videoEnabled) {
@@ -171,7 +194,7 @@ class ToxAVService implements CallAvBackend {
     }
 
     try {
-      final result = _ffi.avInitialize(_ffi.getCurrentInstanceId());
+      final result = _ffi.avInitialize(_capturedInstanceId);
       _logger?.logDebug('[ToxAVService] initialize() FFI result: $result');
       if (result == 1) {
         _initialized = true;
@@ -195,8 +218,11 @@ class ToxAVService implements CallAvBackend {
       _logger?.logDebug('[ToxAVService] shutdown() not initialized, skipping');
       return;
     }
-    _ffi.avShutdown(_ffi.getCurrentInstanceId());
+    _ffi.avShutdown(_capturedInstanceId);
     _initialized = false;
+    _onConferenceAudioReceive = null;
+    _enabledConferenceAudioGroups.clear();
+    _mutedConferenceAudioGroups.clear();
 
     if (_instanceId != null && _instanceId! != 0) {
       _instanceServices.remove(_instanceId!);
@@ -256,8 +282,12 @@ class ToxAVService implements CallAvBackend {
         ffi.Pointer.fromFunction<_AvVideoBitrateChangedCallbackNative>(
       _onVideoBitrateNativeTrampoline,
     );
+    final onConferenceAudioReceiveNative =
+        ffi.Pointer.fromFunction<_AvConferenceAudioReceiveCallbackNative>(
+      _onConferenceAudioReceiveNativeTrampoline,
+    );
 
-    final instanceIdForFfi = _instanceId ?? _ffi.getCurrentInstanceId();
+    final instanceIdForFfi = _capturedInstanceId;
     _ffi.avSetCallCallbackNative(
         instanceIdForFfi, onCallNative.cast(), instanceIdPtr.cast());
     _ffi.avSetCallStateCallbackNative(
@@ -270,6 +300,15 @@ class ToxAVService implements CallAvBackend {
         instanceIdForFfi, onAudioBitrateNative.cast(), instanceIdPtr.cast());
     _ffi.avSetVideoBitrateCallbackNative(
         instanceIdForFfi, onVideoBitrateNative.cast(), instanceIdPtr.cast());
+    try {
+      _ffi.avConferenceSetAudioReceiveCallbackNative(instanceIdForFfi,
+          onConferenceAudioReceiveNative.cast(), instanceIdPtr.cast());
+    } on ArgumentError catch (e, st) {
+      _logger?.logError(
+          '[ToxAVService] conference audio callback binding unavailable',
+          e,
+          st);
+    }
 
     _logger?.logDebug(
         '[ToxAVService] _setupCallbacks() completed with instanceId=$instanceId');
@@ -388,6 +427,67 @@ class ToxAVService implements CallAvBackend {
     final pcmCopy = Int16List(totalSamples);
     pcmCopy.setAll(0, pcm.asTypedList(totalSamples));
     return pcmCopy;
+  }
+
+  @pragma('vm:entry-point')
+  static void _onConferenceAudioReceiveNativeTrampoline(
+    ffi.Pointer<pkgffi.Utf8> groupIdPointer,
+    int conferenceNumber,
+    int peerNumber,
+    ffi.Pointer<ffi.Int16> pcm,
+    int sampleCount,
+    int channels,
+    int samplingRate,
+    ffi.Pointer<ffi.Void> userData,
+  ) {
+    try {
+      final instanceId = _readInstanceId(userData);
+      final target = _lookupService(instanceId);
+      if (target == null ||
+          !target._initialized ||
+          target._onConferenceAudioReceive == null) {
+        return;
+      }
+      if (groupIdPointer == ffi.nullptr || pcm == ffi.nullptr) return;
+
+      final groupId = groupIdPointer.toDartString();
+      if (!ToxAVService.isValidConferenceAudioFrame(
+        groupId: groupId,
+        pcmLength: sampleCount * channels,
+        sampleCount: sampleCount,
+        channels: channels,
+        samplingRate: samplingRate,
+      )) {
+        return;
+      }
+      if (!target._enabledConferenceAudioGroups.contains(groupId) ||
+          target._mutedConferenceAudioGroups.contains(groupId)) {
+        return;
+      }
+      if (conferenceNumber < 0 || peerNumber < 0) return;
+
+      final pcmCopy = copyAudioForCallback(pcm, sampleCount, channels);
+      target._onConferenceAudioReceive!(
+        groupId,
+        conferenceNumber,
+        peerNumber,
+        pcmCopy,
+        sampleCount,
+        channels,
+        samplingRate,
+      );
+    } catch (e, st) {
+      _staticLogger?.logError(
+          '[ToxAVService] _onConferenceAudioReceiveNativeTrampoline exception',
+          e,
+          st);
+    }
+  }
+
+  /// Set conference audio receive callback
+  void setConferenceAudioReceiveCallback(
+      ConferenceAudioReceiveCallback? callback) {
+    _onConferenceAudioReceive = callback;
   }
 
   @pragma('vm:entry-point')
@@ -537,7 +637,7 @@ class ToxAVService implements CallAvBackend {
     }
 
     final result = _ffi.avStartCallNative(
-        _ffi.getCurrentInstanceId(), friendNumber, audioBitRate, videoBitRate);
+        _capturedInstanceId, friendNumber, audioBitRate, videoBitRate);
     final success = result == 1;
     if (success) {
       _logger?.log(
@@ -566,7 +666,7 @@ class ToxAVService implements CallAvBackend {
     }
 
     final result = _ffi.avAnswerCallNative(
-        _ffi.getCurrentInstanceId(), friendNumber, audioBitRate, videoBitRate);
+        _capturedInstanceId, friendNumber, audioBitRate, videoBitRate);
     final success = result == 1;
     if (success) {
       _logger?.log(
@@ -587,8 +687,7 @@ class ToxAVService implements CallAvBackend {
       return false;
     }
 
-    final result =
-        _ffi.avEndCallNative(_ffi.getCurrentInstanceId(), friendNumber);
+    final result = _ffi.avEndCallNative(_capturedInstanceId, friendNumber);
     final success = result == 1;
     if (!success) {
       _logger?.logWarning(
@@ -616,7 +715,7 @@ class ToxAVService implements CallAvBackend {
     if (!_initialized) return false;
 
     final result = _ffi.avMuteAudioNative(
-        _ffi.getCurrentInstanceId(), friendNumber, mute ? 1 : 0);
+        _capturedInstanceId, friendNumber, mute ? 1 : 0);
     return result == 1;
   }
 
@@ -626,7 +725,7 @@ class ToxAVService implements CallAvBackend {
     if (!_initialized) return false;
 
     final result = _ffi.avMuteVideoNative(
-        _ffi.getCurrentInstanceId(), friendNumber, hide ? 1 : 0);
+        _capturedInstanceId, friendNumber, hide ? 1 : 0);
     return result == 1;
   }
 
@@ -645,12 +744,114 @@ class ToxAVService implements CallAvBackend {
         pcmPtr[i] = pcm[i];
       }
 
-      final result = _ffi.avSendAudioFrameNative(_ffi.getCurrentInstanceId(),
+      final result = _ffi.avSendAudioFrameNative(_capturedInstanceId,
           friendNumber, pcmPtr, sampleCount, channels, samplingRate);
       return result == 1;
     } finally {
       pkgffi.malloc.free(pcmPtr);
     }
+  }
+
+  Future<bool> sendConferenceAudioFrame(String groupId, List<int> pcm,
+      int sampleCount, int channels, int samplingRate) async {
+    if (!ToxAVService.isValidConferenceAudioFrame(
+      groupId: groupId,
+      pcmLength: pcm.length,
+      sampleCount: sampleCount,
+      channels: channels,
+      samplingRate: samplingRate,
+    )) {
+      return false;
+    }
+    if (!_initialized || !_enabledConferenceAudioGroups.contains(groupId)) {
+      return false;
+    }
+
+    final pcmPtr = pkgffi.malloc<ffi.Int16>(pcm.length);
+    try {
+      for (int i = 0; i < pcm.length; i++) {
+        pcmPtr[i] = pcm[i];
+      }
+
+      final result = _ffi.avConferenceSendAudioFrame(
+        _capturedInstanceId,
+        groupId,
+        pcmPtr,
+        sampleCount,
+        channels,
+        samplingRate,
+      );
+      return result == 1;
+    } on ArgumentError catch (e, st) {
+      _logger?.logError(
+          '[ToxAVService] conference audio send binding unavailable', e, st);
+      return false;
+    } finally {
+      pkgffi.malloc.free(pcmPtr);
+    }
+  }
+
+  /// Enable conference audio
+  Future<bool> enableConferenceAudio(String groupId) async {
+    if (groupId.isEmpty || !_initialized) return false;
+    if (_enabledConferenceAudioGroups.contains(groupId)) return true;
+
+    try {
+      final result = _ffi.avConferenceEnable(_capturedInstanceId, groupId);
+      if (result != 1) return false;
+      _enabledConferenceAudioGroups.add(groupId);
+      return true;
+    } on ArgumentError catch (e, st) {
+      _logger?.logError(
+          '[ToxAVService] conference audio enable binding unavailable', e, st);
+      return false;
+    }
+  }
+
+  /// Disable conference audio
+  Future<bool> disableConferenceAudio(String groupId) async {
+    if (groupId.isEmpty || !_initialized) return false;
+    final wasTracked = _enabledConferenceAudioGroups.contains(groupId) ||
+        _mutedConferenceAudioGroups.contains(groupId);
+    if (!wasTracked) return true;
+
+    try {
+      final result = _ffi.avConferenceDisable(_capturedInstanceId, groupId);
+      if (result != 1) return false;
+      _enabledConferenceAudioGroups.remove(groupId);
+      _mutedConferenceAudioGroups.remove(groupId);
+      return true;
+    } on ArgumentError catch (e, st) {
+      _logger?.logError(
+          '[ToxAVService] conference audio disable binding unavailable', e, st);
+      return false;
+    }
+  }
+
+  /// Mute conference audio
+  Future<bool> muteConferenceAudio(String groupId, bool mute) async {
+    if (groupId.isEmpty || !_initialized) return false;
+    if (!_enabledConferenceAudioGroups.contains(groupId)) return true;
+    if (_mutedConferenceAudioGroups.contains(groupId) == mute) return true;
+
+    try {
+      final result = _ffi.avConferenceMute(_capturedInstanceId, groupId, mute);
+      if (result != 1) return false;
+      if (mute) {
+        _mutedConferenceAudioGroups.add(groupId);
+      } else {
+        _mutedConferenceAudioGroups.remove(groupId);
+      }
+      return true;
+    } on ArgumentError catch (e, st) {
+      _logger?.logError(
+          '[ToxAVService] conference audio mute binding unavailable', e, st);
+      return false;
+    }
+  }
+
+  bool isConferenceAudioEnabled(String groupId) {
+    return _enabledConferenceAudioGroups.contains(groupId);
   }
 
   /// Send video frame (YUV420 format)
@@ -704,7 +905,7 @@ class ToxAVService implements CallAvBackend {
       }
 
       final result = _ffi.avSendVideoFrameNative(
-        _ffi.getCurrentInstanceId(),
+        _capturedInstanceId,
         friendNumber,
         width,
         height,
@@ -728,7 +929,7 @@ class ToxAVService implements CallAvBackend {
     if (!_initialized) return false;
 
     final result = _ffi.avSetAudioBitRateNative(
-        _ffi.getCurrentInstanceId(), friendNumber, audioBitRate);
+        _capturedInstanceId, friendNumber, audioBitRate);
     return result == 1;
   }
 
@@ -737,7 +938,7 @@ class ToxAVService implements CallAvBackend {
     if (!_initialized) return false;
 
     final result = _ffi.avSetVideoBitRateNative(
-        _ffi.getCurrentInstanceId(), friendNumber, videoBitRate);
+        _capturedInstanceId, friendNumber, videoBitRate);
     return result == 1;
   }
 
@@ -771,7 +972,7 @@ class ToxAVService implements CallAvBackend {
   int getFriendConnectionStatus(int friendNumber) {
     try {
       return _ffi.getFriendConnectionStatusNative(
-          _ffi.getCurrentInstanceId(), friendNumber);
+          _capturedInstanceId, friendNumber);
     } on ArgumentError {
       return -1;
     }
@@ -786,6 +987,19 @@ class ToxAVService implements CallAvBackend {
     if (channels != 1 && channels != 2) return false;
     if (!_isSupportedAudioSampleCount(sampleCount, samplingRate)) return false;
     return sampleCount <= pcmLength ~/ channels;
+  }
+
+  static bool isValidConferenceAudioFrame({
+    required String groupId,
+    required int pcmLength,
+    required int sampleCount,
+    required int channels,
+    required int samplingRate,
+  }) {
+    if (groupId.isEmpty) return false;
+    if (channels != 1 && channels != 2) return false;
+    if (!_isSupportedAudioSampleCount(sampleCount, samplingRate)) return false;
+    return pcmLength == sampleCount * channels;
   }
 
   static bool _isSupportedAudioSampleCount(
