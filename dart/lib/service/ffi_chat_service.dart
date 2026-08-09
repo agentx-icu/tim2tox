@@ -894,12 +894,17 @@ class FfiChatService {
   /// flowed through `Prefs.addAccount(toxId: '')` and downstream string
   /// comparisons as if it were a valid identifier.
   String? getSelfToxId() {
+    final cached = _selfToxIdCache;
+    if (cached != null) return cached;
     final buf = pkgffi.malloc.allocate<ffi.Int8>(256);
     try {
       final n = _ffi.getSelfToxId(buf, 256);
       if (n <= 0) return null;
       final s = buf.cast<pkgffi.Utf8>().toDartString();
-      return s.isEmpty ? null : s;
+      if (s.isEmpty) return null;
+      // Only a WELL-FORMED address is latched — see [_selfToxIdCache].
+      if (_accountScopeToxIdPattern.hasMatch(s)) _selfToxIdCache = s;
+      return s;
     } finally {
       pkgffi.malloc.free(buf);
     }
@@ -908,6 +913,90 @@ class FfiChatService {
   static final RegExp _toxPublicKeyPattern = RegExp(r'^[0-9a-fA-F]{64}$');
   static final RegExp _fullToxIdPattern = RegExp(r'^[0-9a-fA-F]{76}$');
   static final RegExp _hexPayloadPattern = RegExp(r'^[0-9a-fA-F]+$');
+
+  /// Memoised [getSelfToxId] result.
+  ///
+  /// WHY IT IS SAFE TO CACHE: a Tox address is `public key || nospam ||
+  /// checksum`, all three derived from the profile that [init] opened and the
+  /// nospam value stored in it. This package exposes no `tox_self_set_nospam`
+  /// binding, so the address of one initialised instance is CONSTANT. The only
+  /// three events that can change the answer are [init] (a different profile
+  /// is opened on this object), [login] (a new session is established — the C++
+  /// side only publishes `GetSelfToxAddress()` from `login`, so this is also
+  /// where "no identity" flips to "identity") and [dispose] (the instance is
+  /// torn down). All three clear this field.
+  ///
+  /// WHY ONLY WELL-FORMED VALUES ARE LATCHED: `tim2tox_ffi_get_self_tox_id`
+  /// returns 0 bytes until the C++ manager has an identity, i.e. before
+  /// [login]. Caching that "no identity" answer — or a truncated/garbled one —
+  /// would pin every later prefs lookup to the wrong scope for the rest of the
+  /// session. Anything that does not match [_accountScopeToxIdPattern] is
+  /// therefore re-probed on the next call rather than latched.
+  ///
+  /// WHY IT EXISTS AT ALL: [prefsAccountScopeToxId] is consulted on per-message
+  /// (`_setFaceUrlForMsg`) and per-conversation (`_mapConv`, rebuilt every few
+  /// seconds) paths. Each uncached call is a 256-byte malloc + FFI hop + free.
+  String? _selfToxIdCache;
+
+  /// The account identity that must be handed to the `userToxId` parameter of
+  /// [ExtendedPreferencesService]'s per-account key families (blacklist,
+  /// per-peer/per-group receive options).
+  ///
+  /// **This is deliberately NOT [selfId].** [selfId] is the V2TIM login alias
+  /// (`GetLoginUser()`), which integrators pass as a constant placeholder —
+  /// toxee passes the literal `'FlutterUIKitClient'` from all three of its
+  /// login paths. Scoping persisted per-account state by that string parks
+  /// EVERY local account's mutes and blacklist in ONE shared slot that no
+  /// account-teardown path can collect. [selfId] remains correct for MESSAGE
+  /// identity (`isSelf`, `fromUserId`, msgID composition) because the SDK
+  /// stamps outbound messages with the very same value — those uses are
+  /// internally consistent and are intentionally left alone.
+  ///
+  /// `null` means "this account has no resolvable identity yet" (before
+  /// [login]). Callers must NOT substitute a fallback of their own: passing
+  /// `null` through to the `userToxId` parameter lets the host resolve its own
+  /// active account (toxee's `Prefs._recvOptScope` /
+  /// `SharedPreferencesAdapter._recvOptScope` both do exactly that, and refuse
+  /// the read/write when they cannot), whereas inventing a placeholder here is
+  /// the defect this getter exists to remove. The blacklist family is the one
+  /// exception — its key builders turn a null scope into a shared global slot —
+  /// so blacklist call sites must skip entirely on `null` instead of passing it
+  /// down.
+  String? get prefsAccountScopeToxId =>
+      accountScopeFromToxId(getSelfToxId());
+
+  /// The pure decision rule behind [prefsAccountScopeToxId], exposed so it can
+  /// be exercised without an initialised Tox instance.
+  ///
+  /// Returns [rawToxId] VERBATIM when it is a usable account scope, else null.
+  /// No case folding and no length normalisation:
+  /// `lib/util/prefs/scoped_key.dart` (toxee) documents that every producer of
+  /// these ids emits uppercase hex and that folding would orphan every existing
+  /// entry. The host records the SAME string as the account's id when it
+  /// registers the account, so byte-identity is exactly what makes the UI read
+  /// path and this write path address one slot.
+  ///
+  /// The rejection that matters: a V2TIM login alias such as
+  /// `'FlutterUIKitClient'` is NOT a Tox identity and must never become a
+  /// persistence scope.
+  static String? accountScopeFromToxId(String? rawToxId) {
+    final id = rawToxId?.trim();
+    if (id == null || id.isEmpty) return null;
+    return _accountScopeToxIdPattern.hasMatch(id) ? id : null;
+  }
+
+  /// Shapes accepted as an account scope by [prefsAccountScopeToxId].
+  ///
+  /// 76 is the normal Tox address. 64 is the degenerate form
+  /// `V2TIMManagerImpl::Login` falls back to when `ToxManager::getAddress()`
+  /// comes back short (it stores the bare public key): still a stable,
+  /// account-unique identifier whose first 16 chars — the part every scoped
+  /// key actually uses — are identical to the 76-char form's. Refusing it
+  /// would drop the blacklist entirely for that session, which is a worse
+  /// outcome than accepting a shorter but equally unique id. Anything else
+  /// (notably a login alias such as `'FlutterUIKitClient'`) is rejected.
+  static final RegExp _accountScopeToxIdPattern =
+      RegExp(r'^(?:[0-9a-fA-F]{64}|[0-9a-fA-F]{76})$');
   final StreamController<ConversationDraft> _conversationDraftChanges =
       StreamController<ConversationDraft>.broadcast();
   Future<void> _draftOperationTail = Future<void>.value();
@@ -1097,9 +1186,10 @@ class FfiChatService {
   /// S29 block/unblock: in-memory cache of blocked peer Tox IDs (normalized to
   /// 64-char) so the SYNCHRONOUS inbound paths can drop a blocked sender's
   /// message without an async Prefs read. Loaded at login from
-  /// `_prefs.getBlackList(_selfId)` (the same account-scoped key the platform's
-  /// addToBlackList writes) and refreshed by [refreshBlockedUsers] whenever the
-  /// UI / L3 mutates the blacklist. Mirrors the `_quitGroups` cache pattern.
+  /// `_prefs.getBlackList(prefsAccountScopeToxId)` (the same account-scoped key
+  /// the platform's addToBlackList writes) and refreshed by
+  /// [refreshBlockedUsers] whenever the UI / L3 mutates the blacklist. Mirrors
+  /// the `_quitGroups` cache pattern.
   /// NOTE: Tox has no network-layer block — this is a LOCAL receive-side hide.
   final Set<String> _blockedUsers = {};
   Set<String> get blockedUsers => Set.unmodifiable(_blockedUsers);
@@ -1112,11 +1202,24 @@ class FfiChatService {
   }
 
   /// Reload the blocked-user cache from persistence. Called at the end of
-  /// `login()` (selfId is known by then) and by the platform's add/delete
-  /// FromBlackList so a UI / L3 block takes effect mid-session.
+  /// `login()` (the Tox identity is known by then) and by the platform's
+  /// add/delete FromBlackList so a UI / L3 block takes effect mid-session.
+  ///
+  /// Scoped by [prefsAccountScopeToxId], NOT by [selfId]: the blacklist is
+  /// per-account state and `selfId` is the integrator's login placeholder.
+  /// A null scope means the identity is not resolvable yet — bail rather than
+  /// pass null down, because the blacklist key builders on both host impls
+  /// turn a null scope into ONE global slot shared by every local account
+  /// (`black_list` / `black_list_default`), which is the failure this scoping
+  /// exists to prevent.
   Future<void> refreshBlockedUsers() async {
-    if (_selfId.isEmpty) return;
-    final stored = await _prefs?.getBlackList(_selfId) ?? const <String>{};
+    final scope = prefsAccountScopeToxId;
+    if (scope == null) {
+      _logger?.log('[FfiChatService] refreshBlockedUsers: no Tox identity yet, '
+          'keeping the current cache');
+      return;
+    }
+    final stored = await _prefs?.getBlackList(scope) ?? const <String>{};
     _blockedUsers
       ..clear()
       ..addAll(stored.map(normalizeToxId));
@@ -1777,6 +1880,9 @@ class FfiChatService {
   }
 
   Future<void> init({String? profileDirectory}) async {
+    // A different profile may be about to be opened on this object; anything
+    // latched from a previous one is now wrong. See [_selfToxIdCache].
+    _selfToxIdCache = null;
     if (profileDirectory != null && profileDirectory.isNotEmpty) {
       final pathPtr = profileDirectory.toNativeUtf8();
       try {
@@ -2002,6 +2108,11 @@ class FfiChatService {
   }
 
   Future<void> login({required String userId, required String userSig}) async {
+    // The C++ side only publishes `GetSelfToxAddress()` from login, so this is
+    // both the point where "no identity" becomes an identity AND the point
+    // where a previously latched identity could be superseded. Clear before
+    // the call so nothing observes a stale value mid-login.
+    _selfToxIdCache = null;
     _pendingLoginCompleter =
         Completer<({int success, int code, String message})>();
     _loginNativeCallable ??=
@@ -2028,8 +2139,11 @@ class FfiChatService {
       _selfId = buf.cast<pkgffi.Utf8>().toDartString();
     }
     pkgffi.malloc.free(buf);
-    // S29: hydrate the blocked-user cache now that selfId is known (the
-    // blacklist key is account-scoped by full Tox ID). Best-effort.
+    // S29: hydrate the blocked-user cache now that the Tox identity is
+    // published (C++ `Login` sets `logged_in_user_` BEFORE it invokes the
+    // success callback we just awaited, so `prefsAccountScopeToxId` resolves
+    // here). The blacklist key is account-scoped by full Tox ID — NOT by
+    // `_selfId`, which is only the login alias. Best-effort.
     await refreshBlockedUsers();
     // Connection status will be updated via OnConnectSuccess/OnConnectFailed events
     final currentStatus = _ffi.getSelfConnectionStatus();
@@ -8990,6 +9104,10 @@ class FfiChatService {
 
     // 1. Stop new work.
     _draftDisposing = true;
+    // The Tox instance behind the latched address is going away; a service
+    // object that is re-init'ed after dispose must re-probe. See
+    // [_selfToxIdCache].
+    _selfToxIdCache = null;
     if (_globalService == this) {
       _globalService = null;
     }
