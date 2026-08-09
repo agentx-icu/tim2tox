@@ -2348,8 +2348,15 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
         _selfAvatarPathCache = await prefs.getAvatarPath();
       }
       String? path = _selfAvatarPathCache;
-      if ((path == null || path.isEmpty) && ffiService.selfId.isNotEmpty) {
-        path = await prefs.getFriendAvatarPath(ffiService.selfId);
+      if (path == null || path.isEmpty) {
+        // `getFriendAvatarPath` is keyed by a peer's TOX ID, so the lookup for
+        // "my own entry" has to use the Tox identity. Passing `selfId` here
+        // asked for `friend_avatar_path_FlutterUIKitClient`, a key nothing can
+        // ever write. Null => no identity yet => skip the fallback.
+        final selfToxId = ffiService.prefsAccountScopeToxId;
+        if (selfToxId != null) {
+          path = await prefs.getFriendAvatarPath(selfToxId);
+        }
       }
       if (path != null && path.isNotEmpty) {
         msg.faceUrl = path;
@@ -7631,8 +7638,11 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
               'setGroupReceiveMessageOpt: no preferences service available, opt not persisted',
         );
       }
-      final currentUserToxId = ffiService.selfId;
-      if (currentUserToxId.isEmpty) {
+      // Account scope = the TOX identity, not `selfId` (the login alias). See
+      // FfiChatService.prefsAccountScopeToxId: scoping by the alias parked
+      // every local account's mutes in one shared, un-collectable slot.
+      final currentUserToxId = ffiService.prefsAccountScopeToxId;
+      if (currentUserToxId == null) {
         return V2TimCallback(
           code: -1,
           desc:
@@ -8416,8 +8426,10 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
         );
       }
 
-      final currentUserToxId = ffiService.selfId;
-      if (currentUserToxId.isEmpty) {
+      // Account scope = the TOX identity, not `selfId` (the login alias). See
+      // FfiChatService.prefsAccountScopeToxId.
+      final currentUserToxId = ffiService.prefsAccountScopeToxId;
+      if (currentUserToxId == null) {
         return V2TimCallback(
           code: -1,
           desc:
@@ -8495,9 +8507,13 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
         );
       }
 
-      // Add to blacklist via preferences service, using current user's Tox ID
-      final currentUserToxId = ffiService.selfId;
-      if (currentUserToxId.isEmpty) {
+      // Add to blacklist via preferences service, using the current user's TOX
+      // ID — NOT `selfId`, which is the integrator's login alias. A null scope
+      // must abort rather than fall through: the blacklist key builders on the
+      // host turn a null/empty scope into one global slot (`black_list` /
+      // `black_list_default`) shared by every local account.
+      final currentUserToxId = ffiService.prefsAccountScopeToxId;
+      if (currentUserToxId == null) {
         return V2TimValueCallback<List<V2TimFriendOperationResult>>(
           code: -1,
           desc: 'addToBlackList failed: user not logged in (no Tox ID)',
@@ -8578,9 +8594,10 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
         );
       }
 
-      // Remove from blacklist via preferences service, using current user's Tox ID
-      final currentUserToxId = ffiService.selfId;
-      if (currentUserToxId.isEmpty) {
+      // Remove from blacklist via preferences service, using the current user's
+      // TOX ID (see addToBlackList for why a null scope must abort).
+      final currentUserToxId = ffiService.prefsAccountScopeToxId;
+      if (currentUserToxId == null) {
         return V2TimValueCallback<List<V2TimFriendOperationResult>>(
           code: -1,
           desc: 'deleteFromBlackList failed: user not logged in (no Tox ID)',
@@ -8626,9 +8643,10 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
   @override
   Future<V2TimValueCallback<List<V2TimFriendInfo>>> getBlackList() async {
     try {
-      // Get blacklist from preferences service, using current user's Tox ID
-      final currentUserToxId = ffiService.selfId;
-      if (currentUserToxId.isEmpty) {
+      // Get blacklist from preferences service, using the current user's TOX ID
+      // (see addToBlackList for why a null scope must abort).
+      final currentUserToxId = ffiService.prefsAccountScopeToxId;
+      if (currentUserToxId == null) {
         return V2TimValueCallback<List<V2TimFriendInfo>>(
           code: -1,
           desc: 'getBlackList failed: user not logged in (no Tox ID)',
@@ -9058,8 +9076,14 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
         // do-not-disturb switch reflects the saved state on reopen (Tox has no
         // native group recv-opt; see setGroupReceiveMessageOpt). 0 = receive,
         // 2 = not-notify (mute).
+        // Scope by the TOX identity, not `selfId` (the login alias) — this is
+        // the READ side of the slot `setGroupReceiveMessageOpt` writes, so the
+        // two must agree on the scope or the DND switch reads back 0. A null
+        // scope is passed THROUGH (not replaced): the host's
+        // `ExtendedPreferencesService` then resolves its own active account and
+        // returns 0 only when it has none either.
         final groupRecvOpt = await _prefs?.getGroupReceiveMessageOpt(
-                groupID, ffiService.selfId) ??
+                groupID, ffiService.prefsAccountScopeToxId) ??
             0;
         final groupInfo = V2TimGroupInfo(
           groupID: groupID,

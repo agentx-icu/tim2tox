@@ -520,11 +520,17 @@ extension Tim2ToxSdkPlatformConverters on Tim2ToxSdkPlatform {
     // group DND is persisted locally under its own key (mirrors C2C).
     {
       final prefs = preferencesService ?? ffiService.preferencesService;
+      // Scope by the TOX identity, not `selfId` — `selfId` is the V2TIM login
+      // alias the integrator supplies (toxee: the constant
+      // `'FlutterUIKitClient'`), so scoping by it made every local account read
+      // and write ONE shared mute slot. `null` is passed through deliberately:
+      // the host's ExtendedPreferencesService falls back to its own active
+      // account and returns 0 only when it cannot resolve one either. See
+      // FfiChatService.prefsAccountScopeToxId.
+      final accountScope = ffiService.prefsAccountScopeToxId;
       conv.recvOpt = (fakeConv.isGroup
-              ? await prefs?.getGroupReceiveMessageOpt(
-                  peerId, ffiService.selfId)
-              : await prefs?.getC2CReceiveMessageOpt(
-                  peerId, ffiService.selfId)) ??
+              ? await prefs?.getGroupReceiveMessageOpt(peerId, accountScope)
+              : await prefs?.getC2CReceiveMessageOpt(peerId, accountScope)) ??
           0;
     }
 
