@@ -5,6 +5,7 @@
 // helpers). Tests different message types in groups: text, custom,
 // multi-type, conference, broadcast.
 
+import 'dart:async';
 import 'package:test/test.dart';
 import 'package:tencent_cloud_chat_sdk/native_im/adapter/tim_manager.dart';
 import 'package:tencent_cloud_chat_sdk/native_im/adapter/tim_group_manager.dart';
@@ -250,6 +251,12 @@ void main() {
         await pumpTestTick(scenario,
             advanceMs: 50, iterationsPerInstance: 150);
         await pumpTestTick(scenario, advanceMs: 500, iterationsPerInstance: 1);
+        // was: every `expect` below lived INSIDE this try and the catch only
+        // printed, so a timeout executed ZERO assertions. Under RUN_VIRTUAL=1
+        // waitUntilWithVirtualPump grants only ~3.5s of real loopback time for
+        // a 30s virtual budget, so that timeout is the common Tier2 outcome and
+        // this whole test degraded to a no-op while staying green. The wait may
+        // still swallow its own timeout; the assertions now sit after it.
         try {
           await waitUntilWithVirtualPump(
             scenario,
@@ -259,18 +266,20 @@ void main() {
             advanceMs: 50,
             iterationsPerInstance: 1,
           );
-          expect(bobReceivedMessage || bobReceivedAnyMessage, isTrue);
-          if (!bobReceivedMessage) {
-            print(
-                '[GroupMessageTypes] Custom message arrived without customElem decoding, accepting fallback delivery check');
-          } else {
-            expect(
-                bob.receivedMessages
-                    .any((m) => m.customElem?.data == customData),
-                isTrue);
-          }
-        } catch (e) {
+        } on TimeoutException catch (e) {
+          // Reported by the post-wait expect below; non-timeout errors bubble.
           print('[GroupMessageTypes] Custom message delivery timeout: $e');
+        }
+        expect(bobReceivedMessage || bobReceivedAnyMessage, isTrue,
+            reason: 'Bob never received the custom group message');
+        if (!bobReceivedMessage) {
+          print(
+              '[GroupMessageTypes] Custom message arrived without customElem decoding, accepting fallback delivery check');
+        } else {
+          expect(
+              bob.receivedMessages.any((m) => m.customElem?.data == customData),
+              isTrue,
+              reason: 'customElem payload must round-trip unchanged');
         }
       } finally {
         bob.runWithInstance(() => TIMMessageManager.instance
@@ -463,6 +472,10 @@ void main() {
         await pumpTestTick(scenario,
             advanceMs: 50, iterationsPerInstance: 150);
         await pumpTestTick(scenario, advanceMs: 500, iterationsPerInstance: 1);
+        // was: the only `expect` of this test lived INSIDE the try and the
+        // catch only printed — a timeout (the common RUN_VIRTUAL=1 outcome,
+        // ~3.5s of real loopback time for a 30s virtual budget) skipped it
+        // entirely, leaving the broadcast test with zero assertions.
         try {
           await waitUntilWithVirtualPump(
             scenario,
@@ -472,12 +485,13 @@ void main() {
             advanceMs: 50,
             iterationsPerInstance: 1,
           );
-          expect(bobReceived.isNotEmpty || charlieReceived.isNotEmpty, isTrue,
-              reason:
-                  'At least one of bob/charlie should receive the broadcast custom message');
-        } catch (e) {
+        } on TimeoutException catch (e) {
+          // Reported by the post-wait expect below; non-timeout errors bubble.
           print('[GroupMessageTypes] Broadcast custom delivery timeout: $e');
         }
+        expect(bobReceived.isNotEmpty || charlieReceived.isNotEmpty, isTrue,
+            reason:
+                'At least one of bob/charlie should receive the broadcast custom message');
       } finally {
         bob.runWithInstance(() => TIMMessageManager.instance
             .removeAdvancedMsgListener(listener: bobListener));

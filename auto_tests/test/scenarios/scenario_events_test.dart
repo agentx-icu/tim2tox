@@ -23,6 +23,7 @@ import 'package:tencent_cloud_chat_sdk/enum/V2TimGroupListener.dart';
 import 'package:tencent_cloud_chat_sdk/enum/friend_type_enum.dart';
 import 'package:tencent_cloud_chat_sdk/models/v2_tim_message.dart';
 import 'package:tencent_cloud_chat_sdk/models/v2_tim_user_full_info.dart';
+import 'package:tencent_cloud_chat_sdk/tencent_cloud_chat_sdk_platform_interface.dart';
 import '../test_helper.dart';
 import '../test_fixtures.dart';
 
@@ -232,43 +233,82 @@ void main() {
     test('Conversation listener events', () async {
       final eventsReceived = <String>[];
 
-      // Set up conversation listener on bob's instance
+      // The conversation listener must live on the SENDER. C++ only notifies
+      // conversation listeners from V2TIMMessageManagerImpl::SendMessage
+      // (-> NotifyConversationChangedForConvID); the inbound path
+      // (V2TIMManagerImpl::HandleGroupMessage*/friend message) never touches
+      // the conversation manager, so a listener on the receiver can not fire
+      // for an incoming message.
+      //
+      // was: listener registered on bob (the receiver) and the only assertion
+      // was `expect(eventsReceived.length, greaterThanOrEqualTo(0))` — a List
+      // length is never negative, so this test asserted literally nothing.
       final conversationListener = V2TimConversationListener(
         onNewConversation: (conversationList) {
           eventsReceived.add('onNewConversation');
-          bob.markCallbackReceived('onNewConversation');
+          alice.markCallbackReceived('onNewConversation');
         },
         onConversationChanged: (conversationList) {
           eventsReceived.add('onConversationChanged');
-          bob.markCallbackReceived('onConversationChanged');
+          alice.markCallbackReceived('onConversationChanged');
         },
         onTotalUnreadMessageCountChanged: (totalUnreadCount) {
           eventsReceived.add('onTotalUnreadMessageCountChanged');
-          bob.markCallbackReceived('onTotalUnreadMessageCountChanged');
+          alice.markCallbackReceived('onTotalUnreadMessageCountChanged');
         },
       );
 
-      bob.runWithInstance(() => TIMConversationManager.instance
-          .addConversationListener(listener: conversationListener));
-
-      // Send a message from alice to bob to trigger conversation events (use Tox ID)
-      final messageText = 'Test message for conversation';
+      alice.clearCallbackReceived('onConversationChanged');
+      // Register on both paths, mirroring scenario_conversation_callback_test.
       await alice.runWithInstanceAsync(() async {
-        final messageResult =
-            TIMMessageManager.instance.createTextMessage(text: messageText);
-        return TIMMessageManager.instance.sendMessage(
-          groupID: null,
-          message: messageResult.messageInfo,
-          receiver: bob.getToxId(),
-          onlineUserOnly: false,
-        );
+        TIMConversationManager.instance
+            .addConversationListener(listener: conversationListener);
+        await TencentCloudChatSdkPlatform.instance
+            .addConversationListener(listener: conversationListener);
       });
 
-      // Wait for conversation events
-      await pumpTestTick(scenario, advanceMs: 2000, iterationsPerInstance: 1);
+      try {
+        // Send a message from alice to bob to trigger conversation events (use Tox ID)
+        final messageText = 'Test message for conversation';
+        final sendResult = await alice.runWithInstanceAsync(() async {
+          final messageResult =
+              TIMMessageManager.instance.createTextMessage(text: messageText);
+          return await TIMMessageManager.instance.sendMessage(
+            groupID: null,
+            message: messageResult.messageInfo,
+            receiver: bob.getToxId(),
+            onlineUserOnly: false,
+          );
+        });
+        expect(sendResult.code, equals(0));
 
-      // Verify events were received (at least one should be triggered)
-      expect(eventsReceived.length, greaterThanOrEqualTo(0));
+        // Wait for conversation events. The wait only polls (it swallows its
+        // own timeout below); the expects after it are the hard assertions.
+        try {
+          await waitUntilWithVirtualPump(
+            scenario,
+            () => eventsReceived.isNotEmpty,
+            timeout: const Duration(seconds: 30),
+            description: 'alice receives a conversation event after send',
+            advanceMs: 50,
+            iterationsPerInstance: 1,
+          );
+        } on TimeoutException catch (e) {
+          // Reported by the expects below; non-timeout errors bubble up.
+          print('[Events] Conversation event wait timed out: $e');
+        }
+
+        expect(eventsReceived, contains('onConversationChanged'),
+            reason: 'a successful C2C send must update the sender conversation '
+                'row and fire onConversationChanged; '
+                'eventsReceived=$eventsReceived');
+        expect(alice.callbackReceived['onConversationChanged'], isTrue);
+      } finally {
+        alice.runWithInstance(() => TIMConversationManager.instance
+            .removeConversationListener(listener: conversationListener));
+        await TencentCloudChatSdkPlatform.instance
+            .removeConversationListener(listener: conversationListener);
+      }
     }, timeout: const Timeout(Duration(seconds: 60)));
 
     test('Group listener events', () async {
