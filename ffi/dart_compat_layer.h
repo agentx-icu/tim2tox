@@ -10,7 +10,9 @@ extern "C" {
 #endif
 
 // Infrastructure functions
-int DartInitDartApiDL(void* data);
+// Returns intptr_t to match the binding's `ffi.IntPtr` return (and the
+// underlying Dart_InitializeApiDL). 0 = success, non-zero = failure.
+intptr_t DartInitDartApiDL(void* data);
 // Note: Dart_Port is int64_t (64-bit), not int (32-bit)
 void DartRegisterSendPort(int64_t send_port);
 void DartUnregisterSendPort(int64_t send_port);

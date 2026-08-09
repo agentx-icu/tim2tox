@@ -88,11 +88,78 @@ extern "C" {
         }
     }
     
-    // Note: Other miscellaneous functions will be added here as they are extracted from dart_compat_layer.cpp
-    // Expected functions include:
-    // - DartCheckAbility (handled by DartCallExperimentalAPI)
-    // - DartSetOfflinePushToken
-    // - Other unclassified functions
-    
+    // ============================================================================
+    // Explicit "not supported on Tox" stubs
+    // ============================================================================
+    //
+    // These four symbols are declared AND called by the patched Tencent SDK
+    // adapter, but have no meaning on a Tox P2P backend (there is no push
+    // gateway, no app-lifecycle server session, and no cloud translation /
+    // speech-to-text service). Until 2026-08-08 they were simply absent.
+    //
+    // Absence is the worst of the three options. `_lookup` in
+    // native_imsdk_bindings_generated.dart is `late final`, so nothing fails at
+    // startup: the FIRST call throws `ArgumentError: Failed to lookup symbol`
+    // out of the FFI trampoline, which is not the error shape any caller
+    // handles — the Future completes with an unexpected error type and the
+    // feature dies silently. Note toxee registers the two plugins that reach
+    // DartTranslateText / DartConvertVoiceToText (tencent_cloud_chat_text_translate
+    // and tencent_cloud_chat_sound_to_text, wired in HomePage).
+    //
+    // So: define them, and report the failure through the NORMAL async callback
+    // contract with ERR_SDK_INTERFACE_NOT_SUPPORT. Callers already handle a
+    // non-zero code + message. This follows the precedent DartCallExperimentalAPI
+    // set above ("we need to implement the function to avoid symbol lookup
+    // errors"). If any of these ever gains a real Tox-side implementation,
+    // replace the body — the ABI is already correct.
+
+    // Signature: int DartSetOfflinePushToken(Pointer<Char> json_token, Pointer<Void> user_data)
+    int DartSetOfflinePushToken(const char* json_token, void* user_data) {
+        V2TIM_LOG(kInfo, "[dart_compat] DartSetOfflinePushToken: not supported on Tox");
+        (void)json_token;
+        if (user_data) {
+            SendApiCallbackResult(user_data, V2TIMErrorCode::ERR_SDK_INTERFACE_NOT_SUPPORT,
+                                  "Offline push is not supported on the Tox backend");
+        }
+        return 0; // request accepted; outcome delivered via the callback
+    }
+
+    // Signature: int DartDoForeground(Pointer<Void> user_data)
+    int DartDoForeground(void* user_data) {
+        V2TIM_LOG(kInfo, "[dart_compat] DartDoForeground: no-op on Tox");
+        if (user_data) {
+            SendApiCallbackResult(user_data, V2TIMErrorCode::ERR_SDK_INTERFACE_NOT_SUPPORT,
+                                  "Foreground/background push state is not supported on the Tox backend");
+        }
+        return 0;
+    }
+
+    // Signature: int DartTranslateText(Pointer<Char> json_texts, Pointer<Char> source_language,
+    //                                  Pointer<Char> target_language, Pointer<Void> user_data)
+    int DartTranslateText(const char* json_texts, const char* source_language,
+                          const char* target_language, void* user_data) {
+        V2TIM_LOG(kInfo, "[dart_compat] DartTranslateText: not supported on Tox");
+        (void)json_texts;
+        (void)source_language;
+        (void)target_language;
+        if (user_data) {
+            SendApiCallbackResult(user_data, V2TIMErrorCode::ERR_SDK_INTERFACE_NOT_SUPPORT,
+                                  "Text translation requires a cloud service and is not available on the Tox backend");
+        }
+        return 0;
+    }
+
+    // Signature: int DartConvertVoiceToText(Pointer<Char> msg_id, Pointer<Char> language, Pointer<Void> user_data)
+    int DartConvertVoiceToText(const char* msg_id, const char* language, void* user_data) {
+        V2TIM_LOG(kInfo, "[dart_compat] DartConvertVoiceToText: not supported on Tox");
+        (void)msg_id;
+        (void)language;
+        if (user_data) {
+            SendApiCallbackResult(user_data, V2TIMErrorCode::ERR_SDK_INTERFACE_NOT_SUPPORT,
+                                  "Speech-to-text requires a cloud service and is not available on the Tox backend");
+        }
+        return 0;
+    }
+
 } // extern "C"
 

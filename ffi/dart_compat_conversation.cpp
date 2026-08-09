@@ -138,8 +138,17 @@ extern "C" {
     }
     
     // DartGetConversationListByFilter: Get conversation list by filter
-    // Signature: int DartGetConversationListByFilter(Pointer<Char> json_filter, int next_seq, int count, Pointer<Void> user_data)
-    int DartGetConversationListByFilter(const char* json_filter, int next_seq, int count, void* user_data) {
+    // Signature: int DartGetConversationListByFilter(Pointer<Char> json_filter, Uint64 next_seq, Uint32 count, Pointer<Void> user_data)
+    // ABI note: the binding declares next_seq as Uint64 and count as Uint32
+    // (native_imsdk_bindings_generated.dart). This used to be declared
+    // `int next_seq, int count`, which is the SAME width drift already fixed for
+    // DartMarkConversation below: on ARM64/x86_64 the caller passes next_seq in a
+    // 64-bit register and a 32-bit `int` param truncates it; on armeabi-v7a
+    // (a supported ABI — see tool/build_android_ffi.sh and tool/ci/build_tim2tox.sh)
+    // AAPCS puts a 64-bit argument in an even/odd register PAIR, so the
+    // declaration mismatch shifts `count` and `user_data` outright and
+    // user_data is dereferenced as garbage. Keep the widths exact.
+    int DartGetConversationListByFilter(const char* json_filter, uint64_t next_seq, uint32_t count, void* user_data) {
         if (!user_data) {
             return 1;
         }
@@ -428,8 +437,12 @@ extern "C" {
     }
     
     // DartPinConversation: Pin conversation
-    // Signature: int DartPinConversation(Pointer<Char> conv_id, TIMConvType conv_type, int is_pinned, Pointer<Void> user_data)
-    int DartPinConversation(const char* conv_id, unsigned int conv_type, int is_pinned, void* user_data) {
+    // Signature: int DartPinConversation(Pointer<Char> conv_id, TIMConvType conv_type, Bool is_pinned, Pointer<Void> user_data)
+    // ABI note: the binding declares is_pinned as ffi.Bool (ONE byte, upper bits
+    // undefined by the calling convention), not an int. Reading it as a 32-bit
+    // int meant the value depended on register/stack garbage above the low byte
+    // — "unpin" could arrive as a nonzero (true) value. Keep it `bool`.
+    int DartPinConversation(const char* conv_id, unsigned int conv_type, bool is_pinned, void* user_data) {
         V2TIM_LOG(kInfo, "[dart_compat] DartPinConversation: conv_id={}, conv_type={}, is_pinned={}",
                   conv_id ? conv_id : "null", conv_type, is_pinned);
         
@@ -652,8 +665,11 @@ extern "C" {
     }
     
     // DartCleanConversationUnreadMessageCount: Clean conversation unread message count
-    // Signature: int DartCleanConversationUnreadMessageCount(Pointer<Char> conversation_id, int64_t clean_timestamp, int64_t clean_sequence, Pointer<Void> user_data)
-    int DartCleanConversationUnreadMessageCount(const char* conversation_id, int64_t clean_timestamp, int64_t clean_sequence, void* user_data) {
+    // Signature: int DartCleanConversationUnreadMessageCount(Pointer<Char> conversation_id, Uint64 clean_timestamp, Uint64 clean_sequence, Pointer<Void> user_data)
+    // ABI note: the binding declares both as Uint64, not Int64. Same width, so
+    // this is not a frame-shift, but a negative sentinel would round-trip
+    // differently across the boundary. Keep the signedness exact.
+    int DartCleanConversationUnreadMessageCount(const char* conversation_id, uint64_t clean_timestamp, uint64_t clean_sequence, void* user_data) {
         
         if (!conversation_id || !user_data) {
             SendApiCallbackResult(user_data, ERR_INVALID_PARAMETERS, "Invalid parameters");
