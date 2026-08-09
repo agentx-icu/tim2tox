@@ -15,6 +15,119 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
+_stage_native_library_for_flutter_tests() {
+  local lib_name
+  local flutter_engine_arch
+  local artifact_platform
+  case "$(uname -s)" in
+    Darwin)
+      lib_name="libtim2tox_ffi.dylib"
+      artifact_platform="macos"
+      if [[ "$(uname -m)" == "arm64" ]]; then
+        flutter_engine_arch="darwin-arm64"
+      else
+        flutter_engine_arch="darwin-x64"
+      fi
+      ;;
+    Linux)
+      lib_name="libtim2tox_ffi.so"
+      artifact_platform="linux"
+      if [[ "$(uname -m)" == "aarch64" || "$(uname -m)" == "arm64" ]]; then
+        flutter_engine_arch="linux-arm64"
+      else
+        flutter_engine_arch="linux-x64"
+      fi
+      ;;
+    MINGW*|MSYS*|CYGWIN*)
+      lib_name="tim2tox_ffi.dll"
+      artifact_platform="windows"
+      flutter_engine_arch="windows-x64"
+      ;;
+    *)
+      echo "Unsupported host OS for native library staging: $(uname -s)" >&2
+      return 1
+      ;;
+  esac
+
+  local source=""
+  local candidate
+  local artifact_candidates=("$SCRIPT_DIR/../build/ffi/$lib_name")
+  case "$artifact_platform" in
+    macos)
+      artifact_candidates+=(
+        "$SCRIPT_DIR/../build/ci-macos/ffi/$lib_name"
+        "$SCRIPT_DIR/../../build/native-artifacts/macos/$lib_name"
+      )
+      ;;
+    linux)
+      artifact_candidates+=(
+        "$SCRIPT_DIR/../build/ci-linux/ffi/$lib_name"
+        "$SCRIPT_DIR/../../build/native-artifacts/linux/$lib_name"
+      )
+      ;;
+    windows)
+      artifact_candidates+=(
+        "$SCRIPT_DIR/../build/ci-windows/ffi/Release/$lib_name"
+        "$SCRIPT_DIR/../build/ci-windows/ffi/$lib_name"
+        "$SCRIPT_DIR/../../build/native-artifacts/windows/$lib_name"
+      )
+      ;;
+  esac
+  for candidate in "${artifact_candidates[@]}"; do
+    if [[ -f "$candidate" ]]; then
+      source="$candidate"
+      break
+    fi
+  done
+  if [[ -z "$source" ]]; then
+    echo "Native library not found; build Tim2Tox before running auto_tests:" >&2
+    for candidate in "${artifact_candidates[@]}"; do
+      echo "  $candidate" >&2
+    done
+    return 1
+  fi
+
+  local flutter_exe
+  flutter_exe="$(command -v flutter || true)"
+  if [[ -z "$flutter_exe" ]]; then
+    echo "Flutter executable not found on PATH" >&2
+    return 1
+  fi
+  local flutter_bin_dir="$(dirname "$flutter_exe")"
+  local flutter_engine_dir=""
+  local engine_candidate
+  local engine_binary
+  local engine_candidates=(
+    "$flutter_bin_dir/cache/artifacts/engine/$flutter_engine_arch"
+  )
+  if [[ "$artifact_platform" == "macos" ]]; then
+    engine_candidates+=(
+      "$flutter_bin_dir/cache/artifacts/engine/darwin-x64"
+      "$flutter_bin_dir/cache/artifacts/engine/darwin-arm64"
+    )
+  elif [[ "$artifact_platform" == "linux" ]]; then
+    engine_candidates+=(
+      "$flutter_bin_dir/cache/artifacts/engine/linux-x64"
+      "$flutter_bin_dir/cache/artifacts/engine/linux-arm64"
+    )
+  fi
+  for engine_candidate in "${engine_candidates[@]}"; do
+    for engine_binary in flutter_tester flutter_tester.exe; do
+      if [[ -f "$engine_candidate/$engine_binary" ]]; then
+        flutter_engine_dir="$engine_candidate"
+        break 2
+      fi
+    done
+  done
+  if [[ -z "$flutter_engine_dir" ]]; then
+    echo "Flutter engine directory not found under $flutter_bin_dir/cache/artifacts/engine" >&2
+    return 1
+  fi
+
+  ln -sfn "$source" "$flutter_engine_dir/$lib_name"
+  echo "Staged $lib_name for flutter_tester: $flutter_engine_dir/$lib_name -> $source"
+}
+
 # Colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -363,6 +476,8 @@ if [ "$ASSERTION_GUARD" = "1" ]; then
   fi
 fi
 
+_stage_native_library_for_flutter_tests
+
 # Install dependencies.
 # Skip `flutter pub get` when .dart_tool/package_config.json is newer than
 # pubspec.yaml — saves ~5–15s per run. Force a refresh with SKIP_PUB_GET=0.
@@ -375,13 +490,17 @@ else
   echo -e "${YELLOW}Dependencies appear up to date (skipping flutter pub get; set SKIP_PUB_GET=0 to force).${NC}"
 fi
 
-# Test files organized by complexity/dependencies (73 scenario + 3 binary + 1 unit)
+# Test files organized by complexity/dependencies (75 scenario + 5 binary + 8 unit).
+# INVARIANT: every *_test.dart under test/scenarios, test/scenarios_binary and
+# test/unit_tests MUST appear in exactly one array below, or it silently never
+# runs in ANY tier. Six files were orphaned this way until 2026-08-08.
 PHASE1_BASIC=(
   "test/scenarios/scenario_sdk_init_test.dart"
   "test/scenarios/scenario_login_test.dart"
   "test/scenarios/scenario_self_query_test.dart"
   "test/scenarios/scenario_save_load_test.dart"
   "test/scenarios/scenario_multi_instance_test.dart"
+  "test/scenarios/scenario_virtual_clock_smoke_test.dart"
 )
 
 PHASE2_FRIENDSHIP=(
@@ -447,6 +566,7 @@ PHASE8_FILE=(
   "test/scenarios/scenario_file_transfer_test.dart"
   "test/scenarios/scenario_file_cancel_test.dart"
   "test/scenarios/scenario_file_seek_test.dart"
+  "test/scenarios/scenario_qtox_avatar_wire_contract_test.dart"
 )
 
 # Conference (audio/video conference, distinct from group)
@@ -460,6 +580,7 @@ PHASE9_CONFERENCE=(
   "test/scenarios/scenario_conference_invite_merge_test.dart"
   "test/scenarios/scenario_conference_peer_nick_test.dart"
   "test/scenarios/scenario_conference_query_test.dart"
+  "test/scenarios/scenario_qtox_legacy_conference_pcm_test.dart"
 )
 
 # Group extended (additional group scenarios not in core PHASE4)
@@ -500,6 +621,10 @@ PHASE13_BINARY_REPLACEMENT=(
   "test/scenarios_binary/scenario_native_callback_dispatch_test.dart"
   "test/scenarios_binary/scenario_custom_callback_handler_test.dart"
   "test/scenarios_binary/scenario_binary_friend_refuse_test.dart"
+  # CR-01/CR-04: BinaryReplacementHistoryHook uninstall generation + selfId
+  # replay. This is the arbiter for the "both paths must not double-write
+  # history / double-fire callbacks" invariant in CLAUDE.md.
+  "test/scenarios_binary/scenario_binary_history_hook_test.dart"
 )
 
 PHASE14_UNIT=(
@@ -511,6 +636,13 @@ PHASE14_UNIT=(
   "test/unit_tests/qtox_action_and_splitting_state_test.dart"
   "test/unit_tests/ffi_chat_service_c2c_binary_event_test.dart"
   "test/unit_tests/message_history_persistence_test.dart"
+  # CR-05/CR-06/CR-07 + S17/S18 cloudCustomData reply persistence + the
+  # cross-path history de-duplication invariant. 19 tests, pure Dart.
+  # tryBootstrapNode input validation (empty host, embedded newline, port 0 /
+  # 65536, non-hex pubkey) + "a bootstrap attempt must not mutate preferences".
+  "test/unit_tests/ffi_chat_service_bootstrap_test.dart"
+  "test/unit_tests/ffi_chat_service_avatar_sync_test.dart"
+  "test/unit_tests/ffi_chat_service_avatar_detection_test.dart"
 )
 
 # Initialize counters
