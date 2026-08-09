@@ -587,6 +587,7 @@ void main() {
           ? bob.getToxId().substring(0, 64)
           : bob.getToxId();
       var inviteArrived = false;
+      Object? inviteError;
       for (var attempt = 0; !inviteArrived && attempt < 3; attempt++) {
         bob.clearCallbackReceived('onGroupInvited');
         final groupInvResult = await alice.runWithInstanceAsync(
@@ -606,18 +607,23 @@ void main() {
             iterationsPerInstance: 1,
           );
           inviteArrived = true;
-        } catch (_) {
-          // retry
+        } on TimeoutException catch (e) {
+          // Retry; the post-loop expect below is the real assertion.
+          inviteError = e;
         }
       }
-      // Group signaling invite test does not strictly require Bob to have
-      // joined the group; the original test only delayed ~2s. We mirror
-      // that by always advancing some virtual time before continuing.
+      // Settle so the pending invite -> chat_id mapping completes.
       await pumpTestTick(scenario, advanceMs: 2000, iterationsPerInstance: 1);
-      if (!inviteArrived) {
-        print(
-            '[Signaling] Bob did not observe onGroupInvited; proceeding with group signaling invite anyway (mirrors wall-clock behavior).');
-      }
+      // was: `if (!inviteArrived) print('...proceeding anyway...')` — the retry
+      // loop swallowed every timeout and the test carried on testing in-group
+      // signaling with Bob possibly never invited. Under RUN_VIRTUAL=1 that
+      // timeout is the common case (a 15s virtual budget is ~1.8s of real
+      // loopback time), so the "Add Bob to the group" setup step was
+      // unverified. The same 3-retry + post-loop-expect shape is already the
+      // house pattern (scenario_group_tcp_test / scenario_group_message_types_test).
+      expect(inviteArrived, isTrue,
+          reason: 'Bob never received onGroupInvited after 3 retries; '
+              'last error: $inviteError');
 
       // Setup Bob's signaling listener on bob's instance
       var bobReceivedGroupInvite = false;

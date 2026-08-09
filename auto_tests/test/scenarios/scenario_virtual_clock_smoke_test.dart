@@ -8,8 +8,11 @@
 //   4. pumpTestTick + advance combine into a tick loop
 //
 // Does NOT touch any wall-clock helper (establishFriendship, pumpFriendConnection,
-// configureLocalBootstrap, etc.) — those still drive real time. Migrating them
-// to virtual time is the next step.
+// configureLocalBootstrap, etc.) — those still drive real time. The *Virtual
+// helpers those migrated into now live in test_helper.dart and are exercised by
+// the mode-aware scenarios; this file stays as the harness-plumbing smoke.
+
+import 'dart:async';
 
 import 'package:test/test.dart';
 import '../test_helper.dart';
@@ -93,7 +96,12 @@ void main() {
 
     test('waitUntilWithVirtualPump times out on virtual budget', () async {
       final before = VirtualClock.nowMs;
-      expect(
+      // MUST be `await expectLater`: the callback returns a Future, so a plain
+      // `expect(..., throwsA(...))` does not await it — the rejection escapes as
+      // an unawaited async error and the assertion proves nothing. The matcher
+      // is also pinned to TimeoutException; `isA<Object>()` matched literally
+      // anything (including a plain String), so this test could not fail.
+      await expectLater(
         () => waitUntilWithVirtualPump(
           scenario,
           () => false,
@@ -101,7 +109,7 @@ void main() {
           description: 'never true',
           advanceMs: 50,
         ),
-        throwsA(isA<Object>()),
+        throwsA(isA<TimeoutException>()),
       );
       // Even after timeout fires, the virtual clock should be roughly
       // advanced by the budget (within iterate slop).

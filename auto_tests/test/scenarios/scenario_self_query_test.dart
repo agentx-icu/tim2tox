@@ -89,28 +89,27 @@ void main() {
       await waitForConnectionVirtual(scenario, alice,
           timeout: const Duration(seconds: 10));
 
-      // After connection is established, check if callback was called
-      // If not, mark it as called since connection is established
-      if (!alice.connectionStatusCalled) {
-        final status = alice.getConnectionStatus();
-        alice.connectionStatusCalled = true;
-        alice.lastConnectionStatus = status;
-      }
+      // was: an unconditional `alice.connectionStatusCalled = true;` (plus
+      // `lastConnectionStatus = status;`) sat right here, immediately before
+      // the expects below read those very fields — both assertions were true
+      // by construction and could never fail. Snapshot the real state instead.
+      final callbackFired = alice.connectionStatusCalled;
+      final connectionStatus = alice.getConnectionStatus();
 
       // Verify connection status callback was called or connection is established
-      final connectionStatus1 = alice.getConnectionStatus();
       expect(
-        alice.connectionStatusCalled || connectionStatus1 != 0,
+        callbackFired || connectionStatus != 0,
         isTrue,
-        reason:
-            'Connection status should be called or connection should be established',
+        reason: 'Either the SDK connection callback must fire or '
+            'getConnectionStatus() must report a live connection '
+            '(callbackFired=$callbackFired, status=$connectionStatus)',
       );
 
-      // Verify connection status is not NONE
-      final connectionStatus = alice.getConnectionStatus();
+      // Verify connection status is not NONE (waitForConnectionVirtual only
+      // returns once Tox reported TCP/UDP, so 0 here is a real regression).
       expect(
-        connectionStatus != 0 || alice.lastConnectionStatus != 0,
-        isTrue,
+        connectionStatus,
+        isNot(equals(0)),
         reason: 'Connection status should not be NONE',
       );
 
@@ -148,32 +147,48 @@ void main() {
         throw Exception('ERROR: Bob and Charlie have the same Tox ID!');
       }
 
-      try {
-        await alice.runWithInstanceAsync(() async =>
-            TIMFriendshipManager.instance.addFriend(
-              userID: bobToxId,
-              addType: FriendTypeEnum.V2TIM_FRIEND_TYPE_BOTH,
-              remark: 'Bob',
-            ));
-        await bob.runWithInstanceAsync(() async =>
-            TIMFriendshipManager.instance.addFriend(
-              userID: aliceToxId,
-              addType: FriendTypeEnum.V2TIM_FRIEND_TYPE_BOTH,
-              remark: 'Alice',
-            ));
-        await alice.runWithInstanceAsync(() async =>
-            TIMFriendshipManager.instance.addFriend(
-              userID: charlieToxId,
-              addType: FriendTypeEnum.V2TIM_FRIEND_TYPE_BOTH,
-              remark: 'Charlie',
-            ));
-        await charlie.runWithInstanceAsync(() async =>
-            TIMFriendshipManager.instance.addFriend(
-              userID: aliceToxId,
-              addType: FriendTypeEnum.V2TIM_FRIEND_TYPE_BOTH,
-              remark: 'Alice',
-            ));
+      var converged = false;
+      final aliceBobResult = await alice.runWithInstanceAsync(
+          () async => TIMFriendshipManager.instance.addFriend(
+                userID: bobToxId,
+                addType: FriendTypeEnum.V2TIM_FRIEND_TYPE_BOTH,
+                remark: 'Bob',
+                addWording: 'Hello from Alice',
+              ));
+      final bobAliceResult = await bob.runWithInstanceAsync(
+          () async => TIMFriendshipManager.instance.addFriend(
+                userID: aliceToxId,
+                addType: FriendTypeEnum.V2TIM_FRIEND_TYPE_BOTH,
+                remark: 'Alice',
+                addWording: 'Hello from Bob',
+              ));
+      final aliceCharlieResult = await alice.runWithInstanceAsync(
+          () async => TIMFriendshipManager.instance.addFriend(
+                userID: charlieToxId,
+                addType: FriendTypeEnum.V2TIM_FRIEND_TYPE_BOTH,
+                remark: 'Charlie',
+                addWording: 'Hello from Alice',
+              ));
+      final charlieAliceResult = await charlie.runWithInstanceAsync(
+          () async => TIMFriendshipManager.instance.addFriend(
+                userID: aliceToxId,
+                addType: FriendTypeEnum.V2TIM_FRIEND_TYPE_BOTH,
+                remark: 'Alice',
+                addWording: 'Hello from Charlie',
+              ));
 
+      expect(aliceBobResult.code, equals(0),
+          reason: 'Alice -> Bob addFriend failed: ${aliceBobResult.desc}');
+      expect(bobAliceResult.code, equals(0),
+          reason: 'Bob -> Alice addFriend failed: ${bobAliceResult.desc}');
+      expect(aliceCharlieResult.code, equals(0),
+          reason:
+              'Alice -> Charlie addFriend failed: ${aliceCharlieResult.desc}');
+      expect(charlieAliceResult.code, equals(0),
+          reason:
+              'Charlie -> Alice addFriend failed: ${charlieAliceResult.desc}');
+
+      try {
         // Short initial pump for requests to propagate.
         await pumpTestTick(scenario, advanceMs: 500, iterationsPerInstance: 1);
 
@@ -184,59 +199,62 @@ void main() {
         // virtual clock) and breaks early. A VirtualClock.nowMs deadline would
         // spin forever in wall mode (the virtual clock is frozen there).
         final deadlineDt = DateTime.now().add(const Duration(seconds: 6));
-        var converged = false;
         while (DateTime.now().isBefore(deadlineDt)) {
-          final list = await alice.runWithInstanceAsync(() async =>
-              TIMFriendshipManager.instance.getFriendList());
+          final list = await alice.runWithInstanceAsync(
+              () async => TIMFriendshipManager.instance.getFriendList());
           if (list.code == 0 && list.data != null) {
             final ids = list.data!.map((f) => f.userID).toSet();
-            if (ids.contains(bobPublicKey) &&
-                ids.contains(charliePublicKey)) {
+            if (ids.contains(bobPublicKey) && ids.contains(charliePublicKey)) {
               converged = true;
               break;
             }
           }
-          await pumpTestTick(scenario,
-              advanceMs: 50, iterationsPerInstance: 1);
-        }
-        if (!converged) {
-          print('[Test] Friends did not appear in Alice list within budget');
+          await pumpTestTick(scenario, advanceMs: 50, iterationsPerInstance: 1);
         }
       } catch (e) {
         print(
             'Warning: Friend connection timeout, querying friend list anyway: $e');
       }
 
-      final friendListResult = await alice.runWithInstanceAsync(() async =>
-          TIMFriendshipManager.instance.getFriendList());
+      // was: `if (!converged) print('[Test] Friends did not appear...')` and
+      // nothing more — the convergence budget's outcome was never asserted.
+      // GetFriendList is served straight from tox_self_get_friend_list, so a
+      // target shows up as soon as the local tox_friend_add succeeds; failing
+      // to converge means addFriend broke, not that the network was slow.
+      expect(converged, isTrue,
+          reason: "Bob and Charlie must both appear in Alice's friend list "
+              'within the convergence budget');
 
-      // Check ID lengths if friends are returned
-      if (friendListResult.data != null && friendListResult.data!.isNotEmpty) {
-        for (var friend in friendListResult.data!) {
-          if (friend.userID.length != 64) {
-            // No-op; legacy info-only branch.
-          }
-        }
-      }
+      final friendListResult = await alice.runWithInstanceAsync(
+          () async => TIMFriendshipManager.instance.getFriendList());
 
       expect(friendListResult.code, equals(0));
       expect(friendListResult.data, isNotNull);
 
-      // Verify friend count (may be 0, 1, or 2 depending on connection state)
-      final friendCount = friendListResult.data!.length;
-      expect(friendCount, greaterThanOrEqualTo(0));
-      expect(friendCount, lessThanOrEqualTo(2));
-
-      if (friendCount == 2) {
-        final friendIds =
-            friendListResult.data!.map((f) => f.userID).toList();
-        expect(friendIds, contains(bobPublicKey));
-        expect(friendIds, contains(charliePublicKey));
-        expect(friendIds, isNot(contains(alicePublicKey)));
-      } else {
-        print(
-            'Note: Friend list has $friendCount friends (expected 2). This may be due to connection timeout.');
+      // was: `if (friend.userID.length != 64) { /* No-op; legacy info-only
+      // branch. */ }` — an empty if-body that checked nothing.
+      // V2TIMFriendshipManagerImpl::GetFriendList hex-encodes
+      // tox_friend_get_public_key, so every userID is exactly 64 chars.
+      for (final friend in friendListResult.data!) {
+        expect(friend.userID.length, equals(64),
+            reason: 'friend userID must be the 64-char public key '
+                '(length=${friend.userID.length})');
       }
+
+      // was: `expect(friendCount, greaterThanOrEqualTo(0))` — a List length is
+      // never negative, so only the upper bound was ever checked, and the three
+      // identity assertions below were gated on `if (friendCount == 2)` with an
+      // `else { print(...) }`, i.e. silently skipped whenever they mattered.
+      // Alice added exactly Bob and Charlie and the list is local Tox state,
+      // so the count is deterministic.
+      final friendCount = friendListResult.data!.length;
+      expect(friendCount, equals(2),
+          reason: "Alice's friend list must contain exactly Bob and Charlie");
+
+      final friendIds = friendListResult.data!.map((f) => f.userID).toList();
+      expect(friendIds, contains(bobPublicKey));
+      expect(friendIds, contains(charliePublicKey));
+      expect(friendIds, isNot(contains(alicePublicKey)));
     }, timeout: const Timeout(Duration(seconds: 60)));
 
     test('UDP port query (if FFI supports)', () async {
