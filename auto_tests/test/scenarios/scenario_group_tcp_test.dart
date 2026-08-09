@@ -173,18 +173,30 @@ void main() {
       expect(sendGroupResult1.code, equals(0),
           reason: 'sendMessage failed: ${sendGroupResult1.code}');
 
+      // was: `catch (e) { print('Note: Group message may not have been
+      // received yet'); }` with NO assertion afterwards — under RUN_VIRTUAL=1
+      // waitUntilWithVirtualPump only grants ~3.5s of real loopback time for a
+      // 30s virtual budget, so the timeout fired routinely and the whole
+      // "Bob receives the group message" step degraded to a no-op in Tier2
+      // (send-code-only coverage). The wait may still swallow its timeout (it
+      // is just a poll loop), but the post-wait expect below is now the hard
+      // assertion.
       try {
         await waitUntilWithVirtualPump(
           scenario,
           () => groupMessageCompleter1.isCompleted,
-          timeout: const Duration(seconds: 10),
+          timeout: const Duration(seconds: 25),
           description: 'Bob receives first group message',
           advanceMs: 50,
           iterationsPerInstance: 1,
         );
-      } catch (e) {
-        print('Note: Group message may not have been received yet');
+      } on TimeoutException catch (e) {
+        // Expected only when delivery really failed; the post-wait expect
+        // reports it. A non-timeout error is a real bug and propagates.
+        print('[GroupTcp] First group message wait timed out: $e');
       }
+      expect(groupMessageCompleter1.isCompleted, isTrue,
+          reason: 'Bob never received the first group message over TCP');
 
       bob.runWithInstance(() => TIMMessageManager.instance
           .removeAdvancedMsgListener(listener: bobListener));
@@ -203,6 +215,7 @@ void main() {
 
       // Re-invite path also needs invite-retry handling.
       var reInviteReceived = false;
+      Object? reInviteError;
       for (var attempt = 0; !reInviteReceived && attempt < 3; attempt++) {
         bob.clearCallbackReceived('onGroupInvited');
         final reinviteResult = await alice.runWithInstanceAsync(() async =>
@@ -225,16 +238,24 @@ void main() {
             iterationsPerInstance: 1,
           );
           reInviteReceived = true;
-        } catch (_) {
-          // retry
+        } on TimeoutException catch (e) {
+          // Retry; the post-loop expect below is the real assertion.
+          reInviteError = e;
         }
       }
-      if (!reInviteReceived) {
-        print(
-            'Note: Re-invite onGroupInvited timed out (known TCP/re-invite delay); skipping re-join and second message.');
-      }
+      // was: `if (!reInviteReceived) print(...)` followed by
+      // `if (reInviteReceived) { ...re-join + second message... }` — i.e. the
+      // entire second half of this test was silently skipped whenever the
+      // re-invite wait timed out. Under RUN_VIRTUAL=1 that timeout is the
+      // common case (a 30s virtual budget ≈ 3.5s of real loopback time), so
+      // Tier2 exercised only the first half. Assert instead of skipping.
+      expect(reInviteReceived, isTrue,
+          reason: 'Bob never received the re-invite onGroupInvited after 3 '
+              'retries; last error: $reInviteError');
 
-      if (reInviteReceived) {
+      // Scoped block kept from the former `if (reInviteReceived)` guard; the
+      // expect above now makes the re-join + second-message path mandatory.
+      {
         await pumpTestTick(scenario, advanceMs: 500, iterationsPerInstance: 1);
         final rejoinGroupId =
             bob.getLastCallbackGroupId('onGroupInvited') ?? groupId;
@@ -282,19 +303,25 @@ void main() {
         expect(sendGroupResult2.code, equals(0),
             reason: 'sendMessage failed: ${sendGroupResult2.code}');
 
+        // was: `catch (e) { print('Note: Group message may not have been
+        // received (TCP connection delay)'); }` with no assertion — same
+        // virtual-mode no-op as the first message above.
         try {
           await waitUntilWithVirtualPump(
             scenario,
             () => groupMessageCompleter2.isCompleted,
-            timeout: const Duration(seconds: 10),
+            timeout: const Duration(seconds: 25),
             description: 'Bob receives second group message',
             advanceMs: 50,
             iterationsPerInstance: 1,
           );
-        } catch (e) {
-          print(
-              'Note: Group message may not have been received (TCP connection delay)');
+        } on TimeoutException catch (e) {
+          // Reported by the post-wait expect below; non-timeout errors bubble.
+          print('[GroupTcp] Second group message wait timed out: $e');
         }
+        expect(groupMessageCompleter2.isCompleted, isTrue,
+            reason: 'Bob never received the second group message after '
+                're-invite + re-join');
 
         bob.runWithInstance(() => TIMMessageManager.instance
             .removeAdvancedMsgListener(listener: bobListener2));

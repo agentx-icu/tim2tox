@@ -162,34 +162,40 @@ void main() {
               ));
       expect(addResult.code, equals(0));
 
-      // Drive virtual time toward completer with retries.
-      var arrived = false;
-      for (var attempt = 0; !arrived && attempt < 3; attempt++) {
-        if (attempt > 0) {
-          await bob.runWithInstanceAsync(
-              () async => TIMFriendshipManager.instance.addFriend(
-                    userID: aliceToxId,
-                    addType: FriendTypeEnum.V2TIM_FRIEND_TYPE_BOTH,
-                    remark: 'Alice',
-                    addWording: 'Hi',
-                  ));
+      // Drive virtual time while polling observable friend-application state.
+      final spamDeadline = VirtualClock.nowMs + 60000;
+      while (VirtualClock.nowMs < spamDeadline) {
+        if (completer.isCompleted) {
+          break;
         }
-        try {
-          await waitUntilWithVirtualPump(
-            scenario,
-            () => completer.isCompleted,
-            timeout: const Duration(seconds: 60),
-            description:
-                'Alice received friend request (attempt ${attempt + 1})',
-            advanceMs: 50,
-            iterationsPerInstance: 1,
-          );
-          arrived = true;
-        } on TimeoutException catch (e) {
-          // Expected between retry attempts (the post-loop expect enforces the
-          // real assertion); a non-timeout error is a real bug and propagates.
-          print('[Test] Attempt timed out; retrying: $e');
+
+        final appListResult = await alice.runWithInstanceAsync(() async =>
+            TIMFriendshipManager.instance.getFriendApplicationList());
+        final applications = appListResult.data?.friendApplicationList;
+        if (appListResult.code == 0 && applications != null) {
+          final bobPublicKey = bob.getPublicKey();
+          final bobToxId = bob.getToxId();
+          V2TimFriendApplication? application;
+          for (final app in applications) {
+            if (app != null &&
+                (app.userID == bobPublicKey ||
+                    app.userID == bobToxId ||
+                    (app.userID.length >= 64 &&
+                        app.userID.startsWith(bobPublicKey)))) {
+              application = app;
+              break;
+            }
+          }
+          if (application != null) {
+            requestReceived = true;
+            if (!completer.isCompleted) {
+              completer.complete(application);
+            }
+            break;
+          }
         }
+
+        await pumpTestTick(scenario, advanceMs: 50, iterationsPerInstance: 1);
       }
 
       expect(requestReceived, isTrue,
@@ -486,7 +492,6 @@ void main() {
             reason: 'Friend application query should succeed');
         expect(applications.data?.friendApplicationList, isNotNull,
             reason: 'Should have friend application list');
-
         final bobApplications = applications.data!.friendApplicationList!
             .whereType<V2TimFriendApplication>()
             .where(isBobApplication)

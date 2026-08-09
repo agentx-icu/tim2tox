@@ -9,6 +9,7 @@
 /// (port-ready, connection wait, friendship, message delivery) are driven
 /// through pumpTestTick / waitUntilWithVirtualPump.
 
+import 'dart:async';
 import 'package:flutter_test/flutter_test.dart';
 import '../test_helper.dart';
 import '../test_fixtures.dart';
@@ -16,6 +17,8 @@ import 'package:tim2tox_dart/ffi/tim2tox_ffi.dart' as ffi_lib;
 import 'package:ffi/ffi.dart' as pkgffi;
 import 'dart:ffi' as ffi;
 import 'package:tencent_cloud_chat_sdk/native_im/adapter/tim_message_manager.dart';
+import 'package:tencent_cloud_chat_sdk/enum/V2TimAdvancedMsgListener.dart';
+import 'package:tencent_cloud_chat_sdk/models/v2_tim_message.dart';
 
 void main() {
   group('Multi-instance Tox support', () {
@@ -254,74 +257,104 @@ void main() {
         final alice = scenario.nodes[0];
         final bob = scenario.nodes[1];
 
-        if (alice.connectionStatusCalled) {
-          expect(alice.lastConnectionStatus, greaterThan(0),
-              reason: 'Alice should have a connection status > 0 (TCP or UDP)');
-          print('[Test] Alice connection status: ${alice.lastConnectionStatus}');
-        } else {
-          print('[Test] Alice connection status not called yet');
-        }
-
-        if (bob.connectionStatusCalled) {
-          expect(bob.lastConnectionStatus, greaterThan(0),
-              reason: 'Bob should have a connection status > 0 (TCP or UDP)');
-          print('[Test] Bob connection status: ${bob.lastConnectionStatus}');
-        } else {
-          print('[Test] Bob connection status not called yet');
-        }
-
-        // Try to establish friendship and verify they can communicate
-        print('[Test] Attempting to establish friendship...');
+        // was: both expects were guarded by `if (node.connectionStatusCalled)`
+        // — a flag that ONLY scenario_self_query_test.dart ever sets (it is
+        // never set by the harness), so the guard is always false here and this
+        // test executed zero assertions about the connection it is named after.
+        // Assert the real Tox connection status instead, after a bounded wait
+        // (the Future.wait above deliberately swallows its per-node timeout).
         try {
-          await establishFriendshipVirtual(scenario, alice, bob,
-              timeout: const Duration(seconds: 30));
-          print('[Test] Friendship established');
-
-          // Try sending a message to verify connectivity (run in Alice's instance context)
-          print('[Test] Testing message delivery...');
-          final bobToxId = bob.getToxId();
-          final testMessage = 'Hello from Alice!';
-          await alice.runWithInstanceAsync(() async {
-            final messageResult = TIMMessageManager.instance
-                .createTextMessage(text: testMessage);
-            final sendResult = await TIMMessageManager.instance.sendMessage(
-              message: messageResult.messageInfo,
-              receiver: bobToxId,
-              groupID: null,
-              onlineUserOnly: false,
-            );
-            if (sendResult.code != 0) {
-              print('[Test] Message send failed: ${sendResult.desc}');
-            } else {
-              print('[Test] Message sent successfully');
-            }
-          });
-
-          // Wait for message delivery via virtual-clock pump.
           await waitUntilWithVirtualPump(
             scenario,
-            () => bob.receivedMessages
-                .any((msg) => msg.textElem?.text == testMessage),
-            timeout: const Duration(seconds: 10),
-            description: 'Bob receives test message',
+            () =>
+                alice.getConnectionStatus() > 0 &&
+                bob.getConnectionStatus() > 0,
+            timeout: const Duration(seconds: 30),
+            description: 'alice and bob report a non-NONE connection status',
             advanceMs: 50,
             iterationsPerInstance: 1,
-          ).catchError((_) {
-            // Best-effort: original test also tolerates no-receive here.
-          });
+          );
+        } on TimeoutException catch (e) {
+          // Reported by the expects below; non-timeout errors bubble up.
+          print('[Test] Connection status wait timed out: $e');
+        }
+        print('[Test] Alice connection status: ${alice.getConnectionStatus()}, '
+            'Bob connection status: ${bob.getConnectionStatus()}');
+        expect(alice.getConnectionStatus(), greaterThan(0),
+            reason:
+                'Alice should be connected (1=TCP, 2=UDP) via local bootstrap');
+        expect(bob.getConnectionStatus(), greaterThan(0),
+            reason:
+                'Bob should be connected (1=TCP, 2=UDP) via local bootstrap');
 
-          final bobReceivedMessages = bob.receivedMessages
-              .where((msg) => msg.textElem?.text == testMessage)
-              .toList();
+        // Establish friendship and verify the two instances really can
+        // exchange a message over the 127.0.0.1 bootstrap.
+        //
+        // was: the whole block below sat inside `try { ... } catch (e) {
+        // print('Could not establish friendship or send message') }`, the
+        // delivery wait ended in a no-op catchError handler, and the outcome
+        // was only printed — so nothing here was ever asserted (a no-op in
+        // BOTH modes, and guaranteed no-op under RUN_VIRTUAL=1 where the 10s
+        // virtual budget is ~1.2s of real loopback time). Worse, the old
+        // `bobReceivedMessages.isNotEmpty` check was dead code:
+        // `bob.receivedMessages` is only populated by `addReceivedMessage`,
+        // which nothing called because TestNode installs no message listener.
+        print('[Test] Attempting to establish friendship...');
+        await establishFriendshipVirtual(scenario, alice, bob,
+            timeout: const Duration(seconds: 60));
+        print('[Test] Friendship established');
 
-          if (bobReceivedMessages.isNotEmpty) {
-            print('[Test] Message successfully delivered via local bootstrap');
-          } else {
-            print('[Test] Message not received yet (may need more time)');
+        print('[Test] Testing message delivery...');
+        final bobToxId = bob.getToxId();
+        const testMessage = 'Hello from Alice!';
+        final bobListener = V2TimAdvancedMsgListener(
+          onRecvNewMessage: (V2TimMessage message) {
+            bob.addReceivedMessage(message);
+          },
+        );
+        bob.runWithInstance(() =>
+            TIMMessageManager.instance.addAdvancedMsgListener(bobListener));
+        try {
+          var delivered = false;
+          Object? lastError;
+          for (var attempt = 0; !delivered && attempt < 3; attempt++) {
+            final sendResult = await alice.runWithInstanceAsync(() async {
+              final messageResult = TIMMessageManager.instance
+                  .createTextMessage(text: testMessage);
+              return await TIMMessageManager.instance.sendMessage(
+                message: messageResult.messageInfo,
+                receiver: bobToxId,
+                groupID: null,
+                onlineUserOnly: false,
+              );
+            });
+            expect(sendResult.code, equals(0),
+                reason: 'sendMessage failed: ${sendResult.desc}');
+
+            try {
+              await waitUntilWithVirtualPump(
+                scenario,
+                () => bob.receivedMessages
+                    .any((msg) => msg.textElem?.text == testMessage),
+                timeout: const Duration(seconds: 20),
+                description:
+                    'Bob receives test message (attempt ${attempt + 1})',
+                advanceMs: 50,
+                iterationsPerInstance: 1,
+              );
+              delivered = true;
+            } on TimeoutException catch (e) {
+              // Retry; the post-loop expect below is the real assertion.
+              lastError = e;
+            }
           }
-        } catch (e) {
-          print('[Test] Could not establish friendship or send message: $e');
-          print('[Test] This may be due to Tox network connection delays');
+          expect(delivered, isTrue,
+              reason: 'Bob never received the C2C message over the local '
+                  'bootstrap after 3 send attempts; last error: $lastError');
+          print('[Test] Message successfully delivered via local bootstrap');
+        } finally {
+          bob.runWithInstance(() => TIMMessageManager.instance
+              .removeAdvancedMsgListener(listener: bobListener));
         }
 
         print('[Test] Local bootstrap configuration completed');
