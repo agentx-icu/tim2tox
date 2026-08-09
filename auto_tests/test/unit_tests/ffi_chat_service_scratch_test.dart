@@ -599,8 +599,17 @@ void main() {
       final soundStart = source.indexOf('// Sound message — send');
       final soundEnd = source.indexOf('// Video message', soundStart);
 
-      expect(soundStart, greaterThanOrEqualTo(0));
-      expect(soundEnd, greaterThan(soundStart));
+      // NOTE: this is NOT a tautology — String.indexOf returns -1 when the
+      // marker is absent, so `>= 0` really asserts that the sound-send branch
+      // still exists in tim2tox_sdk_platform.dart (the whole test is a source
+      // grep and would otherwise blow up in substring() below). Reasons added
+      // so a renamed marker fails with a diagnosis instead of "-1 >= 0".
+      expect(soundStart, greaterThanOrEqualTo(0),
+          reason: "marker '// Sound message — send' not found in "
+              'dart/lib/sdk/tim2tox_sdk_platform.dart');
+      expect(soundEnd, greaterThan(soundStart),
+          reason: "marker '// Video message' not found after the sound-send "
+              'branch in dart/lib/sdk/tim2tox_sdk_platform.dart');
       final soundBranch = source.substring(soundStart, soundEnd);
       expect(soundBranch, contains('ffiService.copyFileToScratch('));
       expect(soundBranch, contains("category: 'sound_duration'"));

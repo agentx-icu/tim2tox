@@ -47,11 +47,13 @@ void main() {
       );
     });
 
-    test('uses the inclusive qTox 65,536 byte receive limit', () {
+    test('uses the inclusive qTox 10 MiB receive limit', () {
+      const cap = 10 * 1024 * 1024;
+
       expect(FfiChatService.isAvatarAutoAcceptSizeAllowed(-1), isFalse);
       expect(FfiChatService.isAvatarAutoAcceptSizeAllowed(0), isTrue);
-      expect(FfiChatService.isAvatarAutoAcceptSizeAllowed(65536), isTrue);
-      expect(FfiChatService.isAvatarAutoAcceptSizeAllowed(65537), isFalse);
+      expect(FfiChatService.isAvatarAutoAcceptSizeAllowed(cap), isTrue);
+      expect(FfiChatService.isAvatarAutoAcceptSizeAllowed(cap + 1), isFalse);
     });
   });
 }
