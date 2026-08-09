@@ -64,8 +64,12 @@ static void InstallCrashHandlersOnce() {
 extern "C" {
     // Initialize Dart API
     // Function signature must match native_imsdk_bindings_generated.dart:
-    // int DartInitDartApiDL(Pointer<Void> data)
-    int DartInitDartApiDL(void* data) {
+    // IntPtr DartInitDartApiDL(Pointer<Void> data)
+    // ABI note: the binding declares an IntPtr (pointer-width) return, and the
+    // underlying Dart_InitializeApiDL also returns intptr_t. Declaring `int`
+    // here truncated it to 32 bits. Callers only test zero/non-zero so nothing
+    // has broken yet, but the width must match the binding.
+    intptr_t DartInitDartApiDL(void* data) {
         if (!data) {
             return 1;
         }

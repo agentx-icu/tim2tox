@@ -47,8 +47,10 @@ extern "C" {
 #endif
 
 // Initialize Dart API
-// Returns 0 on success, non-zero on failure
-int DartInitDartApiDL(void* data);
+// Returns 0 on success, non-zero on failure.
+// intptr_t (not int) to match the binding's `ffi.IntPtr` return and the
+// underlying Dart_InitializeApiDL.
+intptr_t DartInitDartApiDL(void* data);
 
 // Register Dart SendPort for receiving callbacks
 // Note: Dart_Port is int64_t (64-bit), not int (32-bit)
