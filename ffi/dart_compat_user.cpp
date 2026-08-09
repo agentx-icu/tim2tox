@@ -597,6 +597,61 @@ extern "C" {
         return 0; // TIM_SUCC (request accepted)
     }
     
+    // DartSetGroupReceiveMessageOpt: Set GROUP receive message option (mute)
+    // Signature: int DartSetGroupReceiveMessageOpt(Pointer<Char> group_id, UnsignedInt opt, Pointer<Void> user_data)
+    //
+    // This symbol was MISSING entirely until 2026-08-08 while the SDK adapter
+    // called it (tim_message_manager.dart:810 ->
+    // native_imsdk_bindings_generated.dart:760). `_lookup` is `late final`, so
+    // that was not a startup failure: the first group-mute toggle threw
+    // `ArgumentError: Failed to lookup symbol` and the feature silently did
+    // nothing. It escaped review for the same reason its C2C sibling's 2-vs-3
+    // arg SIGSEGV did — the data-layer gate (`l3_recvopt_mute_toggle`) writes
+    // Prefs directly and never crosses this binding.
+    //
+    // NOTE the shape difference from the C2C variant: arg0 here is a SINGLE
+    // group id (the Dart wrapper passes `group_id` straight through), not a
+    // JSON array of identifiers. Do not ParseJsonStringArray it.
+    int DartSetGroupReceiveMessageOpt(const char* group_id, unsigned int opt, void* user_data) {
+        V2TIM_LOG(kInfo, "[dart_compat] DartSetGroupReceiveMessageOpt: group_id={}, opt={}",
+                  group_id ? group_id : "null", opt);
+
+        if (!group_id || !user_data) {
+            SendApiCallbackResult(user_data, ERR_INVALID_PARAMETERS, "Invalid parameters");
+            return 1; // Error
+        }
+
+        // Same use-after-free hardening as DartSetC2CReceiveMessageOpt: copy
+        // user_data to a string while the pointer is still valid, because the
+        // callback can fire after Dart has freed it.
+        const std::string user_data_str = UserDataToString(user_data);
+
+        SafeGetV2TIMManager()->GetMessageManager()->SetGroupReceiveMessageOpt(
+            V2TIMString(group_id),
+            static_cast<V2TIMReceiveMessageOpt>(opt),
+            new DartCallback(
+                user_data,
+                [user_data_str]() {
+                    // OnSuccess
+                    SendApiCallbackResultWithString(user_data_str, 0, "");
+                },
+                [user_data_str](int error_code, const V2TIMString& error_message) {
+                    // OnError
+                    const char* error_msg_cstr = nullptr;
+                    try {
+                        error_msg_cstr = error_message.CString();
+                    } catch (...) {
+                        error_msg_cstr = nullptr;
+                    }
+                    std::string error_msg = error_msg_cstr ? std::string(error_msg_cstr) : "";
+                    SendApiCallbackResultWithString(user_data_str, error_code, error_msg);
+                }
+            )
+        );
+
+        return 0; // TIM_SUCC (request accepted)
+    }
+
     // DartGetC2CReceiveMessageOpt: Get C2C receive message option
     // Signature: int DartGetC2CReceiveMessageOpt(Pointer<Char> json_opt_param, Pointer<Void> user_data)
     int DartGetC2CReceiveMessageOpt(const char* json_opt_param, void* user_data) {

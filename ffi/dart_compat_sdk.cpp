@@ -58,10 +58,15 @@ extern "C" {
     }
     
     // DartGetServerTime: Get server time
-    // Signature: int DartGetServerTime()
-    int DartGetServerTime() {
+    // Signature: Uint64 DartGetServerTime()
+    // ABI note: the binding declares a Uint64 return. Returning `int` here
+    // truncated the int64 timestamp to 32 bits — the high half of the value the
+    // caller read was whatever the register happened to hold, and even the low
+    // half overflows a signed 32-bit second count in 2038 (immediately, for a
+    // millisecond count). Return the full width.
+    uint64_t DartGetServerTime() {
         int64_t server_time = SafeGetV2TIMManager()->GetServerTime();
-        return static_cast<int>(server_time);
+        return static_cast<uint64_t>(server_time);
     }
     
     // DartSetConfig: Set SDK config
