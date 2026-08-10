@@ -167,20 +167,12 @@ void main() {
 
       print('Result: code=${createResult.code}, desc=${createResult.desc}');
 
-      // was: only the two prints above/below and NO assertion at all — this
-      // test could not fail for any implementation behaviour.
-      // V2TIMGroupManagerImpl::CreateGroup substitutes the generated group ID
-      // when groupName is empty (`if (group_name.empty()) group_name =
-      // finalGroupID;`), so an empty name is accepted and must still produce a
-      // usable group ID.
-      expect(createResult.code, equals(0),
-          reason: 'createGroup with an empty name must fall back to the '
-              'generated group ID as the name: code=${createResult.code}, '
+      // Keep the public Tencent-compatible boundary contract explicit. The
+      // core has a defensive empty-name fallback, but DartCreateGroup rejects
+      // empty input before it reaches that internal path.
+      expect(createResult.code, isNot(equals(0)),
+          reason: 'empty groupName must be rejected: code=${createResult.code}, '
               'desc=${createResult.desc}');
-      expect(createResult.data, isNotNull,
-          reason: 'Group ID should not be null');
-      expect(createResult.data, isNotEmpty,
-          reason: 'Group ID should not be empty');
     }, timeout: const Timeout(Duration(seconds: 35)));
 
     test('Debug: Check connection status before creating group', () async {
