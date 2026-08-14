@@ -59,14 +59,12 @@ void main() {
       final bob = scenario.getNode('bob')!;
       final charlie = scenario.getNode('charlie')!;
 
-      await Future.wait([
-        establishFriendshipVirtual(scenario, alice, bob,
-            timeout: const Duration(seconds: 20)),
-        establishFriendshipVirtual(scenario, alice, charlie,
-            timeout: const Duration(seconds: 20)),
-        establishFriendshipVirtual(scenario, bob, charlie,
-            timeout: const Duration(seconds: 20)),
-      ]);
+      await establishFriendshipVirtual(scenario, alice, bob,
+          timeout: const Duration(seconds: 20));
+      await establishFriendshipVirtual(scenario, alice, charlie,
+          timeout: const Duration(seconds: 20));
+      await establishFriendshipVirtual(scenario, bob, charlie,
+          timeout: const Duration(seconds: 20));
       await pumpFriendConnectionVirtual(scenario, alice, bob,
           duration: const Duration(seconds: 5));
       await pumpFriendConnectionVirtual(scenario, alice, charlie,
@@ -223,14 +221,12 @@ void main() {
 
       // Friendships were already established by test 1's setUpAll-equivalent
       // path; these calls converge in <5s normally. Shorter per-pair timeout.
-      await Future.wait([
-        establishFriendshipVirtual(scenario, alice, bob,
-            timeout: const Duration(seconds: 25)),
-        establishFriendshipVirtual(scenario, alice, charlie,
-            timeout: const Duration(seconds: 25)),
-        establishFriendshipVirtual(scenario, bob, charlie,
-            timeout: const Duration(seconds: 20)),
-      ]);
+      await establishFriendshipVirtual(scenario, alice, bob,
+          timeout: const Duration(seconds: 25));
+      await establishFriendshipVirtual(scenario, alice, charlie,
+          timeout: const Duration(seconds: 25));
+      await establishFriendshipVirtual(scenario, bob, charlie,
+          timeout: const Duration(seconds: 20));
 
       final createResult = await alice.runWithInstanceAsync(
           () async => TIMGroupManager.instance.createGroup(

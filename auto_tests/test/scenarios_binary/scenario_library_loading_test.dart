@@ -1,33 +1,73 @@
-/// Library Loading Tests (Binary Replacement Path)
-///
-/// Tests that setNativeLibraryName() correctly configures the native library
-/// loaded by NativeLibraryManager, and verifies the library is functional.
+// Library Loading Tests (Binary Replacement Path)
+//
+// Tests that setNativeLibraryName() correctly configures the native library
+// loaded by NativeLibraryManager, and verifies the library is functional.
 
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
+
 import 'package:test/test.dart';
 import 'package:tencent_cloud_chat_sdk/native_im/bindings/native_library_manager.dart';
 import 'package:tencent_cloud_chat_sdk/enum/V2TimSDKListener.dart';
 import 'package:tim2tox_dart/ffi/tim2tox_ffi.dart' as ffi_lib;
-import '../test_helper.dart';
 import '../test_fixtures.dart';
 
 void main() {
   group('Library Loading Tests', () {
-    late TestNode node;
-
     setUpAll(() async {
       await setupTestEnvironment();
       // Call setNativeLibraryName BEFORE any NativeLibraryManager usage
       // (which triggers lazy DynamicLibrary loading)
       setupNativeLibraryForTim2Tox();
-      node = await createTestNode('lib_load_node');
-      await node.initSDK();
     });
 
     tearDownAll(() async {
-      await node.dispose();
       await teardownTestEnvironment();
+    });
+
+    test('macOS runtime maps libtim2tox_ffi.dylib from this checkout', () async {
+      if (!Platform.isMacOS) {
+        return;
+      }
+
+      final expectedLibraryPath = resolveTim2ToxLibraryPath();
+      final lsofResult = await Process.run('lsof', [
+        '-n',
+        '-P',
+        '-p',
+        pid.toString(),
+      ]);
+
+      expect(
+        lsofResult.exitCode,
+        equals(0),
+        reason: 'lsof must succeed on macOS',
+      );
+
+      final mappedLibraryPaths = (lsofResult.stdout as String)
+          .split('\n')
+          .where((line) => line.contains('libtim2tox_ffi.dylib'))
+          .map((line) {
+            final match = RegExp(
+              r'(/.*libtim2tox_ffi\.dylib)(?: \(deleted\))?$',
+            ).firstMatch(line);
+            return match?.group(1) ?? line.trim().split(RegExp(r'\s+')).last;
+          })
+          .toList();
+
+      expect(
+        mappedLibraryPaths,
+        isNotEmpty,
+        reason: 'Tim2Tox FFI library must be mapped on macOS',
+      );
+      expect(
+        mappedLibraryPaths.every(
+          (mappedPath) => mappedPath == expectedLibraryPath,
+        ),
+        isTrue,
+        reason: 'Every Tim2Tox FFI mapping must use the current checkout',
+      );
     });
 
     test('setNativeLibraryName configures tim2tox_ffi library', () {
@@ -36,6 +76,12 @@ void main() {
       // could not be opened (lazy _dylib initialization).
       // Verify by checking that the bindings object is accessible.
       expect(NativeLibraryManager.bindings, isNotNull);
+    });
+
+    test('injectCallback returns 0 before registerPort', () {
+      final ffiInstance = ffi_lib.Tim2ToxFfi.open();
+      final result = ffiInstance.injectCallback('{"callback":"noop"}');
+      expect(result, equals(0));
     });
 
     test('NativeLibraryManager.registerPort succeeds with tim2tox_ffi', () {
@@ -80,19 +126,5 @@ void main() {
       );
     }, timeout: const Timeout(Duration(seconds: 10)));
 
-    test('injectCallback returns 0 when called before registerPort on fresh lib', () {
-      // This test verifies the guard: if the Dart port is not registered,
-      // injectCallback should return 0.
-      // Note: We cannot truly test this in the current process because
-      // registerPort() was already called. This test documents expected behavior.
-      // In a real scenario with the original SDK library (dart_native_imsdk),
-      // injectCallback would not exist at all.
-      //
-      // Instead, verify that the function is callable and returns 1
-      // (since registerPort was called in setUpAll).
-      final ffiInstance = ffi_lib.Tim2ToxFfi.open();
-      final result = ffiInstance.injectCallback('{"callback":"noop"}');
-      expect(result, equals(1));
-    });
   });
 }

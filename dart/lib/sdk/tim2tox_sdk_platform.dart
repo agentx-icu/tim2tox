@@ -87,6 +87,7 @@ import 'package:tencent_cloud_chat_sdk/enum/image_types.dart';
 import 'package:tencent_cloud_chat_sdk/enum/utils.dart';
 import '../service/ffi_chat_service.dart';
 import '../models/chat_message.dart';
+import '../utils/binary_replacement_history_hook.dart';
 import '../utils/control_message_envelope.dart';
 import '../utils/message_converter.dart';
 import '../utils/tim2tox_failed_message_persistence.dart';
@@ -842,6 +843,30 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
   // earlier version had four inline 5s/isSelf-only dedup blocks that have
   // since been collapsed into single appendHistory calls).
   void _setupMessageListener() {
+    // The binary-replacement path has no control-signal handling of its own, and
+    // in the product that is the path an inbound C2C message actually takes —
+    // `ffiService.messages` never carries it. Install the shared applier so a
+    // `__revoke__:` arriving there runs the SAME resolve → delete → notify code
+    // as the Platform path below, instead of being persisted as a raw row.
+    BinaryReplacementHistoryHook.applyInboundControlSignal = ({
+      required String text,
+      required String fromUserId,
+      String? groupId,
+      bool isSelf = false,
+    }) async {
+      await _maybeInterceptControlSignal(ChatMessage(
+        text: text,
+        fromUserId: fromUserId,
+        // Must be the REAL value: `_maybeInterceptControlSignal` skips target
+        // resolution for a self-echoed revoke because the sender already
+        // deleted its own copy. Hardcoding false made the echo re-resolve
+        // against the sender's own history and delete a different message
+        // that happened to share the recalled text.
+        isSelf: isSelf,
+        timestamp: DateTime.now(),
+        groupId: (groupId != null && groupId.isNotEmpty) ? groupId : null,
+      ));
+    };
     _messagesSubscription?.cancel();
     _messagesSubscription = ffiService.messages.listen((chatMsg) async {
       if (_debugLog)
@@ -7315,10 +7340,19 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
         // Tox message (1372 bytes) with margin, accounting for JSON escaping +
         // UTF-8 (codex P2). The receiver matches by full length + this prefix
         // via startsWith, so a shorter prefix still disambiguates.
+        // `ffiService.selfId` is the V2TIM LOGIN alias — toxee passes the
+        // literal 'FlutterUIKitClient' — so it does not identify the Tox
+        // account and is meaningless to the peer (observed verbatim in a
+        // received payload: "fromUserId":"FlutterUIKitClient"). The receiver
+        // matches senders by 64-char public key, so publish that: the self Tox
+        // address normalized down to its public-key prefix, empty when the
+        // identity has not resolved yet rather than a misleading placeholder.
+        final selfPublicKey =
+            ConversationIdUtils.normalize(ffiService.getSelfToxId() ?? '');
         String revokePayload(String prefix) => '__revoke__:${json.encode({
                   'msgID': msgID,
                   'senderTimestampMs': senderTimestampMs,
-                  'fromUserId': ffiService.selfId,
+                  'fromUserId': selfPublicKey,
                   'textPrefix': prefix,
                   'textLen': recalledText.length,
                 })}';
@@ -7339,11 +7373,17 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
               isGroup: true);
         }
       } catch (e) {
-        // Wire-side failure should not fail the local revoke.
-        if (_debugLog) {
-          print(
-              '[Tim2ToxSdkPlatform] revokeMessage: signal send failed (peer will keep its copy): $e');
-        }
+        // Wire-side failure should not fail the local revoke — but it MUST NOT
+        // be silent. This is the one place where a recall degrades into "looks
+        // recalled here, still visible to them": the local delete + tombstone
+        // already succeeded, so nothing else in the system will ever mention
+        // it. Logged unconditionally (recalls are rare, so the volume is
+        // nil) — it was `_debugLog`-only, i.e. compiled out, which is why a
+        // real-UI `bGone=false` failure produced no evidence anywhere.
+        _log(
+          '[Tim2ToxSdkPlatform] revokeMessage: control-signal send FAILED — '
+          'the peer KEEPS its copy: $e',
+        );
       }
 
       // Refresh the sender's conversation preview. The local delete above
@@ -7399,6 +7439,91 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
         originalText: originalText,
       );
 
+  /// Pick the local history row an inbound `__revoke__:` signal refers to.
+  ///
+  /// Pure and static so the receive-side recall contract is testable without a
+  /// live `FfiChatService`: the resolution rules below are the whole reason a
+  /// recall either lands on the receiver or silently leaves a ghost row.
+  ///
+  /// [senderUid] MUST already be normalized (see
+  /// [ConversationIdUtils.normalize]).
+  /// Every candidate's `fromUserId` is normalized here before comparison,
+  /// because the signal's sender form (76-char Tox ID) and the stored history
+  /// form (64-char public key, possibly `c2c_`-prefixed) are routinely
+  /// different shapes for the very same peer.
+  ///
+  /// Returns `null` when no UNAMBIGUOUS candidate exists — the caller then
+  /// swallows the signal without deleting anything, because a lingering copy is
+  /// strictly better than deleting the wrong message.
+  static ChatMessage? resolveRevokeTarget({
+    required List<ChatMessage> recent,
+    required String senderUid,
+    String? revokedTextPrefix,
+    int? revokedTextLen,
+    int? senderTimestampMs,
+  }) {
+    ChatMessage? best;
+    final hasContentKey = revokedTextPrefix != null && revokedTextLen != null;
+    bool isSameSender(ChatMessage m) =>
+        ConversationIdUtils.normalize(m.fromUserId) == senderUid;
+    if (hasContentKey) {
+      // CONTENT match (latency-independent, codex P1). Collect ALL
+      // entries from this sender whose text matches by full length +
+      // 200-char prefix, then delete only when the match is
+      // UNAMBIGUOUS. With a v2 content key we do NOT fall back to the
+      // timestamp window — that window matches the sender's send-time
+      // against the receiver's receive-time and would re-introduce the
+      // wrong-delete it was meant to fix (and for a non-text recall,
+      // textLen==0 matches nothing here → we must NOT delete a nearby
+      // text row by timestamp).
+      final matches = <ChatMessage>[];
+      for (final m in recent) {
+        if (!isSameSender(m)) continue;
+        if (m.msgID == null) continue;
+        if (m.text.isEmpty || m.text.startsWith('__')) continue;
+        if (m.text.length != revokedTextLen) continue;
+        if (!m.text.startsWith(revokedTextPrefix)) continue;
+        matches.add(m);
+      }
+      if (matches.length == 1) {
+        best = matches.first;
+      } else if (matches.length > 1 && senderTimestampMs != null) {
+        // Duplicate text: disambiguate ONLY within the matched set by
+        // the closest send-time, and only when one is clearly closest
+        // (<2s); otherwise leave best null (swallow without deleting the
+        // wrong copy — better a lingering copy than a wrong delete).
+        int bestDelta = 2000;
+        for (final m in matches) {
+          final delta =
+              (m.timestamp.millisecondsSinceEpoch - senderTimestampMs).abs();
+          if (delta < bestDelta) {
+            best = m;
+            bestDelta = delta;
+          }
+        }
+      }
+      // matches.isEmpty → best stays null → no delete (the recalled
+      // message may not have arrived yet; a later reload won't show it
+      // since the local copy survives — acceptable vs a wrong delete).
+    } else if (senderTimestampMs != null) {
+      // LEGACY sender (no content key): sender + timestamp window
+      // (closest within 5 s).
+      int bestDelta = 5000;
+      for (final m in recent) {
+        if (!isSameSender(m)) continue;
+        if (m.text.isEmpty) continue;
+        if (m.text.startsWith('__')) continue; // skip control msgs
+        final delta =
+            (m.timestamp.millisecondsSinceEpoch - senderTimestampMs).abs();
+        if (delta <= bestDelta && m.msgID != null) {
+          best = m;
+          bestDelta = delta;
+        }
+      }
+    }
+    return best;
+  }
+
   /// P0-11 / R-3 / U-1 / U-2 receive-side handler.
   ///
   /// Inspect an incoming text payload for any of our magic-prefix control
@@ -7445,7 +7570,14 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
           // locate the actual entry in our history. Skipped for self-sent
           // revoke signals (revokeMessage already deleted the sender's copy).
           if (!chatMsg.isSelf) {
-            final senderUid = chatMsg.fromUserId;
+            // Normalize the control signal's sender ONCE, here at the lookup
+            // boundary. The signal can arrive carrying the sender's 76-char
+            // Tox ID while the same conversation's history rows were stored
+            // with the 64-char public key (or a `c2c_`-prefixed id) — an
+            // un-normalized `==` then matches nothing, no candidate is
+            // selected, and the recalled message survives on the receiver even
+            // though the signal was swallowed.
+            final senderUid = ConversationIdUtils.normalize(chatMsg.fromUserId);
             final convId = chatMsg.groupId ?? senderUid;
             try {
               // Make sure we have history loaded for this conversation.
@@ -7455,66 +7587,15 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
             }
             final history = ffiService.getHistory(convId);
             final recent = history.reversed.take(100).toList();
-            ChatMessage? best;
             final hasContentKey =
                 revokedTextPrefix != null && revokedTextLen != null;
-            if (hasContentKey) {
-              // CONTENT match (latency-independent, codex P1). Collect ALL
-              // entries from this sender whose text matches by full length +
-              // 200-char prefix, then delete only when the match is
-              // UNAMBIGUOUS. With a v2 content key we do NOT fall back to the
-              // timestamp window — that window matches the sender's send-time
-              // against the receiver's receive-time and would re-introduce the
-              // wrong-delete it was meant to fix (and for a non-text recall,
-              // textLen==0 matches nothing here → we must NOT delete a nearby
-              // text row by timestamp).
-              final matches = <ChatMessage>[];
-              for (final m in recent) {
-                if (m.fromUserId != senderUid) continue;
-                if (m.msgID == null) continue;
-                if (m.text.isEmpty || m.text.startsWith('__')) continue;
-                if (m.text.length != revokedTextLen) continue;
-                if (!m.text.startsWith(revokedTextPrefix)) continue;
-                matches.add(m);
-              }
-              if (matches.length == 1) {
-                best = matches.first;
-              } else if (matches.length > 1 && senderTimestampMs != null) {
-                // Duplicate text: disambiguate ONLY within the matched set by
-                // the closest send-time, and only when one is clearly closest
-                // (<2s); otherwise leave best null (swallow without deleting the
-                // wrong copy — better a lingering copy than a wrong delete).
-                int bestDelta = 2000;
-                for (final m in matches) {
-                  final delta =
-                      (m.timestamp.millisecondsSinceEpoch - senderTimestampMs)
-                          .abs();
-                  if (delta < bestDelta) {
-                    best = m;
-                    bestDelta = delta;
-                  }
-                }
-              }
-              // matches.isEmpty → best stays null → no delete (the recalled
-              // message may not have arrived yet; a later reload won't show it
-              // since the local copy survives — acceptable vs a wrong delete).
-            } else if (senderTimestampMs != null) {
-              // LEGACY sender (no content key): sender + timestamp window
-              // (closest within 5 s).
-              int bestDelta = 5000;
-              for (final m in recent) {
-                if (m.fromUserId != senderUid) continue;
-                if (m.text.isEmpty) continue;
-                if (m.text.startsWith('__')) continue; // skip control msgs
-                final delta =
-                    (m.timestamp.millisecondsSinceEpoch - senderTimestampMs)
-                        .abs();
-                if (delta <= bestDelta && m.msgID != null) {
-                  best = m;
-                  bestDelta = delta;
-                }
-              }
-            }
+            final best = resolveRevokeTarget(
+              recent: recent,
+              senderUid: senderUid,
+              revokedTextPrefix: revokedTextPrefix,
+              revokedTextLen: revokedTextLen,
+              senderTimestampMs: senderTimestampMs,
+            );
             if (best != null) {
               targetMsgID = best.msgID;
             } else if (hasContentKey) {
@@ -7525,22 +7606,33 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
             }
           }
 
+          // The receive half of the same command path: log the OUTCOME
+          // unconditionally. "Signal arrived but matched nothing" and "signal
+          // never arrived" are indistinguishable from the outside, and both
+          // present as the peer simply keeping the message — the exact
+          // ambiguity that stalled the real-UI `bGone=false` diagnosis.
           if (targetMsgID != null && targetMsgID.isNotEmpty) {
             try {
               await deleteMessages(msgIDs: [targetMsgID]);
+              _log(
+                '[Tim2ToxSdkPlatform] revoke: deleted local copy '
+                'msgID=$targetMsgID',
+              );
             } catch (e) {
-              if (_debugLog) {
-                print(
-                    '[Tim2ToxSdkPlatform] _maybeInterceptControlSignal: revoke deleteMessages failed (swallowed): $e');
-              }
+              _log(
+                '[Tim2ToxSdkPlatform] revoke: deleteMessages FAILED for '
+                'msgID=$targetMsgID (copy kept): $e',
+              );
             }
             final notifyID = targetMsgID;
             _notifyAdvancedMsgListeners((listener) {
               listener.onRecvMessageRevoked?.call(notifyID);
             });
-          } else if (_debugLog) {
-            print(
-                '[Tim2ToxSdkPlatform] _maybeInterceptControlSignal: revoke target not found, swallowing anyway');
+          } else {
+            _log(
+              '[Tim2ToxSdkPlatform] revoke: signal received but NO matching '
+              'local message — swallowing without deleting',
+            );
           }
           return _interceptResult(swallow: true, originalText: text);
         }

@@ -121,40 +121,27 @@ void main() {
 
       await pumpTestTick(scenario, advanceMs: 3000, iterationsPerInstance: 1);
 
-      // Wait for DHT synchronization so both peers see each other.
-      bool bothPeersVisible = false;
-      final syncDeadline =
-          VirtualClock.nowMs + const Duration(seconds: 15).inMilliseconds;
-      while (VirtualClock.nowMs < syncDeadline && !bothPeersVisible) {
-        final syncCheck = await bob.runWithInstanceAsync(() async =>
-            TIMGroupManager.instance.getGroupMemberList(
-              groupID: groupId,
-              filter: GroupMemberFilterTypeEnum.V2TIM_GROUP_MEMBER_FILTER_ALL,
-              nextSeq: '0',
-            ));
-        if (syncCheck.code == 0 && syncCheck.data != null) {
-          final cnt = syncCheck.data!.memberInfoList?.length ?? 0;
-          if (cnt >= 2) {
-            bothPeersVisible = true;
-            break;
-          }
-        }
-        final aliceCheck = await alice.runWithInstanceAsync(() async =>
-            TIMGroupManager.instance.getGroupMemberList(
-              groupID: groupId,
-              filter: GroupMemberFilterTypeEnum.V2TIM_GROUP_MEMBER_FILTER_ALL,
-              nextSeq: '0',
-            ));
-        if (aliceCheck.code == 0 && aliceCheck.data != null) {
-          final cnt = aliceCheck.data!.memberInfoList?.length ?? 0;
-          if (cnt >= 2) {
-            bothPeersVisible = true;
-            break;
-          }
-        }
-        await pumpTestTick(scenario,
-            advanceMs: 200, iterationsPerInstance: 1);
-      }
+      // Wait for both sides to observe the joined peer before querying the
+      // member details. A single getGroupMemberList sample can legitimately
+      // contain only the local member while NGC propagation is still active.
+      final bobSeenByAlice = await waitUntilFounderSeesMemberInGroupVirtual(
+        scenario,
+        alice,
+        bob,
+        groupId,
+        timeout: const Duration(seconds: 90),
+      );
+      expect(bobSeenByAlice, isNotNull,
+          reason: 'Alice did not observe Bob in the conference');
+      final aliceSeenByBob = await waitUntilFounderSeesMemberInGroupVirtual(
+        scenario,
+        bob,
+        alice,
+        groupId,
+        timeout: const Duration(seconds: 90),
+      );
+      expect(aliceSeenByBob, isNotNull,
+          reason: 'Bob did not observe Alice in the conference');
 
       final memberListResult = await bob.runWithInstanceAsync(() async =>
           TIMGroupManager.instance.getGroupMemberList(

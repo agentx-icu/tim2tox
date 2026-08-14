@@ -1,52 +1,57 @@
 #include "callback_bridge.h"
 #include "V2TIMLog.h"
 #include <cstring>
-#include <cstdio>
 #include <cstdint>
 #include <csignal>
-#if !defined(_WIN32) && !defined(__ANDROID__) && !defined(TIM2TOX_DISABLE_BACKTRACE)
-#include <execinfo.h>
+#ifndef _WIN32
+#include <signal.h>
 #include <unistd.h>
 #endif
 #include <cstdlib>
+
+#ifdef _WIN32
+extern "C" int _write(int, const void*, unsigned int);
+#endif
+
+namespace {
+constexpr char kFatalSignalMarker[] = "[callback_bridge] FATAL: native signal\n";
+
+static void WriteFatalSignalMarker() {
+#ifdef _WIN32
+    (void)_write(2, kFatalSignalMarker,
+                 static_cast<unsigned int>(sizeof(kFatalSignalMarker) - 1));
+#endif
+#ifndef _WIN32
+    (void)write(STDERR_FILENO, kFatalSignalMarker,
+                sizeof(kFatalSignalMarker) - 1);
+#endif
+}
+}
 
 // Store Dart_Port for sending callbacks
 static Dart_Port g_dart_port = ILLEGAL_PORT;
 static std::mutex g_dart_port_mutex;
 static bool g_dart_api_initialized = false;
 
-static void PrintBacktraceOnSignal(int sig) {
-#if defined(_WIN32)
-    // Windows: MSVC/CRT signal semantics differ (SIGSEGV from a hardware fault
-    // is CRT-translated, and re-raising after SIG_DFL is not reliably how WER
-    // captures a dump). Keep the original explicit termination — the backtrace
-    // path below is POSIX-only anyway.
-    fprintf(stderr, "\n[callback_bridge] FATAL: received signal %d\n", sig);
-    fflush(stderr);
+static void HandleFatalSignal(int sig) {
+    WriteFatalSignalMarker();
+#ifdef _WIN32
     std::_Exit(128 + sig);
-#elif defined(__ANDROID__) || defined(TIM2TOX_DISABLE_BACKTRACE)
-    fprintf(stderr, "\n[callback_bridge] FATAL: received signal %d\n", sig);
-    fflush(stderr);
-    // Android (and any backtrace-disabled POSIX build): re-raise with the
-    // default disposition so the platform crash reporter (Android tombstone)
-    // still fires — a plain _exit() would hide the signal and suppress it.
-    signal(sig, SIG_DFL);
-    raise(sig);
-#else
-    void* frames[64];
-    int n = backtrace(frames, 64);
-    fprintf(stderr, "\n[callback_bridge] FATAL: received signal %d\n", sig);
-    backtrace_symbols_fd(frames, n, STDERR_FILENO);
-    fprintf(stderr, "[callback_bridge] FATAL: end backtrace\n");
-    fflush(stderr);
-    // Re-raise with the default disposition instead of _exit(): a plain exit
-    // makes the death look voluntary, so the OS writes NO crash report and the
-    // wait status hides the signal. Restoring SIG_DFL + raise() preserves the
-    // system crash reporter (.ips on Apple platforms) on top of the backtrace
-    // printed above — this is exactly what let this iOS receive-path crash go
-    // reportless before the fix.
-    signal(sig, SIG_DFL);
-    raise(sig);
+#endif
+#ifndef _WIN32
+    struct sigaction default_action {};
+    default_action.sa_handler = SIG_DFL;
+    sigemptyset(&default_action.sa_mask);
+    default_action.sa_flags = 0;
+    (void)sigaction(sig, &default_action, nullptr);
+
+    sigset_t unblocked_signal;
+    sigemptyset(&unblocked_signal);
+    sigaddset(&unblocked_signal, sig);
+    (void)sigprocmask(SIG_UNBLOCK, &unblocked_signal, nullptr);
+
+    (void)kill(getpid(), sig);
+    _exit(128 + sig);
 #endif
 }
 
@@ -54,10 +59,10 @@ static void InstallCrashHandlersOnce() {
     static bool installed = false;
     if (installed) return;
     installed = true;
-    signal(SIGSEGV, PrintBacktraceOnSignal);
-    signal(SIGABRT, PrintBacktraceOnSignal);
+    signal(SIGSEGV, HandleFatalSignal);
+    signal(SIGABRT, HandleFatalSignal);
 #ifdef SIGBUS
-    signal(SIGBUS, PrintBacktraceOnSignal);
+    signal(SIGBUS, HandleFatalSignal);
 #endif
 }
 

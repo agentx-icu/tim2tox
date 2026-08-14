@@ -37,8 +37,10 @@ Static-only class — there is exactly one virtual clock per process.
 
 | Member | Purpose |
 |---|---|
-| `VirtualClock.enableEarly()` | Call **BEFORE** `scenario.initAllNodes()`. Sets the process-global default `test_mode` flag via `tim2tox_ffi_set_default_test_mode(1)` so the `V2TIMManagerImpl` constructor inherits it and `InitSDK` never spawns an `event_thread`. **Required** for signaling and any other flow that depends on `task_queue` being driven by `tim2tox_ffi_iterate_instance` rather than the suppressed event_thread. Also seeds the clock at 1000 ms. |
-| `VirtualClock.enableForScenario(scenario)` | Call **AFTER** `scenario.initAllNodes()`. Calls `tim2tox_ffi_set_test_mode(handle, 1)` on every node's test instance, then seeds the clock at 1000 ms. Idempotent — safe to call multiple times. For group-only tests this is sufficient because group flows go through `tox_iterate` which both event_thread and `pumpTestTick` drive. |
+| `VirtualClock.acquireEarlyLease()` | Acquires one process-global virtual-mode lease. `TestScenario.initAllNodes()` calls this immediately before creating its first native handle in `RUN_VIRTUAL` mode. The first lease enables default test mode and seeds time at 1000 ms; later leases do not rewind time. |
+| `VirtualClock.releaseEarlyLease()` | Releases one lease after a scenario has destroyed all native handles and cleared the polling registry. The final release restores wall-clock defaults and clears virtual time. `TestScenario.dispose()` owns this call. |
+| `VirtualClock.enableEarly()` | Compatibility API for tests that manually initialize nodes instead of using `TestScenario.initAllNodes()`. Repeated calls are idempotent and do not rewind time. |
+| `VirtualClock.enableForScenario(scenario)` | Idempotent compatibility refresh for existing tests. It sets per-instance test mode on handles that already inherited the process default, without reseeding or rewinding the clock. It is not a substitute for the early lease. |
 | `VirtualClock.advance(ms)` | Bump the shared clock by `ms` virtual milliseconds. Does **not** iterate; callers must follow up with iteration. Prefer `pumpTestTick` for the combined advance-then-iterate pattern. |
 | `VirtualClock.nowMs` | Current virtual clock value (read-only int). |
 | `VirtualClock.enabled` | Whether test mode is currently enabled for this process. The `*Virtual` helpers below transparently fall back to wall-clock behavior when `false`. |
@@ -83,20 +85,12 @@ Rule of thumb: if the original test waits, sleeps, or pumps, the virtual variant
 setUpAll(() async {
   await setupTestEnvironment();
 
-  // Step 1: enable test mode BEFORE any test instance is created.
-  // This sets the process-global default so V2TIMManagerImpl's constructor
-  // reads test_mode = true and InitSDK never spawns event_thread.
-  await VirtualClock.enableEarly();
-
   scenario = await createTestScenario(['alice', 'bob']);
   alice = scenario.getNode('alice')!;
   bob = scenario.getNode('bob')!;
 
+  // Acquires the process lease before creating the first native handle.
   await scenario.initAllNodes();
-
-  // Step 2: seed virtual clock & sync the per-instance flag for the handles
-  // that now exist. Idempotent w.r.t. enableEarly.
-  await VirtualClock.enableForScenario(scenario);
 
   await Future.wait([
     alice.login(),
@@ -104,15 +98,21 @@ setUpAll(() async {
   ]);
   await waitUntil(() => alice.loggedIn && bob.loggedIn);
 
-  // Step 3: use *Virtual helpers from here on
+  // Use *Virtual helpers from here on.
   await configureLocalBootstrapVirtual(scenario);
   await Future.wait([
     establishFriendshipVirtual(scenario, alice, bob),
   ]);
 });
+
+tearDownAll(() async {
+  // Destroys handles first and releases the lease only after cleanup succeeds.
+  await scenario.dispose();
+  await teardownTestEnvironment();
+});
 ```
 
-**Order matters.** `enableEarly` must run before `initAllNodes` so the constructor inherits the flag; if you forget and only call `enableForScenario` later, signaling tests will hang because `event_thread` is already running and `task_queue` ownership is ambiguous. Group-only tests that don't touch signaling can skip `enableEarly` — but defaulting to "always call `enableEarly` first" costs nothing.
+**Ownership matters.** Every virtual scenario must create native handles through `initAllNodes` and destroy them through `dispose`. Enabling per-instance mode after initialization cannot stop an `event_thread` that already started. Multiple live scenarios share the process clock through ref-counted leases; disposing one does not reset time while another lease remains.
 
 ---
 

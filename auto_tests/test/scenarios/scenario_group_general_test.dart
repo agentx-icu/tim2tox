@@ -38,7 +38,7 @@ void main() {
       observer = scenario.getNode('observer')!;
 
       await scenario.initAllNodes();
-      // Enable test mode BEFORE login so event_thread never starts.
+      // Refresh the per-instance flag inherited from initAllNodes' early lease.
       if (shouldRunVirtual) await VirtualClock.enableForScenario(scenario);
 
       // Parallelize login
@@ -58,27 +58,17 @@ void main() {
       // Configure local bootstrap (mesh)
       await configureLocalBootstrapVirtual(scenario);
 
-      // Best-effort: don't fail setUpAll if DHT is slow to come up; friend
-      // connection often establishes anyway over TCP relay / iterate cycles.
-      try {
-        await Future.wait([
-          waitForConnectionVirtual(scenario, founder,
-              timeout: const Duration(seconds: 15)),
-          waitForConnectionVirtual(scenario, peer1,
-              timeout: const Duration(seconds: 15)),
-        ]);
-      } catch (_) {
-        // continue — establishFriendship below will retry the wait
-      }
+      await waitForConnectionVirtual(scenario, founder,
+          timeout: const Duration(seconds: 15));
+      await waitForConnectionVirtual(scenario, peer1,
+          timeout: const Duration(seconds: 15));
 
       // Establish founder↔peer1 friendship (also keep observer connected via
       // a friendship so it stays an active DHT node, not just idle background).
-      await Future.wait([
-        establishFriendshipVirtual(scenario, founder, peer1,
-            timeout: const Duration(seconds: 90)),
-        establishFriendshipVirtual(scenario, founder, observer,
-            timeout: const Duration(seconds: 90)),
-      ]);
+      await establishFriendshipVirtual(scenario, founder, peer1,
+          timeout: const Duration(seconds: 90));
+      await establishFriendshipVirtual(scenario, founder, observer,
+          timeout: const Duration(seconds: 90));
     });
 
     tearDownAll(() async {

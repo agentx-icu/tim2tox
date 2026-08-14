@@ -378,6 +378,82 @@ TEST(ControlPathSourceRegressionTest,
         std::string::npos);
 }
 
+TEST(ControlPathSourceRegressionTest,
+     PollTextKeepsOneQueuedRecordAndOpaqueNewlines) {
+    const std::string ffi_source = ReadSource(TIM2TOX_FFI_SOURCE_PATH);
+    const std::string listener = SourceSection(
+        ffi_source,
+        "int poll_text(int64_t instance_id, char* buf, int len) {",
+        "int poll_custom(int64_t instance_id, unsigned char* buf, int len) {");
+
+    EXPECT_NE(listener.find("payload may legally contain newlines"),
+              std::string::npos);
+    EXPECT_NE(listener.find("text_q_.pop();"), std::string::npos);
+    EXPECT_NE(listener.find("CopyPayloadOrReturnRequiredCapacity(s, buf, len)"),
+              std::string::npos);
+    EXPECT_NE(listener.find("if (n < 0) return n;"), std::string::npos);
+}
+
+TEST(ControlPathSourceRegressionTest,
+     FriendApplicationListUsesNegativeRequiredCapacityForBothApis) {
+    const std::string ffi_source = ReadSource(TIM2TOX_FFI_SOURCE_PATH);
+    const std::string capacity_helper = SourceSection(
+        ffi_source,
+        "static int CopyPayloadOrReturnRequiredCapacity(",
+        "class SimpleMsgListenerImpl");
+    const std::string impl = SourceSection(
+        ffi_source,
+        "static int get_friend_applications_impl(",
+        "int tim2tox_ffi_get_friend_applications(");
+    const std::string exact_api = SourceSection(
+        ffi_source,
+        "int tim2tox_ffi_get_friend_applications_for_instance(",
+        "int tim2tox_ffi_accept_friend(");
+
+    EXPECT_NE(
+        capacity_helper.find(
+            "static_cast<size_t>(std::numeric_limits<int>::max()) - 1"),
+        std::string::npos);
+    EXPECT_NE(
+        capacity_helper.find("return std::numeric_limits<int>::min();"),
+        std::string::npos);
+    EXPECT_NE(
+        capacity_helper.find(
+            "const int required_capacity = static_cast<int>(payload_size) + 1;"),
+        std::string::npos);
+    EXPECT_NE(capacity_helper.find("return -required_capacity;"),
+              std::string::npos);
+    EXPECT_NE(
+        capacity_helper.find(
+            "if (buffer_len <= 0) return -required_capacity;"),
+        std::string::npos);
+    EXPECT_EQ(
+        capacity_helper.find("if (!buffer || buffer_len <= 0) return 0;"),
+        std::string::npos);
+    EXPECT_NE(capacity_helper.find("buffer[bytes_written] = 0;"),
+              std::string::npos);
+    EXPECT_NE(
+        impl.find(
+            "return CopyPayloadOrReturnRequiredCapacity(rcb.out, buffer, buffer_len);"),
+        std::string::npos);
+    EXPECT_EQ(impl.find("std::min"), std::string::npos);
+    EXPECT_EQ(impl.find("buffer_len <= 0"), std::string::npos);
+    EXPECT_NE(
+        ffi_source.find(
+            "return get_friend_applications_impl(GetCurrentInstance(), buffer, buffer_len);"),
+        std::string::npos);
+    EXPECT_NE(
+        ffi_source.find(
+            "return get_friend_applications_impl(manager, buffer, buffer_len);"),
+        std::string::npos);
+    EXPECT_NE(exact_api.find("IsInstanceInited(instance_id)"),
+              std::string::npos);
+    EXPECT_NE(exact_api.find("GetManagerForInstanceId(instance_id)"),
+              std::string::npos);
+    EXPECT_EQ(exact_api.find("GetCurrentInstanceId()"), std::string::npos);
+    EXPECT_EQ(exact_api.find("buffer_len <= 0"), std::string::npos);
+}
+
 TEST(ControlPathSourceRegressionTest, GroupCustomSendFailsClosed) {
     const std::string manager = ReadSource(TIM2TOX_MANAGER_SOURCE_PATH);
     const std::string ffi_source = ReadSource(TIM2TOX_FFI_SOURCE_PATH);

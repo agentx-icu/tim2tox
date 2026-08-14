@@ -3,16 +3,49 @@ cmake_minimum_required(VERSION 3.4.1)
 # Enable testing
 enable_testing()
 
-# Find or fetch GTest
-include(FetchContent)
-FetchContent_Declare(
-  googletest
-  GIT_REPOSITORY https://github.com/google/googletest.git
-  GIT_TAG release-1.12.1
-)
-# For Windows: Prevent overriding the parent project's compiler/linker settings
-set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
-FetchContent_MakeAvailable(googletest)
+# Find GTest without network access. Pass a local checkout through
+# FETCHCONTENT_SOURCE_DIR_GOOGLETEST or TIM2TOX_GOOGLETEST_SOURCE_DIR when GTest
+# is not installed on the host.
+find_package(GTest CONFIG QUIET)
+if(TARGET GTest::gtest_main)
+    set(TIM2TOX_GTEST_MAIN_TARGET GTest::gtest_main)
+elseif(TARGET GTest::Main)
+    set(TIM2TOX_GTEST_MAIN_TARGET GTest::Main)
+else()
+    find_package(GTest QUIET)
+    if(TARGET GTest::gtest_main)
+        set(TIM2TOX_GTEST_MAIN_TARGET GTest::gtest_main)
+    elseif(TARGET GTest::Main)
+        set(TIM2TOX_GTEST_MAIN_TARGET GTest::Main)
+    else()
+        set(_tim2tox_googletest_source "${FETCHCONTENT_SOURCE_DIR_GOOGLETEST}")
+        if(NOT _tim2tox_googletest_source AND DEFINED ENV{TIM2TOX_GOOGLETEST_SOURCE_DIR})
+            set(_tim2tox_googletest_source "$ENV{TIM2TOX_GOOGLETEST_SOURCE_DIR}")
+        endif()
+        if(_tim2tox_googletest_source AND EXISTS "${_tim2tox_googletest_source}/CMakeLists.txt")
+            include(FetchContent)
+            FetchContent_Declare(googletest SOURCE_DIR "${_tim2tox_googletest_source}")
+            # For Windows: Prevent overriding the parent project's compiler/linker settings
+            set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
+            FetchContent_MakeAvailable(googletest)
+            set(TIM2TOX_GTEST_MAIN_TARGET gtest_main)
+        else()
+            message(FATAL_ERROR
+                "GTest not found. Set FETCHCONTENT_SOURCE_DIR_GOOGLETEST or "
+                "TIM2TOX_GOOGLETEST_SOURCE_DIR to a local googletest checkout; "
+                "network fetch is intentionally disabled.")
+        endif()
+    endif()
+endif()
+if(TARGET GTest::gtest)
+    set(TIM2TOX_GTEST_TARGET GTest::gtest)
+elseif(TARGET GTest::GTest)
+    set(TIM2TOX_GTEST_TARGET GTest::GTest)
+elseif(TARGET gtest)
+    set(TIM2TOX_GTEST_TARGET gtest)
+else()
+    message(FATAL_ERROR "GTest library target not found")
+endif()
 
 # Include directories
 include_directories(
@@ -28,6 +61,9 @@ include_directories(
 add_executable(tox_util_test ToxUtilTest.cpp)
 add_executable(v2tim_string_test V2TIMStringTest.cpp)
 add_executable(v2tim_message_test V2TIMMessageTest.cpp)
+add_executable(v2tim_log_test
+    V2TIMLogTest.cpp
+    ${CMAKE_SOURCE_DIR}/source/V2TIMLog.cpp)
 add_executable(irc_client_manager_test IrcClientManagerTest.cpp
     ${CMAKE_SOURCE_DIR}/source/IrcClientManager.cpp)
 add_executable(file_io_compat_test
@@ -69,6 +105,11 @@ target_compile_definitions(av_conference_lifecycle_source_regression_test PRIVAT
     TIM2TOX_FFI_HEADER_PATH="${CMAKE_SOURCE_DIR}/ffi/tim2tox_ffi.h"
     TIM2TOX_DART_FFI_PATH="${CMAKE_SOURCE_DIR}/dart/lib/ffi/tim2tox_ffi.dart"
     TIM2TOX_DART_SERVICE_PATH="${CMAKE_SOURCE_DIR}/dart/lib/service/ffi_chat_service.dart")
+add_executable(av_conference_audio_queue_test
+    AVConferenceAudioQueueTest.cpp
+    ${CMAKE_SOURCE_DIR}/source/AVConferenceAudioQueue.cpp)
+target_include_directories(av_conference_audio_queue_test PRIVATE
+    ${CMAKE_SOURCE_DIR})
 add_executable(group_canonical_identity_source_regression_test
     GroupCanonicalIdentitySourceRegressionTest.cpp)
 target_compile_definitions(group_canonical_identity_source_regression_test PRIVATE
@@ -92,27 +133,39 @@ target_compile_definitions(control_path_source_regression_test PRIVATE
     TIM2TOX_ROOT_CMAKE_PATH="${CMAKE_SOURCE_DIR}/CMakeLists.txt"
     TIM2TOX_SOURCE_CMAKE_PATH="${CMAKE_SOURCE_DIR}/source/CMakeLists.txt"
     TIM2TOX_FFI_CMAKE_PATH="${CMAKE_SOURCE_DIR}/ffi/CMakeLists.txt")
+add_executable(native_log_privacy_source_regression_test
+    NativeLogPrivacySourceRegressionTest.cpp)
+target_compile_definitions(native_log_privacy_source_regression_test PRIVATE
+    TIM2TOX_SOURCE_DIR="${CMAKE_SOURCE_DIR}/source"
+    TIM2TOX_FFI_DIR="${CMAKE_SOURCE_DIR}/ffi"
+    TIM2TOX_LOG_HEADER_PATH="${CMAKE_SOURCE_DIR}/source/V2TIMLog.h"
+    TIM2TOX_LOG_SOURCE_PATH="${CMAKE_SOURCE_DIR}/source/V2TIMLog.cpp")
 
 # Link dependencies
 target_link_libraries(tox_util_test
     PRIVATE
     tim2tox
     toxcore_static
-    gtest_main
+    ${TIM2TOX_GTEST_MAIN_TARGET}
 )
 
 target_link_libraries(v2tim_string_test
     PRIVATE
     tim2tox
     toxcore_static
-    gtest_main
+    ${TIM2TOX_GTEST_MAIN_TARGET}
 )
 
 target_link_libraries(v2tim_message_test
     PRIVATE
     tim2tox
     toxcore_static
-    gtest_main
+    ${TIM2TOX_GTEST_MAIN_TARGET}
+)
+
+target_link_libraries(v2tim_log_test
+    PRIVATE
+    ${TIM2TOX_GTEST_TARGET}
 )
 
 find_package(OpenSSL REQUIRED)
@@ -122,35 +175,42 @@ target_link_libraries(irc_client_manager_test
     toxcore_static
     OpenSSL::SSL
     OpenSSL::Crypto
-    gtest_main
+    ${TIM2TOX_GTEST_MAIN_TARGET}
 )
 if(WIN32)
     target_link_libraries(irc_client_manager_test PRIVATE ws2_32)
 endif()
 
-target_link_libraries(file_io_compat_test PRIVATE gtest_main)
-target_link_libraries(event_line_parser_test PRIVATE gtest_main)
-target_link_libraries(dart_send_message_source_regression_test PRIVATE gtest_main)
+target_link_libraries(file_io_compat_test PRIVATE ${TIM2TOX_GTEST_MAIN_TARGET})
+target_link_libraries(event_line_parser_test PRIVATE ${TIM2TOX_GTEST_MAIN_TARGET})
+target_link_libraries(dart_send_message_source_regression_test PRIVATE ${TIM2TOX_GTEST_MAIN_TARGET})
 target_link_libraries(file_transfer_security_source_regression_test PRIVATE
-    gtest_main)
+    ${TIM2TOX_GTEST_MAIN_TARGET})
 target_link_libraries(tim2tox_control_packet_test PRIVATE
     tim2tox
     toxcore_static
-    gtest_main)
+    ${TIM2TOX_GTEST_MAIN_TARGET})
 target_link_libraries(qtox_message_fragmenter_test PRIVATE
     tim2tox
     toxcore_static
-    gtest_main)
-target_link_libraries(qtox_transport_source_regression_test PRIVATE gtest_main)
+    ${TIM2TOX_GTEST_MAIN_TARGET})
+target_link_libraries(qtox_transport_source_regression_test PRIVATE
+    ${TIM2TOX_GTEST_MAIN_TARGET})
 target_link_libraries(av_conference_lifecycle_source_regression_test PRIVATE
-    gtest_main)
+    ${TIM2TOX_GTEST_MAIN_TARGET})
+target_link_libraries(av_conference_audio_queue_test PRIVATE
+    ${TIM2TOX_GTEST_MAIN_TARGET})
 target_link_libraries(group_canonical_identity_source_regression_test PRIVATE
-    gtest_main)
-target_link_libraries(qtox_avatar_source_contract_test PRIVATE gtest_main)
-target_link_libraries(control_path_source_regression_test PRIVATE gtest_main)
+    ${TIM2TOX_GTEST_MAIN_TARGET})
+target_link_libraries(qtox_avatar_source_contract_test PRIVATE
+    ${TIM2TOX_GTEST_MAIN_TARGET})
+target_link_libraries(control_path_source_regression_test PRIVATE
+    ${TIM2TOX_GTEST_MAIN_TARGET})
+target_link_libraries(native_log_privacy_source_regression_test PRIVATE
+    ${TIM2TOX_GTEST_MAIN_TARGET})
 find_package(Threads REQUIRED)
 target_link_libraries(dart_send_message_contract_test PRIVATE
-    gtest_main
+    ${TIM2TOX_GTEST_MAIN_TARGET}
     Threads::Threads)
 if(MSVC)
     target_compile_options(file_io_compat_test PRIVATE /utf-8)
@@ -161,6 +221,7 @@ include(GoogleTest)
 gtest_discover_tests(tox_util_test)
 gtest_discover_tests(v2tim_string_test)
 gtest_discover_tests(v2tim_message_test)
+gtest_discover_tests(v2tim_log_test)
 gtest_discover_tests(irc_client_manager_test)
 add_test(NAME file_io_compat_test COMMAND file_io_compat_test)
 add_test(NAME event_line_parser_test COMMAND event_line_parser_test)
@@ -176,9 +237,13 @@ add_test(NAME qtox_transport_source_regression_test
     COMMAND qtox_transport_source_regression_test)
 add_test(NAME av_conference_lifecycle_source_regression_test
     COMMAND av_conference_lifecycle_source_regression_test)
+add_test(NAME av_conference_audio_queue_test
+    COMMAND av_conference_audio_queue_test)
 add_test(NAME group_canonical_identity_source_regression_test
     COMMAND group_canonical_identity_source_regression_test)
 add_test(NAME qtox_avatar_source_contract_test
     COMMAND qtox_avatar_source_contract_test)
 add_test(NAME control_path_source_regression_test
     COMMAND control_path_source_regression_test)
+add_test(NAME native_log_privacy_source_regression_test
+    COMMAND native_log_privacy_source_regression_test)

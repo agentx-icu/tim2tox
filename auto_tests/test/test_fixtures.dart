@@ -7,6 +7,7 @@ import 'dart:math' as math;
 import 'package:flutter_test/flutter_test.dart';
 import 'package:flutter/services.dart';
 import 'package:path/path.dart' as path;
+import 'package:tim2tox_dart/ffi/tim2tox_ffi.dart';
 import 'package:tencent_cloud_chat_sdk/tencent_cloud_chat_sdk_platform_interface.dart';
 import 'package:tim2tox_dart/sdk/tim2tox_sdk_platform.dart';
 import 'package:tim2tox_dart/service/ffi_chat_service.dart';
@@ -18,9 +19,64 @@ import 'test_helper.dart';
 
 /// Call this in setUpAll() for tests that exercise the binary replacement path
 /// (NativeLibraryManager → libtim2tox_ffi.dylib).
+Tim2ToxFfi? _preloadedTim2ToxFfi;
+Object? _preloadedTencentBindings;
+
 void setupNativeLibraryForTim2Tox() {
+  final libraryPath = resolveTim2ToxLibraryPath();
   setNativeLibraryName('tim2tox_ffi');
+  Tim2ToxFfi.setLibraryPathOverride(libraryPath);
+  setNativeLibraryPath(libraryPath);
+  _preloadedTim2ToxFfi ??= Tim2ToxFfi.open();
+  _preloadedTencentBindings ??= NativeLibraryManager.bindings;
 }
+
+String? resolveTim2ToxLibraryPath() {
+  if (Platform.isAndroid || Platform.isIOS) {
+    return null;
+  }
+
+  final libraryName = switch (Platform.operatingSystem) {
+    'macos' => 'libtim2tox_ffi.dylib',
+    'linux' => 'libtim2tox_ffi.so',
+    'windows' => 'tim2tox_ffi.dll',
+    _ => throw UnsupportedError('Tim2Tox FFI library is unavailable.'),
+  };
+
+  final checkout = Directory.current.absolute;
+  late final String libraryDirectory;
+  if (_hasCheckoutMarkers(checkout, const [
+    'pubspec.yaml',
+    'test/test_fixtures.dart',
+    '../CMakeLists.txt',
+  ])) {
+    libraryDirectory = path.join(checkout.path, '..', 'build', 'ffi');
+  } else if (_hasCheckoutMarkers(checkout, const [
+    'CMakeLists.txt',
+    'dart/pubspec.yaml',
+    'auto_tests/pubspec.yaml',
+  ])) {
+    libraryDirectory = path.join(checkout.path, 'build', 'ffi');
+  } else if (_hasCheckoutMarkers(checkout, const [
+    'pubspec.yaml',
+    'lib/main.dart',
+    'third_party/tim2tox/CMakeLists.txt',
+  ])) {
+    libraryDirectory =
+        path.join(checkout.path, 'third_party', 'tim2tox', 'build', 'ffi');
+  } else {
+    throw StateError('Unable to classify the current checkout.');
+  }
+
+  final library = File(path.join(libraryDirectory, libraryName));
+  if (!library.existsSync()) {
+    throw StateError('Tim2Tox FFI library is unavailable.');
+  }
+  return path.normalize(library.absolute.path);
+}
+
+bool _hasCheckoutMarkers(Directory checkout, List<String> markers) => markers
+    .every((marker) => File(path.join(checkout.path, marker)).existsSync());
 
 /// Mock preferences service for testing
 class MockPreferencesService implements ExtendedPreferencesService {
@@ -431,11 +487,33 @@ class MockBootstrapService implements BootstrapService {
   }
 }
 
+typedef TestNodeInitializer = Future<void> Function(
+  TestNode node, {
+  String? initPath,
+  String? logPath,
+  bool? localDiscoveryEnabled,
+  bool? ipv6Enabled,
+});
+
+typedef TestNodeDisposer = Future<void> Function(TestNode node);
+
 /// Test scenario container
 class TestScenario {
+  TestScenario({
+    bool? virtualMode,
+    TestNodeInitializer? nodeInitializer,
+    TestNodeDisposer? nodeDisposer,
+  })  : _virtualMode = virtualMode ?? shouldRunVirtual,
+        _nodeInitializer = nodeInitializer,
+        _nodeDisposer = nodeDisposer;
+
   final List<TestNode> nodes = [];
   final Map<String, TestNode> nodesByAlias = {};
+  final bool _virtualMode;
+  final TestNodeInitializer? _nodeInitializer;
+  final TestNodeDisposer? _nodeDisposer;
   bool _running = false;
+  bool _virtualClockLeaseAcquired = false;
 
   /// Add a node to the scenario
   TestNode addNode({
@@ -464,23 +542,105 @@ class TestScenario {
     return null;
   }
 
-  /// Initialize all nodes
-  Future<void> initAllNodes({String? initPath, String? logPath}) async {
-    for (final node in nodes) {
-      await node.initSDK(initPath: initPath, logPath: logPath);
+  Future<void> _initializeNode(
+    TestNode node, {
+    String? initPath,
+    String? logPath,
+    bool? localDiscoveryEnabled,
+    bool? ipv6Enabled,
+  }) {
+    final initializer = _nodeInitializer;
+    if (initializer != null) {
+      return initializer(
+        node,
+        initPath: initPath,
+        logPath: logPath,
+        localDiscoveryEnabled: localDiscoveryEnabled,
+        ipv6Enabled: ipv6Enabled,
+      );
     }
-    // Register all instance IDs for polling so FfiChatService consumes file_request and other
-    // instance-scoped events (e.g. file_request:2:...) when using a single shared service.
+    return node.initSDK(
+      initPath: initPath,
+      logPath: logPath,
+      localDiscoveryEnabled: localDiscoveryEnabled,
+      ipv6Enabled: ipv6Enabled,
+    );
+  }
+
+  Future<void> _disposeNodesAndPolling() async {
+    Object? firstError;
+    StackTrace? firstStackTrace;
     for (final node in nodes) {
-      if (node.testInstanceHandle != null) {
-        FfiChatService.registerInstanceForPolling(node.testInstanceHandle!);
+      try {
+        final disposer = _nodeDisposer;
+        if (disposer != null) {
+          await disposer(node);
+        } else {
+          await node.dispose();
+        }
+      } catch (error, stackTrace) {
+        firstError ??= error;
+        firstStackTrace ??= stackTrace;
       }
     }
-    // Tests use TestNode.login() and may bypass platform.login(), so start polling here
-    // to ensure file_request/progress/file_done events are drained in all scenarios.
-    final platform = TencentCloudChatSdkPlatform.instance;
-    if (platform is Tim2ToxSdkPlatform) {
-      await platform.ffiService.startPolling();
+    try {
+      FfiChatService.clearPollingRegistryForTests();
+    } catch (error, stackTrace) {
+      firstError ??= error;
+      firstStackTrace ??= stackTrace;
+    }
+    if (firstError != null) {
+      Error.throwWithStackTrace(firstError, firstStackTrace!);
+    }
+    nodes.clear();
+    nodesByAlias.clear();
+  }
+
+  Future<void> _releaseVirtualClockLease() async {
+    if (!_virtualClockLeaseAcquired) return;
+    await VirtualClock.releaseEarlyLease();
+    _virtualClockLeaseAcquired = false;
+  }
+
+  /// Initialize all nodes.
+  Future<void> initAllNodes({
+    String? initPath,
+    String? logPath,
+    bool? localDiscoveryEnabled,
+    bool? ipv6Enabled,
+  }) async {
+    if (_virtualMode && nodes.isNotEmpty && !_virtualClockLeaseAcquired) {
+      await VirtualClock.acquireEarlyLease();
+      _virtualClockLeaseAcquired = true;
+    }
+
+    try {
+      for (final node in nodes) {
+        await _initializeNode(
+          node,
+          initPath: initPath,
+          logPath: logPath,
+          localDiscoveryEnabled: localDiscoveryEnabled,
+          ipv6Enabled: ipv6Enabled,
+        );
+      }
+      // Register all instance IDs for polling so FfiChatService consumes file_request and other
+      // instance-scoped events (e.g. file_request:2:...) when using a single shared service.
+      for (final node in nodes) {
+        if (node.testInstanceHandle != null) {
+          FfiChatService.registerInstanceForPolling(node.testInstanceHandle!);
+        }
+      }
+      // Tests use TestNode.login() and may bypass platform.login(), so start polling here
+      // to ensure file_request/progress/file_done events are drained in all scenarios.
+      final platform = TencentCloudChatSdkPlatform.instance;
+      if (platform is Tim2ToxSdkPlatform) {
+        await platform.ffiService.startPolling();
+      }
+    } catch (error, stackTrace) {
+      await _disposeNodesAndPolling();
+      await _releaseVirtualClockLease();
+      Error.throwWithStackTrace(error, stackTrace);
     }
   }
 
@@ -503,13 +663,8 @@ class TestScenario {
   /// is still in tearDown or in a waiting loop.
   Future<void> dispose() async {
     _running = false;
-    for (final node in nodes) {
-      await node.dispose();
-    }
-    // Ensure no stale instance IDs remain in global polling registry across scenarios.
-    FfiChatService.clearPollingRegistryForTests();
-    nodes.clear();
-    nodesByAlias.clear();
+    await _disposeNodesAndPolling();
+    await _releaseVirtualClockLease();
   }
 
   bool get isRunning => _running;
@@ -614,14 +769,6 @@ Future<void> setupTestEnvironment() async {
   // Configure NativeLibraryManager to load tim2tox_ffi instead of the default dart_native_imsdk.
   // This MUST happen before any NativeLibraryManager usage (which triggers lazy DynamicLibrary loading).
   setupNativeLibraryForTim2Tox();
-
-  // Set DYLD_LIBRARY_PATH for macOS to find libtim2tox_ffi.dylib
-  if (Platform.isMacOS) {
-    // libPath for future use: path.join(path.dirname(path.dirname(path.dirname(Platform.resolvedExecutable))), 'tim2tox', 'build', 'ffi');
-    // Note: DYLD_LIBRARY_PATH doesn't work in tests, so we'll need to copy the library
-    // or use absolute path in the library loading code
-    // For now, we'll rely on the library being in the system search path
-  }
 
   // Mock path_provider platform channel to avoid plugin dependency.
   // PID-namespace the directories so PARALLEL_WORKERS>1 (or any other

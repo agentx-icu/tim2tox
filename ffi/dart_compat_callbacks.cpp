@@ -786,17 +786,9 @@ public:
             json_msg << "\"code\":0,\"desc\":\"\",";
             json_msg << "\"json_param\":\"" << EscapeJsonString(result_json) << "\"}";
             SendCallbackToDart("apiCallback", json_msg.str(), user_data_);
-        } catch (const std::exception& e) {
-            // Safely get exception message
-            const char* what_msg = e.what();
-            if (!what_msg) {
-                what_msg = "Unknown exception (e.what() returned null)";
-            }
-            V2TIM_LOG(kError, "[dart_compat] DartConversationResultCallback::OnSuccess: Exception: {}", what_msg);
-            // Safely construct error message
-            std::string error_msg = "Exception: ";
-            error_msg += what_msg;
-            SendApiCallbackResult(user_data_, V2TIMErrorCode::ERR_INVALID_PARAMETERS, error_msg);
+        } catch (const std::exception&) {
+            V2TIM_LOG(kError, "[dart_compat] DartConversationResultCallback::OnSuccess: exception");
+            SendApiCallbackResult(user_data_, V2TIMErrorCode::ERR_INVALID_PARAMETERS, "Exception");
         } catch (...) {
             V2TIM_LOG(kError, "[dart_compat] DartConversationResultCallback::OnSuccess: Unknown exception (non-std::exception, possibly access violation)");
             SendApiCallbackResult(user_data_, V2TIMErrorCode::ERR_INVALID_PARAMETERS, "Unknown exception");

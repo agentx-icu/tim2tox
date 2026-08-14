@@ -36,6 +36,7 @@ class V2TIMFriendshipManagerImpl;
 #include <unordered_map>
 #include <vector>
 #include <string>
+#include "AVConferenceAudioQueue.h"
 
 enum class PendingInviteKind {
     kGroupInvite,
@@ -141,6 +142,11 @@ public:
     V2TIMString CanonicalGroupIDForChatIdLocked(
         const V2TIMString& requested_group_id,
         const std::string& chat_id_hex) const;
+    // Turn a `tox_inv_*` invite alias into a stable local group id, rewriting
+    // every mapping that referenced the alias. Returns an empty string when the
+    // group's chat id cannot be read (the only case where the alias must stay).
+    V2TIMString PromoteTemporaryInviteGroupID(const V2TIMString& temp_group_id,
+                                              Tox_Group_Number group_number);
     bool StoreConferenceIdentity(const V2TIMString& groupID, Tox_Group_Number conference_number);
     bool IsRunning() const;  // Implementation in .cpp file to avoid inline optimization issues
     bool IsEventThreadRunning() const;
@@ -178,10 +184,11 @@ public:
         uint8_t channels, uint32_t sampling_rate)>;
     void SetAVConferenceAudioCallback(AVConferenceAudioCallback callback);
     void ClearAVConferenceAudioCallback();
-    void ForwardAVConferenceAudioToDart(
+    void EnqueueAVConferenceAudioFrame(
         const char* group_id, uint32_t conference_number,
         uint32_t peer_number, const int16_t* pcm, size_t sample_count,
         uint8_t channels, uint32_t sampling_rate);
+    void DrainPendingAVConferenceAudioFrames();
     bool SendAVConferenceAudioFrame(const V2TIMString& group_id,
                                     const int16_t* pcm, size_t sample_count,
                                     uint8_t channels, uint32_t sampling_rate);
@@ -190,6 +197,7 @@ public:
     bool IsAVConferenceAudioEnabled(const V2TIMString& group_id) const;
     bool MuteAVConferenceAudio(const V2TIMString& group_id, bool mute);
 #endif
+    void ClearPendingAVConferenceAudioFrames();
     
     // Helper method to get ToxManager instance (for internal use)
     ToxManager* GetToxManager() { return tox_manager_.get(); }
@@ -360,8 +368,10 @@ private:
     // Custom deleter required because ToxAVManager has a private destructor.
     std::unique_ptr<ToxAVManager, void(*)(ToxAVManager*)> toxav_manager_;
     AVConferenceAudioCallback av_conference_audio_callback_;
+    std::unordered_set<Tox_Group_Number> enabled_av_conferences_;
     std::unordered_set<Tox_Group_Number> muted_av_conferences_;
 #endif
+    tim2tox::AVConferenceAudioQueue av_conference_audio_queue_;
     
     std::thread event_thread_;
     std::thread::id event_thread_id_;  // Set by event thread at start; used to avoid deadlock when RunOnEventThread is called from event thread

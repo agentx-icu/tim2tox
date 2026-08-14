@@ -16,6 +16,7 @@ import '../interfaces/logger_service.dart';
 import '../interfaces/bootstrap_service.dart';
 import '../interfaces/scratch_file_service.dart';
 import '../utils/conversation_id_utils.dart';
+import '../utils/control_message_envelope.dart';
 import '../utils/binary_replacement_history_hook.dart';
 import '../utils/message_history_persistence.dart';
 import '../utils/offline_message_queue_persistence.dart';
@@ -476,6 +477,8 @@ class FfiChatService {
     });
   }
 
+  /// [ffiForTesting] is only for deterministic binding fakes created with
+  /// [Tim2ToxFfi.forTesting]. Production callers must leave it unset.
   FfiChatService({
     ExtendedPreferencesService? preferencesService,
     DraftPreferencesService? draftPreferencesService,
@@ -489,7 +492,8 @@ class FfiChatService {
     String? avatarsPath,
     FfiChatPathResolver? pathResolver,
     ScratchFileService? scratchFileService,
-  })  : _ffi = Tim2ToxFfi.open(),
+    Tim2ToxFfi? ffiForTesting,
+  })  : _ffi = ffiForTesting ?? Tim2ToxFfi.open(),
         _prefs = preferencesService,
         _draftPrefs =
             draftPreferencesService ?? _draftServiceFrom(preferencesService),
@@ -1130,7 +1134,30 @@ class FfiChatService {
 
   Stream<ChatMessage> get messages => _messages.stream;
 
-  void _emitInboundMessage(ChatMessage message, {bool force = false}) {
+  /// A magic-prefix control signal (`__revoke__:` / `__face__:` / …) rather
+  /// than a displayable message.
+  ///
+  /// These are COMMANDS. The emit suppression below exists to stop the same
+  /// *delivery* being displayed twice in hybrid mode; applying it to a command
+  /// does not de-duplicate anything, it just drops the command on the floor —
+  /// `Tim2ToxSdkPlatform._maybeInterceptControlSignal` (the only receive-side
+  /// `__revoke__` handler that deletes the recalled row) runs from
+  /// `messages.listen` and therefore never saw one in the product.
+  /// NOT "is any magic-prefix envelope": `__face__:` / `__location__:` /
+  /// `__custom__:` are the WIRE ENCODING of real user content (stickers,
+  /// locations, custom messages — see the send paths in
+  /// `Tim2ToxSdkPlatform.sendMessage`). They must stay on the ordinary
+  /// persist-and-display path. Only an envelope that the interceptor actually
+  /// SWALLOWS is a command, and today that is `__revoke__:` alone.
+  static bool _isControlSignalText(String text) =>
+      parseTextControlEnvelope(text).shouldSwallow;
+
+  /// Returns whether the message was actually pushed onto [messages].
+  ///
+  /// Callers that hand ownership of a side effect (e.g. group unread) to a
+  /// `messages.listen` subscriber MUST check this: a suppressed emit means that
+  /// subscriber never runs, so the side effect has no owner at all.
+  bool _emitInboundMessage(ChatMessage message, {bool force = false}) {
     // In hybrid mode the native advanced listener and the polled simple event
     // describe the same inbound delivery. Persist the polled copy, but do not
     // notify listeners a second time when the native listener surface is live.
@@ -1138,9 +1165,10 @@ class FfiChatService {
         (BinaryReplacementHistoryHook.ownsInboundMessageHistory ||
             TIMMessageManager
                 .instance.v2TimAdvancedMsgListenerList.isNotEmpty)) {
-      return;
+      return false;
     }
     _messages.add(message);
+    return true;
   }
 
   Stream<bool> get connectionStatusStream => _connectionStatus.stream;
@@ -1579,10 +1607,12 @@ class FfiChatService {
   /// ids are detected via the authoritative in-memory `_knownGroups` /
   /// `_quitGroups` sets (a quit group still isn't a C2C peer).
   int getUnreadOf(String peerId) {
-    final norm = ConversationIdUtils.normalize(peerId);
+    final norm = _unreadKey(peerId);
     if (_knownGroups.contains(norm) || _quitGroups.contains(norm)) {
-      // codex: read the NORMALIZED id (callers may pass a raw/prefixed gid),
-      // falling back to the raw key for any pre-normalization writer.
+      // Reader and writer now share [_unreadKey], so the normalized lookup is
+      // authoritative. The raw fallback is kept only as belt-and-braces for a
+      // key that predates the canonical contract; it must never be the path a
+      // correct writer depends on.
       return _unreadByPeer[norm] ?? _unreadByPeer[peerId] ?? 0;
     }
     return getC2CUnreadCount(peerId);
@@ -1626,15 +1656,41 @@ class FfiChatService {
     _lastByPeer[normalizedId] = sortedHistory.first;
   }
 
+  /// Canonical key for every [_unreadByPeer] access that can be handed a
+  /// FOREIGN-shaped conversation id.
+  ///
+  /// The two hybrid paths reach this map with differently-shaped ids: the
+  /// native/binary-replacement path forwards the raw `gid` carried by the
+  /// message, the Platform path and the conversation list speak `group_<gid>` /
+  /// `c2c_<uid>`, and persistence hands back whatever shape it stored. Writing
+  /// under one shape and reading under another silently loses the bucket — that
+  /// is the `C2C=2 / group=0 / total=2` symptom. Normalizing once at the map
+  /// boundary (not in the UI, and not per-caller) is what makes the
+  /// writer/reader contract hold for those paths.
+  ///
+  /// The remaining C2C inbound writers (`_onNativeEvent` file/text,
+  /// `ingestC2cText`) are NOT routed through here only because they already
+  /// hold a canonical id: each one truncates or normalizes its peer id before
+  /// it touches any map. Route any NEW caller through this helper.
+  static String _unreadKey(String conversationId) =>
+      ConversationIdUtils.normalize(conversationId);
+
   /// Increment unread count for a group. Used when a group message is received via
   /// the native path (OnRecvNewMessage) so sidebar and conversation list show unread.
   void incrementGroupUnread(String groupId) {
     if (groupId.isEmpty) return;
-    if (_quitGroups.contains(groupId)) return;
-    if (_activePeerId == groupId) {
-      _unreadByPeer[groupId] = 0;
+    // Normalize BEFORE every identity comparison: `_quitGroups` / `_knownGroups`
+    // and `_activePeerId` all hold normalized ids, so comparing a raw or
+    // `group_`-prefixed argument against them would both fail to suppress a
+    // quit group and fail to zero the conversation the user is currently
+    // looking at.
+    final key = _unreadKey(groupId);
+    if (key.isEmpty) return;
+    if (_quitGroups.contains(key)) return;
+    if (_activePeerId == key) {
+      _unreadByPeer[key] = 0;
     } else {
-      _unreadByPeer.update(groupId, (v) => v + 1, ifAbsent: () => 1);
+      _unreadByPeer.update(key, (v) => v + 1, ifAbsent: () => 1);
     }
   }
 
@@ -1871,7 +1927,10 @@ class FfiChatService {
         final unreadCount =
             _messageHistoryPersistence.getUnreadCount(conversationId);
         if (unreadCount > 0) {
-          _unreadByPeer[conversationId] = unreadCount;
+          // Persistence hands back whatever conversation-id shape it stored;
+          // restore under the canonical key so a group badge survives restart
+          // instead of landing in a bucket no reader looks at.
+          _unreadByPeer[_unreadKey(conversationId)] = unreadCount;
         }
       }
     } catch (e) {
@@ -5003,23 +5062,50 @@ class FfiChatService {
   /// target userId.
   Future<List<({String userId, String wording})>>
       _getFriendApplicationsUnfiltered() async {
-    final buf = pkgffi.malloc.allocate<ffi.Int8>(32 * 1024);
-    // Use current instance ID at call time so runWithInstanceAsync(Alice) gets Alice's list
+    const initialCapacity = 32 * 1024;
+    const maxCapacity = 16 * 1024 * 1024;
+    const maxAttempts = 4;
+
+    // Resolve once so every retry remains routed to the same exact instance.
     final instanceId = _ffi.getCurrentInstanceId();
-    final n = _ffi.getFriendApplicationsForInstance(instanceId, buf, 32 * 1024);
-    final out = <({String userId, String wording})>[];
-    if (n > 0) {
-      final s = buf.cast<pkgffi.Utf8>().toDartString();
-      for (final line in s.split('\n')) {
-        if (line.isEmpty) continue;
-        final parts = line.split('\t');
-        final uid = parts.isNotEmpty ? parts[0] : '';
-        final words = parts.length > 1 ? parts[1] : '';
-        if (uid.isNotEmpty) out.add((userId: uid, wording: words));
+    var capacity = initialCapacity;
+    for (var attempt = 0; attempt < maxAttempts; attempt++) {
+      final buffer = pkgffi.malloc.allocate<ffi.Int8>(capacity);
+      try {
+        final bytesWritten = _ffi.getFriendApplicationsForInstance(
+          instanceId,
+          buffer,
+          capacity,
+        );
+        if (bytesWritten < 0) {
+          final requiredCapacity = -bytesWritten;
+          if (requiredCapacity <= capacity || requiredCapacity > maxCapacity) {
+            return [];
+          }
+          capacity = requiredCapacity;
+          continue;
+        }
+        if (bytesWritten == 0) return [];
+        if (bytesWritten >= capacity) return [];
+
+        final payload =
+            buffer.cast<pkgffi.Utf8>().toDartString(length: bytesWritten);
+        final applications = <({String userId, String wording})>[];
+        for (final line in payload.split('\n')) {
+          if (line.isEmpty) continue;
+          final separator = line.indexOf('\t');
+          final userId = separator < 0 ? line : line.substring(0, separator);
+          final wording = separator < 0 ? '' : line.substring(separator + 1);
+          if (userId.isNotEmpty) {
+            applications.add((userId: userId, wording: wording));
+          }
+        }
+        return applications;
+      } finally {
+        pkgffi.malloc.free(buffer);
       }
     }
-    pkgffi.malloc.free(buf);
-    return out;
+    return [];
   }
 
   /// Wordings surfaced by [getFriendApplications] per userId since startup.
@@ -5111,9 +5197,8 @@ class FfiChatService {
     if (raw.isNotEmpty || dismissed.isNotEmpty) {
       _logger?.log(
         '[FfiChatService] getFriendApplications '
-        'raw=${raw.map((a) => '${_normalizeApplicationUserId(a.userId)}:${a.wording}').toList()} '
-        'dismissed=${dismissed.toList()} '
-        'filtered=${filtered.map((a) => '${_normalizeApplicationUserId(a.userId)}:${a.wording}').toList()}',
+        'rawCount=${raw.length} dismissedCount=${dismissed.length} '
+        'filteredCount=${filtered.length}',
       );
     }
     if (_seededApplications.isEmpty) return filtered;
@@ -5489,17 +5574,28 @@ class FfiChatService {
             : duplicate.copyWith(sourceInstanceId: sourceInstanceId);
         _knownGroups.add(gid);
         _lastByPeer[gid] = emittedDuplicate;
-        // NB: do NOT apply the groupUnreadHandledExternally guard here. This is
-        // the cross-path duplicate branch (the binary-replacement/native side
-        // persisted the message first). The `_messages.add(duplicate)` below
-        // re-enters the platform listener, but the listener DEDUPS an already-
-        // seen inbound and returns BEFORE its unread callback — so it will NOT
-        // bump. This direct bump is therefore the GUARANTEED single source for
-        // this branch; guarding it would UNDER-count (codex P1).
-        if (_activePeerId == gid) {
-          _unreadByPeer[gid] = 0;
-        } else {
-          _unreadByPeer.update(gid, (v) => v + 1, ifAbsent: () => 1);
+        // Bump only for a row THIS service did not already account for.
+        //
+        // The original reasoning ("this branch is the guaranteed single source,
+        // guarding it would UNDER-count") held while the fresh branch below
+        // always deferred. It no longer does — it now bumps whenever the emit
+        // is suppressed, which is the product case — so an unconditional bump
+        // here double-counts a message delivered twice through the Dart ingest
+        // (the conference + group callback duplication this branch exists for).
+        // `alreadyReflected` catches the back-to-back repeat, but not a repeat
+        // separated by another message, which leaves `_lastByPeer` stale.
+        //
+        // Discriminator: a row minted by our own ingest ends with
+        // `_<from>_<gid>` (see the msgID built below); rows persisted by the
+        // native/binary-replacement path carry a C++-minted id. Only the latter
+        // still needs an owner here.
+        final selfMinted =
+            duplicate.msgID?.endsWith('_${from}_$gid') ?? false;
+        final unreadKey = _unreadKey(gid);
+        if (_activePeerId == unreadKey) {
+          _unreadByPeer[unreadKey] = 0;
+        } else if (!selfMinted) {
+          _unreadByPeer.update(unreadKey, (v) => v + 1, ifAbsent: () => 1);
         }
         _emitInboundMessage(emittedDuplicate, force: forceEmit);
       }
@@ -5526,19 +5622,32 @@ class FfiChatService {
       sourceInstanceId: sourceInstanceId,
     );
     _lastByPeer[gid] = msg; // reuse for group last message
-    // Skip the direct unread write when the platform owns group unread: the
-    // `_messages.add(msg)` below re-enters Tim2ToxSdkPlatform's messages.listen,
-    // which calls onGroupMessageReceivedForUnread -> incrementGroupUnread. Doing
-    // BOTH double-counts every Dart-path (poll / l3-inject) group message.
-    if (!groupUnreadHandledExternally) {
-      if (_activePeerId == gid) {
-        _unreadByPeer[gid] = 0;
+    _appendHistory(gid, msg);
+    final emitted = _emitInboundMessage(
+      msg,
+      force: forceEmit || _isControlSignalText(text),
+    );
+    // Defer the unread bump to the platform ONLY when the message actually
+    // reached the stream. [groupUnreadHandledExternally] means "Tim2ToxSdkPlatform's
+    // messages.listen will call onGroupMessageReceivedForUnread -> incrementGroupUnread
+    // instead of us", and that is its single call site — so the hand-off is real
+    // only if `_messages.add` happened.
+    //
+    // It usually does NOT. [_emitInboundMessage] suppresses the add whenever the
+    // native advanced-listener surface is live, which is ALWAYS true in the
+    // product (UIKit registers advanced listeners at startup). Deferring
+    // unconditionally therefore left BOTH owners declining: this method skipped
+    // the bump waiting for a listener that never ran, and group unread stayed 0
+    // forever — the `C2C=2 / group=0 / total=2` sidebar symptom. Only the
+    // `gaction:` paths (forceEmit: true) genuinely emit, and those still defer.
+    if (!groupUnreadHandledExternally || !emitted) {
+      final unreadKey = _unreadKey(gid);
+      if (_activePeerId == unreadKey) {
+        _unreadByPeer[unreadKey] = 0;
       } else {
-        _unreadByPeer.update(gid, (v) => v + 1, ifAbsent: () => 1);
+        _unreadByPeer.update(unreadKey, (v) => v + 1, ifAbsent: () => 1);
       }
     }
-    _appendHistory(gid, msg);
-    _emitInboundMessage(msg, force: forceEmit);
     // Auto-send received receipt for received group messages (not self-sent)
     // Note: reaction messages are sent via custom messages and should not trigger receipts
     if (!msg.isSelf && !_isReactionMessage(text)) {
@@ -5771,7 +5880,7 @@ class FfiChatService {
       );
     }
     _appendHistory(normalizedFrom, msg);
-    _emitInboundMessage(msg, force: forceEmit);
+    _emitInboundMessage(msg, force: forceEmit || _isControlSignalText(text));
     if (!msg.isSelf && !_isReactionMessage(text)) {
       unawaited(_sendReceipt(from, msgID, 'received'));
     }
@@ -6291,7 +6400,7 @@ class FfiChatService {
 
     // Clear last message and unread count
     bool lastRemoved = _lastByPeer.remove(groupID) != null;
-    bool unreadRemoved = _unreadByPeer.remove(groupID) != null;
+    bool unreadRemoved = _unreadByPeer.remove(_unreadKey(groupID)) != null;
     print(
         '[FfiChatService] clearGroupHistory: Removed from _lastByPeer: $lastRemoved, _unreadByPeer: $unreadRemoved');
     print(
@@ -7247,7 +7356,7 @@ class FfiChatService {
       contentKind: outgoing.contentKind,
     );
     _lastByPeer[groupId] = out;
-    _unreadByPeer[groupId] = 0;
+    _unreadByPeer[_unreadKey(groupId)] = 0;
     _appendHistory(groupId, out);
     _messages.add(out);
     return out;

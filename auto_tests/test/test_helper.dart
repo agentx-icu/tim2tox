@@ -1779,10 +1779,8 @@ bool get shouldRunVirtual => Platform.environment['RUN_VIRTUAL'] == '1';
 ///   saves the 7–20 s Tox cold start per file).
 /// - **Virtual-clock** (`RUN_VIRTUAL=1`): builds a fresh scenario from scratch.
 ///   The shared pool is intentionally *not* used here because it never calls
-///   [VirtualClock.enableEarly] before instance creation, which signaling-
-///   sensitive flows require (the constructor must read `test_mode` so
-///   `InitSDK` never spawns an `event_thread`). The from-scratch path mirrors
-///   the canonical virtual `setUpAll` template in `VIRTUAL_CLOCK.md` §4.
+///   [TestScenario.dispose] between users. A fresh scenario owns one virtual
+///   clock lease from before its first native handle through final disposal.
 ///
 /// Either way the returned scenario is logged in, bootstrapped (when
 /// [withBootstrap]), auto-accept enabled, and meshed with friendships (when
@@ -1802,12 +1800,8 @@ Future<TestScenario> acquireScenarioForMode(
 
   // Virtual-clock from-scratch setup.
   await setupTestEnvironment();
-  // Must run BEFORE any test instance is created (process-global default).
-  await VirtualClock.enableEarly();
   final scenario = await createTestScenario(aliases);
   await scenario.initAllNodes();
-  // Idempotent w.r.t. enableEarly; seeds the clock + syncs the per-instance flag.
-  await VirtualClock.enableForScenario(scenario);
   await Future.wait(scenario.nodes.map((n) => n.login()));
   await waitUntil(
     () => scenario.nodes.every((n) => n.loggedIn),
@@ -1821,15 +1815,16 @@ Future<TestScenario> acquireScenarioForMode(
     n.enableAutoAccept();
   }
   if (withFriendship && scenario.nodes.length >= 2) {
-    final pairs = <Future<void>>[];
     for (int i = 0; i < scenario.nodes.length; i++) {
       for (int j = i + 1; j < scenario.nodes.length; j++) {
-        pairs.add(establishFriendshipVirtual(
-            scenario, scenario.nodes[i], scenario.nodes[j],
-            timeout: const Duration(seconds: 60)));
+        await establishFriendshipVirtual(
+          scenario,
+          scenario.nodes[i],
+          scenario.nodes[j],
+          timeout: const Duration(seconds: 60),
+        );
       }
     }
-    await Future.wait(pairs);
   }
   return scenario;
 }
@@ -2092,11 +2087,12 @@ Future<void> configureLocalBootstrap(TestScenario scenario) async {
 // against that shared clock — letting tests advance "time" deterministically
 // without flaky sleeps.
 //
-// Lifecycle (after createTestScenario + initAllNodes, before loginAllNodes):
+// Lifecycle (owned by TestScenario.initAllNodes / TestScenario.dispose):
 //
-//   await VirtualClock.enableForScenario(scenario);
-//   ... loginAllNodes / establishFriendship etc, using pumpTestTick or
-//       waitUntilWithVirtualPump instead of the wall-clock variants.
+//   final scenario = await createTestScenario(...);
+//   await scenario.initAllNodes();
+//   ... use pumpTestTick / waitUntilWithVirtualPump ...
+//   await scenario.dispose();
 //
 // When [VirtualClock.enabled] is false the helpers below transparently fall
 // back to the legacy wall-clock pump so existing tests can opt in piecemeal.
@@ -2105,51 +2101,125 @@ Future<void> configureLocalBootstrap(TestScenario scenario) async {
 /// Process-global shared virtual clock for test-mode tim2tox instances.
 ///
 /// Stateful and intentionally static — there is exactly one C++ virtual clock
-/// per process, and every in-test-mode instance reads from it. Reset between
-/// scenarios is unnecessary because each scenario re-arms the clock from a
-/// known starting value when [enableForScenario] is called.
+/// per process, and every in-test-mode instance reads from it. Test scenarios
+/// hold ref-counted early leases for the lifetime of their native handles.
 class VirtualClock {
   VirtualClock._();
 
   static int _ms = 0;
   static bool _enabled = false;
+  static int _earlyLeaseCount = 0;
+
+  static void _requireNativeSuccess(int result, String operation) {
+    if (result != 1) {
+      throw StateError('Virtual clock native $operation failed: status=$result');
+    }
+  }
+
+  static Future<void> _enableNativeDefault() async {
+    final ffi = ffi_lib.Tim2ToxFfi.open();
+    try {
+      _requireNativeSuccess(
+          ffi.setDefaultTestMode(true), 'default mode enable');
+      const initialTimeMs = 1000;
+      _requireNativeSuccess(
+          ffi.setVirtualTimeMs(initialTimeMs), 'initial time set');
+      _ms = initialTimeMs;
+      _enabled = true;
+    } catch (error, stackTrace) {
+      // A failed first acquisition must not leave the process default armed
+      // for a later wall-clock scenario.
+      ffi.setDefaultTestMode(false);
+      ffi.setVirtualTimeMs(0);
+      _enabled = false;
+      _ms = 0;
+      Error.throwWithStackTrace(error, stackTrace);
+    }
+  }
+
+  static Future<void> _disableNativeDefault() async {
+    final ffi = ffi_lib.Tim2ToxFfi.open();
+    final previousTimeMs = _ms;
+    final defaultResult = ffi.setDefaultTestMode(false);
+    if (defaultResult != 1) {
+      throw StateError(
+          'Virtual clock native default disable failed: status=$defaultResult');
+    }
+
+    final timeResult = ffi.setVirtualTimeMs(0);
+    if (timeResult != 1) {
+      ffi.setDefaultTestMode(true);
+      ffi.setVirtualTimeMs(previousTimeMs);
+      throw StateError(
+          'Virtual clock native reset time failed: status=$timeResult');
+    }
+
+    _enabled = false;
+    _ms = 0;
+  }
 
   /// Enable test mode BEFORE any test instance is created. Sets the
   /// process-global default test_mode flag so the V2TIMManagerImpl
   /// constructor reads it, and InitSDK skips spawning event_thread entirely.
   ///
-  /// Required for tests that depend on event_thread's task_queue being
-  /// suppressed — signaling flows in particular. Call this BEFORE
-  /// `scenario.initAllNodes()`. For group-only tests, [enableForScenario]
-  /// (which sets test_mode after InitSDK) is still sufficient because group
-  /// flows go through tox_iterate which both event_thread and pumpTestTick
-  /// drive.
+  /// Compatibility entry point for tests that explicitly enable before manual
+  /// node initialization. Repeated calls do not rewind virtual time. Normal
+  /// [TestScenario] setup acquires its own lease automatically.
   static Future<void> enableEarly() async {
-    final ffi = ffi_lib.Tim2ToxFfi.open();
-    ffi.setDefaultTestMode(true);
-    _ms = 1000;
-    ffi.setVirtualTimeMs(_ms);
-    _enabled = true;
+    if (_enabled) return;
+    await _enableNativeDefault();
+  }
+
+  /// Acquire one scenario-owned lease before its first native handle exists.
+  static Future<void> acquireEarlyLease() async {
+    if (_earlyLeaseCount > 0) {
+      _earlyLeaseCount++;
+      return;
+    }
+    if (!_enabled) {
+      await _enableNativeDefault();
+    }
+    _earlyLeaseCount = 1;
+  }
+
+  /// Release one scenario-owned lease after all of its handles are destroyed.
+  static Future<void> releaseEarlyLease() async {
+    if (_earlyLeaseCount == 0) return;
+    if (_earlyLeaseCount > 1) {
+      _earlyLeaseCount--;
+      return;
+    }
+
+    await _disableNativeDefault();
+    _earlyLeaseCount = 0;
   }
 
   /// Enable test mode for every node in [scenario] and seed the virtual clock.
   ///
-  /// Call after `scenario.initAllNodes()` but before any `login()`. For
-  /// signaling-style tests that need event_thread fully suppressed before
-  /// InitSDK runs, use [enableEarly] before initAllNodes instead.
-  ///
-  /// Seeds the clock at 1000ms (rather than 0) because some toxcore timers
-  /// treat 0 as "uninitialised" and re-arm on the first iteration.
+  /// This remains as an idempotent compatibility refresh for existing tests;
+  /// [TestScenario.initAllNodes] already enabled the process default before
+  /// constructing native handles. It never rewinds the shared clock.
   static Future<void> enableForScenario(TestScenario scenario) async {
+    if (!_enabled) {
+      await enableEarly();
+    }
     final ffi = ffi_lib.Tim2ToxFfi.open();
     for (final node in scenario.nodes) {
       final handle = node.testInstanceHandle;
       if (handle == null) continue;
-      ffi.setTestMode(handle, true);
+      _requireNativeSuccess(
+          ffi.setTestMode(handle, true), 'instance mode enable');
     }
-    _ms = 1000;
-    ffi.setVirtualTimeMs(_ms);
-    _enabled = true;
+  }
+
+  /// Restore wall-clock defaults only when no scenario leases remain.
+  static Future<void> reset() async {
+    if (_earlyLeaseCount > 0) {
+      throw StateError(
+          'Cannot reset virtual clock while scenario leases are active: count=$_earlyLeaseCount');
+    }
+    if (!_enabled && _ms == 0) return;
+    await _disableNativeDefault();
   }
 
   /// Advance the shared virtual clock by [ms] milliseconds. Does NOT iterate;
@@ -2166,6 +2236,9 @@ class VirtualClock {
 
   /// Whether test mode is currently enabled for this process.
   static bool get enabled => _enabled;
+
+  /// Number of scenarios currently owning native-handle lifetime leases.
+  static int get earlyLeaseCount => _earlyLeaseCount;
 }
 
 /// Drive one tick of the virtual-clock harness: advance the shared clock by
@@ -2673,6 +2746,13 @@ Future<String?> waitUntilFounderSeesMemberInGroupVirtual(
 ///
 /// Polls getFriendList while advancing the shared virtual clock between
 /// samples. Times are virtual ms.
+bool isSuccessfulFriendConnectionBoundary({
+  required int resultCode,
+  required bool hasMatchingFriend,
+  required int? role,
+}) =>
+    resultCode == 0 && hasMatchingFriend && role == 1;
+
 Future<void> waitForFriendConnectionVirtual(
   TestScenario scenario,
   TestNode node,
@@ -2692,28 +2772,18 @@ Future<void> waitForFriendConnectionVirtual(
   final startedAtMs = VirtualClock.nowMs;
   int checkCount = 0;
 
-  final friendPublicKey = friendUserId.length >= 64
-      ? friendUserId.substring(0, 64)
-      : friendUserId;
-  final targetAbbrev = friendPublicKey.length > 16
-      ? '${friendPublicKey.substring(0, 16)}...'
-      : friendPublicKey;
+  final friendPublicKey =
+      friendUserId.length >= 64 ? friendUserId.substring(0, 64) : friendUserId;
+  bool matchesFriend(String uid) =>
+      uid == friendPublicKey ||
+      (uid.length >= 64 && uid.startsWith(friendPublicKey));
 
   print(
-      '[waitForFriendConnectionVirtual] ENTRY node=${node.alias} target=$targetAbbrev timeout=${connectionTimeout.inSeconds}s');
+      '[waitForFriendConnectionVirtual] ENTRY node=${node.alias} targetLength=${friendUserId.length} timeoutMs=${connectionTimeout.inMilliseconds}');
   bool friendInList = false;
   int? lastRole;
 
   await node.runWithInstanceAsync(() async {
-    // Ensure self is connected to DHT first.
-    try {
-      await waitForConnectionVirtual(scenario, node,
-          timeout: const Duration(seconds: 10));
-    } catch (e) {
-      print(
-          '[waitForFriendConnectionVirtual] Warning: self not yet connected to DHT: $e');
-    }
-
     while (VirtualClock.nowMs < deadline) {
       checkCount++;
       final elapsedMs = VirtualClock.nowMs - startedAtMs;
@@ -2727,20 +2797,16 @@ Future<void> waitForFriendConnectionVirtual(
         }
         if (checkCount <= 3 || checkCount % 10 == 0) {
           print(
-              '[waitForFriendConnectionVirtual] Check $checkCount (elapsed=${elapsedMs ~/ 1000}s): getFriendList code=${friendListResult.code} desc=${friendListResult.desc}');
+              '[waitForFriendConnectionVirtual] Check $checkCount elapsedMs=$elapsedMs status=${friendListResult.code}');
         }
       } else if (friendListResult.data != null) {
         final list = friendListResult.data!;
-        bool matchesFriend(String uid) =>
-            uid == friendPublicKey ||
-            (uid.length >= 64 && uid.startsWith(friendPublicKey));
         final matchingFriends =
             list.where((f) => matchesFriend(f.userID)).toList();
 
         if (checkCount <= 2 || checkCount % 10 == 1) {
           print(
-              '[waitForFriendConnectionVirtual] Check $checkCount (elapsed=${elapsedMs ~/ 1000}s): listLen=${list.length} '
-              'friendIds=[${list.map((f) => f.userID.length > 12 ? '${f.userID.substring(0, 12)}...' : f.userID).join(', ')}]');
+              '[waitForFriendConnectionVirtual] Check $checkCount elapsedMs=$elapsedMs listLen=${list.length} matchingCount=${matchingFriends.length}');
         }
 
         if (matchingFriends.isNotEmpty) {
@@ -2748,37 +2814,33 @@ Future<void> waitForFriendConnectionVirtual(
           friendInList = true;
           final role = friendInfo.userProfile?.role;
           lastRole = role;
-          final userProfile = friendInfo.userProfile;
 
           if (checkCount <= 3 || checkCount % 5 == 0) {
             print(
-                '[waitForFriendConnectionVirtual] Check $checkCount (elapsed=${elapsedMs ~/ 1000}s): Friend IN LIST '
-                'role=$role (1=ONLINE, 2=OFFLINE) userProfile?.role=${userProfile?.role}');
+                '[waitForFriendConnectionVirtual] Check $checkCount elapsedMs=$elapsedMs friendInList=true role=$role');
           }
 
           final isOnline = friendInfo.userProfile?.role == 1;
 
-          if (isOnline == true) {
+          if (isOnline) {
             print(
-                '[waitForFriendConnectionVirtual] Friend $targetAbbrev is online after $checkCount checks (elapsed=${elapsedMs ~/ 1000}s)');
+                '[waitForFriendConnectionVirtual] ONLINE node=${node.alias} checkCount=$checkCount elapsedMs=$elapsedMs role=$role');
             return;
-          } else {
-            if (checkCount <= 8 || checkCount % 10 == 0) {
-              print(
-                  '[waitForFriendConnectionVirtual] (elapsed=${elapsedMs ~/ 1000}s) Friend in list but OFFLINE role=$role checkCount=$checkCount');
-            }
+          }
+          if (checkCount <= 8 || checkCount % 10 == 0) {
+            print(
+                '[waitForFriendConnectionVirtual] OFFLINE node=${node.alias} elapsedMs=$elapsedMs role=$role checkCount=$checkCount');
           }
         } else {
           if (friendInList) {
             if (checkCount % 10 == 0) {
               print(
-                  '[waitForFriendConnectionVirtual] WARNING (elapsed=${elapsedMs ~/ 1000}s): Friend was in list but now NOT FOUND');
+                  '[waitForFriendConnectionVirtual] MISSING node=${node.alias} elapsedMs=$elapsedMs wasInList=true listLen=${list.length}');
             }
           } else {
             if (checkCount <= 5 || checkCount % 10 == 0) {
               print(
-                  '[waitForFriendConnectionVirtual] Check $checkCount (elapsed=${elapsedMs ~/ 1000}s): Friend NOT in list '
-                  'availableIds=[${list.map((f) => f.userID.length > 12 ? '${f.userID.substring(0, 12)}...' : f.userID).join(', ')}]');
+                  '[waitForFriendConnectionVirtual] Check $checkCount elapsedMs=$elapsedMs friendInList=false listLen=${list.length}');
             }
           }
         }
@@ -2791,16 +2853,20 @@ Future<void> waitForFriendConnectionVirtual(
 
       if (checkCount % 20 == 0) {
         print(
-            '[waitForFriendConnectionVirtual] PROGRESS elapsed=${elapsedMs ~/ 1000}s checkCount=$checkCount friendInList=$friendInList lastRole=$lastRole');
+            '[waitForFriendConnectionVirtual] PROGRESS node=${node.alias} elapsedMs=$elapsedMs checkCount=$checkCount friendInList=$friendInList lastRole=$lastRole');
       }
 
       // Iterate so Tox can establish P2P + advance the virtual clock.
-      // Real wall sleep is critical: friend P2P handshake needs UDP/TCP
-      // round-trips between iterates, which loopback OS scheduling needs
-      // a few ms to deliver.
+      // Friend P2P handshakes depend on real UDP/TCP round-trips. With every
+      // event thread suppressed from construction, do not advance protocol
+      // time faster than loopback wall time during this connection phase.
+      final remainingMs = deadline - VirtualClock.nowMs;
+      if (remainingMs <= 0) {
+        break;
+      }
       await pumpTestTick(scenario,
-          advanceMs: 250,
-          iterationsPerInstance: 5,
+          advanceMs: remainingMs < 10 ? remainingMs : 10,
+          iterationsPerInstance: 1,
           wallSleep: const Duration(milliseconds: 10));
     }
 
@@ -2811,48 +2877,57 @@ Future<void> waitForFriendConnectionVirtual(
       throw TimeoutException(
           'getFriendList returned 6013 (sdk not init) at end of waitForFriendConnectionVirtual. Teardown may have started.');
     }
-    bool matchesFriend(String uid) =>
-        uid == friendPublicKey ||
-        (uid.length >= 64 && uid.startsWith(friendPublicKey));
-    final hasFriend = finalFriendListResult.code == 0 &&
-        finalFriendListResult.data != null &&
-        finalFriendListResult.data!.any((f) => matchesFriend(f.userID));
+    final finalFriends = finalFriendListResult.data ?? [];
+    final matchingFriends =
+        finalFriends.where((f) => matchesFriend(f.userID)).toList();
+    final hasFriend =
+        finalFriendListResult.code == 0 && matchingFriends.isNotEmpty;
+    final finalRole = matchingFriends.isEmpty
+        ? lastRole
+        : matchingFriends.first.userProfile?.role;
+    final boundaryOnline = isSuccessfulFriendConnectionBoundary(
+      resultCode: finalFriendListResult.code,
+      hasMatchingFriend: matchingFriends.isNotEmpty,
+      role: matchingFriends.isEmpty
+          ? null
+          : matchingFriends.first.userProfile?.role,
+    );
+
+    if (boundaryOnline) {
+      print(
+          '[waitForFriendConnectionVirtual] ONLINE node=${node.alias} checkCount=$checkCount elapsedMs=$elapsedTotalMs role=$finalRole boundary=true');
+      return;
+    }
 
     print(
-        '[waitForFriendConnectionVirtual] TIMEOUT after ${elapsedTotalMs ~/ 1000}s checkCount=$checkCount');
+        '[waitForFriendConnectionVirtual] TIMEOUT node=${node.alias} elapsedMs=$elapsedTotalMs checkCount=$checkCount');
     print(
-        '[waitForFriendConnectionVirtual] FINAL getFriendList code=${finalFriendListResult.code} '
-        'dataLen=${finalFriendListResult.data?.length ?? 0}');
-    if (finalFriendListResult.data != null &&
-        finalFriendListResult.data!.isNotEmpty) {
-      for (int i = 0; i < finalFriendListResult.data!.length; i++) {
-        final f = finalFriendListResult.data![i];
-        final uid = f.userID;
+        '[waitForFriendConnectionVirtual] FINAL node=${node.alias} status=${finalFriendListResult.code} dataLen=${finalFriends.length}');
+    if (finalFriends.isNotEmpty) {
+      for (int i = 0; i < finalFriends.length; i++) {
+        final f = finalFriends[i];
         final role = f.userProfile?.role;
-        final match = matchesFriend(uid);
+        final match = matchesFriend(f.userID);
         print(
-            '[waitForFriendConnectionVirtual]   friend[$i] userID=${uid.length > 20 ? '${uid.substring(0, 20)}...' : uid} '
-            'role=$role (1=ONLINE,2=OFFLINE) matchesTarget=$match');
+            '[waitForFriendConnectionVirtual] friendIndex=$i identifierLength=${f.userID.length} role=$role matchesTarget=$match');
       }
     } else {
-      print(
-          '[waitForFriendConnectionVirtual]   (no friends in list or data null)');
+      print('[waitForFriendConnectionVirtual] friendCount=0');
     }
     print(
-        '[waitForFriendConnectionVirtual] FINAL hasFriend=$hasFriend lastRole=$lastRole');
+        '[waitForFriendConnectionVirtual] FINAL node=${node.alias} hasFriend=$hasFriend lastRole=$finalRole');
 
     throw TimeoutException(
-        'Timeout waiting for friend connection: $friendPublicKey (virtual timeout: $connectionTimeout). '
-        'Final state: friend in list=$hasFriend lastRole=$lastRole elapsed=${elapsedTotalMs ~/ 1000}s. '
-        'This may indicate that nodes are not connected to each other (check bootstrap configuration).');
+        'Timeout waiting for friend connection for ${node.alias} '
+        '(virtualTimeoutMs=${connectionTimeout.inMilliseconds}, targetLength=${friendUserId.length}, '
+        'friendInList=$hasFriend, lastRole=$finalRole, elapsedMs=$elapsedTotalMs).');
   });
 }
 
 /// Virtual-clock variant of [establishFriendship].
 ///
-/// Same multi-stage behaviour: friend-list converge pre-pump → fallback
-/// polling → P2P wait — but every wall-clock delay is driven through the
-/// virtual clock so total elapsed time is virtual ms.
+/// Uses one overall virtual deadline for friend-list convergence and both
+/// online-role checks. Returning guarantees role=1 was observed on both peers.
 Future<void> establishFriendshipVirtual(
   TestScenario scenario,
   TestNode alice,
@@ -2881,67 +2956,56 @@ Future<void> establishFriendshipVirtual(
   alice.enableAutoAccept();
   bob.enableAutoAccept();
 
-  try {
-    await waitForConnectionVirtual(scenario, alice,
-        timeout: const Duration(seconds: 10));
-    await waitForConnectionVirtual(scenario, bob,
-        timeout: const Duration(seconds: 10));
-    if (alice.getConnectionStatus() == 0 || bob.getConnectionStatus() == 0) {
-      print(
-          '[establishFriendshipVirtual] Warning: One or both nodes still have connection_status=0 after wait');
-    }
-  } catch (e) {
-    print(
-        '[establishFriendshipVirtual] Warning: Nodes may not be fully connected: $e');
-  }
-
   final aliceToxId = alice.getToxId();
   final bobToxId = bob.getToxId();
-  print('[establishFriendshipVirtual] ${alice.alias} Tox ID: $aliceToxId');
-  print('[establishFriendshipVirtual] ${bob.alias} Tox ID: $bobToxId');
+  print(
+      '[establishFriendshipVirtual] ${alice.alias} identifierLength=${aliceToxId.length}');
+  print(
+      '[establishFriendshipVirtual] ${bob.alias} identifierLength=${bobToxId.length}');
 
   if (aliceToxId.isEmpty || aliceToxId.length != 76) {
     throw Exception(
-        'Invalid Alice Tox ID: $aliceToxId (expected 76 hex characters)');
+        'Invalid identifier for ${alice.alias}: length=${aliceToxId.length}, expectedLength=76');
   }
   if (bobToxId.isEmpty || bobToxId.length != 76) {
     throw Exception(
-        'Invalid Bob Tox ID: $bobToxId (expected 76 hex characters)');
+        'Invalid identifier for ${bob.alias}: length=${bobToxId.length}, expectedLength=76');
   }
 
   final alicePublicKey = aliceToxId.substring(0, 64);
   final bobPublicKey = bobToxId.substring(0, 64);
   print(
-      '[establishFriendshipVirtual] ${alice.alias} Public Key: $alicePublicKey');
-  print('[establishFriendshipVirtual] ${bob.alias} Public Key: $bobPublicKey');
+      '[establishFriendshipVirtual] ${alice.alias} publicKeyLength=${alicePublicKey.length}');
+  print(
+      '[establishFriendshipVirtual] ${bob.alias} publicKeyLength=${bobPublicKey.length}');
 
   print(
-      '[establishFriendshipVirtual] ${alice.alias} adding ${bob.alias} as friend (Tox ID: $bobToxId)...');
-  final aliceAddResult = await alice.runWithInstanceAsync(
-      () async => TIMFriendshipManager.instance.addFriend(
+      '[establishFriendshipVirtual] ${alice.alias} adding ${bob.alias} as friend');
+  final aliceAddResult = await alice
+      .runWithInstanceAsync(() async => TIMFriendshipManager.instance.addFriend(
             userID: bobToxId,
             addType: FriendTypeEnum.V2TIM_FRIEND_TYPE_BOTH,
             addWording: 'Hello from Alice',
           ));
   if (aliceAddResult.code != 0) {
     print(
-        '[establishFriendshipVirtual] Warning: ${alice.alias} addFriend returned code ${aliceAddResult.code}: ${aliceAddResult.desc}');
+        '[establishFriendshipVirtual] ${alice.alias} addFriend status=${aliceAddResult.code}');
   } else {
     print(
         '[establishFriendshipVirtual] ${alice.alias} successfully added ${bob.alias} as friend');
   }
 
   print(
-      '[establishFriendshipVirtual] ${bob.alias} adding ${alice.alias} as friend (Tox ID: $aliceToxId)...');
-  final bobAddResult = await bob.runWithInstanceAsync(
-      () async => TIMFriendshipManager.instance.addFriend(
+      '[establishFriendshipVirtual] ${bob.alias} adding ${alice.alias} as friend');
+  final bobAddResult = await bob
+      .runWithInstanceAsync(() async => TIMFriendshipManager.instance.addFriend(
             userID: aliceToxId,
             addType: FriendTypeEnum.V2TIM_FRIEND_TYPE_BOTH,
             addWording: 'Hello from Bob',
           ));
   if (bobAddResult.code != 0) {
     print(
-        '[establishFriendshipVirtual] Warning: ${bob.alias} addFriend returned code ${bobAddResult.code}: ${bobAddResult.desc}');
+        '[establishFriendshipVirtual] ${bob.alias} addFriend status=${bobAddResult.code}');
   } else {
     print(
         '[establishFriendshipVirtual] ${bob.alias} successfully added ${alice.alias} as friend');
@@ -2952,114 +3016,92 @@ Future<void> establishFriendshipVirtual(
 
   print(
       '[establishFriendshipVirtual] Pumping until friend lists converge or 3s elapses...');
-  {
-    final prePumpDeadline = VirtualClock.nowMs + 3000;
-    bool converged = false;
-    while (VirtualClock.nowMs < prePumpDeadline) {
-      await pumpTestTick(scenario,
-          advanceMs: 25, iterationsPerInstance: 40);
-      final aliceFriends = await alice.getFriendList();
-      final bobFriends = await bob.getFriendList();
-      if (listContainsPublicKey(aliceFriends, bobPublicKey) &&
-          listContainsPublicKey(bobFriends, alicePublicKey)) {
-        converged = true;
-        break;
-      }
-    }
-    if (converged) {
-      print(
-          '[establishFriendshipVirtual] Friend lists converged during pre-pump');
-    }
+  final boundedPrePumpDeadline = VirtualClock.nowMs + 3000;
+  final prePumpDeadline =
+      boundedPrePumpDeadline < deadline ? boundedPrePumpDeadline : deadline;
+  bool converged = false;
+  List<String> aliceFriends = const [];
+  List<String> bobFriends = const [];
+  while (!converged && VirtualClock.nowMs < prePumpDeadline) {
+    final remainingMs = prePumpDeadline - VirtualClock.nowMs;
+    await pumpTestTick(scenario,
+        advanceMs: remainingMs < 25 ? remainingMs : 25,
+        iterationsPerInstance: 40);
+    aliceFriends = await alice.getFriendList();
+    bobFriends = await bob.getFriendList();
+    converged = listContainsPublicKey(aliceFriends, bobPublicKey) &&
+        listContainsPublicKey(bobFriends, alicePublicKey);
+  }
+  if (converged) {
+    print(
+        '[establishFriendshipVirtual] Friend lists converged during pre-pump');
   }
 
   int checkCount = 0;
-  while (VirtualClock.nowMs < deadline) {
+  while (!converged && VirtualClock.nowMs < deadline) {
     checkCount++;
+    final remainingMs = deadline - VirtualClock.nowMs;
     await pumpTestTick(scenario,
-        advanceMs: 50, iterationsPerInstance: 120);
-    final aliceFriends = await alice.getFriendList();
-    final bobFriends = await bob.getFriendList();
+        advanceMs: remainingMs < 50 ? remainingMs : 50,
+        iterationsPerInstance: 120);
+    aliceFriends = await alice.getFriendList();
+    bobFriends = await bob.getFriendList();
     final aliceHasBob = listContainsPublicKey(aliceFriends, bobPublicKey);
     final bobHasAlice = listContainsPublicKey(bobFriends, alicePublicKey);
 
     if (aliceHasBob && bobHasAlice) {
-      print(
-          '[establishFriendshipVirtual] Bidirectional friendship established after $checkCount checks');
-      final remainingMs = deadline - VirtualClock.nowMs;
-      if (remainingMs < 2000) {
-        print(
-            '[establishFriendshipVirtual] Little time left in timeout, skipping P2P wait');
-        return;
-      }
-      const pumpDurationMs = 800;
-      final actualPumpMs = remainingMs > 4000
-          ? pumpDurationMs
-          : remainingMs.clamp(200, 800);
-      print(
-          '[establishFriendshipVirtual] Pumping Tox for P2P connection (${actualPumpMs}ms)...');
-      await pumpFriendConnectionVirtual(
-        scenario,
-        alice,
-        bob,
-        duration: Duration(milliseconds: actualPumpMs),
-      );
-
-      final remainingForP2PMs = deadline - VirtualClock.nowMs;
-      const minWaitSec = 15;
-      const maxWaitSec = 30;
-      final remainingForP2PSec = remainingForP2PMs ~/ 1000;
-      final halfRemaining =
-          remainingForP2PSec >= 2 ? (remainingForP2PSec ~/ 2) : 0;
-      final waitEachSec = remainingForP2PSec >= 4
-          ? (halfRemaining > maxWaitSec
-              ? maxWaitSec
-              : (halfRemaining < minWaitSec ? minWaitSec : halfRemaining))
-          : remainingForP2PSec.clamp(1, maxWaitSec);
-      final waitEach = Duration(seconds: waitEachSec);
-      print(
-          '[establishFriendshipVirtual] Waiting for Tox P2P connection sequentially (${waitEach.inSeconds}s each)...');
-      // Sequential, not Future.wait: same reasoning as configureLocalBootstrapVirtual.
-      // Concurrent waiters share VirtualClock and stomp on the process-global
-      // current-instance pointer set by runWithInstanceAsync. Going sequentially
-      // gives each side a clean virtual budget and instance context; the other
-      // side still makes Tox-level progress through the shared pump.
-      try {
-        await waitForFriendConnectionVirtual(scenario, alice, bobToxId,
-            timeout: waitEach);
-        await waitForFriendConnectionVirtual(scenario, bob, aliceToxId,
-            timeout: waitEach);
-        print(
-            '[establishFriendshipVirtual] Both sides see friend as ONLINE');
-      } catch (e) {
-        print(
-            '[establishFriendshipVirtual] P2P wait timed out (friend list is established; tests may retry): $e');
-      }
-      return;
+      converged = true;
+      break;
     }
 
     if (checkCount % 5 == 0) {
       print(
           '[establishFriendshipVirtual] Check $checkCount: alice has bob=$aliceHasBob, bob has alice=$bobHasAlice');
       print(
-          '[establishFriendshipVirtual] Check $checkCount: aliceFriends=${aliceFriends.join(", ")}, bobFriends=${bobFriends.join(", ")}');
+          '[establishFriendshipVirtual] Check $checkCount: aliceFriendCount=${aliceFriends.length}, bobFriendCount=${bobFriends.length}');
     }
 
-    await pumpTestTick(scenario,
-        advanceMs: 400, iterationsPerInstance: 1);
+    final remainingAfterCheckMs = deadline - VirtualClock.nowMs;
+    if (remainingAfterCheckMs > 0) {
+      await pumpTestTick(scenario,
+          advanceMs: remainingAfterCheckMs < 400 ? remainingAfterCheckMs : 400,
+          iterationsPerInstance: 1);
+    }
   }
 
-  final finalAliceFriends = await alice.getFriendList();
-  final finalBobFriends = await bob.getFriendList();
-  final finalAliceHasBob =
-      listContainsPublicKey(finalAliceFriends, bobPublicKey);
-  final finalBobHasAlice =
-      listContainsPublicKey(finalBobFriends, alicePublicKey);
+  if (!converged) {
+    final finalAliceFriends = await alice.getFriendList();
+    final finalBobFriends = await bob.getFriendList();
+    final finalAliceHasBob =
+        listContainsPublicKey(finalAliceFriends, bobPublicKey);
+    final finalBobHasAlice =
+        listContainsPublicKey(finalBobFriends, alicePublicKey);
 
-  throw TimeoutException(
-      'Timeout waiting for bidirectional friendship to be established (virtual timeout: $friendshipTimeout). '
-      'Final state: alice has bob=$finalAliceHasBob, bob has alice=$finalBobHasAlice. '
-      'aliceFriends=${finalAliceFriends.join(", ")}, bobFriends=${finalBobFriends.join(", ")}. '
-      'This may indicate that nodes are not connected to each other (check bootstrap configuration).');
+    throw TimeoutException('Timeout waiting for bidirectional friendship '
+        '(virtualTimeoutMs=${friendshipTimeout.inMilliseconds}, '
+        '${alice.alias}Has${bob.alias}=$finalAliceHasBob, '
+        '${bob.alias}Has${alice.alias}=$finalBobHasAlice, '
+        '${alice.alias}FriendCount=${finalAliceFriends.length}, '
+        '${bob.alias}FriendCount=${finalBobFriends.length}).');
+  }
+
+  print(
+      '[establishFriendshipVirtual] Bidirectional friendship established after $checkCount checks');
+  var remainingMs = deadline - VirtualClock.nowMs;
+  await waitForFriendConnectionVirtual(
+    scenario,
+    alice,
+    bobToxId,
+    timeout: Duration(milliseconds: remainingMs > 0 ? remainingMs : 0),
+  );
+  remainingMs = deadline - VirtualClock.nowMs;
+  await waitForFriendConnectionVirtual(
+    scenario,
+    bob,
+    aliceToxId,
+    timeout: Duration(milliseconds: remainingMs > 0 ? remainingMs : 0),
+  );
+  print('[establishFriendshipVirtual] Both sides see friend as ONLINE');
 }
 
 /// Virtual-clock variant of [configureLocalBootstrap].

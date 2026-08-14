@@ -9,7 +9,7 @@
 #endif
 
 #ifndef TIM2TOX_MANAGER_SOURCE_PATH
-#error "TIM2TOX_MANAGER_SOURCE_PATH must point to source/V2TIMManagerImpl.cpp"
+#error "TIM2TOX_MANAGER_SOURCE_PATH must point to source/ToxManager.cpp"
 #endif
 
 namespace {

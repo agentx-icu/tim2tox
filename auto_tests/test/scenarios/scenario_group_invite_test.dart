@@ -27,7 +27,7 @@ void main() {
       peer2 = scenario.getNode('peer2')!;
 
       await scenario.initAllNodes();
-      // Enable test mode BEFORE login so event_thread never starts.
+      // Refresh the per-instance flag inherited from initAllNodes' early lease.
       if (shouldRunVirtual) await VirtualClock.enableForScenario(scenario);
 
       // Enable auto-accept so friend requests are accepted (required for invite flow)

@@ -59,12 +59,10 @@ void main() {
         waitForConnectionVirtual(scenario, charlie,
             timeout: const Duration(seconds: 15)),
       ]);
-      await Future.wait([
-        establishFriendshipVirtual(scenario, alice, bob,
-            timeout: const Duration(seconds: 90)),
-        establishFriendshipVirtual(scenario, alice, charlie,
-            timeout: const Duration(seconds: 90)),
-      ]);
+      await establishFriendshipVirtual(scenario, alice, bob,
+          timeout: const Duration(seconds: 90));
+      await establishFriendshipVirtual(scenario, alice, charlie,
+          timeout: const Duration(seconds: 90));
       await pumpFriendConnectionVirtual(scenario, alice, bob,
           duration: const Duration(seconds: 5));
       await pumpFriendConnectionVirtual(scenario, alice, charlie,

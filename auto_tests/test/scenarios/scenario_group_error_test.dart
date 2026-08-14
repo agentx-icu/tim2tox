@@ -31,7 +31,7 @@ void main() {
       charlie = scenario.getNode('charlie')!;
 
       await scenario.initAllNodes();
-      // Enable test mode BEFORE login so event_thread never starts.
+      // Refresh the per-instance flag inherited from initAllNodes' early lease.
       if (shouldRunVirtual) await VirtualClock.enableForScenario(scenario);
 
       // Parallelize login

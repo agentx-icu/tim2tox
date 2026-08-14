@@ -1,8 +1,46 @@
 import 'dart:ffi' as ffi;
+import 'dart:io';
 
+import 'package:ffi/ffi.dart' as pkgffi;
 import 'package:flutter_test/flutter_test.dart';
+import 'package:path/path.dart' as path;
 import 'package:tim2tox_dart/ffi/tim2tox_ffi.dart';
 import 'package:tim2tox_dart/service/toxav_service.dart';
+
+Directory _tim2ToxRoot() {
+  for (final start in _rootSearchStarts()) {
+    var directory = start;
+    while (true) {
+      if (_hasTim2ToxMarkers(directory)) return directory;
+      final parent = directory.parent;
+      if (parent.path == directory.path) break;
+      directory = parent;
+    }
+  }
+  throw StateError('Tim2Tox root was not found from test search roots.');
+}
+
+Iterable<Directory> _rootSearchStarts() sync* {
+  yield Directory.current.absolute;
+  yield Directory(
+    path.join(Directory.current.absolute.path, 'third_party', 'tim2tox'),
+  );
+  if (Platform.script.scheme == 'file') {
+    yield File(Platform.script.toFilePath()).parent.absolute;
+  }
+}
+
+bool _hasTim2ToxMarkers(Directory directory) {
+  return File(path.join(directory.path, 'README_BUILD.md')).existsSync() &&
+      File(path.join(directory.path, 'CMakeLists.txt')).existsSync() &&
+      Directory(path.join(directory.path, 'source')).existsSync() &&
+      File(path.join(directory.path, 'dart', 'pubspec.yaml')).existsSync();
+}
+
+String _dartPackageRoot() => path.join(_tim2ToxRoot().path, 'dart');
+
+String _readDartSource(String relativePath) =>
+    File(path.join(_dartPackageRoot(), relativePath)).readAsStringSync();
 
 void main() {
   test(
@@ -81,6 +119,135 @@ void main() {
       ),
     );
   });
+
+  test('binds friend lookup to the captured instance', () {
+    final fakeFfi = _RecordingFfi(currentInstanceId: 41);
+    final service = ToxAVService(fakeFfi);
+    final ffiSource = _readDartSource('lib/ffi/tim2tox_ffi.dart');
+
+    fakeFfi.currentInstanceId = 42;
+
+    expect(service.getFriendNumberByUserId('friend-user-id'), equals(7));
+
+    final lookupCalls = fakeFfi.calls.where(
+      (call) => call.operation == 'getFriendNumberByUserId',
+    );
+    expect(
+      lookupCalls,
+      hasLength(1),
+      reason: 'friend lookup must use the instance captured at construction',
+    );
+    expect(lookupCalls.single.instanceId, equals(41));
+
+    expect(
+      ffiSource,
+      contains('tim2tox_ffi_get_friend_number_by_user_id_for_instance'),
+      reason: 'friend lookup needs an instance-scoped native binding',
+    );
+    expect(
+      ffiSource,
+      contains("tim2tox_ffi_get_friend_number_by_user_id');"),
+      reason: 'the additive instance-scoped binding must retain legacy ABI',
+    );
+  });
+
+  test(
+    'falls back to the legacy friend lookup only for the default instance',
+    () {
+      final fakeFfi = _RecordingFfi(currentInstanceId: 0)
+        ..missingFriendLookupForInstanceNative = true;
+      final service = ToxAVService(fakeFfi);
+
+      expect(service.getFriendNumberByUserId('friend-user-id'), equals(7));
+
+      final legacyCalls = fakeFfi.calls.where(
+        (call) => call.operation == 'getFriendNumberByUserIdLegacy',
+      );
+      expect(legacyCalls, hasLength(1));
+      expect(legacyCalls.single.instanceId, equals(0));
+    },
+  );
+
+  test(
+    'does not fall back to ambient friend lookup for nonzero instances',
+    () {
+      final fakeFfi = _RecordingFfi(currentInstanceId: 41)
+        ..missingFriendLookupForInstanceNative = true;
+      final service = ToxAVService(fakeFfi);
+
+      expect(
+        service.getFriendNumberByUserId('friend-user-id'),
+        equals(0xFFFFFFFF),
+      );
+
+      final legacyCalls = fakeFfi.calls.where(
+        (call) => call.operation == 'getFriendNumberByUserIdLegacy',
+      );
+      expect(legacyCalls, isEmpty);
+    },
+  );
+
+  test('ignores a missing conference clear-pending binding', () {
+    final fakeFfi = _RecordingFfi(currentInstanceId: 41)
+      ..missingConferenceClearPendingAudioNative = true;
+    final service = ToxAVService(fakeFfi);
+
+    expect(
+      () => service.setConferenceAudioReceiveCallback(
+        (
+          String _,
+          int __,
+          int ___,
+          List<int> ____,
+          int _____,
+          int ______,
+          int _______,
+        ) {},
+      ),
+      returnsNormally,
+    );
+  });
+
+  test('clears the route on shutdown before init', () {
+    final fakeFfi = _RecordingFfi(currentInstanceId: 41);
+    final service = ToxAVService(fakeFfi);
+    final calls = <int>[];
+
+    service.setCallCallback((friendNumber, _, __) {
+      calls.add(friendNumber);
+    });
+
+    service.shutdown();
+    ToxAVService.dispatchAvCall(41, 7, true, false);
+
+    expect(
+      calls,
+      isEmpty,
+      reason: 'shutdown before init should clear the static route',
+    );
+  });
+
+  test('re-registers the route after init shutdown init', () async {
+    final fakeFfi = _RecordingFfi(currentInstanceId: 41);
+    final service = ToxAVService(fakeFfi);
+    final calls = <int>[];
+
+    service.setCallCallback((friendNumber, _, __) {
+      calls.add(friendNumber);
+    });
+
+    expect(await service.initialize(), isTrue);
+    service.shutdown();
+    expect(await service.initialize(), isTrue);
+
+    ToxAVService.dispatchAvCall(41, 9, true, false);
+
+    expect(
+      calls,
+      orderedEquals([9]),
+      reason: 'reinitialize should restore instance routing',
+    );
+  });
 }
 
 class _RecordedCall {
@@ -94,6 +261,9 @@ class _RecordingFfi implements Tim2ToxFfi {
   _RecordingFfi({required this.currentInstanceId});
 
   int currentInstanceId;
+  bool missingConferenceClearPendingAudioNative = false;
+  bool missingFriendLookupForInstanceNative = false;
+  bool missingLegacyFriendLookupNative = false;
   final calls = <_RecordedCall>[];
 
   void _record(String operation, int instanceId) {
@@ -102,24 +272,35 @@ class _RecordingFfi implements Tim2ToxFfi {
 
   @override
   dynamic noSuchMethod(Invocation invocation) {
+    if (invocation.memberName == #avConferenceClearPendingAudioNative &&
+        missingConferenceClearPendingAudioNative) {
+      throw ArgumentError('missing avConferenceClearPendingAudioNative');
+    }
+    if (invocation.memberName == #getFriendNumberByUserIdForInstanceNative &&
+        missingFriendLookupForInstanceNative) {
+      throw ArgumentError('missing getFriendNumberByUserIdForInstanceNative');
+    }
+    if (invocation.memberName == #getFriendNumberByUserIdNative &&
+        missingLegacyFriendLookupNative) {
+      throw ArgumentError('missing getFriendNumberByUserIdNative');
+    }
     if (invocation.memberName == #avConferenceSendAudioFrame) {
-      _record('sendConferenceAudioFrame',
-          invocation.positionalArguments[0] as int);
+      _record(
+          'sendConferenceAudioFrame', invocation.positionalArguments[0] as int);
       return 1;
     }
     if (invocation.memberName == #avConferenceEnable) {
-      _record('enableConferenceAudio',
-          invocation.positionalArguments[0] as int);
+      _record(
+          'enableConferenceAudio', invocation.positionalArguments[0] as int);
       return 1;
     }
     if (invocation.memberName == #avConferenceDisable) {
-      _record('disableConferenceAudio',
-          invocation.positionalArguments[0] as int);
+      _record(
+          'disableConferenceAudio', invocation.positionalArguments[0] as int);
       return 1;
     }
     if (invocation.memberName == #avConferenceMute) {
-      _record('muteConferenceAudio',
-          invocation.positionalArguments[0] as int);
+      _record('muteConferenceAudio', invocation.positionalArguments[0] as int);
       return 1;
     }
     if (!invocation.isGetter) {
@@ -153,15 +334,21 @@ class _RecordingFfi implements Tim2ToxFfi {
           _record('muteVideo', instanceId);
           return 1;
         },
-      #avSendAudioFrameNative =>
-        (int instanceId, int _, ffi.Pointer<ffi.Int16> __, int ___, int ____, int _____) {
+      #avSendAudioFrameNative => (int instanceId, int _,
+            ffi.Pointer<ffi.Int16> __, int ___, int ____, int _____) {
           _record('sendAudioFrame', instanceId);
           return 1;
         },
-      #avSendVideoFrameNative =>
-        (int instanceId, int _, int __, int ___, ffi.Pointer<ffi.Uint8> ____,
-            ffi.Pointer<ffi.Uint8> _____, ffi.Pointer<ffi.Uint8> ______, int _______,
-            int ________, int _________) {
+      #avSendVideoFrameNative => (int instanceId,
+            int _,
+            int __,
+            int ___,
+            ffi.Pointer<ffi.Uint8> ____,
+            ffi.Pointer<ffi.Uint8> _____,
+            ffi.Pointer<ffi.Uint8> ______,
+            int _______,
+            int ________,
+            int _________) {
           _record('sendVideoFrame', instanceId);
           return 1;
         },
@@ -177,6 +364,15 @@ class _RecordingFfi implements Tim2ToxFfi {
           _record('getFriendConnectionStatus', instanceId);
           return 1;
         },
+      #getFriendNumberByUserIdNative => (ffi.Pointer<pkgffi.Utf8> _) {
+          _record('getFriendNumberByUserIdLegacy', currentInstanceId);
+          return 7;
+        },
+      #getFriendNumberByUserIdForInstanceNative =>
+        (int instanceId, ffi.Pointer<pkgffi.Utf8> _) {
+          _record('getFriendNumberByUserId', instanceId);
+          return 7;
+        },
       #avSetCallCallbackNative ||
       #avSetCallStateCallbackNative ||
       #avSetAudioReceiveCallbackNative ||
@@ -185,6 +381,8 @@ class _RecordingFfi implements Tim2ToxFfi {
       #avSetVideoBitrateCallbackNative ||
       #avConferenceSetAudioReceiveCallbackNative =>
         (int _, Object __, Object ___) {},
+      #avConferenceClearPendingAudioNative => (int instanceId) =>
+          _record('clearPendingConferenceAudio', instanceId),
       _ => super.noSuchMethod(invocation),
     };
   }

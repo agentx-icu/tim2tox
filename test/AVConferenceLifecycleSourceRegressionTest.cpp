@@ -152,6 +152,30 @@ TEST(AVConferenceLifecycleSourceRegressionTest,
 }
 
 TEST(AVConferenceLifecycleSourceRegressionTest,
+     RejoinKnownGroupsRestoresEnabledAvConferencesForAudioQueueing) {
+    const std::string manager = ReadSource(TIM2TOX_MANAGER_SOURCE_PATH);
+    const std::string rejoin = SourceSection(
+        manager,
+        "void V2TIMManagerImpl::RejoinKnownGroups()",
+        nullptr);
+
+    const std::size_t first_enable = rejoin.find("toxav_groupchat_enable_av(");
+    const std::size_t first_insert =
+        rejoin.find("enabled_av_conferences_.insert(conf_num)");
+    const std::size_t second_enable = rejoin.find(
+        "toxav_groupchat_enable_av(", first_enable + 1);
+    const std::size_t second_insert = rejoin.find(
+        "enabled_av_conferences_.insert(conf_num)", first_insert + 1);
+
+    ASSERT_NE(first_enable, std::string::npos);
+    ASSERT_NE(first_insert, std::string::npos);
+    ASSERT_NE(second_enable, std::string::npos);
+    ASSERT_NE(second_insert, std::string::npos);
+    EXPECT_LT(first_enable, first_insert);
+    EXPECT_LT(second_enable, second_insert);
+}
+
+TEST(AVConferenceLifecycleSourceRegressionTest,
      PendingInviteKindRoutesConferenceRetriesToToxAV) {
     const std::string header = ReadSource(TIM2TOX_MANAGER_HEADER_PATH);
     const std::string manager = ReadSource(TIM2TOX_MANAGER_SOURCE_PATH);
@@ -305,6 +329,42 @@ TEST(AVConferenceLifecycleSourceRegressionTest,
               std::string::npos);
     EXPECT_NE(known_groups_sync.find("targetInstanceId"), std::string::npos);
     EXPECT_EQ(known_groups_sync.find("_ffi.getCurrentInstanceId()"),
+              std::string::npos);
+}
+
+TEST(AVConferenceLifecycleSourceRegressionTest,
+     ConferenceAudioQueuesNewest64AndDrainsOnlyFromAvIterate) {
+    const std::string manager = ReadSource(TIM2TOX_MANAGER_SOURCE_PATH);
+    const std::string header = ReadSource(TIM2TOX_MANAGER_HEADER_PATH);
+    const std::string ffi_source = ReadSource(TIM2TOX_FFI_SOURCE_PATH);
+    const std::string handle_conference_audio = SourceSection(
+        manager,
+        "static void HandleAVConferenceAudio(",
+        "#endif // BUILD_TOXAV");
+    const std::string av_iterate = SourceSection(
+        ffi_source,
+        "void tim2tox_ffi_av_iterate(",
+        "int tim2tox_ffi_av_start_call(");
+
+    EXPECT_EQ(handle_conference_audio.find("ForwardAVConferenceAudioToDart("),
+              std::string::npos);
+    EXPECT_NE(handle_conference_audio.find("manager_impl->EnqueueAVConferenceAudioFrame("),
+              std::string::npos);
+    EXPECT_NE(header.find("AVConferenceAudioQueue"), std::string::npos);
+    EXPECT_NE(header.find("EnqueueAVConferenceAudioFrame"), std::string::npos);
+    EXPECT_NE(header.find("DrainPendingAVConferenceAudioFrames"), std::string::npos);
+    EXPECT_NE(av_iterate.find("manager_impl->DrainPendingAVConferenceAudioFrames();"),
+              std::string::npos);
+    EXPECT_EQ(ffi_source.find("g_pending_av_conference_audio_frames"),
+              std::string::npos);
+    EXPECT_EQ(ffi_source.find("DrainAVConferenceAudioFrames("), std::string::npos);
+    EXPECT_NE(ffi_source.find(
+                  "void tim2tox_ffi_av_conference_clear_pending_audio("),
+              std::string::npos);
+    EXPECT_NE(ffi_source.find(
+                  "manager->ClearPendingAVConferenceAudioFrames();"),
+              std::string::npos);
+    EXPECT_EQ(ffi_source.find("kMaxPendingAVConferenceAudioFrames"),
               std::string::npos);
 }
 

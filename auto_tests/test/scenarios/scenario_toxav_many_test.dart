@@ -5,6 +5,7 @@
 /// driven by regular pumpTestTick).
 
 import 'dart:async';
+import 'dart:io';
 import 'package:test/test.dart';
 import 'package:tencent_cloud_chat_sdk/native_im/adapter/tim_friendship_manager.dart';
 import 'package:tencent_cloud_chat_sdk/enum/friend_type_enum.dart';
@@ -14,6 +15,23 @@ import '../test_helper.dart';
 import '../test_fixtures.dart';
 
 void main() {
+  test('ToxAV callbacks stay off native event threads', () {
+    final source = File('../dart/lib/service/toxav_service.dart')
+        .readAsStringSync();
+
+    expect(source, isNot(contains('Pointer.fromFunction<_AvCallCallbackNative>')));
+    expect(source,
+        isNot(contains('Pointer.fromFunction<_AvCallStateCallbackNative>')));
+    expect(source, contains('avSetAudioReceiveCallbackNative'));
+    expect(source, contains('avSetVideoReceiveCallbackNative'));
+    expect(source, contains('avSetAudioBitrateCallbackNative'));
+    expect(source, contains('avSetVideoBitrateCallbackNative'));
+
+    final ambientInstanceReads =
+        RegExp(r'_ffi\.getCurrentInstanceId\(\)').allMatches(source).length;
+    expect(ambientInstanceReads, lessThanOrEqualTo(1));
+  });
+
   group('ToxAV Many Tests', () {
     late TestScenario scenario;
     late TestNode alice;
@@ -165,6 +183,21 @@ void main() {
       }
       await scenario.dispose();
       await teardownTestEnvironment();
+    });
+
+    test('ToxAV global callback dispatch routes each event once', () {
+      var callCount = 0;
+      var stateCount = 0;
+      final bobService = bobAVs.first;
+      final instanceId = bobs.first.testInstanceHandle!;
+      bobService.setCallCallback((_, __, ___) => callCount++);
+      bobService.setCallStateCallback((_, __) => stateCount++);
+
+      ToxAVService.dispatchAvCall(instanceId, 1, true, false);
+      ToxAVService.dispatchAvCallState(instanceId, 1, 2);
+
+      expect(callCount, equals(1));
+      expect(stateCount, equals(1));
     });
 
     test('Multiple simultaneous AV calls', () async {

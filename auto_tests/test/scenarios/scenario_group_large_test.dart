@@ -34,7 +34,7 @@ void main() {
       eve = scenario.getNode('eve')!;
 
       await scenario.initAllNodes();
-      // Enable test mode BEFORE login so event_thread never starts.
+      // Refresh the per-instance flag inherited from initAllNodes' early lease.
       if (shouldRunVirtual) await VirtualClock.enableForScenario(scenario);
 
       // Parallelize login for all 5 nodes
@@ -73,13 +73,10 @@ void main() {
         waitForConnectionVirtual(scenario, eve,
             timeout: const Duration(seconds: 25)),
       ]);
-      // Parallelize friendships — virtual clock is global, so all four halves
-      // step in lockstep through the same pumpTestTick.
-      await Future.wait([
-        for (final peer in [bob, charlie, david, eve])
-          establishFriendshipVirtual(scenario, alice, peer,
-              timeout: const Duration(seconds: 90)),
-      ]);
+      for (final peer in [bob, charlie, david, eve]) {
+        await establishFriendshipVirtual(scenario, alice, peer,
+            timeout: const Duration(seconds: 90));
+      }
       // Brief shared pump so all friend connections get iterate cycles.
       await pumpFriendConnectionVirtual(scenario, alice, bob,
           duration: const Duration(seconds: 3));

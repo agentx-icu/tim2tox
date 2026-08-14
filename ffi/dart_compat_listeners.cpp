@@ -216,8 +216,8 @@ static std::string UserStatusVectorToJson(const V2TIMUserStatusVector& status_ve
             json << "\"user_status_custom_status\":\"" << EscapeJsonString(custom_status) << "\",";
             json << "\"user_status_online_devices\":[]";
             json << "}";
-        } catch (const std::exception& e) {
-            V2TIM_LOG(kError, "[dart_compat] UserStatusVectorToJson: EXCEPTION processing status[{}]: {}", i, e.what());
+        } catch (const std::exception&) {
+            V2TIM_LOG(kError, "[dart_compat] UserStatusVectorToJson: exception processing status_index={}", i);
             json << "{\"user_status_identifier\":\"\",\"user_status_status_type\":0,\"user_status_custom_status\":\"\",\"user_status_online_devices\":[]}";
         } catch (...) {
             V2TIM_LOG(kError, "[dart_compat] UserStatusVectorToJson: UNKNOWN EXCEPTION processing status[{}]", i);
@@ -1097,7 +1097,7 @@ public:
         
         if (instance_id == 0) {
             instance_id = GetCurrentInstanceId();
-            V2TIM_LOG(kWarning, "[DartFriendshipListenerImpl] OnFriendApplicationListAdded: listener not found in map, using GetCurrentInstanceId()={}", (long long)instance_id);
+            V2TIM_LOG(kWarning, "[DartFriendshipListenerImpl] OnFriendApplicationListAdded: event=resolve_instance status=fallback_current");
         }
 
         // Convert V2TIMFriendApplicationVector to JSON array
@@ -1529,8 +1529,8 @@ public:
             std::string user_data = UserDataToString(GetCallbackUserData(instance_id, "ConvEvent"));
             std::string json_msg = BuildGlobalCallbackJson(GlobalCallbackType::ConversationEvent, fields, user_data, instance_id);
             SendCallbackToDart("globalCallback", json_msg, GetCallbackUserData(instance_id, "ConvEvent"));
-        } catch (const std::exception& e) {
-            V2TIM_LOG(kError, "[dart_compat] DartConversationListenerImpl::OnConversationChanged: exception {}", e.what());
+        } catch (const std::exception&) {
+            V2TIM_LOG(kError, "[dart_compat] DartConversationListenerImpl::OnConversationChanged: exception");
         } catch (...) {
             V2TIM_LOG(kError, "[dart_compat] DartConversationListenerImpl::OnConversationChanged: unknown exception");
         }
@@ -1555,8 +1555,8 @@ public:
             std::string user_data = UserDataToString(GetCallbackUserData(instance_id, "ConvEvent"));
             std::string json_msg = BuildGlobalCallbackJson(GlobalCallbackType::ConversationEvent, fields, user_data, instance_id);
             SendCallbackToDart("globalCallback", json_msg, GetCallbackUserData(instance_id, "ConvEvent"));
-        } catch (const std::exception& e) {
-            V2TIM_LOG(kError, "[dart_compat] DartConversationListenerImpl::OnConversationDeleted: exception {}", e.what());
+        } catch (const std::exception&) {
+            V2TIM_LOG(kError, "[dart_compat] DartConversationListenerImpl::OnConversationDeleted: exception");
         } catch (...) {
             V2TIM_LOG(kError, "[dart_compat] DartConversationListenerImpl::OnConversationDeleted: unknown exception");
         }
@@ -3040,9 +3040,7 @@ void ReplayListenersForNewInstance(int64_t instance_id, V2TIMManagerImpl* manage
                 auto* fm = manager->GetFriendshipManager();
                 if (fm) {
                     fm->AddFriendListener(listener);
-                    V2TIM_LOG(kInfo,
-                              "[ReplayListenersForNewInstance] Unconditionally registered Friendship listener={} on instance_id={} fm={} (no prior user_data found)",
-                              (void*)listener, (long long)instance_id, (void*)fm);
+                    V2TIM_LOG(kInfo, "[ReplayListenersForNewInstance] event=friendship status=registered prior_user_data_found=0");
                 }
             }
         }
@@ -3109,8 +3107,7 @@ void ReplayListenersForNewInstance(int64_t instance_id, V2TIMManagerImpl* manage
                 if (mm) {
                     mm->AddAdvancedMsgListener(listener);
                     adv_registered = true;
-                    V2TIM_LOG(kInfo, "[ReplayListenersForNewInstance] Registered AdvancedMsg listener={} on instance_id={} msgManager={}",
-                              (void*)listener, (long long)instance_id, (void*)mm);
+                    V2TIM_LOG(kInfo, "[ReplayListenersForNewInstance] event=advanced_msg status=registered prior_user_data_found=1");
                 }
             }
         };
@@ -3148,8 +3145,7 @@ void ReplayListenersForNewInstance(int64_t instance_id, V2TIMManagerImpl* manage
                 auto* mm = manager->GetMessageManager();
                 if (mm) {
                     mm->AddAdvancedMsgListener(listener);
-                    V2TIM_LOG(kInfo, "[ReplayListenersForNewInstance] Unconditionally registered AdvancedMsg listener={} on instance_id={} msgManager={} (no prior user_data found)",
-                              (void*)listener, (long long)instance_id, (void*)mm);
+                    V2TIM_LOG(kInfo, "[ReplayListenersForNewInstance] event=advanced_msg status=registered prior_user_data_found=0");
                 }
             }
         }
@@ -3182,8 +3178,7 @@ void ReplayListenersForNewInstance(int64_t instance_id, V2TIMManagerImpl* manage
                 if (cm) {
                     cm->AddConversationListener(listener);
                     conv_registered = true;
-                    V2TIM_LOG(kInfo, "[ReplayListenersForNewInstance] Registered Conversation listener={} on instance_id={} convManager={}",
-                              (void*)listener, (long long)instance_id, (void*)cm);
+                    V2TIM_LOG(kInfo, "[ReplayListenersForNewInstance] event=conversation status=registered prior_user_data_found=1");
                 }
             }
         };
@@ -3210,8 +3205,7 @@ void ReplayListenersForNewInstance(int64_t instance_id, V2TIMManagerImpl* manage
                 auto* cm = manager->GetConversationManager();
                 if (cm) {
                     cm->AddConversationListener(listener);
-                    V2TIM_LOG(kInfo, "[ReplayListenersForNewInstance] Unconditionally registered Conversation listener={} on instance_id={} convManager={} (no prior user_data found)",
-                              (void*)listener, (long long)instance_id, (void*)cm);
+                    V2TIM_LOG(kInfo, "[ReplayListenersForNewInstance] event=conversation status=registered prior_user_data_found=0");
                 }
             }
         }

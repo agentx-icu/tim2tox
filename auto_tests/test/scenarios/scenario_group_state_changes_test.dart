@@ -70,7 +70,7 @@ void main() {
       charlie = scenario.getNode('charlie')!;
 
       await scenario.initAllNodes();
-      // Enable test mode BEFORE login so event_thread never starts.
+      // Refresh the per-instance flag inherited from initAllNodes' early lease.
       if (shouldRunVirtual) await VirtualClock.enableForScenario(scenario);
 
       // Parallelize login
@@ -88,11 +88,12 @@ void main() {
 
       await configureLocalBootstrapVirtual(scenario);
       // tim2tox inviteUserToGroup requires inviter to have invitee as friend.
-      await Future.wait([
-        establishFriendshipVirtual(scenario, alice, bob),
-        establishFriendshipVirtual(scenario, alice, charlie),
-        establishFriendshipVirtual(scenario, bob, charlie),
-      ]);
+      await establishFriendshipVirtual(scenario, alice, bob,
+          timeout: const Duration(seconds: 90));
+      await establishFriendshipVirtual(scenario, alice, charlie,
+          timeout: const Duration(seconds: 90));
+      await establishFriendshipVirtual(scenario, bob, charlie,
+          timeout: const Duration(seconds: 90));
       await pumpFriendConnectionVirtual(scenario, alice, bob,
           duration: const Duration(seconds: 4));
       await pumpFriendConnectionVirtual(scenario, alice, charlie,

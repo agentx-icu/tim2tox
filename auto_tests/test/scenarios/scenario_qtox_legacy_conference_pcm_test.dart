@@ -472,5 +472,104 @@ void main() {
       },
       timeout: const Timeout(Duration(seconds: 240)),
     );
+
+    test(
+      'does not dispatch queued PCM until avIterate pumps the receiver',
+      () async {
+        final conferenceIds = await _createJoinedConference(
+          scenario,
+          alice,
+          bob,
+        );
+        final aliceConferenceId = conferenceIds.senderGroupId;
+        final bobConferenceId = conferenceIds.receiverGroupId;
+        const sampleCount = 960;
+        const channels = 1;
+        const sampleRate = 48000;
+        const enqueuedFrames = 5;
+        final receivedMarkers = <int>[];
+
+        bob.runWithInstance(() {
+          bobAv.setConferenceAudioReceiveCallback((
+            String groupId,
+            int conferenceNumber,
+            int peerNumber,
+            List<int> pcm,
+            int samples,
+            int channelCount,
+            int samplingRate,
+          ) {
+            if (groupId != bobConferenceId) return;
+            receivedMarkers.add(pcm.first);
+          });
+        });
+
+        expect(
+          await alice.runWithInstanceAsync(
+            () async => aliceAv.enableConferenceAudio(aliceConferenceId),
+          ),
+          isTrue,
+        );
+        expect(
+          await bob.runWithInstanceAsync(
+            () async => bobAv.enableConferenceAudio(bobConferenceId),
+          ),
+          isTrue,
+        );
+
+        for (var frameIndex = 0; frameIndex < enqueuedFrames; frameIndex++) {
+          final accepted = await alice.runWithInstanceAsync(
+            () async => aliceAv.sendConferenceAudioFrame(
+              aliceConferenceId,
+              List<int>.filled(sampleCount * channels, frameIndex),
+              sampleCount,
+              channels,
+              sampleRate,
+            ),
+          );
+          expect(
+            accepted,
+            isTrue,
+            reason: 'frame $frameIndex should enter the AV conference pipeline',
+          );
+        }
+
+        expect(
+          receivedMarkers,
+          isEmpty,
+          reason: 'conference PCM must not reach Dart before avIterate drains',
+        );
+
+        for (var attempt = 0;
+            receivedMarkers.isEmpty && attempt < 300;
+            attempt++) {
+          await _pumpAv(scenario, iterationsPerInstance: 1);
+        }
+
+        expect(
+          receivedMarkers,
+          isNotEmpty,
+          reason: 'receiver avIterate should drain queued conference PCM',
+        );
+        expect(receivedMarkers, everyElement(inInclusiveRange(0, 4)));
+
+        bob.runWithInstance(
+          () => bobAv.setConferenceAudioReceiveCallback(null),
+        );
+        expect(
+          await bob.runWithInstanceAsync(
+            () async => bobAv.disableConferenceAudio(bobConferenceId),
+          ),
+          isTrue,
+        );
+        expect(
+          await alice.runWithInstanceAsync(
+            () async => aliceAv.disableConferenceAudio(aliceConferenceId),
+          ),
+          isTrue,
+        );
+      },
+      timeout: const Timeout(Duration(seconds: 240)),
+    );
   });
 }

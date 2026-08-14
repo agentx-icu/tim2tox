@@ -54,11 +54,10 @@ void main() {
     });
 
     test('Multiple nodes communication', () async {
-      await Future.wait([
-        for (int i = 1; i < nodes.length; i++)
-          establishFriendshipVirtual(scenario, nodes[0], nodes[i],
-              timeout: const Duration(seconds: 90)),
-      ]);
+      for (int i = 1; i < nodes.length; i++) {
+        await establishFriendshipVirtual(scenario, nodes[0], nodes[i],
+            timeout: const Duration(seconds: 90));
+      }
       await pumpTestTick(scenario, advanceMs: 2000, iterationsPerInstance: 1);
 
       final createResult = await nodes[0].runWithInstanceAsync(

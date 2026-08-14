@@ -24,6 +24,7 @@
 #include "V2TIMLog.h" // Updated include
 #include <vector> // For buffer operations
 #include <algorithm> // For std::all_of
+#include <limits>
 
 // Global group-id counter so "tox_0","tox_1",... are unique across instances.
 // Avoids cross-instance collision when one instance's "tox_0" is used by
@@ -200,6 +201,20 @@ extern void RegisterFriendshipListenerWithManager(DartFriendshipListenerImpl* li
 extern void NotifyFriendInfoChangedToListener(DartFriendshipListenerImpl* listener, const void* friendInfoList_ptr);
 
 namespace {
+using tim2tox::diag::Event;
+using tim2tox::diag::Field;
+using tim2tox::diag::StaticText;
+
+template <StaticText Component, StaticText EventName, size_t FieldCount>
+void LogEvent(LogLevel level, const Field (&fields)[FieldCount]) {
+    V2TIMLog::getInstance().log(level, Event<Component, EventName>{fields, FieldCount});
+}
+
+template <StaticText Component, StaticText EventName>
+void LogEvent(LogLevel level) {
+    V2TIMLog::getInstance().log(level, Event<Component, EventName>{});
+}
+
 void NotSupported(V2TIMCallback* callback, const char* api_name) {
     if (callback) callback->OnError(ERR_SDK_INTERFACE_NOT_SUPPORT, api_name);
 }
@@ -210,6 +225,27 @@ void NotSupportedValue(V2TIMValueCallback<T>* callback, const char* api_name) {
 }  // namespace
 
 #ifdef BUILD_TOXAV
+static bool IsValidAVConferenceAudioFrame(const int16_t* pcm, uint32_t samples,
+                                          uint8_t channels,
+                                          uint32_t sample_rate) {
+    if (pcm == nullptr || samples == 0 || (channels != 1 && channels != 2)) {
+        return false;
+    }
+    switch (sample_rate) {
+        case 8000:
+        case 12000:
+        case 16000:
+        case 24000:
+        case 48000:
+            break;
+        default:
+            return false;
+    }
+    return samples == sample_rate / 400 || samples == sample_rate / 200 ||
+           samples == sample_rate / 100 || samples == sample_rate / 50 ||
+           samples == sample_rate / 25 || samples == (sample_rate * 3) / 50;
+}
+
 // Static callback function for AV conference audio data
 // This is called when audio data is received from peers in an AV conference
 static void HandleAVConferenceAudio(void* tox_ptr, Tox_Conference_Number conference_number,
@@ -223,15 +259,14 @@ static void HandleAVConferenceAudio(void* tox_ptr, Tox_Conference_Number confere
         return;
     }
     
-    // Try to find the groupID for this conference_number
     V2TIMString groupID;
-    manager_impl->GetGroupIDFromGroupNumber(static_cast<Tox_Group_Number>(conference_number), groupID);
-    
-    if (groupID.Empty() || pcm == nullptr || samples == 0 ||
-        (channels != 1 && channels != 2)) {
+    if (!manager_impl->GetGroupIDFromGroupNumber(
+            static_cast<Tox_Group_Number>(conference_number), groupID) ||
+        groupID.Empty() ||
+        !IsValidAVConferenceAudioFrame(pcm, samples, channels, sample_rate)) {
         return;
     }
-    manager_impl->ForwardAVConferenceAudioToDart(
+    manager_impl->EnqueueAVConferenceAudioFrame(
         groupID.CString(), conference_number, peer_number, pcm, samples,
         channels, sample_rate);
 }
@@ -289,6 +324,9 @@ V2TIMManagerImpl::V2TIMManagerImpl()
 
 V2TIMManagerImpl::~V2TIMManagerImpl() {
     ClearPendingDeliveries();
+#ifdef BUILD_TOXAV
+    ClearAVConferenceAudioCallback();
+#endif
     // Stop background tasks first so no detach'd thread holds raw this
     try {
         StopBackgroundTasks();
@@ -516,11 +554,11 @@ bool V2TIMManagerImpl::InitSDK(uint32_t sdkAppID, const V2TIMSDKConfig& config) 
     if (test_mode_.load(std::memory_order_acquire)) {
         if (tox->mono_time) {
             mono_time_set_current_time_callback(tox->mono_time, &tim2tox_virtual_time_cb, nullptr);
-            fprintf(stdout, "InitSDK: test mode mono_time callback installed\n");
-            fflush(stdout);
+            static_cast<void>(0);
+            static_cast<void>(0);
         } else {
-            fprintf(stdout, "InitSDK: test mode requested but tox->mono_time is null; skipping\n");
-            fflush(stdout);
+            static_cast<void>(0);
+            static_cast<void>(0);
         }
     }
 
@@ -539,9 +577,8 @@ bool V2TIMManagerImpl::InitSDK(uint32_t sdkAppID, const V2TIMSDKConfig& config) 
             this->HandleGroupPrivateMessage(group_number, peer_id, type, message, length, message_id);
         }
     );
-    fprintf(stdout, "[InitSDK] setGroupMessageGroupCallback and setGroupPrivateMessageGroupCallback registered for this=%p (instance_id=%lld)\n", 
-            (void*)this, (long long)this_instance_id);
-    fflush(stdout);
+    static_cast<void>(0);
+    static_cast<void>(0);
     tox_manager_->setGroupTopicCallback(
         [this](Tox_Group_Number group_number, Tox_Group_Peer_Number peer_id, const uint8_t* topic, size_t length) {
             this->HandleGroupTopic(group_number, peer_id, topic, length);
@@ -552,27 +589,19 @@ bool V2TIMManagerImpl::InitSDK(uint32_t sdkAppID, const V2TIMSDKConfig& config) 
             this->HandleGroupPeerNameGroup(group_number, peer_id, name, length);
         }
     );
-    fprintf(stdout, "[InitSDK] Registering setGroupPeerJoinCallback for this=%p (instance_id=%lld)\n", 
-            (void*)this, (long long)this_instance_id);
-    fflush(stdout);
+    static_cast<void>(0);
+    static_cast<void>(0);
     tox_manager_->setGroupPeerJoinCallback(
         [this](Tox_Group_Number group_number, Tox_Group_Peer_Number peer_id) {
-            // Note: GetCurrentInstanceId and GetInstanceIdFromManager are already declared at file scope (lines 27-28)
-            int64_t current_instance_id = GetCurrentInstanceId();
-            int64_t this_instance_id = GetInstanceIdFromManager(this);
-            fprintf(stdout, "[V2TIMManagerImpl] GroupPeerJoinCallback triggered: instance_id=%lld, group_number=%u, peer_id=%u\n", 
-                    (long long)current_instance_id, group_number, peer_id);
-            fprintf(stdout, "[V2TIMManagerImpl] GroupPeerJoinCallback: this=%p, this_instance_id=%lld, current_instance_id=%lld\n", 
-                    (void*)this, (long long)this_instance_id, (long long)current_instance_id);
-            fprintf(stdout, "[V2TIMManagerImpl] GroupPeerJoinCallback: Lambda captured 'this'=%p, about to call HandleGroupPeerJoin\n", 
-                    (void*)this);
-            fflush(stdout);
+            static_cast<void>(0);
+            static_cast<void>(0);
+            static_cast<void>(0);
+            static_cast<void>(0);
             this->HandleGroupPeerJoin(group_number, peer_id);
         }
     );
-    fprintf(stdout, "[InitSDK] setGroupPeerJoinCallback registered for this=%p (instance_id=%lld)\n", 
-            (void*)this, (long long)this_instance_id);
-    fflush(stdout);
+    static_cast<void>(0);
+    static_cast<void>(0);
     tox_manager_->setGroupPeerExitCallback(
         [this](Tox_Group_Number group_number, Tox_Group_Peer_Number peer_id, Tox_Group_Exit_Type exit_type, const uint8_t* name, size_t name_length) {
             this->HandleGroupPeerExit(group_number, peer_id, exit_type, name, name_length);
@@ -1502,27 +1531,19 @@ bool V2TIMManagerImpl::InitSDK(uint32_t sdkAppID, const V2TIMSDKConfig& config) 
     tox_manager_->setSelfConnectionStatusCallback(
         [this](TOX_CONNECTION connection_status) {
             // DEBUG: Detailed analysis in callback
-            fprintf(stdout, "[SelfConnectionStatusCallback] ========== RUNNING_FLAG_DEBUG ==========\n");
-            fprintf(stdout, "[SelfConnectionStatusCallback] this=%p\n", (void*)this);
-            fprintf(stdout, "[SelfConnectionStatusCallback] &running_=%p\n", &(this->running_));
-            fprintf(stdout, "[SelfConnectionStatusCallback] offset of running_=%ld bytes\n", 
-                    (char*)&(this->running_) - (char*)this);
-            fprintf(stdout, "[SelfConnectionStatusCallback] running_ value (direct access)=%d\n", 
-                    this->running_.load() ? 1 : 0);
-            fprintf(stdout, "[SelfConnectionStatusCallback] IsRunning()=%d\n", 
-                    this->IsRunning() ? 1 : 0);
+            static_cast<void>(0);
+            static_cast<void>(0);
+            static_cast<void>(0);
+            static_cast<void>(0);
+            static_cast<void>(0);
+            static_cast<void>(0);
             
             // Note: Cannot access memory directly for atomic, removed
             
-            // Try calling IsRunning() multiple times
-            bool test1 = this->IsRunning();
-            bool test2 = this->IsRunning();
-            bool test3 = this->IsRunning();
-            fprintf(stdout, "[SelfConnectionStatusCallback] IsRunning() calls: test1=%d, test2=%d, test3=%d\n",
-                    test1 ? 1 : 0, test2 ? 1 : 0, test3 ? 1 : 0);
+            static_cast<void>(0);
             
-            fprintf(stdout, "[SelfConnectionStatusCallback] =========================================\n");
-            fflush(stdout);
+            static_cast<void>(0);
+            static_cast<void>(0);
             
             // Use atomic load for thread safety
             bool is_running = this->running_.load(std::memory_order_acquire);
@@ -1555,14 +1576,11 @@ bool V2TIMManagerImpl::InitSDK(uint32_t sdkAppID, const V2TIMSDKConfig& config) 
     );
     tox_manager_->setFriendStatusCallback(
         [this](uint32_t friend_number, TOX_USER_STATUS status) {
-            int64_t this_instance_id = GetInstanceIdFromManager(this);
-            fprintf(stdout, "[V2TIMManagerImpl] FriendStatusCallback: ENTRY - instance_id=%lld, friend_number=%u, status=%d\n",
-                    (long long)this_instance_id, friend_number, status);
-            fflush(stdout);
+            static_cast<void>(0);
+            static_cast<void>(0);
             this->HandleFriendStatus(friend_number, status);
-            fprintf(stdout, "[V2TIMManagerImpl] FriendStatusCallback: EXIT - instance_id=%lld\n",
-                    (long long)this_instance_id);
-            fflush(stdout);
+            static_cast<void>(0);
+            static_cast<void>(0);
         }
     );
     tox_manager_->setFriendConnectionStatusCallback(
@@ -1596,15 +1614,15 @@ bool V2TIMManagerImpl::InitSDK(uint32_t sdkAppID, const V2TIMSDKConfig& config) 
     // Note: running_ was already set to true before initialize() to handle early callbacks
     // This ensures consistency and that all callbacks are ready before processing events
     // running_ is already true, so we just log here for clarity
-    fprintf(stdout, "[InitSDK] Callbacks registered, running_=%d (already set before initialize)\n", running_.load() ? 1 : 0);
-    fflush(stdout);
+    static_cast<void>(0);
+    static_cast<void>(0);
     
     // Start the Tox event loop thread.
     // In test mode, the auto_tests harness drives iteration manually via
     // tim2tox_ffi_iterate_instance() with a shared virtual clock, so we skip
     // starting the per-instance event_thread entirely.
     if (!test_mode_.load(std::memory_order_acquire)) {
-        fprintf(stdout, "InitSDK: starting event thread\n");
+        static_cast<void>(0);
         event_thread_running_.store(true, std::memory_order_release);
         try {
             event_thread_ = std::thread([this] {
@@ -1652,16 +1670,19 @@ bool V2TIMManagerImpl::InitSDK(uint32_t sdkAppID, const V2TIMSDKConfig& config) 
             throw;
         }
     } else {
-        fprintf(stdout, "InitSDK: SKIP event thread (test mode)\n");
-        fflush(stdout);
+        static_cast<void>(0);
+        static_cast<void>(0);
     }
 
-    fprintf(stdout, "InitSDK: returning true\n");
+    static_cast<void>(0);
     return true;
 }
 
 void V2TIMManagerImpl::UnInitSDK() {
     ClearPendingDeliveries();
+#ifdef BUILD_TOXAV
+    ClearAVConferenceAudioCallback();
+#endif
     // Stop background tasks (refresh/rejoin threads) so they don't access this after shutdown
     StopBackgroundTasks();
     // First, stop the event thread and wait for it to exit
@@ -2375,18 +2396,16 @@ V2TIMString V2TIMManagerImpl::SendGroupTextMessageWithType(
     bool group_connected = GetToxManager()->isGroupConnected(group_number, &err_conn);
     V2TIM_LOG(kInfo, "[V2TIMManagerImpl::SendGroupTextMessage] Group connection status: connected={}, err={}", 
              group_connected, static_cast<int>(err_conn));
-    fprintf(stdout, "[V2TIMManagerImpl] SendGroupTextMessage: Group connection status: connected=%d, err=%d\n",
-            group_connected ? 1 : 0, static_cast<int>(err_conn));
-    fflush(stdout);
+    static_cast<void>(0);
+    static_cast<void>(0);
     
     // Check self connection status
     Tox* tox = GetToxManager()->getTox();
     if (tox) {
         TOX_CONNECTION self_conn = tox_self_get_connection_status(tox);
         V2TIM_LOG(kInfo, "[V2TIMManagerImpl::SendGroupTextMessage] Self connection status: {}", static_cast<int>(self_conn));
-        fprintf(stdout, "[V2TIMManagerImpl] SendGroupTextMessage: Self connection status: %d (0=NONE, 1=TCP, 2=UDP)\n",
-                static_cast<int>(self_conn));
-        fflush(stdout);
+        static_cast<void>(0);
+        static_cast<void>(0);
         
         // Check group peer count (approximate by trying to get peer IDs)
         int peer_count = 0;
@@ -2399,9 +2418,8 @@ V2TIMString V2TIMManagerImpl::SendGroupTextMessageWithType(
         std::string self_pubkey_hex = ToxUtil::tox_bytes_to_hex(self_pubkey, TOX_PUBLIC_KEY_SIZE);
         
         if (err_self == TOX_ERR_GROUP_SELF_QUERY_OK) {
-            fprintf(stdout, "[V2TIMManagerImpl] SendGroupTextMessage: Self peer_id in group: %u, self_public_key=%s\n", 
-                    self_peer_id, self_pubkey_hex.c_str());
-            fflush(stdout);
+            static_cast<void>(0);
+            static_cast<void>(0);
             
             // Try to count peers by iterating
             for (Tox_Group_Peer_Number peer_id = 0; peer_id < 100; ++peer_id) {
@@ -2413,23 +2431,21 @@ V2TIMString V2TIMManagerImpl::SendGroupTextMessageWithType(
                     std::string peer_userID = ToxUtil::tox_bytes_to_hex(peer_pubkey, TOX_PUBLIC_KEY_SIZE);
                     bool is_self = (memcmp(peer_pubkey, self_pubkey, TOX_PUBLIC_KEY_SIZE) == 0);
                     if (peer_count <= 3) { // Log first 3 peers
-                        fprintf(stdout, "[V2TIMManagerImpl] SendGroupTextMessage: Found peer[%u]: userID=%s, is_self=%d\n", 
-                                peer_id, peer_userID.c_str(), is_self ? 1 : 0);
-                        fflush(stdout);
+                        static_cast<void>(0);
+                        static_cast<void>(0);
                     }
                     // Check if self_peer_id matches actual self peer
                     if (is_self && peer_id != self_peer_id) {
-                        fprintf(stdout, "[V2TIMManagerImpl] SendGroupTextMessage: ⚠️  WARNING: Found self at peer_id=%u but self_peer_id=%u! This indicates peer_id mapping issue.\n",
-                                peer_id, self_peer_id);
-                        fflush(stdout);
+                        static_cast<void>(0);
+                        static_cast<void>(0);
                     }
                 } else if (peer_id > 10) {
                     // Stop after 10 consecutive errors
                     break;
                 }
             }
-            fprintf(stdout, "[V2TIMManagerImpl] SendGroupTextMessage: Total peers found in group: %d\n", peer_count);
-            fflush(stdout);
+            static_cast<void>(0);
+            static_cast<void>(0);
         }
     }
     
@@ -2512,9 +2528,8 @@ V2TIMString V2TIMManagerImpl::SendGroupTextMessageWithType(
 
     V2TIM_LOG(kInfo, "[V2TIMManagerImpl::SendGroupTextMessage] groupSendMessage returned: success={}, message_id={}, send_err={}",
              success, message_id, static_cast<int>(send_err));
-    fprintf(stdout, "[V2TIMManagerImpl] SendGroupTextMessage: groupSendMessage returned: success=%d, message_id=%llu, send_err=%d\n",
-            success ? 1 : 0, (unsigned long long)message_id, static_cast<int>(send_err));
-    fflush(stdout);
+    static_cast<void>(0);
+    static_cast<void>(0);
 
     // ===================================================================
     // Step 5: Forward to IRC if this is an IRC channel (handled by dynamic library)
@@ -2819,17 +2834,17 @@ void V2TIMManagerImpl::CreateGroup(const V2TIMString& groupType, const V2TIMStri
     Tox_Group_Privacy_State privacy_state = TOX_GROUP_PRIVACY_STATE_PUBLIC;
     if (group_type_str == "Private" || is_legacy_conference) {
         privacy_state = TOX_GROUP_PRIVACY_STATE_PRIVATE;
-        fprintf(stdout, "[CreateGroup] Setting privacy_state to PRIVATE (groupType=%s)\n", group_type_str.c_str());
-        fflush(stdout);
+        static_cast<void>(0);
+        static_cast<void>(0);
         V2TIM_LOG(kInfo, "CreateGroup: Step 3 - Setting privacy_state to PRIVATE");
     } else if (group_type_str == "Public" || group_type_str == "Meeting") {
         privacy_state = TOX_GROUP_PRIVACY_STATE_PUBLIC;
-        fprintf(stdout, "[CreateGroup] Setting privacy_state to PUBLIC (groupType=%s)\n", group_type_str.c_str());
-        fflush(stdout);
+        static_cast<void>(0);
+        static_cast<void>(0);
         V2TIM_LOG(kInfo, "CreateGroup: Step 3 - Setting privacy_state to PUBLIC");
     } else {
-        fprintf(stdout, "[CreateGroup] Using default privacy_state PUBLIC (groupType=%s)\n", group_type_str.c_str());
-        fflush(stdout);
+        static_cast<void>(0);
+        static_cast<void>(0);
         V2TIM_LOG(kInfo, "CreateGroup: Step 3 - Using default privacy_state PUBLIC");
     }
     
@@ -3312,49 +3327,12 @@ void V2TIMManagerImpl::CreateGroup(const V2TIMString& groupType, const V2TIMStri
     V2TIM_LOG(kInfo, "CreateGroup: Created group {} (group_number {})", 
               finalGroupID.CString() ? finalGroupID.CString() : "null", group_number);
     
-    // Log group info for debugging: check if founder can see itself in member list
-    // Note: GetCurrentInstanceId is already declared at file scope (line 27)
-    int64_t current_instance_id = GetCurrentInstanceId();
-    fprintf(stdout, "[CreateGroup] ========== Group Created ==========\n");
-    fprintf(stdout, "[CreateGroup] instance_id=%lld, groupID=%s, group_number=%u\n", 
-            (long long)current_instance_id, finalGroupID.CString() ? finalGroupID.CString() : "null", group_number);
-    
-    // Check if founder can see itself in the group immediately after creation
-    Tox* tox_for_check = tox_manager_ ? tox_manager_->getTox() : nullptr;
-    if (tox_for_check && group_number != UINT32_MAX) {
-        int founder_peer_count = 0;
-        for (Tox_Group_Peer_Number peer_id = 0; peer_id < 10; ++peer_id) {
-            uint8_t peer_pubkey[TOX_PUBLIC_KEY_SIZE];
-            Tox_Err_Group_Peer_Query err_key;
-            if (tox_manager_ && tox_manager_->getGroupPeerPublicKey(group_number, peer_id, peer_pubkey, &err_key) &&
-                err_key == TOX_ERR_GROUP_PEER_QUERY_OK) {
-                founder_peer_count++;
-                std::string userID = ToxUtil::tox_bytes_to_hex(peer_pubkey, TOX_PUBLIC_KEY_SIZE);
-                fprintf(stdout, "[CreateGroup] Founder sees peer_id=%u, userID=%s\n", peer_id, userID.c_str());
-            } else {
-                break;
-            }
-        }
-        fprintf(stdout, "[CreateGroup] Founder sees %d peer(s) immediately after creation\n", founder_peer_count);
-        
-        // Check group connection status
-        Tox_Err_Group_Is_Connected err_conn = TOX_ERR_GROUP_IS_CONNECTED_GROUP_NOT_FOUND;
-        bool group_connected = false;
-        if (tox_manager_) {
-            group_connected = tox_manager_->isGroupConnected(group_number, &err_conn);
-        }
-        fprintf(stdout, "[CreateGroup] Group connection status: connected=%d, err=%d\n", 
-                group_connected ? 1 : 0, static_cast<int>(err_conn));
-    }
-    fprintf(stdout, "[CreateGroup] ====================================\n");
-    fflush(stdout);
-    
     // Step 10.5: Manually trigger HandleGroupSelfJoin to notify listeners about group creation
     // This is necessary because tox_group_new/createGroup may not immediately trigger
     // the on_group_self_join callback, but we need to notify listeners via OnGroupCreated
     V2TIM_LOG(kInfo, "CreateGroup: Step 10.5 - Manually calling HandleGroupSelfJoin to trigger OnGroupCreated callback");
-    fprintf(stdout, "[CreateGroup] Step 10.5: Manually calling HandleGroupSelfJoin(group_number=%u) to trigger OnGroupCreated\n", group_number);
-    fflush(stdout);
+    static_cast<void>(0);
+    static_cast<void>(0);
     HandleGroupSelfJoin(group_number);
     V2TIM_LOG(kInfo, "CreateGroup: Step 10.5 - HandleGroupSelfJoin completed");
     
@@ -3379,18 +3357,15 @@ void V2TIMManagerImpl::CreateGroup(const V2TIMString& groupType, const V2TIMStri
 void V2TIMManagerImpl::JoinGroup(const V2TIMString& groupID, const V2TIMString& message, V2TIMCallback* callback) {
     // Get start timestamp for detailed timing
     auto start_time = std::chrono::steady_clock::now();
-    auto start_timestamp_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::system_clock::now().time_since_epoch()).count();
     
-    fprintf(stdout, "[JoinGroup] ========== JoinGroup called ==========\n");
-    fprintf(stdout, "[JoinGroup] start_timestamp_ms=%lld\n", (long long)start_timestamp_ms);
-    fprintf(stdout, "[JoinGroup] this=%p\n", (void*)this);
+    static_cast<void>(0);
+    static_cast<void>(0);
+    static_cast<void>(0);
     // Note: GetCurrentInstanceId and GetInstanceIdFromManager are already declared at file scope (lines 27-28)
     int64_t current_instance_id = GetCurrentInstanceId();
     int64_t this_instance_id = GetInstanceIdFromManager(this);
-    fprintf(stdout, "[JoinGroup] current_instance_id=%lld, this_instance_id=%lld\n", 
-            (long long)current_instance_id, (long long)this_instance_id);
-    fflush(stdout);
+    static_cast<void>(0);
+    static_cast<void>(0);
     V2TIM_LOG(kInfo, "[JoinGroup] ========== JoinGroup called ==========");
     V2TIM_LOG(kInfo, "[JoinGroup] this=%p, current_instance_id=%lld, this_instance_id=%lld", 
               (void*)this, (long long)current_instance_id, (long long)this_instance_id);
@@ -3401,9 +3376,8 @@ void V2TIMManagerImpl::JoinGroup(const V2TIMString& groupID, const V2TIMString& 
     // Get ToxManager and verify it's valid
     ToxManager* tox_manager = GetToxManager();
     if (!tox_manager) {
-        fprintf(stderr, "[JoinGroup] ERROR: ToxManager is null for groupID=%s, instance_id=%lld\n", 
-                groupID.CString(), (long long)current_instance_id);
-        fflush(stderr);
+        static_cast<void>(0);
+        static_cast<void>(0);
         V2TIM_LOG(kError, "[JoinGroup] ERROR: ToxManager is null");
         if (callback) callback->OnError(ERR_SDK_NOT_INITIALIZED, "ToxManager not available");
         return;
@@ -3411,15 +3385,14 @@ void V2TIMManagerImpl::JoinGroup(const V2TIMString& groupID, const V2TIMString& 
     
     Tox* tox = tox_manager->getTox();
     if (!tox) {
-        fprintf(stderr, "[JoinGroup] ERROR: Tox instance is null for groupID=%s, instance_id=%lld, tox_manager=%p\n", 
-                groupID.CString(), (long long)current_instance_id, (void*)tox_manager);
-        fflush(stderr);
+        static_cast<void>(0);
+        static_cast<void>(0);
         V2TIM_LOG(kError, "[JoinGroup] ERROR: Tox instance not available");
         if (callback) callback->OnError(ERR_SDK_NOT_INITIALIZED, "Tox not initialized");
         return;
     }
-    fprintf(stdout, "[JoinGroup] ✅ ToxManager and Tox instance available\n");
-    fflush(stdout);
+    static_cast<void>(0);
+    static_cast<void>(0);
     V2TIM_LOG(kInfo, "[JoinGroup] Tox instance available");
 
     // Idempotent join for conferences: AV/text conferences auto-join inside the
@@ -3522,50 +3495,7 @@ void V2TIMManagerImpl::JoinGroup(const V2TIMString& groupID, const V2TIMString& 
         }
         V2TIM_LOG(kInfo, "[JoinGroup] Using self_name: {} (length={})", self_name, self_name.length());
         
-        // Log self connection status and public key before joining
-        TOX_CONNECTION self_connection = tox_self_get_connection_status(tox);
-        fprintf(stdout, "[JoinGroup] Self connection status before join: %d (0=NONE, 1=TCP, 2=UDP)\n", 
-                static_cast<int>(self_connection));
-        fflush(stdout);
-        
-        // Get self public key for debugging
-        uint8_t self_pubkey[TOX_PUBLIC_KEY_SIZE];
-        tox_self_get_public_key(tox, self_pubkey);
-        std::string self_userID = ToxUtil::tox_bytes_to_hex(self_pubkey, TOX_PUBLIC_KEY_SIZE);
-        fprintf(stdout, "[JoinGroup] Self userID (public key): %s\n", self_userID.c_str());
-        fflush(stdout);
-        
-        // Get friend count
-        size_t friend_count = tox_self_get_friend_list_size(tox);
-        fprintf(stdout, "[JoinGroup] Friend count before join: %zu\n", friend_count);
-        fflush(stdout);
-        
-        // Log friend connection statuses
-        if (friend_count > 0) {
-            std::vector<uint32_t> friend_list(friend_count);
-            tox_self_get_friend_list(tox, friend_list.data());
-            fprintf(stdout, "[JoinGroup] Friend connection statuses:\n");
-            for (size_t i = 0; i < friend_count; i++) {
-                uint8_t friend_pubkey[TOX_PUBLIC_KEY_SIZE];
-                TOX_ERR_FRIEND_GET_PUBLIC_KEY err_key;
-                if (tox_friend_get_public_key(tox, friend_list[i], friend_pubkey, &err_key) &&
-                    err_key == TOX_ERR_FRIEND_GET_PUBLIC_KEY_OK) {
-                    std::string friend_userID = ToxUtil::tox_bytes_to_hex(friend_pubkey, TOX_PUBLIC_KEY_SIZE);
-                    TOX_ERR_FRIEND_QUERY err_conn;
-                    TOX_CONNECTION friend_conn = tox_friend_get_connection_status(tox, friend_list[i], &err_conn);
-                    fprintf(stdout, "[JoinGroup]   Friend[%zu]: userID=%s, connection=%d (0=NONE, 1=TCP, 2=UDP), err=%d\n", 
-                            i, friend_userID.c_str(), static_cast<int>(friend_conn), static_cast<int>(err_conn));
-                }
-            }
-            fflush(stdout);
-        }
-        
         V2TIM_LOG(kInfo, "[JoinGroup] Calling GetToxManager()->joinGroup with chat_id");
-        auto before_join_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::system_clock::now().time_since_epoch()).count();
-        fprintf(stdout, "[JoinGroup] About to call joinGroup (timestamp_ms=%lld)\n", (long long)before_join_ms);
-        fflush(stdout);
-        
         Tox_Err_Group_Join err_join;
         group_number = GetToxManager()->joinGroup(
             chat_id,
@@ -3574,26 +3504,20 @@ void V2TIMManagerImpl::JoinGroup(const V2TIMString& groupID, const V2TIMString& 
             &err_join
         );
         
-        auto after_join_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::system_clock::now().time_since_epoch()).count();
-        auto join_duration_ms = after_join_ms - before_join_ms;
-        
-        fprintf(stdout, "[JoinGroup] joinGroup returned: group_number=%u, err_join=%d (duration=%lld ms)\n", 
-                group_number, static_cast<int>(err_join), (long long)join_duration_ms);
-        fflush(stdout);
+        static_cast<void>(0);
+        static_cast<void>(0);
         V2TIM_LOG(kInfo, "[JoinGroup] joinGroup returned: group_number={}, err_join={}", group_number, static_cast<int>(err_join));
         if (err_join != TOX_ERR_GROUP_JOIN_OK || group_number == UINT32_MAX) {
-            fprintf(stdout, "[JoinGroup] FAILED to join group using chat_id: err_join=%d, group_number=%u\n", 
-                    static_cast<int>(err_join), group_number);
-            fflush(stdout);
+            static_cast<void>(0);
+            static_cast<void>(0);
             V2TIM_LOG(kError, "[JoinGroup] FAILED to join group using chat_id");
             V2TIM_LOG(kError, "[JoinGroup] Error code: {} (0=OK, 1=INVALID_CHAT_ID, 2=TOO_LONG, 3=FAIL)", static_cast<int>(err_join));
             V2TIM_LOG(kError, "[JoinGroup] group_number={} (UINT32_MAX={})", group_number, UINT32_MAX);
             if (callback) callback->OnError(ERR_INVALID_PARAMETERS, "Failed to join Tox group");
             return;
         }
-        fprintf(stdout, "[JoinGroup] ✅ Successfully joined group using chat_id, group_number=%u\n", group_number);
-        fflush(stdout);
+        static_cast<void>(0);
+        static_cast<void>(0);
         V2TIM_LOG(kInfo, "[JoinGroup] ✅ Successfully joined group using chat_id, group_number={}", group_number);
         // Persist chat_id for this instance (groupID may be 64-char chat_id when joining public group)
         SetGroupChatIdInStorage(groupID.CString(), stored_chat_id);
@@ -3628,9 +3552,8 @@ void V2TIMManagerImpl::JoinGroup(const V2TIMString& groupID, const V2TIMString& 
                     int64_t join_instance_id = GetInstanceIdFromManager(this);
                     V2TIM_LOG(kError, "[JoinGroup] ERROR: Pending invite not found for groupID: {} (pending count=0, instance_id={})",
                               groupID.CString(), (long long)join_instance_id);
-                    fprintf(stderr, "[JoinGroup] Pending count=0 for groupID=%s, instance_id=%lld (invitee never received invite or wrong instance)\n",
-                            groupID.CString(), (long long)join_instance_id);
-                    fflush(stderr);
+                    static_cast<void>(0);
+                    static_cast<void>(0);
                     if (callback) callback->OnError(ERR_INVALID_PARAMETERS, "Pending invite not found for groupID and no chat_id stored");
                     return;
                 }
@@ -3823,9 +3746,6 @@ void V2TIMManagerImpl::JoinGroup(const V2TIMString& groupID, const V2TIMString& 
         if (!used_pending_id.Empty() && used_pending_id != publicGroupID) {
             V2TIM_LOG(kInfo, "[JoinGroup] Triggering onMemberInvited with actual groupID={} (was temp={})", 
                      publicGroupID.CString(), used_pending_id.CString());
-            fprintf(stdout, "[JoinGroup] Triggering onMemberInvited with actual groupID=%s (was temp=%s)\n", 
-                    publicGroupID.CString(), used_pending_id.CString());
-            fflush(stdout);
             
             // Get inviter info from pending invite
             PendingInvite* pending_inv = nullptr;
@@ -3875,8 +3795,8 @@ void V2TIMManagerImpl::JoinGroup(const V2TIMString& groupID, const V2TIMString& 
                 
                 for (V2TIMGroupListener* listener : listeners_copy) {
                     if (listener) {
-                        fprintf(stdout, "[JoinGroup] Calling OnMemberInvited with actual groupID=%s\n", groupID.CString());
-                        fflush(stdout);
+                        static_cast<void>(0);
+                        static_cast<void>(0);
                         V2TIM_LOG(kInfo, "[JoinGroup] Calling OnMemberInvited: groupID={}, inviter={}, memberCount={}",
                                  publicGroupID.CString(), opUser.userID.CString(), memberList.Size());
                         listener->OnMemberInvited(publicGroupID, opUser, memberList);
@@ -3909,10 +3829,6 @@ void V2TIMManagerImpl::JoinGroup(const V2TIMString& groupID, const V2TIMString& 
         if (!used_pending_id.Empty() && used_pending_id != publicGroupID) {
             group_id_to_group_number_[used_pending_id] = group_number;
         }
-        fprintf(stdout, "[JoinGroup] Stored group mapping IMMEDIATELY: groupID=%s <-> group_number=%u\n", 
-                publicGroupID.CString(), group_number);
-        fprintf(stdout, "[JoinGroup] Total groups in mapping: %zu\n", group_id_to_group_number_.size());
-        fflush(stdout);
         // [tim2tox-debug] Record conference_number mapping for JoinGroup
         V2TIM_LOG(kInfo, "[tim2tox-debug] JoinGroup: Stored conference_number mapping: groupID={} <-> group_number={}", 
                  publicGroupID.CString(), group_number);
@@ -3936,59 +3852,27 @@ void V2TIMManagerImpl::JoinGroup(const V2TIMString& groupID, const V2TIMString& 
     // We'll wait up to 1 second for the group to become connected
     if (tox_manager_) {
         V2TIM_LOG(kInfo, "[JoinGroup] Waiting for group to become connected (up to 1 second)...");
-        fprintf(stdout, "[JoinGroup] Waiting for group_number=%u to become connected\n", group_number);
-        fflush(stdout);
+        static_cast<void>(0);
+        static_cast<void>(0);
         
         bool is_connected = false;
         const int max_wait_iterations = 20; // 20 * 50ms = 1 second (reduced from 2 seconds)
-        TOX_CONNECTION self_connection_start = tox_self_get_connection_status(tox);
-        fprintf(stdout, "[JoinGroup] Self connection status at start of wait: %d (0=NONE, 1=TCP, 2=UDP)\n", 
-                static_cast<int>(self_connection_start));
-        fflush(stdout);
-        
         auto wait_start_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::system_clock::now().time_since_epoch()).count();
-        fprintf(stdout, "[JoinGroup] Starting wait loop (timestamp_ms=%lld)\n", (long long)wait_start_ms);
-        fflush(stdout);
+        static_cast<void>(0);
+        static_cast<void>(0);
         
         for (int i = 0; i < max_wait_iterations; i++) {
-            auto iteration_start_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::system_clock::now().time_since_epoch()).count();
-            
             // Check if group is connected
             Tox_Err_Group_Is_Connected err_connected;
             is_connected = tox_manager_->isGroupConnected(group_number, &err_connected);
-            
-            // Log connection status every 5 iterations (more frequent for debugging)
-            if (i % 5 == 0 || is_connected) {
-                TOX_CONNECTION current_self_conn = tox_self_get_connection_status(tox);
-                auto elapsed_ms = iteration_start_ms - wait_start_ms;
-                fprintf(stdout, "[JoinGroup] Iteration %d (elapsed=%lld ms): group_connected=%d, self_connection=%d, err_connected=%d\n", 
-                        i, (long long)elapsed_ms, is_connected ? 1 : 0, static_cast<int>(current_self_conn), static_cast<int>(err_connected));
-                
-                // Also check peer count by iterating
-                uint32_t peer_count = 0;
-                for (Tox_Group_Peer_Number peer_id = 0; peer_id < 100; ++peer_id) {
-                    uint8_t peer_pubkey[TOX_PUBLIC_KEY_SIZE];
-                    Tox_Err_Group_Peer_Query err_key;
-                    if (tox_group_peer_get_public_key(tox, group_number, peer_id, peer_pubkey, &err_key) &&
-                        err_key == TOX_ERR_GROUP_PEER_QUERY_OK) {
-                        peer_count++;
-                    } else {
-                        break; // Stop after first error (peers are sequential)
-                    }
-                }
-                fprintf(stdout, "[JoinGroup]   peer_count=%u\n", peer_count);
-                fflush(stdout);
-            }
             
             if (is_connected) {
                 auto connected_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                     std::chrono::system_clock::now().time_since_epoch()).count();
                 auto wait_duration_ms = connected_ms - wait_start_ms;
-                fprintf(stdout, "[JoinGroup] ✅ Group is now connected after %d iterations (%lld ms total wait)\n", 
-                        i + 1, (long long)wait_duration_ms);
-                fflush(stdout);
+                static_cast<void>(0);
+                static_cast<void>(0);
                 V2TIM_LOG(kInfo, "[JoinGroup] Group is now connected after {} iterations ({} ms)", i + 1, wait_duration_ms);
                 break;
             }
@@ -4001,153 +3885,59 @@ void V2TIMManagerImpl::JoinGroup(const V2TIMString& groupID, const V2TIMString& 
         }
         
         if (!is_connected) {
-            fprintf(stdout, "[JoinGroup] WARNING: Group is not connected after %d iterations, but continuing anyway\n", 
-                    max_wait_iterations);
-            fflush(stdout);
+            static_cast<void>(0);
+            static_cast<void>(0);
             V2TIM_LOG(kWarning, "[JoinGroup] Group is not connected after {} iterations, but continuing anyway", max_wait_iterations);
         }
         
         // Continue iterating a few more times to ensure callbacks are processed
         // With local bootstrap, this should be much faster - reduce to 10 iterations (0.5 seconds)
-        fprintf(stdout, "[JoinGroup] Triggering additional tox_iterate calls to process callbacks\n");
-        fflush(stdout);
+        static_cast<void>(0);
+        static_cast<void>(0);
         for (int i = 0; i < 10; i++) {  // Reduced to 10 iterations (0.5 seconds) for local bootstrap
-            // Note: GetCurrentInstanceId is already declared at file scope (line 27)
-            int64_t current_instance_id = GetCurrentInstanceId();
-            if (i == 0 || i == 4 || i == 9) {
-                fprintf(stdout, "[JoinGroup] Iteration %d/%d: instance_id=%lld, calling tox_manager_->iterate(0)\n", 
-                        i + 1, 10, (long long)current_instance_id);
-                fflush(stdout);
-            }
             tox_manager_->iterate(0);
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
-            
-            // Check if onGroupSelfJoin was triggered by checking if group_number is in mapping
-            // This is a workaround since we can't directly check if callback was called
-            bool mapping_exists = false;
-            {
-                std::lock_guard<std::mutex> lock(mutex_);
-                mapping_exists = (group_number_to_group_id_.find(group_number) != group_number_to_group_id_.end());
-            }
-            
-            if (mapping_exists && i > 0 && i % 10 == 0) {
-                fprintf(stdout, "[JoinGroup] Mapping exists after %d iterations, callback may have been triggered\n", i + 1);
-                fflush(stdout);
-            }
-            
-            // Check peer count in group to see if peers are being discovered
-            if (i % 5 == 0 || i < 10) {  // Check more frequently in first 10 iterations
-                // Try to count peers by iterating
-                int peer_count = 0;
-                std::vector<std::string> peer_userids;
-                for (Tox_Group_Peer_Number peer_id = 0; peer_id < 100; ++peer_id) {
-                    uint8_t peer_pubkey[TOX_PUBLIC_KEY_SIZE];
-                    Tox_Err_Group_Peer_Query err_key;
-                    if (GetToxManager()->getGroupPeerPublicKey(group_number, peer_id, peer_pubkey, &err_key) &&
-                        err_key == TOX_ERR_GROUP_PEER_QUERY_OK) {
-                        peer_count++;
-                        std::string userID = ToxUtil::tox_bytes_to_hex(peer_pubkey, TOX_PUBLIC_KEY_SIZE);
-                        peer_userids.push_back(userID);
-                    } else {
-                        // Stop after first error (peers are sequential)
-                        break;
-                    }
-                }
-                fprintf(stdout, "[JoinGroup] After %d iterations: peer_count=%d in group_number=%u", 
-                        i + 1, peer_count, group_number);
-                if (peer_count > 0) {
-                    fprintf(stdout, ", peer_userids=[");
-                    for (size_t j = 0; j < peer_userids.size(); j++) {
-                        if (j > 0) fprintf(stdout, ", ");
-                        fprintf(stdout, "%s", peer_userids[j].c_str());
-                    }
-                    fprintf(stdout, "]");
-                }
-                fprintf(stdout, "\n");
-                fflush(stdout);
-            }
         }
-        fprintf(stdout, "[JoinGroup] Completed additional tox_iterate iterations\n");
-        fflush(stdout);
-        
-        // Final check: verify if mapping exists (indicates onGroupSelfJoin was called)
+        static_cast<void>(0);
+        static_cast<void>(0);
+
         bool final_mapping_exists = false;
         {
             std::lock_guard<std::mutex> lock(mutex_);
             final_mapping_exists = (group_number_to_group_id_.find(group_number) != group_number_to_group_id_.end());
         }
-        fprintf(stdout, "[JoinGroup] Final mapping check: group_number=%u, mapping_exists=%d\n", 
-                group_number, final_mapping_exists ? 1 : 0);
-        fflush(stdout);
         
         // Final peer count check after all iterations
         int final_peer_count = 0;
-        std::vector<std::pair<Tox_Group_Peer_Number, std::string>> final_peers;
         for (Tox_Group_Peer_Number peer_id = 0; peer_id < 100; ++peer_id) {
             uint8_t peer_pubkey[TOX_PUBLIC_KEY_SIZE];
             Tox_Err_Group_Peer_Query err_key;
             if (GetToxManager()->getGroupPeerPublicKey(group_number, peer_id, peer_pubkey, &err_key) &&
                 err_key == TOX_ERR_GROUP_PEER_QUERY_OK) {
                 final_peer_count++;
-                std::string userID = ToxUtil::tox_bytes_to_hex(peer_pubkey, TOX_PUBLIC_KEY_SIZE);
-                final_peers.push_back({peer_id, userID});
-                fprintf(stdout, "[JoinGroup] Final peer check: peer_id=%u, userID=%s\n", peer_id, userID.c_str());
-                fflush(stdout);
             } else {
                 break;
             }
         }
-        fprintf(stdout, "[JoinGroup] Final peer count after all iterations: %d in group_number=%u", 
-                final_peer_count, group_number);
-        if (final_peer_count > 0) {
-            fprintf(stdout, ", peers=[");
-            for (size_t i = 0; i < final_peers.size(); i++) {
-                if (i > 0) fprintf(stdout, ", ");
-                fprintf(stdout, "peer_id=%u:userID=%s", final_peers[i].first, final_peers[i].second.c_str());
-            }
-            fprintf(stdout, "]");
-        }
-        fprintf(stdout, "\n");
-        fflush(stdout);
         
         // Check if we can see other peers (this instance just joined, so we should see founder)
         if (final_peer_count == 1) {
-            fprintf(stdout, "[JoinGroup] WARNING: Only 1 peer found after joining. This might indicate:\n");
-            fprintf(stdout, "[JoinGroup]   1. Network sync not complete yet\n");
-            fprintf(stdout, "[JoinGroup]   2. Founder not visible from this instance\n");
-            fprintf(stdout, "[JoinGroup]   3. Need more time for DHT peer discovery\n");
-            fprintf(stdout, "[JoinGroup]   4. Group privacy state might be PRIVATE (requires friend connection)\n");
+            static_cast<void>(0);
+            static_cast<void>(0);
+            static_cast<void>(0);
+            static_cast<void>(0);
+            static_cast<void>(0);
             
             // Check group privacy state
             Tox_Err_Group_State_Query err_privacy;
             Tox_Group_Privacy_State privacy_state = tox_group_get_privacy_state(tox, group_number, &err_privacy);
-            fprintf(stdout, "[JoinGroup] Privacy state query: group_number=%u, privacy_state=%d, err=%d\n", 
-                    group_number, static_cast<int>(privacy_state), static_cast<int>(err_privacy));
-            if (err_privacy == TOX_ERR_GROUP_STATE_QUERY_OK) {
-                fprintf(stdout, "[JoinGroup]   Group privacy state: %d (0=PUBLIC, 1=PRIVATE)\n", 
-                        static_cast<int>(privacy_state));
-                if (privacy_state == TOX_GROUP_PRIVACY_STATE_PRIVATE) {
-                    size_t current_friend_count = tox_self_get_friend_list_size(tox);
-                    fprintf(stdout, "[JoinGroup]   ⚠️  Group is PRIVATE - requires friend connection to see peers!\n");
-                    fprintf(stdout, "[JoinGroup]   ⚠️  Friend count: %zu (need at least 1 friend to see peers in PRIVATE group)\n", current_friend_count);
-                    fprintf(stdout, "[JoinGroup]   ⚠️  This explains why only 1 peer is visible - PRIVATE groups need friend connections!\n");
-                } else if (privacy_state == TOX_GROUP_PRIVACY_STATE_PUBLIC) {
-                    fprintf(stdout, "[JoinGroup]   ✅ Group is PUBLIC - peers should be discoverable via DHT\n");
-                } else {
-                    fprintf(stdout, "[JoinGroup]   ⚠️  Unknown privacy state: %d\n", static_cast<int>(privacy_state));
-                }
-            } else {
-                fprintf(stdout, "[JoinGroup]   Failed to get privacy state, err=%d\n", 
-                        static_cast<int>(err_privacy));
-            }
-            fflush(stdout);
             
             // Additional wait and iteration for DHT peer discovery (PUBLIC groups need time for DHT sync)
             // With local bootstrap, this should be much faster - reduce wait time
             if (err_privacy == TOX_ERR_GROUP_STATE_QUERY_OK && 
                 privacy_state == TOX_GROUP_PRIVACY_STATE_PUBLIC && final_peer_count == 1) {
-            fprintf(stdout, "[JoinGroup] ⚠️  PUBLIC group but only 1 peer found. Waiting additional time for DHT sync...\n");
-            fflush(stdout);
+            static_cast<void>(0);
+            static_cast<void>(0);
             // Wait additional 1 second (reduced from 2 seconds) with more iterations for DHT peer discovery
             for (int i = 0; i < 10; i++) {
                 GetToxManager()->iterate();
@@ -4166,12 +3956,11 @@ void V2TIMManagerImpl::JoinGroup(const V2TIMString& groupID, const V2TIMString& 
                             break;
                         }
                     }
-                    fprintf(stdout, "[JoinGroup] Additional wait iteration %d/%d: peer_count=%d\n", 
-                            i + 1, 10, current_peer_count);
-                    fflush(stdout);
+                    static_cast<void>(0);
+                    static_cast<void>(0);
                     if (current_peer_count > 1) {
-                        fprintf(stdout, "[JoinGroup] ✅ Found %d peers after additional wait!\n", current_peer_count);
-                        fflush(stdout);
+                        static_cast<void>(0);
+                        static_cast<void>(0);
                         break;
                     }
                 }
@@ -4184,8 +3973,8 @@ void V2TIMManagerImpl::JoinGroup(const V2TIMString& groupID, const V2TIMString& 
         // This is necessary because tox_group_join is asynchronous and onGroupSelfJoin
         // may not be triggered immediately, but we've already stored the mapping.
         if (final_mapping_exists) {
-            fprintf(stdout, "[JoinGroup] Mapping exists, manually calling HandleGroupSelfJoin to notify listeners\n");
-            fflush(stdout);
+            static_cast<void>(0);
+            static_cast<void>(0);
             V2TIM_LOG(kInfo, "[JoinGroup] Manually calling HandleGroupSelfJoin for group_number={}", group_number);
             HandleGroupSelfJoin(group_number);
         }
@@ -4194,15 +3983,15 @@ void V2TIMManagerImpl::JoinGroup(const V2TIMString& groupID, const V2TIMString& 
         // Check if there are other peers in the group and manually trigger HandleGroupPeerJoin
         // for those peers if DHT discovery hasn't completed yet
         // This helps with local bootstrap where DHT sync should be fast
-        fprintf(stdout, "[JoinGroup] Checking for existing peers to notify about this join...\n");
-        fflush(stdout);
+        static_cast<void>(0);
+        static_cast<void>(0);
         
         // Get self peer_id to identify which peer we are
         Tox_Err_Group_Self_Query err_self_final;
         Tox_Group_Peer_Number self_peer_id_final = tox_group_self_get_peer_id(tox, group_number, &err_self_final);
         if (err_self_final == TOX_ERR_GROUP_SELF_QUERY_OK) {
-            fprintf(stdout, "[JoinGroup] Self peer_id in group: %u\n", self_peer_id_final);
-            fflush(stdout);
+            static_cast<void>(0);
+            static_cast<void>(0);
             
             // Check all peers in the group
             // If we see other peers, they should see us join via onGroupPeerJoin callback
@@ -4216,51 +4005,38 @@ void V2TIMManagerImpl::JoinGroup(const V2TIMString& groupID, const V2TIMString& 
                     err_peer_check == TOX_ERR_GROUP_PEER_QUERY_OK) {
                     visible_peer_count++;
                     if (peer_id != self_peer_id_final) {
-                        fprintf(stdout, "[JoinGroup] Found other peer: peer_id=%u (self=%u)\n", peer_id, self_peer_id_final);
-                        fprintf(stdout, "[JoinGroup] Other peer should see us join via onGroupPeerJoin callback\n");
-                        fflush(stdout);
+                        static_cast<void>(0);
+                        static_cast<void>(0);
+                        static_cast<void>(0);
                     }
                 } else {
                     break; // Stop after first error
                 }
             }
-            fprintf(stdout, "[JoinGroup] Visible peer count: %d (including self)\n", visible_peer_count);
-            fflush(stdout);
+            static_cast<void>(0);
+            static_cast<void>(0);
             
             // If we only see ourselves, DHT sync hasn't completed yet
             // Continue iterating to help DHT discovery
             if (visible_peer_count == 1) {
-                fprintf(stdout, "[JoinGroup] ⚠️  Only self visible, DHT sync may be incomplete\n");
-                fprintf(stdout, "[JoinGroup] DHT Discovery Diagnosis:\n");
-                fprintf(stdout, "[JoinGroup]   - Self DHT connection: %d (0=NONE, 1=TCP, 2=UDP)\n", 
-                        static_cast<int>(tox_self_get_connection_status(tox)));
-                
-                // Check group connection status
-                Tox_Err_Group_Is_Connected err_conn_diag;
-                bool group_connected = GetToxManager()->isGroupConnected(group_number, &err_conn_diag);
-                fprintf(stdout, "[JoinGroup]   - Group connected: %d (err=%d)\n", 
-                        group_connected ? 1 : 0, static_cast<int>(err_conn_diag));
-                
-                // Check privacy state
-                Tox_Err_Group_State_Query err_privacy_diag;
-                Tox_Group_Privacy_State privacy_diag = tox_group_get_privacy_state(tox, group_number, &err_privacy_diag);
-                fprintf(stdout, "[JoinGroup]   - Group privacy: %d (0=PUBLIC, 1=PRIVATE, err=%d)\n", 
-                        static_cast<int>(privacy_diag), static_cast<int>(err_privacy_diag));
+                static_cast<void>(0);
+                static_cast<void>(0);
+                static_cast<void>(0);
                 
                 // For PUBLIC groups, DHT discovery should work but may take time
                 // For local bootstrap, we can try to accelerate by:
                 // 1. Ensuring both instances are iterating
                 // 2. Checking if we need to wait longer
                 // 3. Verifying bootstrap configuration
-                fprintf(stdout, "[JoinGroup] Continuing to iterate to help DHT discovery...\n");
-                fflush(stdout);
+                static_cast<void>(0);
+                static_cast<void>(0);
                 
                 // Do more iterations to help DHT discovery (increased from 5 to 20 for better discovery)
                 // With local bootstrap, this should help peers discover each other faster
                 // Note: DHT discovery for PUBLIC groups can take time even with local bootstrap
                 // c-toxcore tests use WAIT_UNTIL which continuously iterates until peers are found
-                fprintf(stdout, "[JoinGroup] Starting extended DHT discovery iterations (20 iterations, 100ms each)...\n");
-                fflush(stdout);
+                static_cast<void>(0);
+                static_cast<void>(0);
                 
                 for (int i = 0; i < 20; i++) {
                     // Call iterate on both instances to help DHT discovery
@@ -4284,35 +4060,33 @@ void V2TIMManagerImpl::JoinGroup(const V2TIMString& groupID, const V2TIMString& 
                                 break;
                             }
                         }
-                        fprintf(stdout, "[JoinGroup] DHT discovery check (iteration %d/20): peer_count=%d\n", i + 1, check_peer_count);
-                        fflush(stdout);
+                        static_cast<void>(0);
+                        static_cast<void>(0);
                         if (check_peer_count > 1) {
-                            fprintf(stdout, "[JoinGroup] ✅ Found %d peers after %d iterations!\n", check_peer_count, i + 1);
-                            fflush(stdout);
+                            static_cast<void>(0);
+                            static_cast<void>(0);
                             break;
                         }
                     }
                 }
-                fprintf(stdout, "[JoinGroup] Completed extended DHT discovery iterations\n");
-                fflush(stdout);
+                static_cast<void>(0);
+                static_cast<void>(0);
             }
         }
     } else {
-        fprintf(stdout, "[JoinGroup] WARNING: tox_manager_ is null, cannot check connection status\n");
-        fflush(stdout);
+        static_cast<void>(0);
+        static_cast<void>(0);
     }
     
     // Calculate total duration
     auto end_time = std::chrono::steady_clock::now();
     auto total_duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
         end_time - start_time).count();
-    auto end_timestamp_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::system_clock::now().time_since_epoch()).count();
     
-    fprintf(stdout, "[JoinGroup] ========== JoinGroup completing ==========\n");
-    fprintf(stdout, "[JoinGroup] Total duration: %lld ms\n", (long long)total_duration_ms);
-    fprintf(stdout, "[JoinGroup] end_timestamp_ms=%lld\n", (long long)end_timestamp_ms);
-    fflush(stdout);
+    static_cast<void>(0);
+    static_cast<void>(0);
+    static_cast<void>(0);
+    static_cast<void>(0);
     
     V2TIM_LOG(kInfo, "[JoinGroup] Calling callback->OnSuccess");
     if (callback) {
@@ -4322,9 +4096,8 @@ void V2TIMManagerImpl::JoinGroup(const V2TIMString& groupID, const V2TIMString& 
         V2TIM_LOG(kWarning, "[JoinGroup] callback is null, skipping OnSuccess");
     }
     
-    fprintf(stdout, "[JoinGroup] ========== JoinGroup completed (total=%lld ms) ==========\n", 
-            (long long)total_duration_ms);
-    fflush(stdout);
+    static_cast<void>(0);
+    static_cast<void>(0);
     V2TIM_LOG(kInfo, "[JoinGroup] ========== JoinGroup completed (total={} ms) ==========", total_duration_ms);
 }
 
@@ -4456,9 +4229,8 @@ void V2TIMManagerImpl::QuitGroup(const V2TIMString& groupID, V2TIMCallback* call
 
 void V2TIMManagerImpl::DismissGroup(const V2TIMString& groupID, V2TIMCallback* callback) {
     std::string group_id_str = groupID.CString();
-    fprintf(stdout, "[V2TIMManagerImpl] DismissGroup: ENTRY - groupID=%s, callback=%p\n", 
-            group_id_str.c_str(), callback);
-    fflush(stdout);
+    static_cast<void>(0);
+    static_cast<void>(0);
     V2TIM_LOG(kInfo, "DismissGroup: dismissing group %s", group_id_str.c_str());
     Tox_Group_Number group_number = UINT32_MAX;
     {
@@ -4466,15 +4238,11 @@ void V2TIMManagerImpl::DismissGroup(const V2TIMString& groupID, V2TIMCallback* c
         auto it = group_id_to_group_number_.find(groupID);
         if (it != group_id_to_group_number_.end()) {
             group_number = it->second;
-            fprintf(stdout, "[V2TIMManagerImpl] DismissGroup: Found group_number=%u in mapping\n", group_number);
-            fflush(stdout);
         }
     }
 
     V2TIMGroupManagerImpl* groupManagerImpl = static_cast<V2TIMGroupManagerImpl*>(GetGroupManager());
     if (!groupManagerImpl) {
-        fprintf(stderr, "[V2TIMManagerImpl] DismissGroup: ERROR - GroupManagerImpl not available\n");
-        fflush(stderr);
         if (callback) {
             callback->OnError(ERR_SDK_NOT_INITIALIZED, "GroupManager not available");
         }
@@ -4507,9 +4275,6 @@ void V2TIMManagerImpl::DismissGroup(const V2TIMString& groupID, V2TIMCallback* c
     };
 
     DismissGroupCallbackWrapper wrapper_callback(group_number);
-    fprintf(stdout, "[V2TIMManagerImpl] DismissGroup: Calling GroupManagerImpl::DismissGroup (group_number=%u)\n",
-            group_number);
-    fflush(stdout);
     groupManagerImpl->DismissGroup(groupID, &wrapper_callback);
 
     if (!wrapper_callback.succeeded()) {
@@ -5010,17 +4775,15 @@ void V2TIMManagerImpl::HandleGroupMessageGroup(Tox_Group_Number group_number, To
     }
     V2TIM_LOG(kInfo, "[V2TIMManagerImpl::HandleGroupMessageGroup] Self-check: is_ours={}, err_self={}", 
              is_ours, static_cast<int>(err_self));
-    fprintf(stdout, "[HandleGroupMessageGroup] Self-check: is_ours=%d, err_self=%d\n", 
-            is_ours ? 1 : 0, static_cast<int>(err_self));
-    fflush(stdout);
+    static_cast<void>(0);
+    static_cast<void>(0);
     
     // Ignore self-messages whenever we determined the sender is us (do not rely on err_self being OK,
     // since isGroupPeerOurs may return true without setting error in some code paths).
     if (is_ours) {
         V2TIM_LOG(kInfo, "[V2TIMManagerImpl::HandleGroupMessageGroup] Ignoring self-message in group.");
-        fprintf(stdout, "[HandleGroupMessageGroup] Ignoring self-message: group_number=%u, peer_id=%u\n", 
-                group_number, peer_id);
-        fflush(stdout);
+        static_cast<void>(0);
+        static_cast<void>(0);
         return; // Don't process messages sent by self
     }
     
@@ -5042,25 +4805,23 @@ void V2TIMManagerImpl::HandleGroupMessageGroup(Tox_Group_Number group_number, To
 
     V2TIM_LOG(kInfo, "[V2TIMManagerImpl::HandleGroupMessageGroup] getGroupPeerPublicKey: group_number={}, peer_id={}, got_key={}, err_peer={}", 
              group_number, peer_id, got_key ? 1 : 0, static_cast<int>(err_peer));
-    fprintf(stdout, "[HandleGroupMessageGroup] getGroupPeerPublicKey: group_number=%u, peer_id=%u, got_key=%d, err_peer=%d\n",
-            group_number, peer_id, got_key ? 1 : 0, static_cast<int>(err_peer));
-    fflush(stdout);
+    static_cast<void>(0);
+    static_cast<void>(0);
     
     // Get self public key for comparison
     uint8_t self_pubkey[TOX_PUBLIC_KEY_SIZE];
     tox_self_get_public_key(tox, self_pubkey);
     std::string self_pubkey_hex = ToxUtil::tox_bytes_to_hex(self_pubkey, TOX_PUBLIC_KEY_SIZE);
-    fprintf(stdout, "[HandleGroupMessageGroup] Self public key: %s\n", self_pubkey_hex.c_str());
-    fflush(stdout);
+    static_cast<void>(0);
+    static_cast<void>(0);
     
     if (!got_key || err_peer != TOX_ERR_GROUP_PEER_QUERY_OK) {
         if (err_peer == TOX_ERR_GROUP_PEER_QUERY_PEER_NOT_FOUND) {
             // Peer is temporarily not found in Tox state (e.g., just joined, state not yet stable).
             // Use a synthetic sender ID based on peer_id so the message is still delivered instead of dropped.
             V2TIM_LOG(kWarning, "HandleGroupMessage: Peer not found (err_peer=PEER_NOT_FOUND), using synthetic sender for group_number={}, peer_id={}", group_number, peer_id);
-            fprintf(stdout, "[HandleGroupMessageGroup] Peer not found temporarily, using synthetic sender: group_number=%u, peer_id=%u\n",
-                    group_number, peer_id);
-            fflush(stdout);
+            static_cast<void>(0);
+            static_cast<void>(0);
             // Fill sender_pubkey with synthetic value: 0xFF + peer_id bytes so it's distinct
             memset(sender_pubkey, 0xFF, TOX_PUBLIC_KEY_SIZE);
             sender_pubkey[0] = static_cast<uint8_t>((peer_id >> 24) & 0xFF);
@@ -5069,9 +4830,8 @@ void V2TIMManagerImpl::HandleGroupMessageGroup(Tox_Group_Number group_number, To
             sender_pubkey[3] = static_cast<uint8_t>(peer_id & 0xFF);
         } else {
             V2TIM_LOG(kError, "HandleGroupMessage: Failed to get peer public key: got_key={}, err_peer={}", got_key ? 1 : 0, static_cast<int>(err_peer));
-            fprintf(stderr, "[HandleGroupMessageGroup] ERROR: Failed to get peer public key: got_key=%d, err_peer=%d\n",
-                    got_key ? 1 : 0, static_cast<int>(err_peer));
-            fflush(stderr);
+            static_cast<void>(0);
+            static_cast<void>(0);
             return;
         }
     }
@@ -5123,8 +4883,8 @@ void V2TIMManagerImpl::HandleGroupMessageGroup(Tox_Group_Number group_number, To
                         }
                         groupID = resolvedID;
                         V2TIM_LOG(kInfo, "[V2TIMManagerImpl::HandleGroupMessageGroup] Resolved unknown group_number {} -> groupID={} (via getGroupChatId)", group_number, groupID.CString());
-                        fprintf(stdout, "[HandleGroupMessageGroup] Resolved unknown group_number %u -> groupID=%s\n", (unsigned)group_number, groupID.CString());
-                        fflush(stdout);
+                        static_cast<void>(0);
+                        static_cast<void>(0);
                         break;
                     }
                 }
@@ -5160,8 +4920,8 @@ void V2TIMManagerImpl::HandleGroupMessageGroup(Tox_Group_Number group_number, To
                     }
                     groupID = resolvedID;
                     V2TIM_LOG(kInfo, "[V2TIMManagerImpl::HandleGroupMessageGroup] Resolved unknown group_number {} -> groupID={} (via getGroupByChatId)", group_number, groupID.CString());
-                    fprintf(stdout, "[HandleGroupMessageGroup] Resolved unknown group_number %u -> groupID=%s (via getGroupByChatId)\n", (unsigned)group_number, groupID.CString());
-                    fflush(stdout);
+                    static_cast<void>(0);
+                    static_cast<void>(0);
                     break;
                 }
             }
@@ -5178,8 +4938,8 @@ void V2TIMManagerImpl::HandleGroupMessageGroup(Tox_Group_Number group_number, To
             }
             groupID = syntheticID;
             V2TIM_LOG(kInfo, "[V2TIMManagerImpl::HandleGroupMessageGroup] Using synthetic groupID {} for unknown group_number {}", groupID.CString(), group_number);
-            fprintf(stdout, "[HandleGroupMessageGroup] Using synthetic groupID %s for group_number %u (message will be delivered)\n", groupID.CString(), (unsigned)group_number);
-            fflush(stdout);
+            static_cast<void>(0);
+            static_cast<void>(0);
         }
     }
 
@@ -5192,9 +4952,8 @@ void V2TIMManagerImpl::HandleGroupMessageGroup(Tox_Group_Number group_number, To
 
     V2TIM_LOG(kInfo, "[V2TIMManagerImpl::HandleGroupMessageGroup] Received group msg type {} group_number={} peer_id={} length={}",
              type, group_number, peer_id, length);
-    fprintf(stdout, "[HandleGroupMessageGroup] Received group message: group_number=%u, peer_id=%u, type=%d, length=%zu\n",
-            group_number, peer_id, static_cast<int>(type), length);
-    fflush(stdout);
+    static_cast<void>(0);
+    static_cast<void>(0);
 
     // Populate the peer_id cache so GetGroupMemberList can list this peer even if
     // HandleGroupPeerJoin never fired (e.g. because the group join never fully completed).
@@ -5203,9 +4962,8 @@ void V2TIMManagerImpl::HandleGroupMessageGroup(Tox_Group_Number group_number, To
         std::transform(key_lower.begin(), key_lower.end(), key_lower.begin(), ::tolower);
         std::lock_guard<std::mutex> lock(mutex_);
         group_peer_id_cache_[group_number][key_lower] = peer_id;
-        fprintf(stdout, "[HandleGroupMessageGroup] Cached peer group_number=%u peer_id=%u\n",
-                group_number, peer_id);
-        fflush(stdout);
+        static_cast<void>(0);
+        static_cast<void>(0);
     }
 
     if (type == TOX_MESSAGE_TYPE_ACTION) {
@@ -5300,30 +5058,22 @@ void V2TIMManagerImpl::HandleGroupMessageGroup(Tox_Group_Number group_number, To
                  v2_message.elemList.Size());
         V2TIM_LOG(kInfo, "[V2TIMManagerImpl::HandleGroupMessageGroup] Message created: timestamp={}",
                  v2_message.timestamp);
-        fprintf(stdout, "[HandleGroupMessageGroup] Message created: isSelf=%d, elemCount=%zu\n",
-                v2_message.isSelf ? 1 : 0, v2_message.elemList.Size());
-        if (v2_message.elemList.Size() > 0 && v2_message.elemList[0]->elemType == V2TIM_ELEM_TYPE_TEXT) {
-            V2TIMTextElem* textElem = static_cast<V2TIMTextElem*>(v2_message.elemList[0]);
-            fprintf(stdout, "[HandleGroupMessageGroup] Message text length: %zu\n", textElem->text.Size());
-        }
-        fflush(stdout);
+        static_cast<void>(0);
+        static_cast<void>(0);
         
         // --- Notify Advanced Listeners --- 
         // Set receiver instance override so OnRecvNewMessage (in dart_compat_listeners) routes to this instance.
         int64_t receiver_instance_id = GetInstanceIdFromManager(this);
         V2TIM_LOG(kInfo, "[V2TIMManagerImpl::HandleGroupMessageGroup] About to notify advanced listeners, msgManager={}, receiver_instance_id={}", 
                  (void*)msgManager, (long long)receiver_instance_id);
-        fprintf(stdout, "[HandleGroupMessageGroup] About to notify advanced listeners (receiver_instance_id=%lld)\n",
-                (long long)receiver_instance_id);
-        fflush(stdout);
         {
             ReceiverInstanceOverrideGuard receiver_instance_guard(
                 receiver_instance_id);
             msgManager->NotifyAdvancedListenersReceivedMessage(v2_message);
         }
         V2TIM_LOG(kInfo, "[V2TIMManagerImpl::HandleGroupMessageGroup] Advanced listeners notified");
-        fprintf(stdout, "[HandleGroupMessageGroup] Advanced listeners notified successfully\n");
-        fflush(stdout);
+        static_cast<void>(0);
+        static_cast<void>(0);
 
         // --- Notify Simple Listeners (Optional - Keep for now) --- 
         std::vector<V2TIMSimpleMsgListener*> listeners_to_notify;
@@ -5462,8 +5212,8 @@ void V2TIMManagerImpl::HandleGroupCustomPacket(
 }
 
 void V2TIMManagerImpl::HandleGroupPrivateMessage(Tox_Group_Number group_number, Tox_Group_Peer_Number peer_id, TOX_MESSAGE_TYPE type, const uint8_t* message_data, size_t length, Tox_Group_Message_Id message_id) {
-    fprintf(stdout, "[HandleGroupPrivateMessage] ENTRY group_number=%u peer_id=%u type=%d len=%zu\n", group_number, peer_id, type, length);
-    fflush(stdout);
+    static_cast<void>(0);
+    static_cast<void>(0);
     Tox* tox = GetToxManager()->getTox();
     V2TIMMessageManagerImpl* msgManager = static_cast<V2TIMMessageManagerImpl*>(GetMessageManager());
     if (!tox || !running_) return;
@@ -6167,25 +5917,6 @@ void V2TIMManagerImpl::HandleSelfConnectionStatus(TOX_CONNECTION connection_stat
 }
 
 void V2TIMManagerImpl::HandleFriendRequest(const uint8_t* public_key, const uint8_t* message_data, size_t length) {
-    extern int64_t GetInstanceIdFromManager(V2TIMManagerImpl* manager);
-    int64_t instance_id = GetInstanceIdFromManager(this);
-    fprintf(stdout, "[HandleFriendRequest] ========== ENTRY ==========\n");
-    fprintf(stderr, "[HandleFriendRequest] ========== ENTRY ==========\n");
-    fprintf(stdout, "[HandleFriendRequest] this=%p, instance_id=%lld\n", (void*)this, (long long)instance_id);
-    fprintf(stderr, "[HandleFriendRequest] this=%p, instance_id=%lld\n", (void*)this, (long long)instance_id);
-    fprintf(stdout, "[HandleFriendRequest] public_key (first 20 chars): ");
-    fprintf(stderr, "[HandleFriendRequest] public_key (first 20 chars): ");
-    for (int i = 0; i < 20 && i < TOX_PUBLIC_KEY_SIZE; ++i) {
-        fprintf(stdout, "%02X", public_key[i]);
-        fprintf(stderr, "%02X", public_key[i]);
-    }
-    fprintf(stdout, "...\n");
-    fprintf(stderr, "...\n");
-    fprintf(stdout, "[HandleFriendRequest] message length: %zu\n", length);
-    fprintf(stderr, "[HandleFriendRequest] message length: %zu\n", length);
-    fflush(stdout);
-    fflush(stderr);
-    
     char sender_hex_id[TOX_PUBLIC_KEY_SIZE * 2 + 1];
     std::string hex_id = ToxUtil::tox_bytes_to_hex(public_key, TOX_PUBLIC_KEY_SIZE);
     strcpy(sender_hex_id, hex_id.c_str());
@@ -6207,8 +5938,8 @@ void V2TIMManagerImpl::HandleFriendRequest(const uint8_t* public_key, const uint
     V2TIMFriendApplicationVector applications;
     applications.PushBack(application);
     
-    fprintf(stdout, "[HandleFriendRequest] Created application with message_length=%zu\n", length);
-    fflush(stdout);
+    static_cast<void>(0);
+    static_cast<void>(0);
     
     // Notify only the current instance's listener (not all instances)
     // This is critical for multi-instance support, as each instance should only
@@ -6217,21 +5948,20 @@ void V2TIMManagerImpl::HandleFriendRequest(const uint8_t* public_key, const uint
     // because HandleFriendRequest is called from Tox callback thread, where g_current_instance_id
     // may not be set correctly. Using 'this' pointer ensures we get the correct instance.
     V2TIM_LOG(kInfo, "HandleFriendRequest: Calling GetFriendshipListenerForManager(this={})", (void*)this);
-    fprintf(stdout, "[HandleFriendRequest] Calling GetFriendshipListenerForManager(this=%p)\n", (void*)this);
-    fflush(stdout);
+    static_cast<void>(0);
+    static_cast<void>(0);
     DartFriendshipListenerImpl* listener = GetFriendshipListenerForManager(this);
     V2TIM_LOG(kInfo, "HandleFriendRequest: GetFriendshipListenerForManager() returned: {}", (void*)listener);
-    fprintf(stdout, "[HandleFriendRequest] GetFriendshipListenerForManager() returned: %p\n", (void*)listener);
-    fflush(stdout);
+    static_cast<void>(0);
+    static_cast<void>(0);
     
     // If no listener found, try to get or create one for this instance
     if (!listener) {
         int64_t this_instance_id = GetInstanceIdFromManager(this);
         
         V2TIM_LOG(kInfo, "HandleFriendRequest: No listener found, creating one for instance {}", this_instance_id);
-        fprintf(stdout, "[HandleFriendRequest] No listener found, creating one for instance %lld\n", 
-                (long long)this_instance_id);
-        fflush(stdout);
+        static_cast<void>(0);
+        static_cast<void>(0);
         
         // Create listener directly for this instance_id
         listener = GetOrCreateFriendshipListenerForInstance(this_instance_id);
@@ -6240,20 +5970,20 @@ void V2TIMManagerImpl::HandleFriendRequest(const uint8_t* public_key, const uint
         // We don't need to register it with friendship manager here, as it will be used directly
         if (listener) {
             V2TIM_LOG(kInfo, "HandleFriendRequest: Created friendship listener for instance {}", this_instance_id);
-            fprintf(stdout, "[HandleFriendRequest] Created friendship listener for instance %lld\n", (long long)this_instance_id);
-            fflush(stdout);
+            static_cast<void>(0);
+            static_cast<void>(0);
         }
     }
     
     if (listener) {
         V2TIM_LOG(kInfo, "HandleFriendRequest: Notifying current instance's listener about friend request from {}", senderUserID.CString());
         V2TIM_LOG(kInfo, "HandleFriendRequest: Calling NotifyFriendApplicationListAddedToListener with {} applications", applications.Size());
-        fprintf(stdout, "[HandleFriendRequest] Calling NotifyFriendApplicationListAddedToListener with %zu applications\n", applications.Size());
-        fflush(stdout);
+        static_cast<void>(0);
+        static_cast<void>(0);
         NotifyFriendApplicationListAddedToListener(listener, &applications);
         V2TIM_LOG(kInfo, "HandleFriendRequest: NotifyFriendApplicationListAddedToListener completed");
-        fprintf(stdout, "[HandleFriendRequest] NotifyFriendApplicationListAddedToListener completed\n");
-        fflush(stdout);
+        static_cast<void>(0);
+        static_cast<void>(0);
         
         // CRITICAL: Also store the application in pending_applications_ so GetFriendApplicationList works
         // This is needed because NotifyFriendApplicationListAddedToListener only notifies listeners,
@@ -6261,33 +5991,33 @@ void V2TIMManagerImpl::HandleFriendRequest(const uint8_t* public_key, const uint
         V2TIMFriendshipManagerImpl* fm = static_cast<V2TIMFriendshipManagerImpl*>(GetFriendshipManager());
         if (fm) {
             V2TIM_LOG(kInfo, "HandleFriendRequest: Storing application in pending_applications_ for GetFriendApplicationList");
-            fprintf(stdout, "[HandleFriendRequest] Storing application in pending_applications_ for GetFriendApplicationList\n");
-            fflush(stdout);
+            static_cast<void>(0);
+            static_cast<void>(0);
             fm->NotifyFriendApplicationListAdded(applications);
-            fprintf(stdout, "[HandleFriendRequest] Application stored in pending_applications_\n");
-            fflush(stdout);
+            static_cast<void>(0);
+            static_cast<void>(0);
         } else {
-            fprintf(stdout, "[HandleFriendRequest] ERROR: GetFriendshipManager() returned null!\n");
-            fflush(stdout);
+            static_cast<void>(0);
+            static_cast<void>(0);
         }
     } else {
         V2TIM_LOG(kWarning, "HandleFriendRequest: No listener found for current instance, friend request from {} will not be notified", senderUserID.CString());
-        fprintf(stdout, "[HandleFriendRequest] WARNING: No listener found for current instance!\n");
-        fflush(stdout);
+        static_cast<void>(0);
+        static_cast<void>(0);
         // Fallback: Also notify through the global FriendshipManagerImpl for backward compatibility
         // This ensures that if no per-instance listener is registered, the request is still processed
         V2TIMFriendshipManagerImpl* fm = static_cast<V2TIMFriendshipManagerImpl*>(GetFriendshipManager());
         if (fm) {
             V2TIM_LOG(kInfo, "HandleFriendRequest: Falling back to global FriendshipManagerImpl");
-            fprintf(stdout, "[HandleFriendRequest] Falling back to global FriendshipManagerImpl\n");
-            fflush(stdout);
+            static_cast<void>(0);
+            static_cast<void>(0);
             fm->NotifyFriendApplicationListAdded(applications);
         }
     }
-    fprintf(stdout, "[HandleFriendRequest] ========== EXIT ==========\n");
-    fprintf(stderr, "[HandleFriendRequest] ========== EXIT ==========\n");
-    fflush(stdout);
-    fflush(stderr);
+    static_cast<void>(0);
+    static_cast<void>(0);
+    static_cast<void>(0);
+    static_cast<void>(0);
 }
 
 void V2TIMManagerImpl::HandleFriendName(uint32_t friend_number, const uint8_t* name_data, size_t length) {
@@ -6553,15 +6283,13 @@ void V2TIMManagerImpl::HandleFriendConnectionStatus(uint32_t friend_number, TOX_
 }
 
 void V2TIMManagerImpl::HandleFriendStatus(uint32_t friend_number, TOX_USER_STATUS status) {
-    fprintf(stdout, "[V2TIMManagerImpl] HandleFriendStatus: ENTRY - friend_number=%u, status=%d\n", 
-            friend_number, status);
-    fflush(stdout);
+    static_cast<void>(0);
+    static_cast<void>(0);
     
     Tox* tox = GetToxManager()->getTox();
     if (!tox || !running_) {
-        fprintf(stdout, "[V2TIMManagerImpl] HandleFriendStatus: EXIT early - tox=%p, running_=%d\n", 
-                (void*)tox, running_ ? 1 : 0);
-        fflush(stdout);
+        static_cast<void>(0);
+        static_cast<void>(0);
         return;
     }
 
@@ -6609,45 +6337,39 @@ void V2TIMManagerImpl::HandleFriendStatus(uint32_t friend_number, TOX_USER_STATU
         listeners_to_notify.assign(sdk_listeners_.begin(), sdk_listeners_.end());
     }
     
-    int64_t this_instance_id = GetInstanceIdFromManager(this);
-    fprintf(stdout, "[V2TIMManagerImpl] HandleFriendStatus: Notifying %zu SDK listeners (instance_id=%lld, friendUserID=%s, statusType=%d, tox_status=%d)\n", 
-            listeners_to_notify.size(), (long long)this_instance_id, friendUserID.CString(), v2_status.statusType, status);
-    fflush(stdout);
+    static_cast<void>(0);
+    static_cast<void>(0);
     
     V2TIMUserStatusVector statusVector;
     statusVector.PushBack(v2_status);
     
-    fprintf(stdout, "[V2TIMManagerImpl] HandleFriendStatus: statusVector.Size()=%zu before calling listeners\n",
-            statusVector.Size());
-    fflush(stdout);
+    static_cast<void>(0);
+    static_cast<void>(0);
     
     for (size_t i = 0; i < listeners_to_notify.size(); i++) {
         V2TIMSDKListener* listener = listeners_to_notify[i];
         if (listener) {
-            fprintf(stdout, "[V2TIMManagerImpl] HandleFriendStatus: Calling OnUserStatusChanged on listener[%zu]=%p (instance_id=%lld)\n", 
-                    i, (void*)listener, (long long)this_instance_id);
-            fflush(stdout);
+            static_cast<void>(0);
+            static_cast<void>(0);
             try {
                 listener->OnUserStatusChanged(statusVector); // Notify with the status vector
-                fprintf(stdout, "[V2TIMManagerImpl] HandleFriendStatus: Successfully called OnUserStatusChanged on listener[%zu]\n", i);
+                static_cast<void>(0);
             } catch (const std::exception& e) {
-                fprintf(stderr, "[V2TIMManagerImpl] HandleFriendStatus: EXCEPTION calling OnUserStatusChanged on listener[%zu]: %s\n",
-                        i, e.what());
-                fflush(stderr);
+                static_cast<void>(0);
+                static_cast<void>(0);
             } catch (...) {
-                fprintf(stderr, "[V2TIMManagerImpl] HandleFriendStatus: UNKNOWN EXCEPTION calling OnUserStatusChanged on listener[%zu]\n", i);
-                fflush(stderr);
+                static_cast<void>(0);
+                static_cast<void>(0);
             }
-            fflush(stdout);
+            static_cast<void>(0);
         } else {
-            fprintf(stderr, "[V2TIMManagerImpl] HandleFriendStatus: WARNING - listener[%zu] is null\n", i);
-            fflush(stderr);
+            static_cast<void>(0);
+            static_cast<void>(0);
         }
     }
     
-    fprintf(stdout, "[V2TIMManagerImpl] HandleFriendStatus: Finished notifying all listeners (instance_id=%lld)\n",
-            (long long)this_instance_id);
-    fflush(stdout);
+    static_cast<void>(0);
+    static_cast<void>(0);
 }
 
 void V2TIMManagerImpl::HandleGroupTitle(uint32_t conference_number, uint32_t peer_number, const uint8_t* title_data, size_t length) {
@@ -7082,6 +6804,111 @@ bool V2TIMManagerImpl::IsTemporaryInviteGroupID(const V2TIMString& groupID) cons
     return value != nullptr && std::strncmp(value, "tox_inv_", 8) == 0;
 }
 
+// Promote a `tox_inv_<friend>_<ms>` invite alias to a stable `tox_<n>` id.
+//
+// WHY THIS EXISTS: an invitee that has never seen the group before reaches
+// HandleGroupSelfJoin holding only the temporary alias. Publishing that alias
+// is wrong (it is per-invite, not per-group), but simply refusing to publish —
+// which is what happened before — dropped the self-join on the floor: the Dart
+// layer was never told it had joined, so the group never appeared in
+// knownGroups, never got a conversation, and could not accrue unread. The
+// invitee's whole group surface stayed invisible.
+//
+// It only reproduced in the two-process real-UI campaign: in single-process
+// auto_tests A and B share `g_cross_instance_group_identity`, so the invitee
+// resolved the inviter's canonical id and the alias never survived to the
+// guard. Separate processes have separate maps, so it always survived.
+V2TIMString V2TIMManagerImpl::PromoteTemporaryInviteGroupID(
+    const V2TIMString& temp_group_id, Tox_Group_Number group_number) {
+    uint8_t chat_id[TOX_GROUP_CHAT_ID_SIZE];
+    Tox_Err_Group_State_Query err_chat_id = TOX_ERR_GROUP_STATE_QUERY_OK;
+    if (!GetToxManager()->getGroupChatId(group_number, chat_id, &err_chat_id) ||
+        err_chat_id != TOX_ERR_GROUP_STATE_QUERY_OK) {
+        return V2TIMString();
+    }
+    std::ostringstream oss;
+    for (size_t i = 0; i < TOX_GROUP_CHAT_ID_SIZE; ++i) {
+        oss << std::hex << std::setw(2) << std::setfill('0')
+            << static_cast<int>(chat_id[i]);
+    }
+    const std::string chat_id_hex = oss.str();
+
+    // Highest `tox_<n>` already in use, from BOTH sources CreateGroup consults.
+    // Skipping this is not cosmetic: `g_next_group_id_global` is a process
+    // static that restarts at 0, while `tox_0` may already exist in Dart
+    // persistence from a previous session — CreateGroup's own comment calls out
+    // that reusing it makes the new group load the old group's history. Read
+    // the Dart-side list OUTSIDE `mutex_`, as CreateGroup does.
+    std::unordered_set<std::string> taken;
+    uint64_t max_existing_id = 0;
+    auto note_existing = [&](const std::string& existing_id) {
+        if (existing_id.rfind("tox_", 0) != 0 || existing_id.length() <= 4) {
+            return;
+        }
+        try {
+            const uint64_t id_num = std::stoull(existing_id.substr(4));
+            if (id_num > max_existing_id) max_existing_id = id_num;
+        } catch (...) {
+            // Non-numeric suffix (e.g. "tox_community_1") — not our namespace.
+        }
+    };
+    for (const auto& g : GetKnownGroupIDs()) {
+        taken.insert(g);
+        note_existing(g);
+    }
+
+    V2TIMString canonical;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        // Prefer an id already agreed for this chat_id (same-process peers, or
+        // a rejoin after the alias was minted) before allocating a new one.
+        canonical = CanonicalGroupIDForChatIdLocked(temp_group_id, chat_id_hex);
+        if (canonical.Empty() || IsTemporaryInviteGroupID(canonical)) {
+            for (const auto& pair : group_id_to_group_number_) {
+                note_existing(std::string(pair.first.CString()));
+            }
+            char buf[32];
+            uint64_t candidate = g_next_group_id_global.fetch_add(1);
+            if (candidate <= max_existing_id) {
+                candidate = max_existing_id + 1;
+                uint64_t expected = g_next_group_id_global.load();
+                while (expected <= candidate &&
+                       !g_next_group_id_global.compare_exchange_weak(
+                           expected, candidate + 1)) {
+                    // retry with the refreshed `expected`
+                }
+            }
+            snprintf(buf, sizeof(buf), "tox_%llu",
+                     (unsigned long long)candidate);
+            while (group_id_to_group_number_.find(buf) !=
+                       group_id_to_group_number_.end() ||
+                   taken.count(std::string(buf)) > 0) {
+                candidate = g_next_group_id_global.fetch_add(1);
+                if (candidate <= max_existing_id) candidate = max_existing_id + 1;
+                snprintf(buf, sizeof(buf), "tox_%llu",
+                         (unsigned long long)candidate);
+            }
+            canonical = V2TIMString(buf);
+        }
+
+        // Move every alias-keyed entry over, then drop the alias so nothing can
+        // resolve through it again.
+        group_id_to_group_number_.erase(temp_group_id);
+        group_id_to_chat_id_.erase(temp_group_id);
+        pending_group_invites_.erase(temp_group_id);
+        group_id_to_group_number_[canonical] = group_number;
+        group_number_to_group_id_[group_number] = canonical;
+        group_id_to_chat_id_[canonical] =
+            std::vector<uint8_t>(chat_id, chat_id + TOX_GROUP_CHAT_ID_SIZE);
+        chat_id_to_group_id_[chat_id_hex] = canonical;
+    }
+    RememberCrossInstanceGroupIdentity(canonical.CString(), chat_id_hex);
+    V2TIM_LOG(kInfo,
+              "PromoteTemporaryInviteGroupID: promoted %s -> %s for group_number=%u",
+              temp_group_id.CString(), canonical.CString(), group_number);
+    return canonical;
+}
+
 V2TIMString V2TIMManagerImpl::CanonicalGroupIDForChatIdLocked(
     const V2TIMString& requested_group_id,
     const std::string& chat_id_hex) const {
@@ -7186,26 +7013,61 @@ void V2TIMManagerImpl::SetAVConferenceAudioCallback(
 void V2TIMManagerImpl::ClearAVConferenceAudioCallback() {
     std::lock_guard<std::mutex> lock(mutex_);
     av_conference_audio_callback_ = nullptr;
+    enabled_av_conferences_.clear();
     muted_av_conferences_.clear();
+    av_conference_audio_queue_.ClearAll();
 }
 
-void V2TIMManagerImpl::ForwardAVConferenceAudioToDart(
+void V2TIMManagerImpl::EnqueueAVConferenceAudioFrame(
     const char* group_id, uint32_t conference_number,
     uint32_t peer_number, const int16_t* pcm, size_t sample_count,
     uint8_t channels, uint32_t sampling_rate) {
+    if (group_id == nullptr || group_id[0] == '\0' || pcm == nullptr ||
+        sample_count == 0 || (channels != 1 && channels != 2)) {
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!av_conference_audio_callback_ ||
+            enabled_av_conferences_.find(conference_number) ==
+                enabled_av_conferences_.end() ||
+            muted_av_conferences_.find(conference_number) !=
+            muted_av_conferences_.end()) {
+            return;
+        }
+    }
+    if (sample_count > std::numeric_limits<size_t>::max() / channels) {
+        return;
+    }
+    const size_t total_samples = sample_count * channels;
+    tim2tox::AVConferenceAudioFrame frame;
+    frame.group_id = group_id;
+    frame.conference_number = conference_number;
+    frame.peer_number = peer_number;
+    frame.pcm.assign(pcm, pcm + total_samples);
+    frame.sample_count = sample_count;
+    frame.channels = channels;
+    frame.sampling_rate = sampling_rate;
+    av_conference_audio_queue_.Enqueue(std::move(frame));
+}
+
+void V2TIMManagerImpl::DrainPendingAVConferenceAudioFrames() {
+    std::vector<tim2tox::AVConferenceAudioFrame> frames =
+        av_conference_audio_queue_.Drain();
+    if (frames.empty()) return;
+
     AVConferenceAudioCallback callback;
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (group_id == nullptr ||
-            muted_av_conferences_.find(conference_number) !=
-                muted_av_conferences_.end()) {
-            return;
-        }
         callback = av_conference_audio_callback_;
     }
-    if (callback) {
-        callback(group_id, conference_number, peer_number, pcm, sample_count,
-                 channels, sampling_rate);
+    if (!callback) return;
+
+    for (const auto& frame : frames) {
+        if (frame.pcm.empty()) continue;
+        callback(frame.group_id.c_str(), frame.conference_number,
+                 frame.peer_number, frame.pcm.data(), frame.sample_count,
+                 frame.channels, frame.sampling_rate);
     }
 }
 
@@ -7229,8 +7091,17 @@ bool V2TIMManagerImpl::EnableAVConferenceAudio(
             HandleAVConferenceAudio, this)) {
         return false;
     }
-    if (av_manager->isConferenceAudioEnabled(conference_number)) return true;
-    return av_manager->enableConferenceAudio(conference_number);
+    if (av_manager->isConferenceAudioEnabled(conference_number)) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        enabled_av_conferences_.insert(conference_number);
+        return true;
+    }
+    const bool result = av_manager->enableConferenceAudio(conference_number);
+    if (result) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        enabled_av_conferences_.insert(conference_number);
+    }
+    return result;
 }
 
 bool V2TIMManagerImpl::DisableAVConferenceAudio(
@@ -7244,7 +7115,9 @@ bool V2TIMManagerImpl::DisableAVConferenceAudio(
                             : true;
     if (result) {
         std::lock_guard<std::mutex> lock(mutex_);
+        enabled_av_conferences_.erase(conference_number);
         muted_av_conferences_.erase(conference_number);
+        av_conference_audio_queue_.ClearGroup(group_id.CString());
     }
     return result;
 }
@@ -7270,12 +7143,17 @@ bool V2TIMManagerImpl::MuteAVConferenceAudio(
     std::lock_guard<std::mutex> lock(mutex_);
     if (mute) {
         muted_av_conferences_.insert(conference_number);
+        av_conference_audio_queue_.ClearGroup(group_id.CString());
     } else {
         muted_av_conferences_.erase(conference_number);
     }
     return true;
 }
 #endif
+
+void V2TIMManagerImpl::ClearPendingAVConferenceAudioFrames() {
+    av_conference_audio_queue_.ClearAll();
+}
 
 // Helper method to notify group listeners about member kicked
 void V2TIMManagerImpl::NotifyGroupMemberKicked(const V2TIMString& groupID, const V2TIMGroupMemberInfoVector& memberList) {
@@ -7386,64 +7264,13 @@ void V2TIMManagerImpl::HandleGroupPeerNameGroup(Tox_Group_Number group_number, T
 }
 
 void V2TIMManagerImpl::HandleGroupPeerJoin(Tox_Group_Number group_number, Tox_Group_Peer_Number peer_id) {
-    // Get timestamp for detailed timing
-    auto callback_timestamp_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::system_clock::now().time_since_epoch()).count();
-    
     // Log which instance is handling peer join (for multi-instance debugging)
     // Note: GetCurrentInstanceId is already declared at file scope (line 27)
     int64_t current_instance_id = GetCurrentInstanceId();
-    fprintf(stdout, "[HandleGroupPeerJoin] ========== ENTRY ==========\n");
-    fprintf(stdout, "[HandleGroupPeerJoin] callback_timestamp_ms=%lld, instance_id=%lld, group_number=%u, peer_id=%u\n", 
-            (long long)callback_timestamp_ms, (long long)current_instance_id, group_number, peer_id);
+    static_cast<void>(0);
+    static_cast<void>(0);
     
-    // Get peer information for debugging
-    if (tox_manager_ && tox_manager_->getTox()) {
-        Tox* tox = tox_manager_->getTox();
-        
-        // Get peer public key
-        uint8_t peer_pubkey[TOX_PUBLIC_KEY_SIZE];
-        Tox_Err_Group_Peer_Query err_key;
-        bool got_key = tox_group_peer_get_public_key(tox, group_number, peer_id, peer_pubkey, &err_key);
-        if (got_key && err_key == TOX_ERR_GROUP_PEER_QUERY_OK) {
-            std::string peer_userID = ToxUtil::tox_bytes_to_hex(peer_pubkey, TOX_PUBLIC_KEY_SIZE);
-            fprintf(stdout, "[HandleGroupPeerJoin] Peer userID: %s (length=%zu)\n", 
-                    peer_userID.c_str(), peer_userID.length());
-        } else {
-            fprintf(stdout, "[HandleGroupPeerJoin] Failed to get peer public key, err=%d\n", 
-                    static_cast<int>(err_key));
-        }
-        
-        // Get peer name (buffer may not be NUL-terminated; use strnlen to avoid OOB read)
-        uint8_t name_buffer[TOX_MAX_NAME_LENGTH + 1] = {};
-        Tox_Err_Group_Peer_Query err_name;
-        if (tox_group_peer_get_name(tox, group_number, peer_id, name_buffer, &err_name) &&
-            err_name == TOX_ERR_GROUP_PEER_QUERY_OK) {
-            size_t name_len = strnlen(reinterpret_cast<const char*>(name_buffer), TOX_MAX_NAME_LENGTH);
-            fprintf(stdout, "[HandleGroupPeerJoin] Peer name: %.*s (length=%zu)\n",
-                    static_cast<int>(name_len), reinterpret_cast<const char*>(name_buffer), name_len);
-        }
-        
-        // Get peer role
-        Tox_Err_Group_Peer_Query err_role;
-        Tox_Group_Role peer_role = tox_group_peer_get_role(tox, group_number, peer_id, &err_role);
-        if (err_role == TOX_ERR_GROUP_PEER_QUERY_OK) {
-            fprintf(stdout, "[HandleGroupPeerJoin] Peer role: %d (0=USER, 1=MODERATOR, 2=FOUNDER, 3=OBSERVER)\n", 
-                    static_cast<int>(peer_role));
-        }
-        
-        // Check if this is ourselves
-        Tox_Err_Group_Self_Query err_self;
-        Tox_Group_Peer_Number self_peer_id = tox_group_self_get_peer_id(tox, group_number, &err_self);
-        if (err_self == TOX_ERR_GROUP_SELF_QUERY_OK && self_peer_id == peer_id) {
-            fprintf(stdout, "[HandleGroupPeerJoin] ⚠️  NOTE: This is our own peer join event (self_peer_id=%u)\n", 
-                    self_peer_id);
-        } else {
-            fprintf(stdout, "[HandleGroupPeerJoin] ✅ This is a different peer joining (self_peer_id=%u, peer_id=%u)\n", 
-                    self_peer_id, peer_id);
-        }
-    }
-    fflush(stdout);
+    static_cast<void>(0);
     V2TIM_LOG(kInfo, "[HandleGroupPeerJoin] ENTRY - instance_id=%lld, group_number=%u, peer_id=%u", 
               (long long)current_instance_id, group_number, peer_id);
     V2TIMString groupID;
@@ -7451,34 +7278,31 @@ void V2TIMManagerImpl::HandleGroupPeerJoin(Tox_Group_Number group_number, Tox_Gr
         std::lock_guard<std::mutex> lock(mutex_);
         auto it = group_number_to_group_id_.find(group_number);
         if (it == group_number_to_group_id_.end()) {
-            fprintf(stdout, "[HandleGroupPeerJoin] ERROR: Group_number=%u not found in mapping (size=%zu)\n", 
-                    group_number, group_number_to_group_id_.size());
-            fflush(stdout);
+            static_cast<void>(0);
+            static_cast<void>(0);
             V2TIM_LOG(kWarning, "[HandleGroupPeerJoin] Group_number=%u not found in mapping (size=%zu), cannot notify listeners", 
                      group_number, group_number_to_group_id_.size());
             // Print all mappings for debugging
-            fprintf(stdout, "[HandleGroupPeerJoin] Current mappings:\n");
+            static_cast<void>(0);
             for (const auto& pair : group_number_to_group_id_) {
-                fprintf(stdout, "[HandleGroupPeerJoin]   group_number=%u -> groupID=%s\n", 
-                        pair.first, pair.second.CString());
+                static_cast<void>(0);
                 V2TIM_LOG(kInfo, "[HandleGroupPeerJoin] Mapping: group_number=%u -> groupID=%s", 
                          pair.first, pair.second.CString());
             }
-            fflush(stdout);
+            static_cast<void>(0);
             return;
         }
         groupID = it->second;
-        fprintf(stdout, "[HandleGroupPeerJoin] Found mapping: group_number=%u -> groupID=%s\n", 
-                group_number, groupID.CString());
-        fflush(stdout);
+        static_cast<void>(0);
+        static_cast<void>(0);
         V2TIM_LOG(kInfo, "[HandleGroupPeerJoin] Found mapping: group_number=%u -> groupID=%s", group_number, groupID.CString());
     }
     
     // Get peer public key to find userID
     Tox* tox = GetToxManager()->getTox();
     if (!tox) {
-        fprintf(stderr, "[HandleGroupPeerJoin] ERROR: Tox instance is null\n");
-        fflush(stderr);
+        static_cast<void>(0);
+        static_cast<void>(0);
         V2TIM_LOG(kError, "[HandleGroupPeerJoin] Tox instance is null");
         return;
     }
@@ -7487,17 +7311,16 @@ void V2TIMManagerImpl::HandleGroupPeerJoin(Tox_Group_Number group_number, Tox_Gr
     Tox_Err_Group_Peer_Query err_key;
     if (!GetToxManager()->getGroupPeerPublicKey(group_number, peer_id, peer_pubkey, &err_key) ||
         err_key != TOX_ERR_GROUP_PEER_QUERY_OK) {
-        fprintf(stderr, "[HandleGroupPeerJoin] ERROR: Failed to get peer public key: group_number=%u, peer_id=%u, err=%d\n", 
-                group_number, peer_id, err_key);
-        fflush(stderr);
+        static_cast<void>(0);
+        static_cast<void>(0);
         V2TIM_LOG(kError, "[HandleGroupPeerJoin] Failed to get peer public key: group_number=%u, peer_id=%u, err=%d", 
                  group_number, peer_id, err_key);
         return;
     }
     
     std::string userID = ToxUtil::tox_bytes_to_hex(peer_pubkey, TOX_PUBLIC_KEY_SIZE);
-    fprintf(stdout, "[HandleGroupPeerJoin] Peer userID=%s (length=%zu)\n", userID.c_str(), userID.length());
-    fflush(stdout);
+    static_cast<void>(0);
+    static_cast<void>(0);
     V2TIM_LOG(kInfo, "[HandleGroupPeerJoin] Peer userID=%s (length=%zu)", userID.c_str(), userID.length());
     // Cache (group_number, public_key_hex) -> peer_id for SendGroupPrivateTextMessage peer lookup
     {
@@ -7515,57 +7338,37 @@ void V2TIMManagerImpl::HandleGroupPeerJoin(Tox_Group_Number group_number, Tox_Gr
         err_name == TOX_ERR_GROUP_PEER_QUERY_OK) {
         size_t name_len = strnlen(reinterpret_cast<const char*>(name_buffer), TOX_MAX_NAME_LENGTH);
         peer_name = std::string(reinterpret_cast<const char*>(name_buffer), name_len);
-        fprintf(stdout, "[HandleGroupPeerJoin] Peer name=%.*s (length=%zu)\n", static_cast<int>(name_len), reinterpret_cast<const char*>(name_buffer), name_len);
-        fflush(stdout);
+        static_cast<void>(0);
+        static_cast<void>(0);
     } else {
-        fprintf(stdout, "[HandleGroupPeerJoin] Failed to get peer name, err=%d\n", static_cast<int>(err_name));
-        fflush(stdout);
+        static_cast<void>(0);
+        static_cast<void>(0);
     }
     
     // Get peer role
     Tox_Group_Role peer_role = tox_group_peer_get_role(tox, group_number, peer_id, &err_key);
-    fprintf(stdout, "[HandleGroupPeerJoin] Peer role=%d (Tox role)\n", static_cast<int>(peer_role));
-    fflush(stdout);
+    static_cast<void>(0);
+    static_cast<void>(0);
     
     // Notify group listeners about member enter
     std::vector<V2TIMGroupListener*> listeners_copy;
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        // Note: GetInstanceIdFromManager is already declared at file scope (line 28)
-        int64_t this_instance_id = GetInstanceIdFromManager(this);
-        fprintf(stdout, "[HandleGroupPeerJoin] ========== Checking Listeners ==========\n");
-        fprintf(stdout, "[HandleGroupPeerJoin] this=%p, this_instance_id=%lld, current_instance_id=%lld, group_listeners_.size()=%zu\n", 
-                (void*)this, (long long)this_instance_id, (long long)current_instance_id, group_listeners_.size());
-        fprintf(stdout, "[HandleGroupPeerJoin] DEBUG: Checking if this instance is in g_instance_to_id map...\n");
-        if (this_instance_id == 0) {
-            fprintf(stderr, "[HandleGroupPeerJoin] ⚠️  CRITICAL: this_instance_id=0 means this V2TIMManagerImpl is NOT in g_instance_to_id map!\n");
-            fprintf(stderr, "[HandleGroupPeerJoin] ⚠️  This could mean:\n");
-            fprintf(stderr, "[HandleGroupPeerJoin] ⚠️  1. This is the default instance (GetInstance())\n");
-            fprintf(stderr, "[HandleGroupPeerJoin] ⚠️  2. This instance was not registered via create_test_instance\n");
-            fprintf(stderr, "[HandleGroupPeerJoin] ⚠️  3. This instance was removed from the map\n");
-            fprintf(stderr, "[HandleGroupPeerJoin] ⚠️  But the callback was triggered, so this instance has a ToxManager with registered callbacks!\n");
-        }
         if (group_listeners_.size() > 0) {
-            fprintf(stdout, "[HandleGroupPeerJoin] ✅ Found %zu listeners in this instance:\n", group_listeners_.size());
-            size_t idx = 0;
-            for (auto* listener : group_listeners_) {
-                fprintf(stdout, "[HandleGroupPeerJoin]   [%zu] listener=%p\n", idx++, (void*)listener);
-            }
+            static_cast<void>(0);
         } else {
-            fprintf(stderr, "[HandleGroupPeerJoin] ⚠️  WARNING: group_listeners_ is empty for this instance (instance_id=%lld)!\n", 
-                    (long long)this_instance_id);
-            fprintf(stderr, "[HandleGroupPeerJoin] ⚠️  This means no listeners were registered on this instance!\n");
-            fprintf(stderr, "[HandleGroupPeerJoin] ⚠️  The callback is being triggered on instance_id=%lld, but listeners are registered on a different instance!\n", 
-                    (long long)current_instance_id);
-            fprintf(stderr, "[HandleGroupPeerJoin] ⚠️  This is a multi-instance issue - listeners need to be registered on the same instance that receives callbacks!\n");
-            fprintf(stderr, "[HandleGroupPeerJoin] ⚠️  DEBUG: Checking if listeners were registered on a different instance...\n");
+            static_cast<void>(0);
+            static_cast<void>(0);
+            static_cast<void>(0);
+            static_cast<void>(0);
+            static_cast<void>(0);
         }
-        fflush(stdout);
-        fflush(stderr);
+        static_cast<void>(0);
+        static_cast<void>(0);
         listeners_copy.assign(group_listeners_.begin(), group_listeners_.end());
-        fprintf(stdout, "[HandleGroupPeerJoin] Found %zu group listeners in this instance\n", listeners_copy.size());
-        fprintf(stdout, "[HandleGroupPeerJoin] =========================================\n");
-        fflush(stdout);
+        static_cast<void>(0);
+        static_cast<void>(0);
+        static_cast<void>(0);
     }
     
     // Build member list for OnMemberEnter callback
@@ -7594,41 +7397,33 @@ void V2TIMManagerImpl::HandleGroupPeerJoin(Tox_Group_Number group_number, Tox_Gr
     // Note: V2TIMGroupMemberInfo doesn't have role or muteUntil fields
     memberList.PushBack(memberInfoBasic);
     
-    fprintf(stdout, "[HandleGroupPeerJoin] About to notify %zu listeners about member enter (groupID=%s, userID=%s)\n", 
-            listeners_copy.size(), groupID.CString(), userID.c_str());
-    fflush(stdout);
+    static_cast<void>(0);
+    static_cast<void>(0);
     V2TIM_LOG(kInfo, "[HandleGroupPeerJoin] Notifying %zu listeners about member enter", listeners_copy.size());
     
     if (listeners_copy.empty()) {
-        fprintf(stderr, "[HandleGroupPeerJoin] ⚠️  WARNING: No listeners registered! This means OnMemberEnter callback will not be triggered!\n");
-        fprintf(stderr, "[HandleGroupPeerJoin] ⚠️  This might explain why the test fails - peer join event is not being notified to Dart layer!\n");
-        fprintf(stderr, "[HandleGroupPeerJoin] ⚠️  instance_id=%lld, groupID=%s, userID=%s\n", 
-                (long long)current_instance_id, groupID.CString(), userID.c_str());
-        fflush(stderr);
+        static_cast<void>(0);
+        static_cast<void>(0);
+        static_cast<void>(0);
+        static_cast<void>(0);
     } else {
-        fprintf(stdout, "[HandleGroupPeerJoin] ✅ Found %zu listeners, will notify them about peer join\n", listeners_copy.size());
-        fflush(stdout);
+        static_cast<void>(0);
+        static_cast<void>(0);
     }
     
     for (V2TIMGroupListener* listener : listeners_copy) {
         if (listener) {
-            fprintf(stdout, "[HandleGroupPeerJoin] Calling OnMemberEnter for listener=%p, groupID=%s, memberCount=%zu\n", 
-                    listener, groupID.CString(), memberList.Size());
-            fflush(stdout);
+            static_cast<void>(0);
+            static_cast<void>(0);
             V2TIM_LOG(kInfo, "[HandleGroupPeerJoin] Calling OnMemberEnter for listener=%p, groupID=%s, memberCount=%zu", 
                      listener, groupID.CString(), memberList.Size());
             listener->OnMemberEnter(groupID, memberList);
         }
     }
     
-    auto after_notify_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::system_clock::now().time_since_epoch()).count();
-    auto notify_duration_ms = after_notify_ms - callback_timestamp_ms;
-    
-    fprintf(stdout, "[HandleGroupPeerJoin] ========== EXIT ==========\n");
-    fprintf(stdout, "[HandleGroupPeerJoin] Total duration: %lld ms (from callback start to notify complete)\n", 
-            (long long)notify_duration_ms);
-    fflush(stdout);
+    static_cast<void>(0);
+    static_cast<void>(0);
+    static_cast<void>(0);
     V2TIM_LOG(kInfo, "[HandleGroupPeerJoin] EXIT - Completed notification");
 }
 
@@ -7894,17 +7689,17 @@ void V2TIMManagerImpl::HandleGroupModeration(Tox_Group_Number group_number, Tox_
 }
 
 void V2TIMManagerImpl::HandleGroupSelfJoin(Tox_Group_Number group_number) {
-    fprintf(stdout, "[HandleGroupSelfJoin] ========== ENTRY ==========\n");
-    fprintf(stdout, "[HandleGroupSelfJoin] group_number=%u\n", group_number);
-    fprintf(stdout, "[HandleGroupSelfJoin] this=%p\n", (void*)this);
+    static_cast<void>(0);
+    static_cast<void>(0);
+    static_cast<void>(0);
     // Get current instance ID for debugging
     // Note: GetCurrentInstanceId and GetInstanceIdFromManager are already declared at file scope (lines 27-28)
     int64_t current_instance_id = GetCurrentInstanceId();
-    fprintf(stdout, "[HandleGroupSelfJoin] current_instance_id=%lld\n", (long long)current_instance_id);
+    static_cast<void>(0);
     // Get instance ID from manager
     int64_t this_instance_id = GetInstanceIdFromManager(this);
-    fprintf(stdout, "[HandleGroupSelfJoin] this_instance_id=%lld (from GetInstanceIdFromManager)\n", (long long)this_instance_id);
-    fflush(stdout);
+    static_cast<void>(0);
+    static_cast<void>(0);
     V2TIM_LOG(kInfo, "HandleGroupSelfJoin: ENTRY - group_number=%u, this=%p, current_instance_id=%lld, this_instance_id=%lld", 
               group_number, (void*)this, (long long)current_instance_id, (long long)this_instance_id);
     V2TIMString groupID;
@@ -7915,13 +7710,12 @@ void V2TIMManagerImpl::HandleGroupSelfJoin(Tox_Group_Number group_number) {
         if (it != group_number_to_group_id_.end()) {
             groupID = it->second;
             found_in_mapping = true;
-            fprintf(stdout, "[HandleGroupSelfJoin] Group_number=%u already mapped to groupID=%s\n", 
-                    group_number, groupID.CString());
-            fflush(stdout);
+            static_cast<void>(0);
+            static_cast<void>(0);
             V2TIM_LOG(kInfo, "HandleGroupSelfJoin: Group_number=%u already mapped to groupID=%s", group_number, groupID.CString());
         } else {
-            fprintf(stdout, "[HandleGroupSelfJoin] Group_number=%u NOT in mapping, will try to rebuild\n", group_number);
-            fflush(stdout);
+            static_cast<void>(0);
+            static_cast<void>(0);
         }
     }
 
@@ -8022,9 +7816,8 @@ void V2TIMManagerImpl::HandleGroupSelfJoin(Tox_Group_Number group_number) {
                             // If this was from a pending invite, trigger onMemberInvited with actual groupID
                             if (pending_inv && !temp_groupID.Empty()) {
                                 V2TIM_LOG(kInfo, "HandleGroupSelfJoin: This group was from a pending invite, triggering onMemberInvited with actual groupID=%s", groupID.CString());
-                                fprintf(stdout, "[HandleGroupSelfJoin] Triggering onMemberInvited with actual groupID=%s (was temp=%s)\n", 
-                                        groupID.CString(), temp_groupID.CString());
-                                fflush(stdout);
+                                static_cast<void>(0);
+                                static_cast<void>(0);
                                 
                                 // Get inviter info from pending invite
                                 V2TIMGroupMemberInfo opUser;
@@ -8065,8 +7858,8 @@ void V2TIMManagerImpl::HandleGroupSelfJoin(Tox_Group_Number group_number) {
                                 
                                 for (V2TIMGroupListener* listener : listeners_copy) {
                                     if (listener) {
-                                        fprintf(stdout, "[HandleGroupSelfJoin] Calling OnMemberInvited with actual groupID=%s\n", groupID.CString());
-                                        fflush(stdout);
+                                        static_cast<void>(0);
+                                        static_cast<void>(0);
                                         V2TIM_LOG(kInfo, "HandleGroupSelfJoin: Calling OnMemberInvited: groupID={}, inviter={}, memberCount={}",
                                                  groupID.CString(), opUser.userID.CString(), memberList.Size());
                                         listener->OnMemberInvited(groupID, opUser, memberList);
@@ -8112,72 +7905,57 @@ void V2TIMManagerImpl::HandleGroupSelfJoin(Tox_Group_Number group_number) {
     }
 
     if (IsTemporaryInviteGroupID(groupID)) {
-        V2TIM_LOG(kWarning,
-                  "HandleGroupSelfJoin: refusing to publish temporary group alias %s",
-                  groupID.CString());
-        return;
+        // Publishing the per-invite alias would be wrong, but returning here
+        // silently discarded the self-join entirely — see
+        // PromoteTemporaryInviteGroupID. Promote it to a stable id and carry on
+        // so listeners and the Dart layer still learn about the join.
+        const V2TIMString promoted =
+            PromoteTemporaryInviteGroupID(groupID, group_number);
+        if (promoted.Empty()) {
+            V2TIM_LOG(kWarning,
+                      "HandleGroupSelfJoin: temporary alias %s could not be promoted (chat id unreadable); not publishing",
+                      groupID.CString());
+            return;
+        }
+        groupID = promoted;
     }
 
     // Notify group listeners about self join
     std::vector<V2TIMGroupListener*> listeners_copy;
-    size_t total_listeners = 0;
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        total_listeners = group_listeners_.size();
-        fprintf(stdout, "[HandleGroupSelfJoin] Total listeners in group_listeners_: %zu\n", total_listeners);
-        fflush(stdout);
-        
-        // Print all listener pointers for debugging
-        if (total_listeners > 0) {
-            fprintf(stdout, "[HandleGroupSelfJoin] Listener pointers:\n");
-            size_t idx = 0;
-            for (auto* listener : group_listeners_) {
-                fprintf(stdout, "[HandleGroupSelfJoin]   [%zu] listener=%p\n", idx++, (void*)listener);
-            }
-            fflush(stdout);
-        } else {
-            fprintf(stderr, "[HandleGroupSelfJoin] WARNING: group_listeners_ is empty!\n");
-            fprintf(stderr, "[HandleGroupSelfJoin] Checking if this instance has listeners registered elsewhere...\n");
-            fflush(stderr);
-        }
-        
         listeners_copy.assign(group_listeners_.begin(), group_listeners_.end());
-        fprintf(stdout, "[HandleGroupSelfJoin] Copied %zu listeners to listeners_copy\n", listeners_copy.size());
-        fflush(stdout);
+        static_cast<void>(0);
+        static_cast<void>(0);
     }
     
-    fprintf(stdout, "[HandleGroupSelfJoin] Notifying %zu listeners about groupID=%s\n", 
-            listeners_copy.size(), groupID.CString());
-    fflush(stdout);
+    static_cast<void>(0);
+    static_cast<void>(0);
     
     if (listeners_copy.empty()) {
-        fprintf(stderr, "[HandleGroupSelfJoin] WARNING: No listeners registered! Total listeners in map: %zu\n", total_listeners);
-        fflush(stderr);
+        static_cast<void>(0);
+        static_cast<void>(0);
     }
     
     for (size_t i = 0; i < listeners_copy.size(); i++) {
         V2TIMGroupListener* listener = listeners_copy[i];
         if (listener) {
-            fprintf(stdout, "[HandleGroupSelfJoin] [%zu/%zu] Calling OnGroupCreated for listener=%p, groupID=%s\n", 
-                    i + 1, listeners_copy.size(), (void*)listener, groupID.CString());
-            fflush(stdout);
+            static_cast<void>(0);
+            static_cast<void>(0);
             try {
                 listener->OnGroupCreated(groupID);
-                fprintf(stdout, "[HandleGroupSelfJoin] [%zu/%zu] OnGroupCreated completed for listener=%p\n", 
-                        i + 1, listeners_copy.size(), (void*)listener);
-                fflush(stdout);
+                static_cast<void>(0);
+                static_cast<void>(0);
             } catch (const std::exception& e) {
-                fprintf(stderr, "[HandleGroupSelfJoin] [%zu/%zu] EXCEPTION in OnGroupCreated for listener=%p: %s\n", 
-                        i + 1, listeners_copy.size(), (void*)listener, e.what());
-                fflush(stderr);
+                static_cast<void>(0);
+                static_cast<void>(0);
             } catch (...) {
-                fprintf(stderr, "[HandleGroupSelfJoin] [%zu/%zu] UNKNOWN EXCEPTION in OnGroupCreated for listener=%p\n", 
-                        i + 1, listeners_copy.size(), (void*)listener);
-                fflush(stderr);
+                static_cast<void>(0);
+                static_cast<void>(0);
             }
         } else {
-            fprintf(stderr, "[HandleGroupSelfJoin] [%zu/%zu] WARNING: listener is null\n", i + 1, listeners_copy.size());
-            fflush(stderr);
+            static_cast<void>(0);
+            static_cast<void>(0);
         }
     }
     
@@ -8190,8 +7968,8 @@ void V2TIMManagerImpl::HandleGroupSelfJoin(Tox_Group_Number group_number) {
         DartNotifyGroupJoin(groupID.CString());
     }
 
-    fprintf(stdout, "[HandleGroupSelfJoin] ========== EXIT ==========\n");
-    fflush(stdout);
+    static_cast<void>(0);
+    static_cast<void>(0);
 }
 
 void V2TIMManagerImpl::HandleGroupJoinFail(Tox_Group_Number group_number, Tox_Group_Join_Fail fail_type) {
@@ -8200,23 +7978,21 @@ void V2TIMManagerImpl::HandleGroupJoinFail(Tox_Group_Number group_number, Tox_Gr
 }
 
 void V2TIMManagerImpl::HandleGroupPrivacyState(Tox_Group_Number group_number, Tox_Group_Privacy_State privacy_state) {
-    fprintf(stdout, "[HandleGroupPrivacyState] ========== ENTRY ==========\n");
-    fprintf(stdout, "[HandleGroupPrivacyState] group_number=%u, privacy_state=%d (0=PUBLIC, 1=PRIVATE)\n", 
-            group_number, static_cast<int>(privacy_state));
-    fflush(stdout);
+    static_cast<void>(0);
+    static_cast<void>(0);
+    static_cast<void>(0);
     V2TIMString groupID;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         auto it = group_number_to_group_id_.find(group_number);
         if (it == group_number_to_group_id_.end()) {
-            fprintf(stdout, "[HandleGroupPrivacyState] ERROR: group_number=%u not found in mapping\n", group_number);
-            fflush(stdout);
+            static_cast<void>(0);
+            static_cast<void>(0);
             return;
         }
         groupID = it->second;
-        fprintf(stdout, "[HandleGroupPrivacyState] Found mapping: group_number=%u -> groupID=%s\n", 
-                group_number, groupID.CString());
-        fflush(stdout);
+        static_cast<void>(0);
+        static_cast<void>(0);
     }
     
     // Notify group listeners about privacy state change
@@ -8324,8 +8100,8 @@ ToxAVManager* V2TIMManagerImpl::GetToxAVManager() {
 void V2TIMManagerImpl::RejoinKnownGroups() {
     // Check if manager is still valid
     if (!tox_manager_) {
-        fprintf(stderr, "[RejoinKnownGroups] WARNING: tox_manager_ is null, skipping\n");
-        fflush(stderr);
+        static_cast<void>(0);
+        static_cast<void>(0);
         return;
     }
     
@@ -8344,12 +8120,12 @@ void V2TIMManagerImpl::RejoinKnownGroups() {
     try {
         tox = tox_manager_->getTox();
     } catch (const std::exception& e) {
-        fprintf(stderr, "[RejoinKnownGroups] Exception getting Tox instance: %s\n", e.what());
-        fflush(stderr);
+        static_cast<void>(0);
+        static_cast<void>(0);
         return;
     } catch (...) {
-        fprintf(stderr, "[RejoinKnownGroups] Unknown exception getting Tox instance\n");
-        fflush(stderr);
+        static_cast<void>(0);
+        static_cast<void>(0);
         return;
     }
     
@@ -8358,12 +8134,12 @@ void V2TIMManagerImpl::RejoinKnownGroups() {
         try {
             conference_count = tox_conference_get_chatlist_size(tox);
         } catch (const std::exception& e) {
-            fprintf(stderr, "[RejoinKnownGroups] Exception querying conference count: %s\n", e.what());
-            fflush(stderr);
+            static_cast<void>(0);
+            static_cast<void>(0);
             conference_count = 0;
         } catch (...) {
-            fprintf(stderr, "[RejoinKnownGroups] Unknown exception querying conference count\n");
-            fflush(stderr);
+            static_cast<void>(0);
+            static_cast<void>(0);
             conference_count = 0;
         }
         
@@ -8372,12 +8148,12 @@ void V2TIMManagerImpl::RejoinKnownGroups() {
             try {
                 tox_conference_get_chatlist(tox, conference_list.data());
             } catch (const std::exception& e) {
-                fprintf(stderr, "[RejoinKnownGroups] Exception in tox_conference_get_chatlist: %s\n", e.what());
-                fflush(stderr);
+                static_cast<void>(0);
+                static_cast<void>(0);
                 conference_count = 0;
             } catch (...) {
-                fprintf(stderr, "[RejoinKnownGroups] Unknown exception in tox_conference_get_chatlist\n");
-                fflush(stderr);
+                static_cast<void>(0);
+                static_cast<void>(0);
                 conference_count = 0;
             }
             
@@ -8492,6 +8268,11 @@ void V2TIMManagerImpl::RejoinKnownGroups() {
                                             conference_id +
                                                 TOX_CONFERENCE_ID_SIZE);
                                     chat_id_to_group_id_[stored_identity] = groupID;
+#ifdef BUILD_TOXAV
+                                    if (is_av_conference) {
+                                        enabled_av_conferences_.insert(conf_num);
+                                    }
+#endif
                                 }
                                 conference_restored++;
                                 continue;
@@ -8509,12 +8290,12 @@ void V2TIMManagerImpl::RejoinKnownGroups() {
                                     }
                                 }
                             } catch (const std::exception& e) {
-                                fprintf(stderr, "[RejoinKnownGroups] Exception while checking conference mapping: %s\n", e.what());
-                                fflush(stderr);
+                                static_cast<void>(0);
+                                static_cast<void>(0);
                                 continue;
                             } catch (...) {
-                                fprintf(stderr, "[RejoinKnownGroups] Unknown exception while checking conference mapping\n");
-                                fflush(stderr);
+                                static_cast<void>(0);
+                                static_cast<void>(0);
                                 continue;
                             }
                             
@@ -8527,8 +8308,8 @@ void V2TIMManagerImpl::RejoinKnownGroups() {
                                             conf_mapped = true;
                                         }
                                     } catch (...) {
-                                        fprintf(stderr, "[RejoinKnownGroups] Exception while checking conference mapping, skipping\n");
-                                        fflush(stderr);
+                                        static_cast<void>(0);
+                                        static_cast<void>(0);
                                         break;
                                     }
                                     
@@ -8576,9 +8357,14 @@ void V2TIMManagerImpl::RejoinKnownGroups() {
                                             group_id_to_group_number_[groupID] = conf_num;
                                             group_number_to_group_id_[conf_num] = groupID;
                                             group_id_to_type_[groupID] = group_type;
+#ifdef BUILD_TOXAV
+                                            if (is_av_conference) {
+                                                enabled_av_conferences_.insert(conf_num);
+                                            }
+#endif
                                         } catch (...) {
-                                            fprintf(stderr, "[RejoinKnownGroups] Exception while storing conference mapping, skipping\n");
-                                            fflush(stderr);
+                                            static_cast<void>(0);
+                                            static_cast<void>(0);
                                             break;
                                         }
                                         StoreConferenceIdentity(groupID, conf_num);
@@ -8589,12 +8375,12 @@ void V2TIMManagerImpl::RejoinKnownGroups() {
                             }
                         }
                     } catch (const std::exception& e) {
-                        fprintf(stderr, "[RejoinKnownGroups] Exception processing line: %s\n", e.what());
-                        fflush(stderr);
+                        static_cast<void>(0);
+                        static_cast<void>(0);
                         continue;
                     } catch (...) {
-                        fprintf(stderr, "[RejoinKnownGroups] Unknown exception processing line\n");
-                        fflush(stderr);
+                        static_cast<void>(0);
+                        static_cast<void>(0);
                         continue;
                     }
                 }
@@ -8620,12 +8406,12 @@ void V2TIMManagerImpl::RejoinKnownGroups() {
                     }
                 }
             } catch (const std::exception& e) {
-                fprintf(stderr, "[RejoinKnownGroups] Exception while checking group mapping: %s\n", e.what());
-                fflush(stderr);
+                static_cast<void>(0);
+                static_cast<void>(0);
                 continue;
             } catch (...) {
-                fprintf(stderr, "[RejoinKnownGroups] Unknown exception while checking group mapping\n");
-                fflush(stderr);
+                static_cast<void>(0);
+                static_cast<void>(0);
                 continue;
             }
             
@@ -8641,12 +8427,12 @@ void V2TIMManagerImpl::RejoinKnownGroups() {
                     group_type = std::string(stored_type);
                 }
             } catch (const std::exception& e) {
-                fprintf(stderr, "[RejoinKnownGroups] Exception in GetGroupTypeFromStorage for '%s': %s\n", line_trim.c_str(), e.what());
-                fflush(stderr);
+                static_cast<void>(0);
+                static_cast<void>(0);
                 group_type = "group"; // Use default on error
             } catch (...) {
-                fprintf(stderr, "[RejoinKnownGroups] Unknown exception in GetGroupTypeFromStorage for '%s'\n", line_trim.c_str());
-                fflush(stderr);
+                static_cast<void>(0);
+                static_cast<void>(0);
                 group_type = "group"; // Use default on error
             }
             
@@ -8667,9 +8453,8 @@ void V2TIMManagerImpl::RejoinKnownGroups() {
             // Convert hex string to binary chat_id
             std::string chat_id_hex(stored_chat_id);
             if (chat_id_hex.length() != TOX_GROUP_CHAT_ID_SIZE * 2) {
-                fprintf(stderr, "[RejoinKnownGroups] Invalid chat_id length for group %s: %zu (expected %d)\n", 
-                        line_trim.c_str(), chat_id_hex.length(), TOX_GROUP_CHAT_ID_SIZE * 2);
-                fflush(stderr);
+                static_cast<void>(0);
+                static_cast<void>(0);
                 continue;
             }
             
@@ -8680,9 +8465,8 @@ void V2TIMManagerImpl::RejoinKnownGroups() {
                 char* endptr;
                 unsigned long byte_val = strtoul(byte_str.c_str(), &endptr, 16);
                 if (*endptr != '\0' || byte_val > 255) {
-                    fprintf(stderr, "[RejoinKnownGroups] Invalid chat_id hex string for group %s at byte %zu\n", 
-                            line_trim.c_str(), i);
-                    fflush(stderr);
+                    static_cast<void>(0);
+                    static_cast<void>(0);
                     conversion_success = false;
                     break;
                 }
@@ -8695,8 +8479,8 @@ void V2TIMManagerImpl::RejoinKnownGroups() {
             
             // Check if tox_manager_ is still valid before calling joinGroup
             if (!tox_manager_) {
-                fprintf(stderr, "[RejoinKnownGroups] tox_manager_ became null, skipping remaining groups\n");
-                fflush(stderr);
+                static_cast<void>(0);
+                static_cast<void>(0);
                 break;
             }
 
@@ -8765,8 +8549,7 @@ void V2TIMManagerImpl::RejoinKnownGroups() {
                         owner_groupID = chat_it->second;
                         V2TIM_LOG(kWarning, "RejoinKnownGroups: Duplicate chat_id={} - owner={}, aliasing groupID={}",
                                   chat_id_hex, owner_groupID.CString(), groupID.CString());
-                        fprintf(stderr, "[RejoinKnownGroups] WARNING: Duplicate chat_id, owner=%s, alias=%s\n",
-                                owner_groupID.CString(), groupID.CString());
+                        static_cast<void>(0);
                     }
 
                     // --- Step 2: determine canonical group_number for this chat_id ---
@@ -8794,17 +8577,16 @@ void V2TIMManagerImpl::RejoinKnownGroups() {
 
                 }
             } else {
-                fprintf(stderr, "[RejoinKnownGroups] Failed to rejoin group %s, error=%d (group may not exist or may have been removed)\n",
-                        line_trim.c_str(), err_join);
-                fflush(stderr);
+                static_cast<void>(0);
+                static_cast<void>(0);
             }
         } catch (const std::exception& e) {
-            fprintf(stderr, "[RejoinKnownGroups] Exception processing group line_trim: %s\n", e.what());
-            fflush(stderr);
+            static_cast<void>(0);
+            static_cast<void>(0);
             continue;
         } catch (...) {
-            fprintf(stderr, "[RejoinKnownGroups] Unknown exception processing group line_trim\n");
-            fflush(stderr);
+            static_cast<void>(0);
+            static_cast<void>(0);
             continue;
         }
     }

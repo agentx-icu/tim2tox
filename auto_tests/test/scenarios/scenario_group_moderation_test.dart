@@ -99,7 +99,7 @@ void main() {
       member2 = scenario.getNode('member2')!;
 
       await scenario.initAllNodes();
-      // Enable test mode BEFORE login so event_thread never starts.
+      // Refresh the per-instance flag inherited from initAllNodes' early lease.
       if (shouldRunVirtual) await VirtualClock.enableForScenario(scenario);
 
       // Logins still complete synchronously from Dart's POV (loggedIn flag
@@ -115,12 +115,8 @@ void main() {
 
       // Full-mesh bootstrap with virtual-time DHT-connect wait.
       await configureLocalBootstrapVirtual(scenario);
-      // Both friendships in parallel — virtual clock is global so both halves
-      // step in lockstep through the same pumpTestTick.
-      await Future.wait([
-        establishFriendshipVirtual(scenario, founder, member1),
-        establishFriendshipVirtual(scenario, founder, member2),
-      ]);
+      await establishFriendshipVirtual(scenario, founder, member1);
+      await establishFriendshipVirtual(scenario, founder, member2);
     });
 
     tearDownAll(() async {

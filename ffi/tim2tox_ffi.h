@@ -182,8 +182,14 @@ int tim2tox_ffi_save_friend_status_message(const char* friend_id, const char* st
 
 // Friend applications list as lines:
 // "<userID>\t<addWording>\n"
+// If the caller buffer cannot hold the full payload plus the trailing NUL,
+// these entry points return the negative required capacity. The required
+// capacity counts the NUL terminator. If the required capacity does not fit in
+// a signed int, they return INT_MIN.
 int tim2tox_ffi_get_friend_applications(char* buffer, int buffer_len);
-// Same but for a specific instance_id (avoids GetCurrentInstance() being changed before native runs)
+// Same but for a specific instance_id (avoids GetCurrentInstance() being
+// changed before native runs). Uses the same negative-required-capacity
+// convention as tim2tox_ffi_get_friend_applications.
 int tim2tox_ffi_get_friend_applications_for_instance(int64_t instance_id, char* buffer, int buffer_len);
 
 // Accept a friend application by userID; returns 1 if submitted
@@ -594,6 +600,7 @@ void tim2tox_ffi_av_set_video_bitrate_callback(int64_t instance_id, tim2tox_av_v
 void tim2tox_ffi_av_conference_set_audio_receive_callback(
     int64_t instance_id, tim2tox_av_conference_audio_receive_callback_t callback,
     void* user_data);
+void tim2tox_ffi_av_conference_clear_pending_audio(int64_t instance_id);
 int tim2tox_ffi_av_conference_send_audio_frame(
     int64_t instance_id, const char* group_id, const int16_t* pcm,
     size_t sample_count, uint8_t channels, uint32_t sampling_rate);
@@ -604,6 +611,7 @@ int tim2tox_ffi_av_conference_mute(int64_t instance_id, const char* group_id, in
 // Helper: Get friend number by user ID
 // user_id: user ID (hex string)
 // Returns: friend number on success, UINT32_MAX on failure
+uint32_t tim2tox_ffi_get_friend_number_by_user_id_for_instance(int64_t instance_id, const char* user_id);
 uint32_t tim2tox_ffi_get_friend_number_by_user_id(const char* user_id);
 
 // Helper: Get user ID (public key hex string) by friend number

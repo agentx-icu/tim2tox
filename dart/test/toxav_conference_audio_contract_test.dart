@@ -4,7 +4,48 @@ import 'dart:typed_data';
 
 import 'package:ffi/ffi.dart' as pkgffi;
 import 'package:flutter_test/flutter_test.dart';
+import 'package:path/path.dart' as path;
 import 'package:tim2tox_dart/service/toxav_service.dart';
+
+Directory _tim2ToxRootDirectory() {
+  for (final start in _rootSearchStarts()) {
+    var directory = start;
+    while (true) {
+      if (_hasTim2ToxMarkers(directory)) return directory;
+      final parent = directory.parent;
+      if (parent.path == directory.path) break;
+      directory = parent;
+    }
+  }
+  throw StateError('Tim2Tox root was not found from test search roots.');
+}
+
+Iterable<Directory> _rootSearchStarts() sync* {
+  yield Directory.current.absolute;
+  yield Directory(
+    path.join(Directory.current.absolute.path, 'third_party', 'tim2tox'),
+  );
+  if (Platform.script.scheme == 'file') {
+    yield File(Platform.script.toFilePath()).parent.absolute;
+  }
+}
+
+bool _hasTim2ToxMarkers(Directory directory) {
+  return File(path.join(directory.path, 'README_BUILD.md')).existsSync() &&
+      File(path.join(directory.path, 'CMakeLists.txt')).existsSync() &&
+      Directory(path.join(directory.path, 'source')).existsSync() &&
+      File(path.join(directory.path, 'dart', 'pubspec.yaml')).existsSync();
+}
+
+String _dartPackageRoot() => path.join(_tim2ToxRootDirectory().path, 'dart');
+
+String _tim2ToxRoot() => _tim2ToxRootDirectory().path;
+
+String _readTim2ToxSource(String relativePath) =>
+    File(path.join(_tim2ToxRoot(), relativePath)).readAsStringSync();
+
+String _readDartSource(String relativePath) =>
+    File(path.join(_dartPackageRoot(), relativePath)).readAsStringSync();
 
 void main() {
   group('legacy qTox AV conference audio contract', () {
@@ -46,11 +87,9 @@ void main() {
     );
 
     test(
-      'native receive handler forwards PCM with conference and peer metadata',
+      'native receive handler enqueues PCM with conference and peer metadata',
       () {
-        final source = File(
-          '../source/V2TIMManagerImpl.cpp',
-        ).readAsStringSync();
+        final source = _readTim2ToxSource('source/V2TIMManagerImpl.cpp');
         final start = source.indexOf('static void HandleAVConferenceAudio(');
         final end = source.indexOf('#endif // BUILD_TOXAV', start);
 
@@ -70,14 +109,15 @@ void main() {
         expect(body, contains('samples'));
         expect(body, contains('channels'));
         expect(body, contains('sample_rate'));
-        expect(body, contains('ForwardAVConferenceAudioToDart'));
+        expect(body, contains('EnqueueAVConferenceAudioFrame'));
+        expect(body, isNot(contains('ForwardAVConferenceAudioToDart(')));
       },
     );
 
     test(
       'native FFI exports legacy group-audio receive, send, and controls',
       () {
-        final header = File('../ffi/tim2tox_ffi.h').readAsStringSync();
+        final header = _readTim2ToxSource('ffi/tim2tox_ffi.h');
 
         for (final symbol in <String>[
           'tim2tox_ffi_av_conference_set_audio_receive_callback',
@@ -98,9 +138,7 @@ void main() {
     test(
       'native AV initialization is idempotent before FFI callback binding',
       () {
-        final managerSource = File(
-          '../source/ToxAVManager.cpp',
-        ).readAsStringSync();
+        final managerSource = _readTim2ToxSource('source/ToxAVManager.cpp');
         final initializeStart = managerSource.indexOf(
           'void ToxAVManager::initialize(',
         );
@@ -142,7 +180,7 @@ void main() {
           ),
         );
 
-        final ffiSource = File('../ffi/tim2tox_ffi.cpp').readAsStringSync();
+        final ffiSource = _readTim2ToxSource('ffi/tim2tox_ffi.cpp');
         final ffiInitializeStart = ffiSource.indexOf(
           'int tim2tox_ffi_av_initialize(',
         );
@@ -169,7 +207,7 @@ void main() {
         expect(nativeInitialize, greaterThanOrEqualTo(0));
         expect(callbackBinding, greaterThan(nativeInitialize));
         expect(initializedRegistration, greaterThan(callbackBinding));
-        expect(ffiInitialize, contains('catch (const std::exception& e)'));
+        expect(ffiInitialize, contains('catch (const std::exception&)'));
         expect(ffiInitialize, contains('catch (...)'));
       },
     );
@@ -177,9 +215,7 @@ void main() {
     test(
       'conference create join and re-enable retain the native PCM context',
       () {
-        final managerSource = File(
-          '../source/V2TIMManagerImpl.cpp',
-        ).readAsStringSync();
+        final managerSource = _readTim2ToxSource('source/V2TIMManagerImpl.cpp');
         expect(
           managerSource,
           contains(
@@ -213,9 +249,7 @@ void main() {
         expect(nativeEnable, greaterThan(contextRegistration));
         expect(enableBody, contains('HandleAVConferenceAudio, this'));
 
-        final avManagerSource = File(
-          '../source/ToxAVManager.cpp',
-        ).readAsStringSync();
+        final avManagerSource = _readTim2ToxSource('source/ToxAVManager.cpp');
         final nativeEnableStart = avManagerSource.indexOf(
           'bool ToxAVManager::enableConferenceAudio(',
         );
@@ -236,7 +270,7 @@ void main() {
     );
 
     test('Dart FFI uses size_t sample_count for conference audio ABI', () {
-      final source = File('lib/ffi/tim2tox_ffi.dart').readAsStringSync();
+      final source = _readDartSource('lib/ffi/tim2tox_ffi.dart');
 
       final callbackStart = source.indexOf(
         'typedef _av_conference_audio_receive_callback_native',
@@ -332,7 +366,7 @@ void main() {
     });
 
     test('Dart service owns legacy conference audio lifecycle', () {
-      final source = File('lib/service/toxav_service.dart').readAsStringSync();
+      final source = _readDartSource('lib/service/toxav_service.dart');
 
       for (final api in <String>[
         'ConferenceAudioReceiveCallback',
@@ -390,5 +424,106 @@ void main() {
       expect(disableMethod, contains('_enabledConferenceAudioGroups.remove'));
       expect(disableMethod, contains('_mutedConferenceAudioGroups.remove'));
     });
+
+    test(
+      'conference audio is queued until avIterate drains manager-owned frames',
+      () {
+        final managerSource = _readTim2ToxSource('source/V2TIMManagerImpl.cpp');
+        final ffiSource = _readTim2ToxSource('ffi/tim2tox_ffi.cpp');
+        final serviceSource = _readDartSource('lib/service/toxav_service.dart');
+
+        final handleStart = managerSource.indexOf(
+          'static void HandleAVConferenceAudio(',
+        );
+        final handleEnd = managerSource.indexOf(
+          '#endif // BUILD_TOXAV',
+          handleStart,
+        );
+        expect(handleStart, greaterThanOrEqualTo(0));
+        expect(handleEnd, greaterThan(handleStart));
+
+        final handleBody = managerSource.substring(handleStart, handleEnd);
+        expect(
+          handleBody,
+          contains('manager_impl->EnqueueAVConferenceAudioFrame('),
+        );
+        expect(handleBody, isNot(contains('ForwardAVConferenceAudioToDart(')));
+
+        final trampolineStart = serviceSource.indexOf(
+          'static void _onConferenceAudioReceiveNativeTrampoline',
+        );
+        final trampolineEnd = serviceSource.indexOf(
+          '/// Set conference audio receive callback',
+          trampolineStart,
+        );
+        expect(trampolineStart, greaterThanOrEqualTo(0));
+        expect(trampolineEnd, greaterThan(trampolineStart));
+        final trampolineBody = serviceSource.substring(
+          trampolineStart,
+          trampolineEnd,
+        );
+        expect(trampolineBody, contains('copyAudioForCallback'));
+        expect(trampolineBody, contains('target._onConferenceAudioReceive!('));
+
+        final iterateStart = ffiSource.indexOf('void tim2tox_ffi_av_iterate(');
+        final iterateEnd = ffiSource.indexOf(
+          'int tim2tox_ffi_av_start_call(',
+          iterateStart,
+        );
+        expect(iterateStart, greaterThanOrEqualTo(0));
+        expect(iterateEnd, greaterThan(iterateStart));
+
+        final iterateBody = ffiSource.substring(iterateStart, iterateEnd);
+        expect(
+          iterateBody,
+          contains('manager_impl->DrainPendingAVConferenceAudioFrames();'),
+          reason: 'avIterate is the only Dart-dispatch drain point',
+        );
+        expect(
+          ffiSource,
+          isNot(contains('g_pending_av_conference_audio_frames')),
+          reason: 'conference PCM queue ownership belongs to V2TIMManagerImpl',
+        );
+        expect(
+          ffiSource,
+          isNot(contains('DrainAVConferenceAudioFrames(')),
+          reason: 'FFI must not own a process-global conference PCM drain',
+        );
+        expect(
+          ffiSource,
+          contains('tim2tox_ffi_av_conference_clear_pending_audio('),
+          reason:
+              'callback replacement needs an additive pending-frame clear ABI',
+        );
+        expect(
+          ffiSource,
+          contains('manager->ClearPendingAVConferenceAudioFrames();'),
+        );
+        expect(
+            ffiSource, isNot(contains('kMaxPendingAVConferenceAudioFrames')));
+
+        final callbackSetterStart = serviceSource.indexOf(
+          'void setConferenceAudioReceiveCallback(',
+        );
+        final callbackSetterEnd = serviceSource.indexOf(
+          "@pragma('vm:entry-point')",
+          callbackSetterStart,
+        );
+        expect(callbackSetterStart, greaterThanOrEqualTo(0));
+        expect(callbackSetterEnd, greaterThan(callbackSetterStart));
+        final callbackSetter = serviceSource.substring(
+          callbackSetterStart,
+          callbackSetterEnd,
+        );
+        final nativeClear = callbackSetter.indexOf(
+          'avConferenceClearPendingAudioNative(_boundInstanceId)',
+        );
+        final replacement = callbackSetter.indexOf(
+          '_onConferenceAudioReceive = callback',
+        );
+        expect(nativeClear, greaterThanOrEqualTo(0));
+        expect(replacement, greaterThan(nativeClear));
+      },
+    );
   });
 }

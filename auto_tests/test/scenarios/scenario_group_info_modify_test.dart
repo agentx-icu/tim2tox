@@ -26,7 +26,7 @@ void main() {
       bob = scenario.getNode('bob')!;
 
       await scenario.initAllNodes();
-      // Enable test mode BEFORE login so event_thread never starts.
+      // Refresh the per-instance flag inherited from initAllNodes' early lease.
       if (shouldRunVirtual) await VirtualClock.enableForScenario(scenario);
 
       await Future.wait([
@@ -45,12 +45,8 @@ void main() {
       // tim2tox inviteUserToGroup needs invitee as friend. Only one sub-test
       // exercises the cross-instance join+sync flow, but doing it once in
       // setUpAll keeps the friendship warm for all tests.
-      try {
-        await establishFriendshipVirtual(scenario, alice, bob,
-            timeout: const Duration(seconds: 90));
-      } catch (e) {
-        print('[setUpAll] establishFriendshipVirtual best-effort: $e');
-      }
+      await establishFriendshipVirtual(scenario, alice, bob,
+          timeout: const Duration(seconds: 90));
     });
 
     tearDownAll(() async {

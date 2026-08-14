@@ -1799,10 +1799,9 @@ void V2TIMGroupManagerImpl::GetGroupMemberList(
     }
     V2TIM_LOG(kInfo, "[GetGroupMemberList] Using callback-tracked peers: {} cached peer_ids for group_number={} groupID={}",
               cached_peer_ids.size(), group_number, groupID.CString());
-    fprintf(stdout, "[GetGroupMemberList] Cache has %zu peers for group_number=%u groupID=%s self_conn=%d group_connected=%d privacy=%d\n",
-            cached_peer_ids.size(), group_number, groupID.CString(),
-            static_cast<int>(tox_self_get_connection_status(tox)), is_connected ? 1 : 0, static_cast<int>(privacy_state));
-    fflush(stdout);
+    V2TIM_LOG(kInfo, "[GetGroupMemberList] peer cache diagnostic: cached_peer_count={} self_conn={} group_connected={} privacy={}",
+              cached_peer_ids.size(), static_cast<int>(tox_self_get_connection_status(tox)),
+              is_connected ? 1 : 0, static_cast<int>(privacy_state));
 
     int total_peers_found = 0;
     for (Tox_Group_Peer_Number peer_id : cached_peer_ids) {
@@ -1814,9 +1813,8 @@ void V2TIMGroupManagerImpl::GetGroupMemberList(
         if (!got_key || err_key != TOX_ERR_GROUP_PEER_QUERY_OK) {
             V2TIM_LOG(kInfo, "[GetGroupMemberList] Cached peer_id={} no longer valid (err={}), skipping",
                       peer_id, static_cast<int>(err_key));
-            fprintf(stdout, "[GetGroupMemberList] Cached peer_id=%u no longer valid err=%d, skipping\n",
-                    peer_id, static_cast<int>(err_key));
-            fflush(stdout);
+            V2TIM_LOG(kInfo, "[GetGroupMemberList] stale cached peer skipped: err={}",
+                      static_cast<int>(err_key));
             continue;
         }
 
@@ -1902,9 +1900,8 @@ void V2TIMGroupManagerImpl::GetGroupMemberList(
             is_conference_group = true;
             V2TIM_LOG(kInfo, "[GetGroupMemberList] Conference fallback: group_number={} is a conference with {} peers",
                       group_number, conf_peer_count);
-            fprintf(stdout, "[GetGroupMemberList] Conference fallback: group_number=%u has %u conference peers\n",
-                    group_number, conf_peer_count);
-            fflush(stdout);
+            V2TIM_LOG(kInfo, "[GetGroupMemberList] conference fallback diagnostic: conference_peer_count={}",
+                      conf_peer_count);
             uint8_t self_pubkey[TOX_PUBLIC_KEY_SIZE];
             tox_self_get_public_key(tox, self_pubkey);
             for (uint32_t ci = 0; ci < conf_peer_count; ++ci) {

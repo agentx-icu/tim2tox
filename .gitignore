@@ -1,6 +1,11 @@
 # Build directories
 build/
 cmake-build-*/
+# The C++ test suite is documented as `cmake -S . -B build-tests` (CLAUDE.md,
+# doc/), and side-by-side comparison trees (build-tests-toxav-green/-red, …)
+# follow the same prefix. Without this they sit untracked at ~150 MB and can be
+# swept into a commit by a `git add -A`.
+build-tests*/
 
 # IDE directories
 .idea/
@@ -74,6 +79,7 @@ auto_tests/lldb_pin_crash.log
 auto_tests/merged_results/
 auto_tests/test_results_*.log
 auto_tests/test_summary_*.txt
+auto_tests/flutter_*.log
 build.log
 example/*_savedata.tox
 

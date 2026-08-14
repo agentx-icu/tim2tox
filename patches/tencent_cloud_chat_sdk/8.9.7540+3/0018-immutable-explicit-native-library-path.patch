@@ -1,0 +1,110 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: tim2tox-bootstrap <bootstrap@local>
+Date: Mon, 3 Aug 2026 00:00:00 -0700
+Subject: [PATCH] 0018-immutable-explicit-native-library-path
+
+---
+ .../bindings/native_library_manager.dart      | 57 ++++++++++++++++++-
+ 1 file changed, 56 insertions(+), 1 deletion(-)
+
+diff --git a/lib/native_im/bindings/native_library_manager.dart b/lib/native_im/bindings/native_library_manager.dart
+index ea929fe..25f800d 100644
+--- a/lib/native_im/bindings/native_library_manager.dart
++++ b/lib/native_im/bindings/native_library_manager.dart
+@@ -42,22 +42,77 @@ import 'package:tencent_cloud_chat_sdk/enum/V2TimGroupListener.dart';
+ import 'package:tencent_cloud_chat_sdk/enum/V2TimSignalingListener.dart';
+ import 'package:tencent_cloud_chat_sdk/tencent_cloud_chat_sdk_platform_interface.dart';
+ import 'native_imsdk_bindings_generated.dart';
+-
++
+ /// Override the native library name before any SDK call.
+ /// Default is 'dart_native_imsdk' (the original Tencent Cloud IM SDK).
+ /// Call this early in main() to load a different native library.
+ String _nativeLibName = 'dart_native_imsdk';
++String? _nativeLibPath;
++bool _nativeLibNameConfigured = false;
++bool _nativeLibPathConfigured = false;
++bool _nativeLibraryOpened = false;
++
+ void setNativeLibraryName(String name) {
++  if (_nativeLibNameConfigured) {
++    if (_nativeLibName != name) {
++      throw StateError('Native library name is immutable.');
++    }
++    return;
++  }
++  if (_nativeLibraryOpened) {
++    throw StateError('Native library is already open.');
++  }
++  if (name.isEmpty) {
++    throw ArgumentError('Native library name must not be empty.');
++  }
+   _nativeLibName = name;
++  _nativeLibNameConfigured = true;
++}
++
++/// Override the native library path before any SDK call.
++/// A null path keeps packaged platform loading while still fixing the choice
++/// for the lifetime of the process.
++void setNativeLibraryPath(String? path) {
++  if (_nativeLibPathConfigured) {
++    if (_nativeLibPath != path) {
++      throw StateError('Native library path is immutable.');
++    }
++    return;
++  }
++  if (_nativeLibraryOpened) {
++    throw StateError('Native library is already open.');
++  }
++  if (path != null && !_isAbsoluteNativeLibraryPath(path)) {
++    throw ArgumentError('Native library path must be absolute.');
++  }
++  _nativeLibPath = path;
++  _nativeLibPathConfigured = true;
+ }
+-
++
++bool _isAbsoluteNativeLibraryPath(String path) => Platform.isWindows
++    ? RegExp(r'^(?:[A-Za-z]:[\\/]|\\\\)').hasMatch(path)
++    : path.startsWith('/');
++
+ /// The dynamic library in which the symbols for [NativeImsdkBindings] can be found.
+ final DynamicLibrary _dylib = () {
++  _nativeLibraryOpened = true;
++  final libPath = _nativeLibPath;
++  if (libPath != null) {
++    if (!File(libPath).existsSync()) {
++      throw StateError('Configured native library is unavailable.');
++    }
++    try {
++      return DynamicLibrary.open(libPath);
++    } catch (_) {
++      throw StateError('Configured native library could not be opened.');
++    }
++  }
++
+   final libName = _nativeLibName;
+   if (Platform.isAndroid || Platform.isLinux) {
+     return DynamicLibrary.open('lib$libName.so');
+   }
+-
++
+   if (Platform.isIOS) {
+     // Resolve an absolute path inside the running app bundle's Frameworks/
+     // directory; a relative dlopen path is resolved against the process working
+@@ -1507,9 +1562,9 @@ class NativeLibraryManager {
+-
++
+         break;
+       default:
+         print("invalid group report type");
+         break;
+     }
+   }
+-
++
+-}
+\ No newline at end of file
++}
+--
+2.50.1 (Apple Git-155)

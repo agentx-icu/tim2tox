@@ -1,14 +1,13 @@
 #ifndef V2TIM_LOG_H
 #define V2TIM_LOG_H
 
-#include <string>
-#include <fstream>
-#include <mutex>
-#include <sstream>
-#include <memory>
-#include <cstdio>
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
+#include <fstream>
+#include <memory>
+#include <mutex>
+#include <string>
 
 // Define log levels
 enum class LogLevel {
@@ -26,6 +25,67 @@ constexpr LogLevel kWarning = LogLevel::WARNING;
 constexpr LogLevel kError = LogLevel::ERROR;
 constexpr LogLevel kFatal = LogLevel::FATAL;
 
+namespace tim2tox::diag {
+
+enum class FieldKind {
+    Count,
+    Length,
+    Status,
+    Bool,
+    Enum,
+};
+
+template <size_t Size>
+struct StaticText {
+    char value[Size];
+
+    consteval StaticText(const char (&literal)[Size]) : value{} {
+        if (literal[Size - 1] != '\0') {
+            throw "diagnostic labels must be null-terminated string literals";
+        }
+        for (size_t index = 0; index < Size; ++index) {
+            value[index] = literal[index];
+        }
+    }
+};
+
+struct Field {
+    FieldKind kind;
+    int64_t value;
+
+    static constexpr Field Count(int64_t value) {
+        return Field{FieldKind::Count, value};
+    }
+
+    static constexpr Field Length(int64_t value) {
+        return Field{FieldKind::Length, value};
+    }
+
+    static constexpr Field Status(int64_t value) {
+        return Field{FieldKind::Status, value};
+    }
+
+    static constexpr Field Bool(bool value) {
+        return Field{FieldKind::Bool, value ? 1 : 0};
+    }
+
+    static constexpr Field Enum(int64_t value) {
+        return Field{FieldKind::Enum, value};
+    }
+};
+
+template <StaticText Component, StaticText EventName>
+struct Event {
+    const Field* fields;
+    size_t field_count;
+
+    constexpr Event(const Field* event_fields = nullptr,
+                    size_t event_field_count = 0)
+        : fields(event_fields),
+          field_count(event_field_count) {}
+};
+
+}
 
 // Singleton Logger Class
 class V2TIMLog {
@@ -39,39 +99,83 @@ public:
 
     // Logging methods using variadic templates
     template<typename... Args>
-    void Debug(const char* format, Args... args) {
+    void Debug(const char* format, Args&&... args) {
         log(LogLevel::DEBUG, format, args...);
     }
 
     template<typename... Args>
-    void Info(const char* format, Args... args) {
+    void Info(const char* format, Args&&... args) {
         log(LogLevel::INFO, format, args...);
     }
 
     template<typename... Args>
-    void Warning(const char* format, Args... args) {
+    void Warning(const char* format, Args&&... args) {
         log(LogLevel::WARNING, format, args...);
     }
 
     template<typename... Args>
-    void Error(const char* format, Args... args) {
+    void Error(const char* format, Args&&... args) {
         log(LogLevel::ERROR, format, args...);
     }
 
     template<typename... Args>
-    void Fatal(const char* format, Args... args) {
+    void Fatal(const char* format, Args&&... args) {
         log(LogLevel::FATAL, format, args...);
     }
 
-    // Make log method public so it can be called via the macro
-    template<typename... Args>
-    void log(LogLevel level, const char* format, Args... args) {
-        if (destroyed_.load()) return;
-        if (level < min_level_) return;
+    template <tim2tox::diag::StaticText Component, tim2tox::diag::StaticText EventName>
+    void Debug(const tim2tox::diag::Event<Component, EventName>& event) {
+        log(LogLevel::DEBUG, event);
+    }
 
-        std::stringstream ss;
-        formatMessage(ss, format, args...);
-        writeLog(level, ss.str());
+    template <tim2tox::diag::StaticText Component, tim2tox::diag::StaticText EventName>
+    void Info(const tim2tox::diag::Event<Component, EventName>& event) {
+        log(LogLevel::INFO, event);
+    }
+
+    template <tim2tox::diag::StaticText Component, tim2tox::diag::StaticText EventName>
+    void Warning(const tim2tox::diag::Event<Component, EventName>& event) {
+        log(LogLevel::WARNING, event);
+    }
+
+    template <tim2tox::diag::StaticText Component, tim2tox::diag::StaticText EventName>
+    void Error(const tim2tox::diag::Event<Component, EventName>& event) {
+        log(LogLevel::ERROR, event);
+    }
+
+    template <tim2tox::diag::StaticText Component, tim2tox::diag::StaticText EventName>
+    void Fatal(const tim2tox::diag::Event<Component, EventName>& event) {
+        log(LogLevel::FATAL, event);
+    }
+
+    template <tim2tox::diag::StaticText Component, tim2tox::diag::StaticText EventName>
+    void FatalStatic() {
+        log(LogLevel::FATAL, tim2tox::diag::Event<Component, EventName>{});
+    }
+
+    // Make log method public so it can be called via the macro
+    //
+    // Legacy printf/fmt-style call sites (`V2TIM_LOG(kInfo, "text %u", x)`).
+    // The variadic ARGUMENTS are still dropped: the codebase mixes printf
+    // (`%u`) and fmt (`{}`) placeholders in the same macro, so there is no one
+    // safe way to substitute them here. The FORMAT STRING is now forwarded as
+    // the event name instead of the constant "legacy_message" — that alone
+    // turns several hundred previously indistinguishable records into
+    // identifiable ones, which is what makes C++ control flow observable at
+    // all. Before this, every legacy call emitted a byte-identical
+    // content-free line, so no amount of log reading could tell which branch
+    // ran.
+    template<typename... Args>
+    void log(LogLevel level, const char* format, Args&&...) {
+        writeLog(level, "v2tim_log", format ? format : "legacy_message",
+                 nullptr, 0);
+    }
+
+    template <tim2tox::diag::StaticText Component, tim2tox::diag::StaticText EventName>
+    void log(LogLevel level,
+             const tim2tox::diag::Event<Component, EventName>& event) {
+        writeLog(level, Component.value, EventName.value, event.fields,
+                 event.field_count);
     }
 
 private:
@@ -85,29 +189,10 @@ private:
     V2TIMLog(V2TIMLog&&) = delete;
     V2TIMLog& operator=(V2TIMLog&&) = delete;
 
-    // Helper methods: writeLog produces unified format PID/TID/SeqNo/Time/Level/body
-    void writeLog(LogLevel level, const std::string& body);
+    void writeLog(LogLevel level, const char* component, const char* event,
+                  const tim2tox::diag::Field* fields, size_t field_count);
     const char* getLevelString(LogLevel level);
-
-    // Recursive template function for formatting messages
-    void formatMessage(std::stringstream& ss, const char* format); // Base case
-
-    template<typename T, typename... Args>
-    void formatMessage(std::stringstream& ss, const char* format, T value, Args... args) {
-        const char* p = format;
-        while (*p) {
-            if (*p == '{' && *(p + 1) == '}') {
-                ss << value;
-                formatMessage(ss, p + 2, args...); // Recurse with the rest
-                return;
-            }
-            ss << *p++;
-        }
-        // If format string ends but there are still arguments, append them directly (optional behavior)
-         ss << value; // Append the current value
-         formatMessage(ss, "", args...); // Continue with remaining args and empty format
-    }
-
+    const char* getFieldString(tim2tox::diag::FieldKind kind);
 
     // Member variables
     std::unique_ptr<std::ofstream> log_file_;
@@ -115,15 +200,8 @@ private:
     bool console_output_;
     std::mutex mutex_;
     std::atomic<bool> destroyed_;
-    std::atomic<uint64_t> sequence_;  // SeqNo for unified format (no zero-padding)
 };
 
-// Macros for easy logging
-// Usage: V2TIMLog(kInfo, "User {} logged in from IP {}", userID, ipAddress);
-// #define V2TIMLog(level, ...) V2TIMLog::getInstance().log(level, __VA_ARGS__)
-// 暂时注释掉宏定义，以后再统一解决冲突问题
-
-// 添加宏定义，用于简化日志调用
 #define V2TIM_LOG(level, ...) \
     do { \
         if (level == kDebug) V2TIMLog::getInstance().Debug(__VA_ARGS__); \
@@ -134,4 +212,4 @@ private:
     } while(0)
 
 
-#endif // V2TIM_LOG_H 
+#endif // V2TIM_LOG_H

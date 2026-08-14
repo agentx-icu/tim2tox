@@ -41,27 +41,21 @@ TEST(V2TIMStringTest, Comparison) {
     V2TIMString str1("Apple");
     V2TIMString str2("Apple");
     V2TIMString str3("Banana");
-    
+
     // Equality
     EXPECT_TRUE(str1 == str2);
     EXPECT_FALSE(str1 == str3);
-    
+
     // Inequality
     EXPECT_FALSE(str1 != str2);
     EXPECT_TRUE(str1 != str3);
-    
+
     // Less than
     EXPECT_TRUE(str1 < str3);
     EXPECT_FALSE(str3 < str1);
-
     EXPECT_FALSE(str1 < str2);
     EXPECT_FALSE(str2 < str1);
-    EXPECT_TRUE(str1 == str2);
-    EXPECT_FALSE(str1 != str2);
-
-    EXPECT_TRUE(str1 < str3);
     EXPECT_FALSE(str3 < str2);
-    EXPECT_TRUE(str1 != str3);
 }
 
 // Test hash function for V2TIMString
@@ -103,4 +97,4 @@ TEST(V2TIMStringTest, UtilityMethods) {
     
     // Test Size (same as Length)
     EXPECT_EQ(str.Size(), str.Length());
-} 
+}

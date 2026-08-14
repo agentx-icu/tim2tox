@@ -386,6 +386,7 @@ typedef _av_conference_set_audio_receive_callback_c = ffi.Void Function(
   ffi.Pointer<ffi.NativeFunction<_av_conference_audio_receive_callback_native>>,
   ffi.Pointer<ffi.Void>,
 );
+typedef _av_conference_clear_pending_audio_c = ffi.Void Function(ffi.Int64);
 typedef _av_conference_send_audio_frame_c = ffi.Int32 Function(
   ffi.Int64,
   ffi.Pointer<pkgffi.Utf8>, // group_id
@@ -409,6 +410,8 @@ typedef _av_conference_mute_c = ffi.Int32 Function(
 );
 typedef _get_friend_number_by_user_id_c = ffi.Uint32 Function(
     ffi.Pointer<pkgffi.Utf8>);
+typedef _get_friend_number_by_user_id_for_instance_c = ffi.Uint32 Function(
+    ffi.Int64, ffi.Pointer<pkgffi.Utf8>);
 typedef _get_user_id_by_friend_number_c = ffi.Pointer<pkgffi.Utf8> Function(
     ffi.Uint32);
 
@@ -457,7 +460,39 @@ typedef _set_default_test_mode_c = ffi.Int32 Function(ffi.Int32);
 /// Low-level FFI bindings to tim2tox C library
 class Tim2ToxFfi {
   Tim2ToxFfi._(this._lib);
+
+  /// Test-only base constructor for narrowly scoped binding fakes.
+  ///
+  /// Production code must use [open]. A fake must override every binding that
+  /// its test invokes; this constructor does not provide a usable native API.
+  Tim2ToxFfi.forTesting() : _lib = ffi.DynamicLibrary.process();
+
   final ffi.DynamicLibrary _lib;
+
+  static String? _libraryPathOverride;
+  static bool _libraryPathConfigured = false;
+  static bool _libraryOpened = false;
+
+  static void setLibraryPathOverride(String? path) {
+    if (_libraryPathConfigured) {
+      if (_libraryPathOverride != path) {
+        throw StateError('Tim2Tox FFI library path is immutable.');
+      }
+      return;
+    }
+    if (_libraryOpened) {
+      throw StateError('Tim2Tox FFI library is already open.');
+    }
+    if (path != null && !_isAbsoluteLibraryPath(path)) {
+      throw ArgumentError('Tim2Tox FFI library path must be absolute.');
+    }
+    _libraryPathOverride = path;
+    _libraryPathConfigured = true;
+  }
+
+  static bool _isAbsoluteLibraryPath(String path) => Platform.isWindows
+      ? RegExp(r'^(?:[A-Za-z]:[\\/]|\\\\)').hasMatch(path)
+      : path.startsWith('/');
 
   static String? fileControlErrorMessage(int result) => switch (result) {
         -1 => 'Invalid arguments.',
@@ -1043,6 +1078,9 @@ class Tim2ToxFfi {
                           _av_conference_audio_receive_callback_native>>,
                   ffi.Pointer<ffi.Void>)>(
           'tim2tox_ffi_av_conference_set_audio_receive_callback');
+  late final void Function(int) avConferenceClearPendingAudioNative = _lib
+      .lookupFunction<_av_conference_clear_pending_audio_c, void Function(int)>(
+          'tim2tox_ffi_av_conference_clear_pending_audio');
   late final int Function(
           int, ffi.Pointer<pkgffi.Utf8>, ffi.Pointer<ffi.Int16>, int, int, int)
       avConferenceSendAudioFrameNative = _lib.lookupFunction<
@@ -1069,6 +1107,11 @@ class Tim2ToxFfi {
               _get_friend_number_by_user_id_c,
               int Function(ffi.Pointer<pkgffi.Utf8>)>(
           'tim2tox_ffi_get_friend_number_by_user_id');
+  late final int Function(int, ffi.Pointer<pkgffi.Utf8>)
+      getFriendNumberByUserIdForInstanceNative = _lib.lookupFunction<
+              _get_friend_number_by_user_id_for_instance_c,
+              int Function(int, ffi.Pointer<pkgffi.Utf8>)>(
+          'tim2tox_ffi_get_friend_number_by_user_id_for_instance');
   late final ffi.Pointer<pkgffi.Utf8> Function(int)
       getUserIdByFriendNumberNative = _lib.lookupFunction<
           _get_user_id_by_friend_number_c,
@@ -1394,6 +1437,20 @@ class Tim2ToxFfi {
   /// then falls back to system library search path.
   /// Supports multiple platforms: macOS, Linux, Windows, Android, iOS
   static Tim2ToxFfi open() {
+    _libraryOpened = true;
+    final overridePath = _libraryPathOverride;
+    if (overridePath != null) {
+      final library = File(overridePath);
+      if (!library.existsSync()) {
+        throw StateError('Configured Tim2Tox FFI library is unavailable.');
+      }
+      try {
+        return Tim2ToxFfi._(ffi.DynamicLibrary.open(overridePath));
+      } catch (_) {
+        throw StateError('Configured Tim2Tox FFI library could not be opened.');
+      }
+    }
+
     if (Platform.isMacOS) {
       return _openMacOS();
     } else if (Platform.isLinux) {

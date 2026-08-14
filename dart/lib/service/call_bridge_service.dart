@@ -72,6 +72,7 @@ class _PendingTeardown {
   _PendingTeardown(this.action);
 
   final Future<bool> Function() action;
+  final Completer<bool> terminal = Completer<bool>();
   int attempts = 0;
   Timer? timer;
 }
@@ -229,7 +230,11 @@ class CallBridgeService {
     unawaited(_startAvLegTeardown(callInfo.inviteID, friendNumber));
   }
 
-  Future<bool> _startAvLegTeardown(String inviteID, int friendNumber) {
+  Future<bool> _startAvLegTeardown(
+    String inviteID,
+    int friendNumber, {
+    bool waitForTerminal = false,
+  }) {
     return _startBoundedTeardown(
       _TeardownKey(
         _TeardownOperation.avEnd,
@@ -239,6 +244,7 @@ class CallBridgeService {
         inviteID: inviteID,
         friendNumber: friendNumber,
       )),
+      waitForTerminal: waitForTerminal,
     );
   }
 
@@ -278,14 +284,18 @@ class CallBridgeService {
   }
 
   Future<bool> _startBoundedTeardown(
-    _TeardownKey key,
-    Future<bool> Function() action,
-  ) async {
-    _pendingTeardowns.remove(key)?.timer?.cancel();
+      _TeardownKey key, Future<bool> Function() action,
+      {bool waitForTerminal = false}) async {
+    final replaced = _pendingTeardowns.remove(key);
+    replaced?.timer?.cancel();
+    if (replaced != null && !replaced.terminal.isCompleted) {
+      replaced.terminal.complete(false);
+    }
     final pending = _PendingTeardown(action);
     _pendingTeardowns[key] = pending;
 
     final success = await _runTeardownAttempt(key, pending);
+    if (waitForTerminal) return pending.terminal.future;
     return success;
   }
 
@@ -294,16 +304,19 @@ class CallBridgeService {
     _PendingTeardown pending,
   ) async {
     if (_pendingTeardowns[key] != pending) {
+      if (!pending.terminal.isCompleted) pending.terminal.complete(false);
       return false;
     }
 
     pending.attempts += 1;
     final success = await pending.action();
     if (_pendingTeardowns[key] != pending) {
+      if (!pending.terminal.isCompleted) pending.terminal.complete(false);
       return success;
     }
     if (success || pending.attempts >= _maxTeardownAttempts) {
       _pendingTeardowns.remove(key);
+      if (!pending.terminal.isCompleted) pending.terminal.complete(success);
       return success;
     }
 
@@ -345,12 +358,16 @@ class CallBridgeService {
   /// awaiting. In that stale-success case the bridge owns cleanup and starts a
   /// bounded AV teardown using the resolved friend number supplied by the
   /// adapter.
-  bool markAvLegStarted(String inviteID, {int? friendNumber}) {
+  bool markAvLegStarted(
+    String inviteID, {
+    int? friendNumber,
+    bool teardownIfMissing = true,
+  }) {
     _logger?.log(
         '[CallBridge] markAvLegStarted hasFriendNumber=${friendNumber != null}');
     final callInfo = _activeCalls[inviteID];
     if (callInfo == null) {
-      if (friendNumber != null) {
+      if (friendNumber != null && teardownIfMissing) {
         unawaited(_startAvLegTeardown(inviteID, friendNumber));
       }
       return false;
@@ -360,6 +377,35 @@ class CallBridgeService {
     }
     callInfo.avLegStarted = true;
     return true;
+  }
+
+  Future<bool> endAvLegAndWaitForTeardown(
+    String inviteID,
+    int friendNumber,
+  ) {
+    return _startAvLegTeardown(
+      inviteID,
+      friendNumber,
+      waitForTerminal: true,
+    );
+  }
+
+  Future<void> waitForAvTeardownsForFriend(int friendNumber) async {
+    while (true) {
+      final pending = _pendingTeardowns.entries
+          .where((entry) {
+            if (entry.key.operation != _TeardownOperation.avEnd) {
+              return false;
+            }
+            final target = entry.key.target;
+            return target is _AvTeardownToken &&
+                target.friendNumber == friendNumber;
+          })
+          .map((entry) => entry.value.terminal.future)
+          .toList();
+      if (pending.isEmpty) return;
+      await Future.wait(pending);
+    }
   }
 
   /// Accept an invitation and start call.
@@ -390,6 +436,11 @@ class CallBridgeService {
     }
     if (result.code != 0) {
       await _failAccept(inviteID, postAccept: false);
+      return false;
+    }
+
+    await waitForAvTeardownsForFriend(friendNumber);
+    if (!identical(_activeCalls[inviteID], callInfo)) {
       return false;
     }
 
@@ -471,7 +522,21 @@ class CallBridgeService {
   /// End a call. The emitted `endReason` reflects which side of the lifecycle
   /// we were in: `'cancel'` for an outgoing call that never connected, and
   /// `'hangup'` for an established (or just-accepted) session.
-  Future<bool> endCall(String inviteID) async {
+  Future<bool> endCall(String inviteID) {
+    return _endCall(inviteID, awaitAvTeardown: false);
+  }
+
+  /// End a call and wait for the hidden AV teardown to finish or exhaust its
+  /// bounded retries. Used by serialized stale-start cleanup before another
+  /// native start may claim the same friend.
+  Future<bool> endCallAndWaitForTeardown(String inviteID) {
+    return _endCall(inviteID, awaitAvTeardown: true);
+  }
+
+  Future<bool> _endCall(
+    String inviteID, {
+    required bool awaitAvTeardown,
+  }) async {
     final callInfo = _activeCalls[inviteID];
     if (callInfo == null) return false;
 
@@ -488,7 +553,7 @@ class CallBridgeService {
     // down during the registerOutgoingCall→startCall gap has friendNumber set
     // but no media leg yet, and endCall on a never-started call can block/error.
     if (friendNumber != null && avLegStarted) {
-      unawaited(_startBoundedTeardown(
+      final teardown = _startBoundedTeardown(
         _TeardownKey(
           _TeardownOperation.avEnd,
           (inviteID: inviteID, friendNumber: friendNumber),
@@ -497,7 +562,13 @@ class CallBridgeService {
           inviteID: inviteID,
           friendNumber: friendNumber,
         )),
-      ));
+        waitForTerminal: awaitAvTeardown,
+      );
+      if (awaitAvTeardown) {
+        await teardown;
+      } else {
+        unawaited(teardown);
+      }
     }
 
     if (isOutgoingPreAnswer) {
@@ -523,6 +594,7 @@ class CallBridgeService {
   void dispose() {
     for (final pending in _pendingTeardowns.values) {
       pending.timer?.cancel();
+      if (!pending.terminal.isCompleted) pending.terminal.complete(false);
     }
     _pendingTeardowns.clear();
     if (_signalingListener != null) {

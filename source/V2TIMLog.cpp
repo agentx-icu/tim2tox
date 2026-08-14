@@ -1,21 +1,11 @@
 #include "V2TIMLog.h"
 #include <iostream>
-#include <ctime>
-#include <iomanip>
-#include <atomic>
-#include <thread>
-#include <chrono>
 #include <sstream>
-#include <functional>
-#include <unordered_map>
 #if defined(_WIN32) || defined(_WIN64)
-#include <process.h>
-// Avoid Windows min/max macros interfering with std::min/std::max
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
 #include <windows.h>
-// Some Windows headers define macros like ERROR that can break C++ enum/scope usage.
 #ifdef ERROR
 #undef ERROR
 #endif
@@ -31,18 +21,6 @@
 #ifdef FATAL
 #undef FATAL
 #endif
-#define getpid _getpid
-#else
-#include <unistd.h>
-#if defined(__linux__)
-#include <sys/syscall.h>
-#endif
-#endif
-
-// On macOS/iOS only: map each std::thread::id to a short, process-unique integer (1, 2, 3, …).
-#if defined(__APPLE__)
-static std::unordered_map<std::thread::id, int> s_tid_map;
-static int s_tid_next = 1;
 #endif
 
 // Define the static instance getter
@@ -55,17 +33,14 @@ V2TIMLog& V2TIMLog::getInstance() {
 V2TIMLog::V2TIMLog()
     : min_level_(LogLevel::INFO),
       console_output_(true),
-      destroyed_(false),
-      sequence_(0)
+      destroyed_(false)
 {
 }
 
 // Destructor: Close the log file if open
 V2TIMLog::~V2TIMLog() {
-    // Mark as destroyed to prevent any further logging attempts
     destroyed_.store(true);
-    // Wait a bit to ensure any in-flight log operations complete
-    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    std::lock_guard<std::mutex> lock(mutex_);
     if (log_file_ && log_file_->is_open()) {
         log_file_->close();
     }
@@ -74,19 +49,22 @@ V2TIMLog::~V2TIMLog() {
 // Set the path for the log file
 void V2TIMLog::setLogFile(const std::string& path) {
     if (destroyed_.load()) return;
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (destroyed_.load()) return;
-    // Close existing file if open
-    if (log_file_ && log_file_->is_open()) {
-        log_file_->close();
+    bool open_failed = false;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (destroyed_.load()) return;
+        if (log_file_ && log_file_->is_open()) {
+            log_file_->close();
+        }
+        log_file_ = std::make_unique<std::ofstream>(path, std::ios::app);
+        if (!log_file_ || !log_file_->is_open()) {
+            log_file_.reset();
+            console_output_ = true;
+            open_failed = true;
+        }
     }
-    // Attempt to open the new file
-    log_file_ = std::make_unique<std::ofstream>(path, std::ios::app);
-    if (!log_file_ || !log_file_->is_open()) {
-        // Log error to console if file opening fails
-        enableConsoleOutput(true); // Ensure console output is on for the error
-        Error("Failed to open log file: {}", path);
-        log_file_.reset(); // Reset pointer if opening failed
+    if (open_failed) {
+        Error("log_file_open_failed");
     }
 }
 
@@ -106,60 +84,23 @@ void V2TIMLog::enableConsoleOutput(bool enable) {
     console_output_ = enable;
 }
 
-// Core function: unified format [pid-tid-seqno] YYYY-MM-DD HH:MM:SS [LEVEL] body
-void V2TIMLog::writeLog(LogLevel level, const std::string& body) {
+void V2TIMLog::writeLog(LogLevel level, const char* component, const char* event,
+                        const tim2tox::diag::Field* fields, size_t field_count) {
     if (destroyed_.load()) return;
-    std::lock_guard<std::mutex> lock(mutex_);
+    // unique_lock (not lock_guard): the console write below is done with the
+    // mutex released, so it must be unlockable early.
+    std::unique_lock<std::mutex> lock(mutex_);
     if (destroyed_.load()) return;
+    if (level < min_level_) return;
 
-    const uint64_t seq = sequence_++;
-    const int pid = static_cast<int>(getpid());
-
-    std::string tid_str;
-#if defined(__APPLE__)
-    // macOS/iOS: use short process-unique integer instead of long hex thread id
-    auto real_tid = std::this_thread::get_id();
-    auto it = s_tid_map.find(real_tid);
-    if (it == s_tid_map.end()) {
-        it = s_tid_map.emplace(real_tid, s_tid_next++).first;
-    }
-    tid_str = std::to_string(it->second);
-#elif defined(_WIN32) || defined(_WIN64)
-    // Windows: kernel thread id (integer)
-    tid_str = std::to_string(static_cast<unsigned long long>(GetCurrentThreadId()));
-#elif defined(__linux__)
-    // Linux: kernel thread id (integer), gettid(2) via syscall
-    tid_str = std::to_string(static_cast<long>(syscall(SYS_gettid)));
-#else
-    // Other (e.g. BSD): fallback to process-unique integer from thread::id hash
-    tid_str = std::to_string(std::hash<std::thread::id>{}(std::this_thread::get_id()));
-#endif
-
-    auto now = std::time(nullptr);
-#ifdef _WIN32
-    std::tm tm_buf;
-    localtime_s(&tm_buf, &now);
-    auto* tm = &tm_buf;
-#else
-#ifdef __unix__
-    std::tm tm_buf;
-    auto* tm = localtime_r(&now, &tm_buf);
-#else
-    auto* tm = std::localtime(&now);
-#endif
-#endif
-
-    std::stringstream timestamp;
-    if (tm) {
-        timestamp << std::put_time(tm, "%Y-%m-%d %H:%M:%S");
-    } else {
-        timestamp << "[Timestamp Error]";
-    }
-
-    // [pid-tid-seqno] YYYY-MM-DD HH:MM:SS [LEVEL] body
     std::stringstream line;
-    line << "[" << pid << "-" << tid_str << "-" << seq << "] "
-         << timestamp.str() << " [" << getLevelString(level) << "] " << body << "\n";
+    line << "[" << getLevelString(level) << "] component="
+         << component << " event=" << event;
+    for (size_t index = 0; fields && index < field_count; ++index) {
+        line << " " << getFieldString(fields[index].kind) << "="
+             << fields[index].value;
+    }
+    line << "\n";
     std::string full_message = line.str();
 
     if (log_file_ && log_file_->is_open()) {
@@ -167,8 +108,23 @@ void V2TIMLog::writeLog(LogLevel level, const std::string& body) {
         log_file_->flush();
     }
 
-    if (console_output_) {
-        std::cout << full_message;
+    const bool write_console = console_output_;
+    lock.unlock();
+
+    if (write_console) {
+        // MUST flush. When stdout is a terminal this is nearly free, but the
+        // automated harness launches the app with stdout redirected to a file
+        // (`nohup … >toxee_stdio.log`), where libstdc++ switches to full
+        // buffering — and the app is always killed rather than exited, so the
+        // buffer was never drained. Every console log line written during a
+        // real-UI run was silently discarded, which is why the native side
+        // looked completely silent while the logger was in fact working.
+        //
+        // Done with `mutex_` RELEASED: a flush blocks until the reader drains,
+        // so a paused/stalled consumer on the other end of a pipe would
+        // otherwise hold the logger mutex and wedge every logging thread —
+        // including the Tox event thread — taking the whole native core down.
+        std::cout << full_message << std::flush;
     }
 }
 
@@ -184,7 +140,13 @@ const char* V2TIMLog::getLevelString(LogLevel level) {
     }
 }
 
-// Base case for recursive formatMessage template
-void V2TIMLog::formatMessage(std::stringstream& ss, const char* format) {
-    ss << format; // Append the remaining format string
-} 
+const char* V2TIMLog::getFieldString(tim2tox::diag::FieldKind kind) {
+    switch (kind) {
+        case tim2tox::diag::FieldKind::Count:  return "count";
+        case tim2tox::diag::FieldKind::Length: return "length";
+        case tim2tox::diag::FieldKind::Status: return "status";
+        case tim2tox::diag::FieldKind::Bool:   return "bool";
+        case tim2tox::diag::FieldKind::Enum:   return "enum";
+        default:                               return "enum";
+    }
+}

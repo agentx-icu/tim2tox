@@ -11,6 +11,7 @@ import 'package:tencent_cloud_chat_sdk/enum/V2TimAdvancedMsgListener.dart';
 import 'package:tencent_cloud_chat_sdk/native_im/adapter/tim_message_manager.dart';
 import '../interfaces/logger_service.dart';
 import '../models/chat_message.dart';
+import 'control_message_envelope.dart';
 import 'message_history_persistence.dart';
 import 'message_converter.dart';
 
@@ -66,6 +67,25 @@ class BinaryReplacementHistoryHook {
   /// inbound messages. Read-only so the Platform poll path can avoid creating
   /// a second row for the same generic custom event in hybrid integrations.
   static bool get ownsInboundMessageHistory => _persistence != null;
+
+  /// Applies an inbound magic-prefix control signal that arrived on the
+  /// BINARY-REPLACEMENT path. Installed by `Tim2ToxSdkPlatform` so both inbound
+  /// paths share ONE implementation of resolve-target → delete → notify.
+  ///
+  /// Why this seam exists: `__revoke__:` is consumed on the Platform path by
+  /// `Tim2ToxSdkPlatform._maybeInterceptControlSignal`, which runs off
+  /// `FfiChatService.messages`. In the product a C2C message reaches the app
+  /// through the native binary-replacement listener instead, so that stream
+  /// never carries it — the signal was persisted here as a literal
+  /// `__revoke__:{…}` history row and the recalled message was never deleted on
+  /// the receiver (real-UI `chat_recall_message` bGone=false, reproduced with
+  /// the row found verbatim in the peer's chat_history JSON).
+  static Future<void> Function({
+    required String text,
+    required String fromUserId,
+    String? groupId,
+    bool isSelf,
+  })? applyInboundControlSignal;
 
   /// Initialize the hook with persistence service and self ID
   static void initialize(MessageHistoryPersistence persistence, String selfId,
@@ -146,6 +166,11 @@ class BinaryReplacementHistoryHook {
     // S29: clear the block predicate so it can't reference the torn-down
     // session's FfiChatService across a logout→login (stale block list).
     isBlockedPredicate = null;
+    // Same reasoning as isBlockedPredicate above: this closure captures the
+    // torn-down session's platform + FfiChatService, so leaving it installed
+    // would apply a control signal against the PREVIOUS account's history
+    // after a logout→login (and retain that whole object graph).
+    applyInboundControlSignal = null;
     _pendingSelfIdBuffer.clear();
     _warnedEmptySelfIdThisGeneration = false;
     // Bump generation last so a concurrent saveMessage that already captured
@@ -224,6 +249,46 @@ class BinaryReplacementHistoryHook {
       )) {
         return;
       }
+    }
+
+    // Magic-prefix control signals (`__revoke__:` …) are TRANSPORT, not chat
+    // content — the same class as the internal-protocol payloads above, and
+    // they must be consumed BEFORE the selfId buffering below so a recall is
+    // never parked in the pending buffer. See [applyInboundControlSignal].
+    // `shouldSwallow`, NOT "has a magic prefix": `__face__:` / `__location__:`
+    // / `__custom__:` are how stickers, locations and custom messages travel on
+    // the wire. Consuming those here would delete real user content from
+    // history. Only `__revoke__:` is a command.
+    final controlText = v2Msg.textElem?.text ?? '';
+    if (controlText.isNotEmpty &&
+        parseTextControlEnvelope(controlText).shouldSwallow) {
+      final handler = applyInboundControlSignal;
+      if (handler == null) {
+        _logFallback(
+            'BinaryReplacementHistoryHook: inbound control signal with no '
+            'handler installed — dropped without applying');
+      } else {
+        try {
+          // isSelf matters: the receive-side revoke resolver deliberately skips
+          // target resolution for a self-echoed signal (the sender already
+          // deleted its own copy). Forcing `false` here made a sender's own
+          // echo re-resolve against its own history and delete a DIFFERENT
+          // message with the same text.
+          final selfId = capturedSelfId;
+          final sender = v2Msg.sender ?? v2Msg.userID ?? '';
+          await handler(
+            text: controlText,
+            fromUserId: sender,
+            groupId: v2Msg.groupID,
+            isSelf: v2Msg.isSelf ?? (selfId.isNotEmpty && sender == selfId),
+          );
+        } catch (e) {
+          _logFallback(
+              'BinaryReplacementHistoryHook: control signal handler failed: $e');
+        }
+      }
+      // Never persist the raw signal as displayable history, handled or not.
+      return;
     }
 
     // CR-04: selfId not yet resolved. Buffer instead of persisting with an

@@ -790,6 +790,11 @@ V2TIMMessage::V2TIMMessage() = default;
 V2TIMMessage::V2TIMMessage(const V2TIMMessage&) = default;
 V2TIMMessage& V2TIMMessage::operator=(const V2TIMMessage&) = default;
 V2TIMMessage::~V2TIMMessage() = default;
+// Tox only exposes delivery receipts. Read state is authoritative on the Dart
+// side in MessageHistoryPersistence, so these remain ABI shims for the V2TIM
+// surface.
+bool V2TIMMessage::IsRead() const { return false; }
+bool V2TIMMessage::IsPeerRead() const { return false; }
 V2TIMElem::V2TIMElem() = default;
 V2TIMElem::V2TIMElem(const V2TIMElem&) = default;
 V2TIMElem::~V2TIMElem() = default;
@@ -915,5 +920,3 @@ void V2TIMMessage::SetLocalCustomData(const V2TIMBuffer &localCustomData, V2TIMC
     (void)localCustomData;
     (void)callback;
 }
-
-

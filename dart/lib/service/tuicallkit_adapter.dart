@@ -88,6 +88,8 @@ class TUICallKitAdapter {
 
   // Track active calls by user ID
   final Map<String, String> _userToInviteId = {}; // userID -> inviteID
+  final Map<String, int> _outgoingSetupGenerations = {};
+  final Map<String, Future<void>> _nativeStartTails = {};
 
   /// Fires when an outgoing call is successfully initiated so the UI can show the ringing overlay.
   OutgoingCallCallback? onOutgoingCallInitiated;
@@ -188,6 +190,8 @@ class TUICallKitAdapter {
             'Outgoing call preflight denied');
       }
     }
+    final setupGeneration = (_outgoingSetupGenerations[userID] ?? 0) + 1;
+    _outgoingSetupGenerations[userID] = setupGeneration;
 
     // Create call data JSON
     final callData = jsonEncode({
@@ -212,6 +216,28 @@ class TUICallKitAdapter {
     }
 
     final inviteID = result.data!;
+    if (_outgoingSetupGenerations[userID] != setupGeneration) {
+      await _cancelStaleInvite(inviteID);
+      return false;
+    }
+    final previousInviteID = _userToInviteId[userID];
+    final resolvedFriendNumber = _avService.getFriendNumberByUserId(userID);
+    final hasFriend = resolvedFriendNumber != 0xFFFFFFFF;
+    if (hasFriend) {
+      await _callBridge.waitForAvTeardownsForFriend(resolvedFriendNumber);
+    }
+    if (previousInviteID != null && previousInviteID != inviteID) {
+      final previousCall = _callBridge.getCallInfo(previousInviteID);
+      if (previousCall != null) {
+        _logger?.log(
+            '[TUICallKitAdapter] ending stale tracked call before replacement');
+        await _callBridge.endCallAndWaitForTeardown(previousInviteID);
+      }
+    }
+    if (_outgoingSetupGenerations[userID] != setupGeneration) {
+      await _cancelStaleInvite(inviteID);
+      return false;
+    }
     _userToInviteId[userID] = inviteID;
 
     // Resolve friend number BEFORE registering so the bridge gets the
@@ -220,8 +246,6 @@ class TUICallKitAdapter {
     // again with the resolved number — and any state-machine lookup that
     // landed in the gap (notably `onOutgoingCallInitiated` listeners that
     // queried `getCallInfo(inviteID).friendNumber`) saw `null`.
-    final resolvedFriendNumber = _avService.getFriendNumberByUserId(userID);
-    final hasFriend = resolvedFriendNumber != 0xFFFFFFFF;
     _logger?.log(
         '[TUICallKitAdapter] resolveFriend status=done type=${type ?? TYPE_AUDIO} userCount=${userids.length} hasFriend=$hasFriend');
 
@@ -239,8 +263,8 @@ class TUICallKitAdapter {
         '[TUICallKitAdapter] outgoingInitiated status=notify type=${type ?? TYPE_AUDIO} userCount=${userids.length} hasCallback=${onOutgoingCallInitiated != null}');
     onOutgoingCallInitiated?.call(inviteID, userID, type ?? TYPE_AUDIO);
 
-    if (!_ownsBridgeCall(inviteID)) {
-      _userToInviteId.remove(userID);
+    if (!_isCurrentSetup(userID, setupGeneration, inviteID)) {
+      await _discardStaleSetup(userID, inviteID);
       _logger?.log(
           '[TUICallKitAdapter] setup status=cancelled type=${type ?? TYPE_AUDIO} userCount=${userids.length} hasFriend=$hasFriend');
       return false;
@@ -261,8 +285,8 @@ class TUICallKitAdapter {
     // Initialize ToxAV if needed
     if (!_avService.isInitialized) {
       await _avService.initialize();
-      if (!_ownsBridgeCall(inviteID)) {
-        _userToInviteId.remove(userID);
+      if (!_isCurrentSetup(userID, setupGeneration, inviteID)) {
+        await _discardStaleSetup(userID, inviteID);
         _logger?.log(
             '[TUICallKitAdapter] setup status=cancelled type=${type ?? TYPE_AUDIO} userCount=${userids.length} hasFriend=true');
         return false;
@@ -279,64 +303,177 @@ class TUICallKitAdapter {
       } catch (_) {
         // Ignore — no active call to end
       }
-      if (!_ownsBridgeCall(inviteID)) {
-        _userToInviteId.remove(userID);
+      if (!_isCurrentSetup(userID, setupGeneration, inviteID)) {
+        await _discardStaleSetup(userID, inviteID);
         _logger?.log(
             '[TUICallKitAdapter] setup status=cancelled type=${type ?? TYPE_AUDIO} userCount=${userids.length} hasFriend=true');
         return false;
       }
     }
 
-    if (!_ownsBridgeCall(inviteID)) {
-      _userToInviteId.remove(userID);
+    if (!_isCurrentSetup(userID, setupGeneration, inviteID)) {
+      await _discardStaleSetup(userID, inviteID);
       _logger?.log(
           '[TUICallKitAdapter] setup status=cancelled type=${type ?? TYPE_AUDIO} userCount=${userids.length} hasFriend=true');
       return false;
     }
 
     // Start the call
-    final callResult = await _avService.startCall(resolvedFriendNumber,
-        audioBitRate: audioBitRate, videoBitRate: videoBitRate);
-    _logger?.log(
-        '[TUICallKitAdapter] startCall status=done type=${type ?? TYPE_AUDIO} userCount=${userids.length} result=$callResult');
-    if (!_ownsBridgeCall(inviteID)) {
-      _userToInviteId.remove(userID);
-      if (callResult) {
-        _callBridge.markAvLegStarted(
+    final startLease = await _startCallWithLease(
+      userID,
+      resolvedFriendNumber,
+      audioBitRate: audioBitRate,
+      videoBitRate: videoBitRate,
+    );
+    final callResult = startLease.result;
+    try {
+      if (startLease.error != null) {
+        await _cleanupSetupInvite(
+          userID,
           inviteID,
-          friendNumber: resolvedFriendNumber,
+          waitForTeardown: _outgoingSetupGenerations[userID] != setupGeneration,
+        );
+        throw CallSetupException(
+          CallSetupFailureReason.avStartFailed,
+          'ToxAV startCall failed for friendNumber=$resolvedFriendNumber',
         );
       }
       _logger?.log(
-          '[TUICallKitAdapter] setup status=cancelled type=${type ?? TYPE_AUDIO} userCount=${userids.length} hasStarted=$callResult');
-      return false;
-    }
-    if (!callResult) {
-      _userToInviteId.remove(userID);
-      await _callBridge.endCall(inviteID);
-      throw CallSetupException(CallSetupFailureReason.avStartFailed,
-          'ToxAV startCall failed for friendNumber=$resolvedFriendNumber');
-    }
+          '[TUICallKitAdapter] startCall status=done type=${type ?? TYPE_AUDIO} userCount=${userids.length} result=$callResult');
+      if (!_isCurrentSetup(userID, setupGeneration, inviteID)) {
+        final hasReplacement =
+            _outgoingSetupGenerations[userID] != setupGeneration;
+        if (callResult) {
+          final claimed = _callBridge.markAvLegStarted(
+            inviteID,
+            friendNumber: resolvedFriendNumber,
+            teardownIfMissing: !hasReplacement,
+          );
+          if (claimed) {
+            if (hasReplacement) {
+              await _callBridge.endCallAndWaitForTeardown(inviteID);
+            } else {
+              await _callBridge.endCall(inviteID);
+            }
+          } else if (hasReplacement) {
+            await _callBridge.endAvLegAndWaitForTeardown(
+              inviteID,
+              resolvedFriendNumber,
+            );
+          }
+        } else {
+          await _cleanupSetupInvite(
+            userID,
+            inviteID,
+            waitForTeardown: hasReplacement,
+          );
+        }
+        _removeOwnedInvite(userID, inviteID);
+        _logger?.log(
+            '[TUICallKitAdapter] setup status=cancelled type=${type ?? TYPE_AUDIO} userCount=${userids.length} hasStarted=$callResult');
+        return false;
+      }
+      if (!callResult) {
+        await _cleanupSetupInvite(
+          userID,
+          inviteID,
+          waitForTeardown: _outgoingSetupGenerations[userID] != setupGeneration,
+        );
+        throw CallSetupException(CallSetupFailureReason.avStartFailed,
+            'ToxAV startCall failed for friendNumber=$resolvedFriendNumber');
+      }
 
-    // The ToxAV media leg is now live. Tell the bridge so a later
-    // cancel/reject/timeout/endCall tears it down — and, crucially, so a
-    // teardown that lands in the registerOutgoingCall→startCall gap above does
-    // NOT call endCall() on a leg that never started.
-    final claimed = _callBridge.markAvLegStarted(
-      inviteID,
-      friendNumber: resolvedFriendNumber,
-    );
-    if (!claimed) {
-      _userToInviteId.remove(userID);
-      _logger?.log(
-          '[TUICallKitAdapter] setup status=cancelled type=${type ?? TYPE_AUDIO} userCount=${userids.length} hasStarted=true');
-      return false;
+      // The ToxAV media leg is now live. Tell the bridge so a later
+      // cancel/reject/timeout/endCall tears it down — and, crucially, so a
+      // teardown that lands in the registerOutgoingCall→startCall gap above does
+      // NOT call endCall() on a leg that never started.
+      final claimed = _callBridge.markAvLegStarted(
+        inviteID,
+        friendNumber: resolvedFriendNumber,
+      );
+      if (!claimed) {
+        _removeOwnedInvite(userID, inviteID);
+        _logger?.log(
+            '[TUICallKitAdapter] setup status=cancelled type=${type ?? TYPE_AUDIO} userCount=${userids.length} hasStarted=true');
+        return false;
+      }
+      return true;
+    } finally {
+      startLease.release();
     }
-    return true;
   }
 
   bool _ownsBridgeCall(String inviteID) =>
       _callBridge.getCallInfo(inviteID) != null;
+
+  Future<_NativeStartLease> _startCallWithLease(
+    String userID,
+    int friendNumber, {
+    required int audioBitRate,
+    required int videoBitRate,
+  }) async {
+    final previous = _nativeStartTails[userID];
+    final releaseSignal = Completer<void>();
+    _nativeStartTails[userID] = releaseSignal.future;
+    if (previous != null) await previous;
+
+    void release() {
+      if (!releaseSignal.isCompleted) releaseSignal.complete();
+      if (identical(_nativeStartTails[userID], releaseSignal.future)) {
+        _nativeStartTails.remove(userID);
+      }
+    }
+
+    try {
+      final result = await _avService.startCall(
+        friendNumber,
+        audioBitRate: audioBitRate,
+        videoBitRate: videoBitRate,
+      );
+      return _NativeStartLease(result, release);
+    } catch (error) {
+      return _NativeStartLease.failed(error, release);
+    }
+  }
+
+  bool _isCurrentSetup(String userID, int setupGeneration, String inviteID) =>
+      _outgoingSetupGenerations[userID] == setupGeneration &&
+      _ownsBridgeCall(inviteID);
+
+  Future<void> _discardStaleSetup(String userID, String inviteID) async {
+    await _cleanupSetupInvite(userID, inviteID, waitForTeardown: false);
+  }
+
+  Future<void> _cleanupSetupInvite(
+    String userID,
+    String inviteID, {
+    required bool waitForTeardown,
+  }) async {
+    if (_ownsBridgeCall(inviteID)) {
+      if (waitForTeardown) {
+        await _callBridge.endCallAndWaitForTeardown(inviteID);
+      } else {
+        await _callBridge.endCall(inviteID);
+      }
+    } else {
+      await _cancelStaleInvite(inviteID);
+    }
+    _removeOwnedInvite(userID, inviteID);
+  }
+
+  void _removeOwnedInvite(String userID, String inviteID) {
+    if (_userToInviteId[userID] == inviteID) {
+      _userToInviteId.remove(userID);
+    }
+  }
+
+  Future<void> _cancelStaleInvite(String inviteID) async {
+    try {
+      await _sdkPlatform.cancel(inviteID: inviteID);
+    } catch (_) {
+      // The stale setup never owns UI or AV state; cancellation is best effort.
+    }
+  }
 
   /// Dispose
   ///
@@ -348,6 +485,8 @@ class TUICallKitAdapter {
   /// references to the disposed `ToxAVService` and `CallBridgeService`.
   void dispose() {
     _userToInviteId.clear();
+    _outgoingSetupGenerations.clear();
+    _nativeStartTails.clear();
     if (identical(_instance, this)) {
       _instance = null;
     }
@@ -355,6 +494,19 @@ class TUICallKitAdapter {
       _globalAdapter = null;
     }
   }
+}
+
+class _NativeStartLease {
+  _NativeStartLease(this.result, this._release, {this.error});
+
+  _NativeStartLease.failed(Object error, void Function() release)
+      : this(false, release, error: error);
+
+  final bool result;
+  final Object? error;
+  final void Function() _release;
+
+  void release() => _release();
 }
 
 /// Global adapter instance

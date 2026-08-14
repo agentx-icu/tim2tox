@@ -26,7 +26,7 @@ void main() {
       await setupTestEnvironment();
       scenario = await createTestScenario(['alice', 'bob']);
       await scenario.initAllNodes();
-      // Enable test mode BEFORE login so event_thread never starts.
+      // Refresh the per-instance flag inherited from initAllNodes' early lease.
       await VirtualClock.enableForScenario(scenario);
       // Now safe to log in — InitSDK will see test_mode_ = true and skip the
       // event_thread spawn.

@@ -16,6 +16,7 @@
 #include <memory>
 #include <mutex>
 #include <condition_variable>
+#include <limits>
 #include "ToxManager.h"
 #include "ToxUtil.h"
 #include "V2TIMManagerImpl.h"
@@ -172,6 +173,18 @@ static std::map<int64_t, bool> g_auto_accept_group_invites; // instance_id -> bo
 namespace {
 std::atomic<tim2tox_event_cb> g_cb{nullptr};
 std::atomic<void*> g_cb_user{nullptr};
+
+size_t SafeCStringLength(const char* value) {
+    return value ? std::strlen(value) : 0;
+}
+
+int HasCStringValue(const char* value) {
+    return value && value[0] != '\0' ? 1 : 0;
+}
+
+int BoolMetadata(bool value) {
+    return value ? 1 : 0;
+}
 
 // IRC dynamic library handle
 void* g_irc_lib_handle = nullptr;
@@ -332,6 +345,25 @@ static std::string LowerHex(const uint8_t* data, size_t size) {
     return encoded;
 }
 
+static int CopyPayloadOrReturnRequiredCapacity(const std::string& payload, char* buffer,
+                                               int buffer_len) {
+    const size_t payload_size = payload.size();
+    if (payload_size > static_cast<size_t>(std::numeric_limits<int>::max()) - 1) {
+        return std::numeric_limits<int>::min();
+    }
+    const int required_capacity = static_cast<int>(payload_size) + 1;
+    if (buffer_len <= 0) return -required_capacity;
+    if (!buffer) return 0;
+    if (required_capacity > buffer_len) {
+        return -required_capacity;
+    }
+
+    const int bytes_written = static_cast<int>(payload_size);
+    if (bytes_written > 0) memcpy(buffer, payload.data(), payload_size);
+    buffer[bytes_written] = 0;
+    return bytes_written;
+}
+
 class SimpleMsgListenerImpl : public V2TIMSimpleMsgListener {
 public:
     void enqueue_text_line_for_instance(int64_t instance_id, const std::string& s) {
@@ -387,18 +419,16 @@ public:
             auto& front = text_q_.front();
             if (front.first == 0 || front.first == instance_id) {
                 const std::string& s = front.second;
-                const size_t cap = (len > 0) ? static_cast<size_t>(len) : 0;
+                // Each dequeue returns exactly one opaque queued record. The
+                // payload may legally contain newlines, so callers must treat
+                // the returned bytes as a single event and never split on '\n'.
                 // Need room for the bytes plus the NUL terminator. If it does
                 // not fit, return the required size as a NEGATIVE value and
                 // leave the event queued — the caller grows its buffer and
                 // retries. (Previously the event was copied truncated and
                 // popped, silently losing the tail of a long file path.)
-                if (s.size() + 1 > cap) {
-                    return -static_cast<int>(s.size() + 1);
-                }
-                const int n = static_cast<int>(s.size());
-                if (n > 0) memcpy(buf, s.data(), n);
-                buf[n] = 0;
+                const int n = CopyPayloadOrReturnRequiredCapacity(s, buf, len);
+                if (n < 0) return n;
                 text_q_.pop();
                 return n;
             }
@@ -949,18 +979,21 @@ static void RegisterToxManagerFileCallbacks(V2TIMManagerImpl* manager_impl) {
 // Extended version with options support
 int64_t tim2tox_ffi_create_test_instance_ex(const char* init_path, int local_discovery_enabled, int ipv6_enabled) {
     if (!init_path) {
-        V2TIM_LOG(kError, "[ffi] create_test_instance_ex: init_path is null");
+        V2TIM_LOG(kError, "[ffi] create_test_instance_ex: event=entry status=invalid_init_path init_path_length=0");
         return 0;
     }
 
-    V2TIM_LOG(kInfo, "[ffi] create_test_instance_ex: ENTRY - init_path={}, local_discovery={}, ipv6={}", init_path, local_discovery_enabled, ipv6_enabled);
+    V2TIM_LOG(kInfo,
+              "[ffi] create_test_instance_ex: event=entry status=start init_path_length={} local_discovery_enabled={} ipv6_enabled={}",
+              SafeCStringLength(init_path), BoolMetadata(local_discovery_enabled != 0),
+              BoolMetadata(ipv6_enabled != 0));
 
     V2TIMManagerImpl* instance = new V2TIMManagerImpl();
     if (!instance) {
-        V2TIM_LOG(kError, "[ffi] create_test_instance_ex: failed to create V2TIMManagerImpl");
+        V2TIM_LOG(kError, "[ffi] create_test_instance_ex: event=allocate status=failure");
         return 0;
     }
-    V2TIM_LOG(kInfo, "[ffi] create_test_instance_ex: Created V2TIMManagerImpl instance={}", (void*)instance);
+    V2TIM_LOG(kInfo, "[ffi] create_test_instance_ex: event=allocate status=success");
     
     // CRITICAL: Register instance BEFORE InitSDK so that GetInstanceIdFromManager can find it
     // This ensures that InitSDK can correctly identify which instance it's initializing
@@ -970,23 +1003,27 @@ int64_t tim2tox_ffi_create_test_instance_ex(const char* init_path, int local_dis
         instance_id = g_next_instance_id++;
         g_test_instances[instance_id] = instance;
         g_instance_to_id[instance] = instance_id; // Update reverse map
-        V2TIM_LOG(kInfo, "[ffi] create_test_instance_ex: Registered instance_id={}, instance={} BEFORE InitSDK", (long long)instance_id, (void*)instance);
+        V2TIM_LOG(kInfo,
+                  "[ffi] create_test_instance_ex: event=register status=success total_instances={}",
+                  g_test_instances.size());
     }
 
     {
         std::lock_guard<std::mutex> lock(g_test_instance_options_mutex);
         g_test_instance_options[instance_id] = {local_discovery_enabled, ipv6_enabled};
-        V2TIM_LOG(kInfo, "[ffi] create_test_instance_ex: Stored options for instance_id={}", (long long)instance_id);
+        V2TIM_LOG(kInfo,
+                  "[ffi] create_test_instance_ex: event=store_options status=success option_count={}",
+                  g_test_instance_options.size());
     }
 
     V2TIMSDKConfig cfg;
     cfg.initPath = V2TIMString(init_path);
 
     instance->AddSDKListener(&G.sdk_listener);
-    V2TIM_LOG(kInfo, "[ffi] create_test_instance_ex: About to call InitSDK for instance={} (instance_id={})", (void*)instance, (long long)instance_id);
+    V2TIM_LOG(kInfo, "[ffi] create_test_instance_ex: event=init_sdk status=start");
     bool ok = instance->InitSDK(0, cfg);
     if (!ok) {
-        V2TIM_LOG(kError, "[ffi] create_test_instance_ex: InitSDK failed");
+        V2TIM_LOG(kError, "[ffi] create_test_instance_ex: event=init_sdk status=failure");
         // Clean up registration on failure
         {
             std::lock_guard<std::mutex> lock(g_test_instances_mutex);
@@ -1003,7 +1040,7 @@ int64_t tim2tox_ffi_create_test_instance_ex(const char* init_path, int local_dis
     instance->AddSimpleMsgListener(&G.simple_listener);
     RegisterToxManagerFileCallbacks(instance);
 
-    V2TIM_LOG(kInfo, "[ffi] create_test_instance_ex: InitSDK completed successfully for instance={} (instance_id={})", (void*)instance, (long long)instance_id);
+    V2TIM_LOG(kInfo, "[ffi] create_test_instance_ex: event=init_sdk status=success");
 
     MarkInstanceInited(instance_id);
 
@@ -1044,23 +1081,25 @@ extern "C" bool GetTestInstanceOptions(int64_t instance_id, int* out_local_disco
 
 int tim2tox_ffi_set_current_instance(int64_t instance_handle) {
     std::lock_guard<std::mutex> lock(g_test_instances_mutex);
-    
-    int64_t old_instance_id = g_current_instance_id;
-    
+
     if (instance_handle == 0) {
         g_current_instance_id = 0;
-        V2TIM_LOG(kInfo, "[ffi] set_current_instance: Changed from instance_id={} to 0 (default)", (long long)old_instance_id);
+        V2TIM_LOG(kInfo, "[ffi] set_current_instance: event=switch status=default");
         return 1;
     }
 
     auto it = g_test_instances.find(instance_handle);
     if (it == g_test_instances.end()) {
-        V2TIM_LOG(kError, "[ffi] set_current_instance: instance {} not found (total instances: {})", (long long)instance_handle, g_test_instances.size());
+        V2TIM_LOG(kError,
+                  "[ffi] set_current_instance: event=switch status=not_found total_instances={}",
+                  g_test_instances.size());
         return 0;
     }
 
     g_current_instance_id = instance_handle;
-    V2TIM_LOG(kInfo, "[ffi] set_current_instance: Changed from instance_id={} to {} (manager={})", (long long)old_instance_id, (long long)instance_handle, (void*)it->second);
+    V2TIM_LOG(kInfo,
+              "[ffi] set_current_instance: event=switch status=success total_instances={}",
+              g_test_instances.size());
     return 1;
 }
 
@@ -1082,8 +1121,6 @@ void ClearReceiverTextKindOverride(void) { g_receiver_text_kind_override = -1; }
 int64_t GetCurrentInstanceId() {
     std::lock_guard<std::mutex> lock(g_test_instances_mutex);
     int64_t instance_id = g_current_instance_id;
-    // fprintf(stdout, "[ffi] GetCurrentInstanceId: returning instance_id=%lld\n", (long long)instance_id);
-    // fflush(stdout);
     return instance_id;
 }
 
@@ -1236,7 +1273,7 @@ V2TIMManagerImpl* GetCurrentInstance() {
         // This ensures GetInstanceIdFromManager can find it
         if (default_instance && g_instance_to_id.find(default_instance) == g_instance_to_id.end()) {
             g_instance_to_id[default_instance] = 0;
-            V2TIM_LOG(kInfo, "[ffi] GetCurrentInstance: Registered default instance {} with instance_id=0", (void*)default_instance);
+            V2TIM_LOG(kInfo, "[ffi] GetCurrentInstance: event=register_default status=success");
         }
         return default_instance;
     }
@@ -1247,7 +1284,7 @@ V2TIMManagerImpl* GetCurrentInstance() {
     V2TIMManagerImpl* default_instance = V2TIMManagerImpl::GetInstance();
     if (default_instance && g_instance_to_id.find(default_instance) == g_instance_to_id.end()) {
         g_instance_to_id[default_instance] = 0;
-        V2TIM_LOG(kInfo, "[ffi] GetCurrentInstance: Registered default instance {} with instance_id=0 (fallback)", (void*)default_instance);
+        V2TIM_LOG(kInfo, "[ffi] GetCurrentInstance: event=register_default status=fallback_success");
     }
     return default_instance;
 }
@@ -1255,6 +1292,14 @@ V2TIMManagerImpl* GetCurrentInstance() {
 // R-08: Get manager for instance_id; no fallback to default (return nullptr if not found).
 static V2TIMManagerImpl* GetInstanceFromId(int64_t instance_id) {
     if (instance_id == 0) return GetCurrentInstance();
+    std::lock_guard<std::mutex> lock(g_test_instances_mutex);
+    auto it = g_test_instances.find(instance_id);
+    if (it != g_test_instances.end()) return it->second;
+    return nullptr;
+}
+
+static V2TIMManagerImpl* GetExactInstanceFromId(int64_t instance_id) {
+    if (instance_id == 0) return V2TIMManagerImpl::GetInstance();
     std::lock_guard<std::mutex> lock(g_test_instances_mutex);
     auto it = g_test_instances.find(instance_id);
     if (it != g_test_instances.end()) return it->second;
@@ -1270,7 +1315,9 @@ int tim2tox_ffi_init_with_path(const char* init_path) {
     V2TIMSDKConfig cfg;
     if (init_path && init_path[0] != '\0') {
         cfg.initPath = V2TIMString(init_path);
-        V2TIM_LOG(kInfo, "[ffi] tim2tox_ffi_init_with_path: using initPath={}", init_path);
+        V2TIM_LOG(kInfo,
+                  "[ffi] tim2tox_ffi_init_with_path: event=configure status=has_init_path init_path_length={}",
+                  SafeCStringLength(init_path));
     }
     V2TIMManagerImpl* manager_impl = GetCurrentInstance();
     manager_impl->AddSDKListener(&G.sdk_listener);
@@ -1284,63 +1331,63 @@ int tim2tox_ffi_init_with_path(const char* init_path) {
 }
 
 int tim2tox_ffi_login(const char* user_id, const char* user_sig) {
-    V2TIM_LOG(kInfo, "[ffi] tim2tox_ffi_login: ENTRY - user_id={}, user_sig={}, inited={}", user_id ? user_id : "(null)", user_sig ? "(provided)" : "(null)", IsCurrentInstanceInited());
+    V2TIM_LOG(kInfo,
+              "[ffi] tim2tox_ffi_login: event=entry status=start user_id_length={} has_user_sig={} inited={}",
+              SafeCStringLength(user_id), HasCStringValue(user_sig),
+              BoolMetadata(IsCurrentInstanceInited()));
 
     if (!IsCurrentInstanceInited()) {
-        V2TIM_LOG(kError, "[ffi] tim2tox_ffi_login: ERROR - current instance not inited, returning 0");
+        V2TIM_LOG(kError, "[ffi] tim2tox_ffi_login: event=entry status=not_inited");
         return 0;
     }
 
     static struct Cb : public V2TIMCallback {
         void OnSuccess() override {
-            V2TIM_LOG(kInfo, "[ffi] tim2tox_ffi_login: OnSuccess callback called");
+            V2TIM_LOG(kInfo, "[ffi] tim2tox_ffi_login: event=callback status=success");
         }
         void OnError(int code, const V2TIMString& msg) override {
-            V2TIM_LOG(kError, "[ffi] tim2tox_ffi_login: OnError callback called - code={}, msg={}", code, msg.CString());
-            V2TIM_LOG(kError, "[ffi] Login error {}: {}", code, msg.CString());
+            const char* message = msg.CString();
+            V2TIM_LOG(kError,
+                      "[ffi] tim2tox_ffi_login: event=callback status=error code={} message_length={}",
+                      code, SafeCStringLength(message));
         }
     } cb;
 
-    V2TIM_LOG(kInfo, "[ffi] tim2tox_ffi_login: Calling GetCurrentInstance()->Login()");
+    V2TIM_LOG(kInfo, "[ffi] tim2tox_ffi_login: event=dispatch status=start");
 
     GetCurrentInstance()->Login(user_id ? user_id : "", user_sig ? user_sig : "", &cb);
 
-    V2TIM_LOG(kInfo, "[ffi] tim2tox_ffi_login: EXIT - returning 1");
+    V2TIM_LOG(kInfo, "[ffi] tim2tox_ffi_login: event=exit status=success");
     return 1;
 }
 
 int tim2tox_ffi_login_async(int64_t instance_id, const char* user_id, const char* user_sig, tim2tox_login_callback_t callback, void* user_data) {
     int64_t id = (instance_id == 0) ? GetCurrentInstanceId() : instance_id;
-    // NOTE: keep both "instance_id" (original arg) and "id" (normalized) to debug routing issues.
     V2TIM_LOG(kInfo,
-              "[ffi] tim2tox_ffi_login_async: ENTRY instance_id={}, resolved_id={}, callback_ptr={}, user_data_ptr={}, user_id={}",
-              (long long)instance_id,
-              (long long)id,
-              (void*)callback,
-              user_data,
-              user_id ? user_id : "(null)");
+              "[ffi] tim2tox_ffi_login_async: event=entry status=start requested_default={} resolved_default={} has_callback={} has_user_data={} user_id_length={} has_user_sig={}",
+              BoolMetadata(instance_id == 0), BoolMetadata(id == 0),
+              BoolMetadata(callback != nullptr), BoolMetadata(user_data != nullptr),
+              SafeCStringLength(user_id), HasCStringValue(user_sig));
 
     V2TIMManagerImpl* manager = GetInstanceFromId(instance_id);
     if (!manager) {
         V2TIM_LOG(kError,
-                  "[ffi] tim2tox_ffi_login_async: ERROR manager not found for instance_id={}. callback_ptr={}",
-                  (long long)instance_id,
-                  (void*)callback);
+                  "[ffi] tim2tox_ffi_login_async: event=entry status=no_manager requested_default={} has_callback={}",
+                  BoolMetadata(instance_id == 0), BoolMetadata(callback != nullptr));
         if (callback) callback(0, -1, "instance not found", user_data);
         return 0;
     }
     if (!IsInstanceInited(id)) {
         V2TIM_LOG(kError,
-                  "[ffi] tim2tox_ffi_login_async: ERROR instance not inited for resolved_id={}. callback_ptr={}",
-                  (long long)id,
-                  (void*)callback);
+                  "[ffi] tim2tox_ffi_login_async: event=entry status=not_inited resolved_default={} has_callback={}",
+                  BoolMetadata(id == 0), BoolMetadata(callback != nullptr));
         if (callback) callback(0, -2, "instance not inited", user_data);
         return 0;
     }
     if (!user_id || !user_id[0]) {
         V2TIM_LOG(kError,
-                  "[ffi] tim2tox_ffi_login_async: ERROR user_id empty. callback_ptr={}",
-                  (void*)callback);
+                  "[ffi] tim2tox_ffi_login_async: event=entry status=empty_user_id has_callback={} user_id_length={}",
+                  BoolMetadata(callback != nullptr), SafeCStringLength(user_id));
         if (callback) callback(0, -3, "user_id empty", user_data);
         return 0;
     }
@@ -1353,21 +1400,19 @@ int tim2tox_ffi_login_async(int64_t instance_id, const char* user_id, const char
 
         void OnSuccess() override {
             V2TIM_LOG(kInfo,
-                      "[ffi] tim2tox_ffi_login_async: OnSuccess called. cb_ptr={}, ud_ptr={}",
-                      (void*)cb,
-                      ud);
+                      "[ffi] tim2tox_ffi_login_async: event=callback status=success has_callback={} has_user_data={}",
+                      BoolMetadata(cb != nullptr), BoolMetadata(ud != nullptr));
             if (cb) cb(1, 0, "", ud);
             delete this;
         }
         void OnError(int code, const V2TIMString& msg) override {
+            const char* message = msg.CString();
             V2TIM_LOG(kError,
-                      "[ffi] tim2tox_ffi_login_async: OnError called. code={}, cb_ptr={}, ud_ptr={}, msg={}",
-                      code,
-                      (void*)cb,
-                      ud,
-                      msg.CString());
+                      "[ffi] tim2tox_ffi_login_async: event=callback status=error code={} has_callback={} has_user_data={} message_length={}",
+                      code, BoolMetadata(cb != nullptr), BoolMetadata(ud != nullptr),
+                      SafeCStringLength(message));
             if (cb) {
-                std::string msg_copy(msg.CString());
+                std::string msg_copy(message ? message : "");
                 cb(0, code, msg_copy.c_str(), ud);
             }
             delete this;
@@ -1376,9 +1421,9 @@ int tim2tox_ffi_login_async(int64_t instance_id, const char* user_id, const char
     auto* login_cb = new LoginCb(callback, user_data);
     manager->Login(user_id ? user_id : "", user_sig ? user_sig : "", login_cb);
     V2TIM_LOG(kInfo,
-              "[ffi] tim2tox_ffi_login_async: EXIT (Login invoked). instance_id={}, resolved_id={}",
-              (long long)instance_id,
-              (long long)id);
+              "[ffi] tim2tox_ffi_login_async: event=dispatch status=invoked requested_default={} resolved_default={} user_id_length={} has_user_sig={}",
+              BoolMetadata(instance_id == 0), BoolMetadata(id == 0),
+              SafeCStringLength(user_id), HasCStringValue(user_sig));
     return 1;
 }
 
@@ -1408,10 +1453,16 @@ static void EmitFriendAddResultCallback(const std::string& user_id,
 }
 
 int tim2tox_ffi_add_friend(const char* user_id, const char* wording) {
-    V2TIM_LOG(kInfo, "[ffi] tim2tox_ffi_add_friend: ENTRY - user_id={}, wording={}, inited={}", user_id ? user_id : "(null)", wording ? wording : "(null)", IsCurrentInstanceInited());
+    V2TIM_LOG(kInfo,
+              "[ffi] tim2tox_ffi_add_friend: event=entry status=start user_id_length={} wording_length={} has_wording={} inited={}",
+              SafeCStringLength(user_id), SafeCStringLength(wording),
+              HasCStringValue(wording), BoolMetadata(IsCurrentInstanceInited()));
 
     if (!IsCurrentInstanceInited() || !user_id) {
-        V2TIM_LOG(kError, "[ffi] tim2tox_ffi_add_friend: ERROR - inited={}, user_id={}, returning 0", IsCurrentInstanceInited(), (void*)user_id);
+        V2TIM_LOG(kError,
+                  "[ffi] tim2tox_ffi_add_friend: event=entry status=invalid_state has_user_id={} user_id_length={} inited={}",
+                  BoolMetadata(user_id != nullptr), SafeCStringLength(user_id),
+                  BoolMetadata(IsCurrentInstanceInited()));
         // Emit a synthetic failure so the Dart-side Completer doesn't hang on
         // a sync-dispatch failure. user_id may be null here.
         EmitFriendAddResultCallback(user_id ? user_id : "",
@@ -1437,24 +1488,31 @@ int tim2tox_ffi_add_friend(const char* user_id, const char* wording) {
             // resultCode is a failure even though the callback is named
             // OnSuccess — log accordingly so the log line doesn't mislead
             // readers (e.g. result_code=6770 = ERR_INVALID_PARAMETERS).
+            const char* result_info = r.resultInfo.CString();
             if (r.resultCode == 0) {
-                V2TIM_LOG(kInfo, "[ffi] tim2tox_ffi_add_friend: OnSuccess - result_code={}, result_info={}", r.resultCode, r.resultInfo.CString());
+                V2TIM_LOG(kInfo,
+                          "[ffi] tim2tox_ffi_add_friend: event=callback status=success result_code={} result_info_length={}",
+                          r.resultCode, SafeCStringLength(result_info));
             } else {
-                V2TIM_LOG(kError, "[ffi] tim2tox_ffi_add_friend: OnFailure - result_code={}, result_info={}", r.resultCode, r.resultInfo.CString());
+                V2TIM_LOG(kError,
+                          "[ffi] tim2tox_ffi_add_friend: event=callback status=failure result_code={} result_info_length={}",
+                          r.resultCode, SafeCStringLength(result_info));
             }
             // Prefer the requested user_id (full Tox address as the caller
             // typed it) over r.userID (which the manager normalizes to the
             // 64-char public key) so Dart can match the Completer it
             // registered against the same key the caller used.
             EmitFriendAddResultCallback(requested_user_id, r.resultCode,
-                                        r.resultInfo.CString() ? r.resultInfo.CString() : "");
+                                        result_info ? result_info : "");
             delete this;
         }
         void OnError(int code, const V2TIMString& msg) override {
-            V2TIM_LOG(kError, "[ffi] tim2tox_ffi_add_friend: OnError - code={}, msg={}", code, msg.CString());
-            V2TIM_LOG(kError, "[ffi] AddFriend error {}: {}", code, msg.CString());
+            const char* message = msg.CString();
+            V2TIM_LOG(kError,
+                      "[ffi] tim2tox_ffi_add_friend: event=callback status=error code={} message_length={}",
+                      code, SafeCStringLength(message));
             EmitFriendAddResultCallback(requested_user_id, code,
-                                        msg.CString() ? msg.CString() : "");
+                                        message ? message : "");
             delete this;
         }
     };
@@ -1465,21 +1523,31 @@ int tim2tox_ffi_add_friend(const char* user_id, const char* wording) {
 }
 
 int tim2tox_ffi_send_c2c_text(const char* user_id, const char* text) {
-    V2TIM_LOG(kInfo, "[ffi] tim2tox_ffi_send_c2c_text: ENTRY - text_len={}, inited={}", text ? strlen(text) : 0, IsCurrentInstanceInited());
+    V2TIM_LOG(kInfo,
+              "[ffi] tim2tox_ffi_send_c2c_text: event=entry status=start user_id_length={} text_length={} inited={}",
+              SafeCStringLength(user_id), SafeCStringLength(text),
+              BoolMetadata(IsCurrentInstanceInited()));
 
     if (!IsCurrentInstanceInited() || !user_id || !text) {
-        V2TIM_LOG(kError, "[ffi] tim2tox_ffi_send_c2c_text: invalid parameters - inited={}, returning 0", IsCurrentInstanceInited());
+        V2TIM_LOG(kError,
+                  "[ffi] tim2tox_ffi_send_c2c_text: event=entry status=invalid_state has_user_id={} has_text={} text_length={} inited={}",
+                  BoolMetadata(user_id != nullptr), BoolMetadata(text != nullptr),
+                  SafeCStringLength(text), BoolMetadata(IsCurrentInstanceInited()));
         return 0;
     }
 
     struct SendCb : public V2TIMSendCallback {
         void OnSuccess(const V2TIMMessage& m) override {
-            (void)m;
-            V2TIM_LOG(kInfo, "[ffi] tim2tox_ffi_send_c2c_text: OnSuccess");
+            const char* message_id = m.msgID.CString();
+            V2TIM_LOG(kInfo,
+                      "[ffi] tim2tox_ffi_send_c2c_text: event=callback status=success message_id_length={}",
+                      SafeCStringLength(message_id));
         }
         void OnError(int code, const V2TIMString& msg) override {
-            (void)msg;
-            V2TIM_LOG(kError, "[ffi] tim2tox_ffi_send_c2c_text: OnError - code={}", code);
+            const char* message = msg.CString();
+            V2TIM_LOG(kError,
+                      "[ffi] tim2tox_ffi_send_c2c_text: event=callback status=error code={} message_length={}",
+                      code, SafeCStringLength(message));
         }
         void OnProgress(uint32_t p) override {
             (void)p;
@@ -1495,11 +1563,13 @@ int tim2tox_ffi_send_c2c_text(const char* user_id, const char* text) {
     }
     V2TIMString msg_id = manager_impl->SendC2CTextMessage(text, user_id, &sendcb);
     if (msg_id.Empty()) {
-        V2TIM_LOG(kError, "[ffi] tim2tox_ffi_send_c2c_text: EXIT - empty msg_id, returning 0");
+        V2TIM_LOG(kError, "[ffi] tim2tox_ffi_send_c2c_text: event=exit status=empty_message_id");
         return 0;
     }
 
-    V2TIM_LOG(kInfo, "[ffi] tim2tox_ffi_send_c2c_text: EXIT - returning success");
+    V2TIM_LOG(kInfo,
+              "[ffi] tim2tox_ffi_send_c2c_text: event=exit status=success message_id_length={}",
+              SafeCStringLength(msg_id.CString()));
     return 1;
 }
 
@@ -1716,7 +1786,7 @@ int tim2tox_ffi_save_friend_status_message(const char* friend_id, const char* st
 }
 
 static int get_friend_applications_impl(V2TIMManager* manager, char* buffer, int buffer_len) {
-    if (!manager || !buffer || buffer_len <= 0) return 0;
+    if (!manager) return 0;
     struct RCb : public V2TIMValueCallback<V2TIMFriendApplicationResult> {
         std::string out; std::mutex m; std::condition_variable cv; bool done=false;
         void OnSuccess(const V2TIMFriendApplicationResult& r) override {
@@ -1736,20 +1806,16 @@ static int get_friend_applications_impl(V2TIMManager* manager, char* buffer, int
     manager->GetFriendshipManager()->GetFriendApplicationList(&rcb);
     std::unique_lock<std::mutex> lk(rcb.m);
     rcb.cv.wait_for(lk, std::chrono::seconds(3), [&]{return rcb.done;});
-    int n = (int)std::min(rcb.out.size(), (size_t)(buffer_len - 1));
-    if (n > 0) memcpy(buffer, rcb.out.data(), n);
-    buffer[n] = 0;
-    return n;
+    return CopyPayloadOrReturnRequiredCapacity(rcb.out, buffer, buffer_len);
 }
 
 int tim2tox_ffi_get_friend_applications(char* buffer, int buffer_len) {
-    if (!IsCurrentInstanceInited() || !buffer || buffer_len <= 0) return 0;
+    if (!IsCurrentInstanceInited()) return 0;
     return get_friend_applications_impl(GetCurrentInstance(), buffer, buffer_len);
 }
 
 int tim2tox_ffi_get_friend_applications_for_instance(int64_t instance_id, char* buffer, int buffer_len) {
-    int64_t id = (instance_id == 0) ? GetCurrentInstanceId() : instance_id;
-    if (!IsInstanceInited(id) || !buffer || buffer_len <= 0) return 0;
+    if (!IsInstanceInited(instance_id)) return 0;
     V2TIMManager* manager = GetManagerForInstanceId(instance_id);
     if (!manager) return 0;
     return get_friend_applications_impl(manager, buffer, buffer_len);
@@ -1851,8 +1917,8 @@ int tim2tox_ffi_create_group(const char* group_name, const char* group_type, cha
         V2TIMString groupID("");
         V2TIMString groupName(group_name ? group_name : "");
         manager_impl->CreateGroup(groupTypeStr, groupID, groupName, &cb);
-    } catch (const std::exception& e) {
-        V2TIM_LOG(kError, "[ffi] CreateGroup: Exception caught when calling CreateGroup: {}", e.what());
+    } catch (const std::exception&) {
+        V2TIM_LOG(kError, "[ffi] CreateGroup: exception caught when calling CreateGroup");
         return 0;
     } catch (...) {
         V2TIM_LOG(kError, "[ffi] CreateGroup: Unknown exception caught when calling CreateGroup (possible vtable corruption)");
@@ -3746,8 +3812,8 @@ int tim2tox_ffi_av_initialize(int64_t instance_id) {
         }
         V2TIM_LOG(kInfo, "[ffi] tim2tox_ffi_av_initialize() succeeded");
         return 1;
-    } catch (const std::exception& e) {
-        V2TIM_LOG(kError, "[ffi] tim2tox_ffi_av_initialize() exception: {}", e.what());
+    } catch (const std::exception&) {
+        V2TIM_LOG(kError, "[ffi] tim2tox_ffi_av_initialize() exception");
         return 0;
     } catch (...) {
         V2TIM_LOG(kError, "[ffi] tim2tox_ffi_av_initialize() unknown exception");
@@ -3761,17 +3827,21 @@ void tim2tox_ffi_av_shutdown(int64_t instance_id) {
     V2TIM_LOG(kInfo, "[ffi] tim2tox_ffi_av_shutdown() instance_id={}", (long long)instance_id);
     ClearPendingAVBitrateEvents(instance_id);
 
+    V2TIMManagerImpl* manager_impl = GetInstanceFromId(instance_id);
+    if (manager_impl) {
+        manager_impl->ClearAVConferenceAudioCallback();
+    }
+
     {
         std::lock_guard<std::mutex> lock(g_av_callbacks_mutex);
         if (g_av_initialized_instances.find(instance_id) == g_av_initialized_instances.end()) {
             V2TIM_LOG(kInfo, "[ffi] tim2tox_ffi_av_shutdown() instance {} not initialized, skipping", (long long)instance_id);
+            g_instance_av_callbacks.erase(instance_id);
             return;
         }
     }
     
-    V2TIMManagerImpl* manager_impl = GetInstanceFromId(instance_id);
     if (manager_impl) {
-        manager_impl->ClearAVConferenceAudioCallback();
         ToxAVManager* av_mgr = manager_impl->GetToxAVManager();
         if (av_mgr) {
             av_mgr->shutdown();
@@ -3802,6 +3872,7 @@ void tim2tox_ffi_av_iterate(int64_t instance_id) {
         ToxAVManager* av_mgr = manager_impl->GetToxAVManager();
         if (av_mgr) {
             av_mgr->iterate();
+            manager_impl->DrainPendingAVConferenceAudioFrames();
             DrainAVBitrateEvents(instance_id);
         }
     }
@@ -4109,6 +4180,13 @@ void tim2tox_ffi_av_conference_set_audio_receive_callback(
     callbacks->on_conference_audio_receive_user_data = user_data;
 }
 
+void tim2tox_ffi_av_conference_clear_pending_audio(int64_t instance_id) {
+    V2TIMManagerImpl* manager = GetExactInstanceFromId(instance_id);
+    if (!manager)
+        return;
+    manager->ClearPendingAVConferenceAudioFrames();
+}
+
 static bool IsValidConferenceAudioFrame(size_t sample_count, uint8_t channels,
                                         uint32_t sampling_rate) {
     if (sample_count == 0 || sample_count > UINT32_MAX ||
@@ -4190,21 +4268,17 @@ int tim2tox_ffi_av_conference_mute(int64_t instance_id, const char* group_id,
 // Helper function: Get friend number by user ID
 // This function is always available, not just when BUILD_TOXAV is enabled
 // It's moved outside BUILD_TOXAV block because it doesn't depend on ToxAV
-uint32_t tim2tox_ffi_get_friend_number_by_user_id(const char* user_id) {
-    V2TIM_LOG(kInfo, "[ffi] get_friend_number_by_user_id: called with user_id={}", user_id ? user_id : "(null)");
-    
-    if (!IsCurrentInstanceInited()) {
-        V2TIM_LOG(kError, "[ffi] get_friend_number_by_user_id: current instance not inited");
-        return UINT32_MAX;
-    }
-    
+static uint32_t GetFriendNumberByUserIdOnManager(
+    V2TIMManagerImpl* manager_impl, const char* user_id) {
+    V2TIM_LOG(kInfo,
+              "[ffi] get_friend_number_by_user_id: event=entry status=start has_user_id={} user_id_length={}",
+              BoolMetadata(user_id != nullptr), SafeCStringLength(user_id));
+
     if (!user_id) {
         V2TIM_LOG(kError, "[ffi] get_friend_number_by_user_id: user_id is null");
         return UINT32_MAX;
     }
-    
-    // Use ToxManager to get friend number
-    V2TIMManagerImpl* manager_impl = GetCurrentInstance();
+
     if (!manager_impl) {
         V2TIM_LOG(kError, "[ffi] get_friend_number_by_user_id: V2TIMManagerImpl instance not available");
         return UINT32_MAX;
@@ -4233,7 +4307,11 @@ uint32_t tim2tox_ffi_get_friend_number_by_user_id(const char* user_id) {
         user_id_len--;
     }
     
-    V2TIM_LOG(kInfo, "[ffi] get_friend_number_by_user_id: original user_id='{}', trimmed length={} (expected 64 or 76)", user_id, user_id_len);
+    V2TIM_LOG(kInfo,
+              "[ffi] get_friend_number_by_user_id: event=normalize status=trimmed input_length={} trimmed_length={} expected_public_key_length={} expected_address_length={}",
+              SafeCStringLength(user_id), user_id_len,
+              static_cast<int>(TOX_PUBLIC_KEY_SIZE * 2),
+              static_cast<int>(TOX_ADDRESS_SIZE * 2));
     
     if (user_id_len == 0) {
         V2TIM_LOG(kError, "[ffi] get_friend_number_by_user_id: user_id is empty after trimming");
@@ -4261,19 +4339,22 @@ uint32_t tim2tox_ffi_get_friend_number_by_user_id(const char* user_id) {
             V2TIM_LOG(kError, "[ffi] get_friend_number_by_user_id: failed to convert 76-char hex string to bytes (invalid hex)");
         }
     } else {
-        V2TIM_LOG(kError, "[ffi] get_friend_number_by_user_id: invalid user_id length {} (expected {} or {}). first 20 chars: {}",
-                  user_id_len, (int)(TOX_PUBLIC_KEY_SIZE * 2), (int)(TOX_ADDRESS_SIZE * 2),
-                  user_id_len > 20 ? std::string(trimmed_start, 20) : std::string(trimmed_start));
+        V2TIM_LOG(kError,
+                  "[ffi] get_friend_number_by_user_id: event=validate status=invalid_length trimmed_length={} expected_public_key_length={} expected_address_length={}",
+                  user_id_len, static_cast<int>(TOX_PUBLIC_KEY_SIZE * 2),
+                  static_cast<int>(TOX_ADDRESS_SIZE * 2));
     }
     
     if (!converted) {
-        V2TIM_LOG(kError, "[ffi] get_friend_number_by_user_id: hex conversion failed for user_id={}", user_id);
+        V2TIM_LOG(kError,
+                  "[ffi] get_friend_number_by_user_id: event=convert status=failure trimmed_length={}",
+                  user_id_len);
         return UINT32_MAX;
     }
     
-    // Debug: print first few bytes of converted public key
-    V2TIM_LOG(kInfo, "[ffi] get_friend_number_by_user_id: converted public_key (first 4 bytes): {} {} {} {}",
-              (int)public_key[0], (int)public_key[1], (int)public_key[2], (int)public_key[3]);
+    V2TIM_LOG(kInfo,
+              "[ffi] get_friend_number_by_user_id: event=convert status=success key_length={}",
+              static_cast<int>(TOX_PUBLIC_KEY_SIZE));
     
     // Check friend list size for debugging
     size_t friend_count = tox_self_get_friend_list_size(tox);
@@ -4291,13 +4372,33 @@ uint32_t tim2tox_ffi_get_friend_number_by_user_id(const char* user_id) {
             case TOX_ERR_FRIEND_BY_PUBLIC_KEY_NOT_FOUND: errorStr = "NOT_FOUND"; break;
             default: errorStr = "UNKNOWN"; break;
         }
-        V2TIM_LOG(kError, "[ffi] get_friend_number_by_user_id: tox_friend_by_public_key failed with error {} ({}) for user_id={}",
-                  err, errorStr, user_id);
+        V2TIM_LOG(kError,
+                  "[ffi] get_friend_number_by_user_id: event=lookup status=failure error={} error_name={} trimmed_length={}",
+                  err, errorStr, user_id_len);
         return UINT32_MAX;
     }
     
-    V2TIM_LOG(kInfo, "[ffi] get_friend_number_by_user_id: successfully found friend_number={} for user_id={}", friend_number, user_id);
+    V2TIM_LOG(kInfo, "[ffi] get_friend_number_by_user_id: event=lookup status=success");
     return friend_number;
+}
+
+uint32_t tim2tox_ffi_get_friend_number_by_user_id_for_instance(
+    int64_t instance_id, const char* user_id) {
+    if (!IsInstanceInited(instance_id)) {
+        V2TIM_LOG(kError,
+                  "[ffi] get_friend_number_by_user_id_for_instance: exact instance not inited");
+        return UINT32_MAX;
+    }
+    return GetFriendNumberByUserIdOnManager(
+        GetExactInstanceFromId(instance_id), user_id);
+}
+
+uint32_t tim2tox_ffi_get_friend_number_by_user_id(const char* user_id) {
+    if (!IsCurrentInstanceInited()) {
+        V2TIM_LOG(kError, "[ffi] get_friend_number_by_user_id: current instance not inited");
+        return UINT32_MAX;
+    }
+    return GetFriendNumberByUserIdOnManager(GetCurrentInstance(), user_id);
 }
 
 // Helper function: Get user ID (public key hex string) by friend number
@@ -4332,14 +4433,16 @@ const char* tim2tox_ffi_get_user_id_by_friend_number(uint32_t friend_number) {
     bool ok = tox_friend_get_public_key(tox, friend_number, public_key, &err);
 
     if (!ok || err != TOX_ERR_FRIEND_GET_PUBLIC_KEY_OK) {
-        V2TIM_LOG(kError, "[ffi] get_user_id_by_friend_number: tox_friend_get_public_key failed for friend_number={}, err={}", friend_number, (int)err);
+        V2TIM_LOG(kError,
+                  "[ffi] get_user_id_by_friend_number: event=lookup status=failure error={}",
+                  static_cast<int>(err));
         return nullptr;
     }
 
     // Convert 32-byte public key to 64-char hex string
     std::string hex = ToxUtil::tox_bytes_to_hex(public_key, TOX_PUBLIC_KEY_SIZE);
     if (hex.empty()) {
-        V2TIM_LOG(kError, "[ffi] get_user_id_by_friend_number: tox_bytes_to_hex returned empty for friend_number={}", friend_number);
+        V2TIM_LOG(kError, "[ffi] get_user_id_by_friend_number: event=convert status=empty_hex");
         return nullptr;
     }
 
@@ -4348,7 +4451,9 @@ const char* tim2tox_ffi_get_user_id_by_friend_number(uint32_t friend_number) {
     memset(result_buf, 0, sizeof(result_buf));
     strncpy(result_buf, hex.c_str(), TOX_PUBLIC_KEY_SIZE * 2);
 
-    V2TIM_LOG(kInfo, "[ffi] get_user_id_by_friend_number: successfully found user_id={} for friend_number={}", result_buf, friend_number);
+    V2TIM_LOG(kInfo,
+              "[ffi] get_user_id_by_friend_number: event=lookup status=success user_id_length={}",
+              static_cast<int>(TOX_PUBLIC_KEY_SIZE * 2));
     return result_buf;
 }
 
@@ -4387,6 +4492,12 @@ void tim2tox_ffi_av_set_audio_bitrate_callback(int64_t, tim2tox_av_audio_bitrate
 void tim2tox_ffi_av_set_video_bitrate_callback(int64_t, tim2tox_av_video_bitrate_callback_t, void*) {}
 void tim2tox_ffi_av_conference_set_audio_receive_callback(
     int64_t, tim2tox_av_conference_audio_receive_callback_t, void*) {}
+void tim2tox_ffi_av_conference_clear_pending_audio(int64_t instance_id) {
+    V2TIMManagerImpl* manager = GetExactInstanceFromId(instance_id);
+    if (!manager)
+        return;
+    manager->ClearPendingAVConferenceAudioFrames();
+}
 int tim2tox_ffi_av_conference_send_audio_frame(
     int64_t, const char*, const int16_t*, size_t, uint8_t, uint32_t) { return 0; }
 int tim2tox_ffi_av_conference_enable(int64_t, const char*) { return 0; }

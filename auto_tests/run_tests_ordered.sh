@@ -15,6 +15,8 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
+. "$SCRIPT_DIR/bundle_attribution.sh"
+
 _stage_native_library_for_flutter_tests() {
   local lib_name
   local flutter_engine_arch
@@ -513,6 +515,13 @@ PHASE2_FRIENDSHIP=(
   "test/scenarios/scenario_friend_read_receipt_test.dart"
   "test/scenarios/scenario_friend_request_spam_test.dart"
 )
+
+if [ "${RUN_VIRTUAL:-0}" = "1" ]; then
+  PHASE2_FRIENDSHIP=(
+    "test/scenarios/scenario_virtual_friendship_contract_test.dart"
+    "${PHASE2_FRIENDSHIP[@]}"
+  )
+fi
 
 PHASE3_MESSAGE=(
   "test/scenarios/scenario_message_test.dart"
@@ -1078,7 +1087,9 @@ run_phase_bundled() {
   # at the top of the script would otherwise abort on the non-zero status;
   # `|| true` pattern keeps the script going while preserving the code.
   local exit_code=0
-  timeout "${bundle_timeout}s" flutter test "${resolved_files[@]}" > "$bundle_log" 2>&1 || exit_code=$?
+  # Every suite shares process-global FFI instance routing and virtual-clock
+  # state, so a bundled invocation must serialize its input files.
+  timeout "${bundle_timeout}s" flutter test --concurrency=1 "${resolved_files[@]}" > "$bundle_log" 2>&1 || exit_code=$?
   local end_time
   end_time=$(date +%s)
   local duration=$((end_time - start_time))
@@ -1096,39 +1107,28 @@ run_phase_bundled() {
     echo -e "${RED}❌ BUNDLE FAILED: $phase_name (${duration}s, exit=$exit_code)${NC}" | tee -a "$RESULTS_FILE"
   fi
 
-  # Try to extract per-file pass/fail from flutter test's output. Each
-  # failing test prints a line like:
-  #   "00:34 +5 -1: <file.dart>: <group> <test name> [E]"
-  # We grep the unique file paths that had failures and attribute them.
-  local failed_files
-  failed_files=$(grep -E "\-[0-9]+:.+\.dart:" "$bundle_log" 2>/dev/null \
-                  | grep -oE "/[^[:space:]]+\.dart" 2>/dev/null \
-                  | sort -u || true)
   local bundle_failed=0
   local bundle_passed=0
-  if [ -n "$failed_files" ]; then
-    for ff in $failed_files; do
-      FAILED_TESTS+=("$(basename "$ff" .dart) (BUNDLE)")
-      ((bundle_failed++))
-    done
-  fi
-  # Any file we sent that didn't appear in failed_files is treated as passed.
-  for tf in "${resolved_files[@]}"; do
-    local hit=0
-    for ff in $failed_files; do
-      if [ "$(basename "$tf")" = "$(basename "$ff")" ]; then
-        hit=1
-        break
-      fi
-    done
-    if [ "$hit" -eq 0 ]; then
-      ((bundle_passed++))
-    fi
-  done
+  local status test_name label
+  while IFS=$'\t' read -r status test_name label; do
+    case "$status" in
+      FAILED)
+        if [ "$label" = "BUNDLE" ]; then
+          FAILED_TESTS+=("$test_name (BUNDLE)")
+        else
+          FAILED_TESTS+=("$test_name ($label)")
+        fi
+        bundle_failed=$((bundle_failed + 1))
+        ;;
+      PASSED)
+        bundle_passed=$((bundle_passed + 1))
+        ;;
+    esac
+  done < <(bundle_attribution_rows "$exit_code" "$bundle_log" "${resolved_files[@]}")
   TOTAL_PASSED=$((TOTAL_PASSED + bundle_passed))
   TOTAL_FAILED=$((TOTAL_FAILED + bundle_failed))
 
-  echo -e "${YELLOW}[Bundle] $bundle_passed pass / $bundle_failed fail (attributed); see $bundle_log${NC}" | tee -a "$RESULTS_FILE"
+  echo -e "${YELLOW}[Bundle] $bundle_passed pass / $bundle_failed fail (parsed/conservative); see $bundle_log${NC}" | tee -a "$RESULTS_FILE"
   # Show last 50 lines for diagnostics
   echo -e "${YELLOW}Last 50 lines of bundle log:${NC}" | tee -a "$RESULTS_FILE"
   tail -50 "$bundle_log" | tee -a "$RESULTS_FILE"
