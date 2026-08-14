@@ -43,36 +43,65 @@ String? resolveTim2ToxLibraryPath() {
     _ => throw UnsupportedError('Tim2Tox FFI library is unavailable.'),
   };
 
+  for (final directory in _tim2toxLibraryDirectories()) {
+    final library = File(path.join(directory, libraryName));
+    if (library.existsSync()) {
+      return path.normalize(library.absolute.path);
+    }
+  }
+
+  // Not under any known build directory. Return null rather than throwing:
+  // null leaves the path unset, so Tim2ToxFfi.open() / NativeLibraryManager
+  // fall back to their own search (next to the executable, then the system
+  // search path). CI depends on exactly that — run_tests_ordered.sh stages the
+  // library beside `flutter_tester` and the workflow exports LD_LIBRARY_PATH,
+  // so a hard throw here turned a working loader into a suite-wide setUpAll
+  // failure.
+  return null;
+}
+
+/// Directories that may hold a built Tim2Tox native library, most-specific
+/// first. Mirrors the candidate list in `auto_tests/run_tests_ordered.sh`:
+/// `build/ffi` is the local `build_ffi.sh` output, `build/ci-<os>/ffi` is what
+/// `tool/ci/build_tim2tox.sh` produces, and `build/native-artifacts/<os>` is
+/// the superproject cache the toxee workflows restore into.
+Iterable<String> _tim2toxLibraryDirectories() sync* {
   final checkout = Directory.current.absolute;
-  late final String libraryDirectory;
+  final String tim2toxRoot;
+  final String superprojectRoot;
   if (_hasCheckoutMarkers(checkout, const [
     'pubspec.yaml',
     'test/test_fixtures.dart',
     '../CMakeLists.txt',
   ])) {
-    libraryDirectory = path.join(checkout.path, '..', 'build', 'ffi');
+    // Launched from auto_tests/ (the usual case, including CI).
+    tim2toxRoot = path.join(checkout.path, '..');
+    superprojectRoot = path.join(checkout.path, '..', '..');
   } else if (_hasCheckoutMarkers(checkout, const [
     'CMakeLists.txt',
     'dart/pubspec.yaml',
     'auto_tests/pubspec.yaml',
   ])) {
-    libraryDirectory = path.join(checkout.path, 'build', 'ffi');
+    tim2toxRoot = checkout.path;
+    superprojectRoot = path.join(checkout.path, '..');
   } else if (_hasCheckoutMarkers(checkout, const [
     'pubspec.yaml',
     'lib/main.dart',
     'third_party/tim2tox/CMakeLists.txt',
   ])) {
-    libraryDirectory =
-        path.join(checkout.path, 'third_party', 'tim2tox', 'build', 'ffi');
+    tim2toxRoot = path.join(checkout.path, 'third_party', 'tim2tox');
+    superprojectRoot = checkout.path;
   } else {
     throw StateError('Unable to classify the current checkout.');
   }
 
-  final library = File(path.join(libraryDirectory, libraryName));
-  if (!library.existsSync()) {
-    throw StateError('Tim2Tox FFI library is unavailable.');
+  final os = Platform.operatingSystem;
+  yield path.join(tim2toxRoot, 'build', 'ffi');
+  yield path.join(tim2toxRoot, 'build', 'ci-$os', 'ffi');
+  if (Platform.isWindows) {
+    yield path.join(tim2toxRoot, 'build', 'ci-$os', 'ffi', 'Release');
   }
-  return path.normalize(library.absolute.path);
+  yield path.join(superprojectRoot, 'build', 'native-artifacts', os);
 }
 
 bool _hasCheckoutMarkers(Directory checkout, List<String> markers) => markers
