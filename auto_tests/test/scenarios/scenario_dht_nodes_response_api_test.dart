@@ -293,7 +293,13 @@ void main() {
         ffiInstance.setCurrentInstance(prev);
         try {
           dir.deleteSync(recursive: true);
-        } catch (_) {}
+        } catch (e) {
+          // Non-fatal: the probe instance is already destroyed, so a leftover
+          // temp dir cannot affect the verdict. Report it rather than swallow
+          // it — a repeated failure here means the instance did not release
+          // its save file, which IS worth noticing.
+          print('[dht-probe] temp dir cleanup failed (${dir.path}): $e');
+        }
       }
     }, timeout: const Timeout(Duration(seconds: 180)));
   });

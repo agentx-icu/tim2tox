@@ -157,7 +157,7 @@ run_check "No empty catchError handlers" \
 # braces, so `catch (_) { // retry — request may have been dropped }` sails past
 # it. That comment-only form is the shape actually used in this suite, and it
 # swallows real failures exactly the same way. Ratcheted at the 2026-08-08 count.
-run_ratchet "No NEW comment-only catch blocks" 37 \
+run_ratchet "No NEW comment-only catch blocks" 36 \
   "catch\\s*\\([^\\)]*\\)\\s*\\{(?:\\s*//[^\\n]*\\n)*\\s*\\}"
 
 if [ "$FAILED" -ne 0 ]; then
