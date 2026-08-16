@@ -32,6 +32,15 @@ public:
                    size_t savedata_length = 0);
     void shutdown();
 
+    // A fixed TCP-relay-server port (TOX_TCP_RELAY_PORT / debug.toxee.tcp_relay_port)
+    // is a PER-PROCESS resource: only one Tox in the process can bind it, and a
+    // second one fails tox_new outright with TOX_ERR_NEW_PORT_ALLOC. Auxiliary
+    // instances (e.g. a short-lived bootstrap-node reachability probe) neither
+    // need nor may run a relay server, so the session instance keeps the port
+    // and everyone else silently runs without one. Default true so the ordinary
+    // single-instance path is unchanged.
+    void setTcpRelayServerAllowed(bool allowed) { tcp_relay_server_allowed_ = allowed; }
+
     // 核心功能接口
     Tox* getTox() const;
     void iterate(uint32_t timeout = 0);
@@ -297,6 +306,7 @@ private:
     mutable std::mutex mutex_;
     std::mutex iterate_mutex_;  // Serialize tox_iterate - toxcore requires single-threaded access per instance
     std::atomic<bool> is_shutting_down_{false};  // Flag to prevent double cleanup; atomic for lock-free read in iterate()
+    bool tcp_relay_server_allowed_{true};  // see setTcpRelayServerAllowed
 
     // 回调存储
     SelfConnectionStatusCallback self_connection_status_cb_;

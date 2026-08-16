@@ -361,19 +361,28 @@ class Tim2ToxFailedMessagePersistence {
   /// When [accountToxId] is provided, only that account's failed-message key is
   /// scanned. The method still preserves legacy 16-char-prefix migration by
   /// migrating before the scan.
-  static Future<void> removeFailedMessagesByIDs({
+  /// Returns the NUMBER of failed rows actually removed.
+  ///
+  /// The count matters because a failed (never-sent) message lives ONLY here —
+  /// it is not in `FfiChatService`'s history. `Tim2ToxSdkPlatform.deleteMessages`
+  /// adds this count to the history count so its `desc` can distinguish "this
+  /// call removed something" from "the messages were already absent"; both are
+  /// reported as SUCCESS (delete-for-me is idempotent), so the count is
+  /// diagnostic, not a verdict. Never report a removal that did not happen:
+  /// callers read the total to log a no-op.
+  static Future<int> removeFailedMessagesByIDs({
     required Set<String> messageIDs,
     String? accountToxId,
   }) async {
-    if (messageIDs.isEmpty) return;
+    if (messageIDs.isEmpty) return 0;
     try {
       final prefs = await SharedPreferences.getInstance();
       await _migrateLegacyPrefixKey(prefs, accountToxId);
       final key = _storageKey(accountToxId);
       final failedMessagesMap = _decodeStore(prefs.getString(key));
-      if (failedMessagesMap == null || failedMessagesMap.isEmpty) return;
+      if (failedMessagesMap == null || failedMessagesMap.isEmpty) return 0;
 
-      var changed = false;
+      var removed = 0;
       for (final entry in failedMessagesMap.entries.toList()) {
         final rawList = entry.value;
         if (rawList is! List) continue;
@@ -385,7 +394,7 @@ class Tim2ToxFailedMessagePersistence {
             .where((message) => !_matchesMessageID(message, messageIDs))
             .toList();
         if (filtered.length == conversationFailedMessages.length) continue;
-        changed = true;
+        removed += conversationFailedMessages.length - filtered.length;
         if (filtered.isEmpty) {
           failedMessagesMap.remove(entry.key);
         } else {
@@ -393,11 +402,13 @@ class Tim2ToxFailedMessagePersistence {
         }
       }
 
-      if (changed) {
+      if (removed > 0) {
         await prefs.setString(key, json.encode(failedMessagesMap));
       }
+      return removed;
     } catch (e) {
       // Ignore errors.
+      return 0;
     }
   }
 

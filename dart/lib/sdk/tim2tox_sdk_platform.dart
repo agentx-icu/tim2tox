@@ -2413,24 +2413,28 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
     );
   }
 
-  Future<void> _removeFailedMessagesByIDsForCurrentAccount(
+  /// Returns the number of failed rows removed across both keys, so callers can
+  /// tell a real removal from a no-op.
+  Future<int> _removeFailedMessagesByIDsForCurrentAccount(
     Iterable<String> msgIDs,
   ) async {
     final ids = msgIDs.where((msgID) => msgID.isNotEmpty).toSet();
-    if (ids.isEmpty) return;
+    if (ids.isEmpty) return 0;
+    var removed = 0;
     final accountToxId = ffiService.getSelfToxId();
     if (accountToxId != null && accountToxId.isNotEmpty) {
-      await Tim2ToxFailedMessagePersistence.removeFailedMessagesByIDs(
+      removed += await Tim2ToxFailedMessagePersistence.removeFailedMessagesByIDs(
         messageIDs: ids,
         accountToxId: accountToxId,
       );
     }
     // Pre-account-scoping rows have no account suffix. Clean only that legacy
     // base key in addition to the current full-ID key; never scan other keys.
-    await Tim2ToxFailedMessagePersistence.removeFailedMessagesByIDs(
+    removed += await Tim2ToxFailedMessagePersistence.removeFailedMessagesByIDs(
       messageIDs: ids,
       accountToxId: null,
     );
+    return removed;
   }
 
   /// Fill [members] faceUrl, nickName, and role from local prefs.
@@ -6700,23 +6704,67 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
     List<String>? msgIDs,
     List<dynamic>? webMessageInstanceList,
   }) async {
+    // SEMANTICS: "delete for me" is IDEMPOTENT, and its post-condition is
+    // "none of the requested messages is in a local store any more" — NOT
+    // "this call is the one that removed them".
+    //
+    // History (2026-08-16). This method used to answer `code: 0` blindly. That
+    // was rightly called a lie, but the "honest" replacement — non-zero when 0
+    // messages were removed — was strictly worse in the only place the code is
+    // read. The ONLY consumer is the UIKit fork's `deleteMessagesForMe`, which
+    // does exactly one thing with a non-zero code: SKIP the list strip. There
+    // is no toast, no dialog, no retry. So the user tapped Delete, confirmed,
+    // and nothing happened, forever, with no feedback — and the row became
+    // permanently undeletable, because every retry took the same branch.
+    //
+    // Worse, "removed 0" is the NORMAL outcome of two ordinary situations:
+    //   * an idempotent re-delete (the row is already gone from both stores);
+    //   * a row the fork could only identify as `""` (neither a non-empty
+    //     `msgID` nor a non-empty `id`), which matches nothing by construction.
+    // Neither is a failure. In both, the user's goal — "this message is not in
+    // my history" — is already true when we return, so `code: 0` is the honest
+    // answer and the fork strips the row.
+    //
+    // A GENUINE failure is one where the delete could not be PERFORMED: the
+    // history write or the failed-message store threw. That still returns
+    // non-zero, so the fork keeps the row on screen — which is the truthful UI
+    // state (the message really is still there) and lets the user retry. The
+    // count is not thrown away either: it goes into `desc`, so a no-op is
+    // diagnosable in logs without being reported as an error nobody renders.
     try {
       if (msgIDs == null || msgIDs.isEmpty) {
+        // Nothing requested, so the post-condition already holds. Reporting a
+        // failure here would be another code no caller can act on: with an
+        // empty request the fork has nothing to strip either way.
         return V2TimCallback(
-          code: -1,
-          desc: 'msgIDs is empty',
+          code: 0,
+          desc: 'success (no message ids requested)',
         );
       }
 
-      // Delete messages via FfiChatService
-      await ffiService.deleteMessages(msgIDs);
-      await _removeFailedMessagesByIDsForCurrentAccount(msgIDs);
+      // Both stores count: `FfiChatService` owns delivered history, while a
+      // failed (never-sent) message exists only in the failed-message
+      // persistence, and deleting one of those is a legitimate removal.
+      final deletedFromHistory = await ffiService.deleteMessages(msgIDs);
+      final removedFailed =
+          await _removeFailedMessagesByIDsForCurrentAccount(msgIDs);
+
+      if (deletedFromHistory + removedFailed == 0) {
+        return V2TimCallback(
+          code: 0,
+          desc:
+              'success (already absent: 0 of ${msgIDs.length} requested '
+              'msgIDs were in history or failed-message storage)',
+        );
+      }
 
       return V2TimCallback(
         code: 0,
         desc: 'success',
       );
     } catch (e) {
+      // The delete could not be performed. This is the ONLY non-zero path, and
+      // it is the one where leaving the row on screen is correct.
       return V2TimCallback(
         code: -1,
         desc: 'deleteMessages failed: $e',

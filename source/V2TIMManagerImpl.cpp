@@ -379,6 +379,10 @@ bool V2TIMManagerImpl::InitSDK(uint32_t sdkAppID, const V2TIMSDKConfig& config) 
     V2TIM_LOG(kInfo, "[InitSDK] creating new ToxManager instance for this={} (instance_id={})",
               (void*)this, (long long)this_instance_id);
     tox_manager_ = std::make_unique<ToxManager>();
+    // Only the default/session instance may run the harness TCP relay server on
+    // its fixed port; an auxiliary instance that tried would fail tox_new with
+    // TOX_ERR_NEW_PORT_ALLOC and never come up at all.
+    tox_manager_->setTcpRelayServerAllowed(this_instance_id == 0);
     V2TIM_LOG(kInfo, "[InitSDK] Created ToxManager={} for this={} (instance_id={})",
               (void*)tox_manager_.get(), (void*)this, (long long)this_instance_id);
 #ifdef BUILD_TOXAV

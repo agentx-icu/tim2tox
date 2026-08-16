@@ -142,12 +142,19 @@ class TUICallKitAdapter {
         PARAM_NAME_USERIDS: userids,
         PARAM_NAME_GROUPID: groupid ?? "",
       });
-    } catch (e) {
+    } catch (e, st) {
       final reason = e is CallSetupException
           ? e.reason
           : CallSetupFailureReason.internalError;
+      // An UNTYPED throw (internalError) used to be swallowed here with no
+      // trace of what actually failed, which made a real defect
+      // (an outgoing-call preflight throwing on iOS) indistinguishable from
+      // any other internal fault: the only symptom was
+      // "the call never rang". Typed reasons stay one-line; untyped ones carry
+      // the cause + stack so the next occurrence is diagnosable from the log.
       _logger?.logWarning(
-          '[TUICallKitAdapter] handleCall status=${reason.name} type=$type userCount=${userids.length}');
+          '[TUICallKitAdapter] handleCall status=${reason.name} type=$type userCount=${userids.length}'
+          '${e is CallSetupException ? '' : ' cause=$e stack=$st'}');
       try {
         onCallSetupFailed?.call(reason, List.unmodifiable(userids));
       } catch (_) {

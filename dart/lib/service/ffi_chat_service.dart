@@ -593,6 +593,18 @@ class FfiChatService {
       <String, Future<void>>{};
   final Set<String> _historyLoadLoggedKeys = <String>{};
 
+  /// In-flight fire-and-forget read-barrier writes started by [setActivePeer].
+  ///
+  /// [setActivePeer] is synchronous ON PURPOSE — opening a conversation is UI
+  /// navigation and must not block on disk — so its `markConversationViewed`
+  /// write is unawaited. Untracked, that write can still be in flight when
+  /// [dispose] tears the persistence layer down (logout / account switch /
+  /// shutdown right after opening a conversation), which loses the read barrier
+  /// and brings the conversation back UNREAD on the next start. Tracking it
+  /// here lets [dispose] drain it, exactly like [_drainTrackedHistoryLoadsForDispose]
+  /// does for history loads.
+  final Set<Future<void>> _readBarrierWrites = <Future<void>>{};
+
   /// Get the preferences service (for use by SDK Platform)
   ExtendedPreferencesService? get preferencesService => _prefs;
 
@@ -966,8 +978,7 @@ class FfiChatService {
   /// exception — its key builders turn a null scope into a shared global slot —
   /// so blacklist call sites must skip entirely on `null` instead of passing it
   /// down.
-  String? get prefsAccountScopeToxId =>
-      accountScopeFromToxId(getSelfToxId());
+  String? get prefsAccountScopeToxId => accountScopeFromToxId(getSelfToxId());
 
   /// The pure decision rule behind [prefsAccountScopeToxId], exposed so it can
   /// be exercised without an initialised Tox instance.
@@ -1554,7 +1565,10 @@ class FfiChatService {
     // timestamp rather than the local wall clock, so clock drift/rollback
     // between this device and the remote peer can't inflate or zero the
     // unread count on restart.
-    unawaited(
+    // Tracked, not bare-`unawaited`: dispose() must be able to drain this or a
+    // logout right after opening a conversation loses the read barrier. See
+    // [_readBarrierWrites].
+    _trackReadBarrierWrite(
         _messageHistoryPersistence.markConversationViewed(conversationId));
     _unreadByPeer[normalizedId] = 0;
   }
@@ -2135,6 +2149,31 @@ class FfiChatService {
         _logger?.logError('history load failed', error, stackTrace);
       },
     ));
+  }
+
+  /// Register a fire-and-forget read-barrier write so [dispose] can wait it out.
+  ///
+  /// The tracked future absorbs its own errors (logging them once), so the
+  /// drain below never has to handle a failure and no unhandled async error can
+  /// escape to the zone.
+  void _trackReadBarrierWrite(Future<void> write) {
+    late final Future<void> tracked;
+    tracked = write.then<void>(
+      (_) {},
+      onError: (Object error, StackTrace stackTrace) {
+        _logger?.logError(
+          '[FfiChatService] read-barrier write failed',
+          error,
+          stackTrace,
+        );
+      },
+    ).whenComplete(() => _readBarrierWrites.remove(tracked));
+    _readBarrierWrites.add(tracked);
+  }
+
+  Future<void> _drainReadBarrierWritesForDispose() async {
+    if (_readBarrierWrites.isEmpty) return;
+    await Future.wait(_readBarrierWrites.toList(growable: false));
   }
 
   Future<void> _drainTrackedHistoryLoadsForDispose() async {
@@ -5589,8 +5628,7 @@ class FfiChatService {
         // `_<from>_<gid>` (see the msgID built below); rows persisted by the
         // native/binary-replacement path carry a C++-minted id. Only the latter
         // still needs an owner here.
-        final selfMinted =
-            duplicate.msgID?.endsWith('_${from}_$gid') ?? false;
+        final selfMinted = duplicate.msgID?.endsWith('_${from}_$gid') ?? false;
         final unreadKey = _unreadKey(gid);
         if (_activePeerId == unreadKey) {
           _unreadByPeer[unreadKey] = 0;
@@ -8019,6 +8057,18 @@ class FfiChatService {
     _ircCallbacksOwner = this;
   }
 
+  /// Tear down a registration made by [setDhtNodesResponseCallback].
+  ///
+  /// Clears the Dart-side handler AND the native registration (and the
+  /// instance-routing entry for non-default instances), so a transient
+  /// consumer — e.g. a bootstrap-node reachability probe — can borrow the
+  /// single callback slot and hand it back instead of leaking a live
+  /// `NativeCallable` registration for the rest of the session.
+  void clearDhtNodesResponseCallback() {
+    _dhtNodesResponseCallback = null;
+    _clearDhtNodesResponseRegistration();
+  }
+
   /// Set DHT nodes response callback
   /// callback: callback function (publicKey, ip, port) -> void
   /// Note: This callback may be called from Tox's background thread
@@ -9238,6 +9288,10 @@ class FfiChatService {
     _profileSaveTimer = null;
 
     await _drainTrackedHistoryLoadsForDispose();
+    // Read-barrier writes are fire-and-forget from setActivePeer; drain them
+    // here, while persistence is still live, so an open-then-logout does not
+    // lose the "conversation read" state.
+    await _drainReadBarrierWritesForDispose();
 
     await _scratchFiles.dispose();
 

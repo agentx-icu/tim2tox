@@ -7,6 +7,11 @@
 #include <atomic>
 #include <cstdio>
 #include <filesystem>
+// std::ostringstream (CreateMergerMessage's cloudCustomData builder). Apple's
+// libc++ drags <sstream> in transitively via other headers, so macOS/iOS built
+// fine without it; the NDK's libc++ does not, and the Android build failed with
+// "implicit instantiation of undefined template 'std::basic_ostringstream'".
+#include <sstream>
 #include "TIMResultDefine.h"
 #include "MergerMessageUtil.h"
 #include "RevokeMessageUtil.h"

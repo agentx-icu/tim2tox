@@ -10,6 +10,7 @@
 
 import 'dart:async';
 import 'dart:ffi' as ffi;
+import 'dart:io';
 import 'package:test/test.dart';
 import 'package:ffi/ffi.dart' as pkgffi;
 import 'package:tim2tox_dart/ffi/tim2tox_ffi.dart' as ffi_lib;
@@ -103,33 +104,258 @@ void main() {
         chatServices.add(chatService);
       }
 
-      for (int i = 1; i < nodes.length; i++) {
-        final bootstrapSource = nodes[i - 1];
-        final bsPort = await bootstrapSource.runWithInstanceAsync(() async {
+      final dhtKeys = <String>[];
+      final udpPorts = <int>[];
+      for (final node in nodes) {
+        final pair = await node.runWithInstanceAsync(() async {
           final ffiInstance = ffi_lib.Tim2ToxFfi.open();
-          return ffiInstance.getUdpPort(ffiInstance.getCurrentInstanceId());
+          final port = ffiInstance.getUdpPort(ffiInstance.getCurrentInstanceId());
+          final buf = pkgffi.malloc.allocate<ffi.Int8>(65);
+          try {
+            final len = ffiInstance.getDhtIdNative(buf, 65);
+            final key = (len > 0 && len <= 64)
+                ? buf.cast<pkgffi.Utf8>().toDartString(length: len)
+                : '';
+            return (port, key);
+          } finally {
+            pkgffi.malloc.free(buf);
+          }
         });
-        final bsDhtId = bootstrapSource.getToxId();
-        final bsPublicKey =
-            bsDhtId.length == 76 ? bsDhtId.substring(0, 64) : bsDhtId;
+        udpPorts.add(pair.$1);
+        dhtKeys.add(pair.$2);
+      }
+      print('[dht-api] dhtKeys=${dhtKeys.map(_short).toList()} ports=$udpPorts');
+      // The node key a getnodes request is ENCRYPTED to must be the peer's DHT
+      // public key (`tox_self_get_dht_id`), NOT the first 64 chars of its Tox
+      // ID (its long-term key). Addressing a node by its Tox ID makes the
+      // request undecryptable, the node silently drops it, and the test then
+      // "proves" nothing while looking like it exercised the API.
+      for (var i = 0; i < numNodes; i++) {
+        expect(dhtKeys[i], isNot(equalsIgnoringCase(publicKeys[i])),
+            reason: 'DHT id and Tox ID prefix must not be conflated');
+      }
+
+      var totalRequests = 0;
+      for (int i = 1; i < nodes.length; i++) {
+        final bsPort = udpPorts[i - 1];
+        final bsPublicKey = dhtKeys[i - 1];
 
         final chatService = chatServices[i];
-        for (final targetPublicKey in publicKeys) {
-          chatService.dhtSendNodesRequest(
-              bsPublicKey, '127.0.0.1', bsPort, targetPublicKey);
-        }
+        await nodes[i].runWithInstanceAsync(() async {
+          for (final targetPublicKey in publicKeys) {
+            final ok = chatService.dhtSendNodesRequest(
+                bsPublicKey, '127.0.0.1', bsPort, targetPublicKey);
+            expect(ok, isTrue,
+                reason: 'node$i could not send a getnodes request to '
+                    '127.0.0.1:$bsPort');
+            totalRequests++;
+          }
+        });
       }
 
       // Allow DHT to respond.
-      await pumpTestTick(scenario, advanceMs: 5000, iterationsPerInstance: 1);
+      for (var round = 0; round < 10; round++) {
+        await pumpTestTick(scenario, advanceMs: 5000, iterationsPerInstance: 20);
+        if (!shouldRunVirtual) {
+          await Future<void>.delayed(const Duration(seconds: 1));
+        }
+      }
 
+      for (var i = 0; i < discoveredNodes.length; i++) {
+        print('[dht-api] node$i dht=${_short(dhtKeys[i])} '
+            'queried=${i == 0 ? "-" : _short(dhtKeys[i - 1])} '
+            'discovered=${discoveredNodes[i].length} '
+            '${discoveredNodes[i].map(_short).toList()}');
+      }
       final discoveryCounts = discoveredNodes.map((set) => set.length).toList();
       final totalDiscoveries = discoveryCounts.reduce((a, b) => a + b);
 
-      expect(totalDiscoveries >= 0, isTrue,
-          reason: 'DHT nodes API should work');
-    }, timeout: const Timeout(Duration(seconds: 120)));
+      // NOT `>= 0`. The previous assertion was tautological and passed with
+      // ZERO deliveries for years, which is exactly how the FFI callback could
+      // be silently dead. This one goes red the moment the callback stops
+      // being delivered to Dart.
+      expect(totalDiscoveries, greaterThan(0),
+          reason: 'tox_callback_dht_nodes_response delivered NOTHING to Dart '
+              'after $totalRequests getnodes requests between $numNodes live '
+              'peers — the FFI callback chain (tox_callback_dht_nodes_response '
+              '-> on_dht_nodes_response_internal -> NativeCallable trampoline '
+              '-> FfiChatService) is broken.');
+
+      // CONTRACT PIN. toxcore reports the nodes CONTAINED IN the response (the
+      // responder's neighbours), never the responder itself — see
+      // DHT.c:handle_nodes_response, which loops over `plain_nodes[i]`. A node
+      // never lists itself among its own close nodes, so the key we queried can
+      // never come back. Any consumer that waits for a callback keyed by the
+      // QUERIED node's public key therefore waits forever. toxee's
+      // BootstrapNodeProbe did exactly that and reported every node — live or
+      // dead — as unreachable.
+      for (var i = 1; i < numNodes; i++) {
+        if (discoveredNodes[i].isEmpty) continue;
+        expect(discoveredNodes[i].map((k) => k.toUpperCase()),
+            isNot(contains(dhtKeys[i - 1].toUpperCase())),
+            reason: 'node$i queried ${_short(dhtKeys[i - 1])} and the callback '
+                'reported that same key back. If this ever passes, the event '
+                'semantics changed and responder-keyed matching became viable; '
+                'revisit BootstrapNodeProbe.');
+      }
+    }, timeout: const Timeout(Duration(seconds: 180)));
+
+    /// Pins the exact contract toxee's `BootstrapNodeProbe` now relies on.
+    ///
+    /// A bootstrap-node reachability probe cannot key on the responder (see the
+    /// contract pin above), so it instead runs on a **deliberately isolated**
+    /// Tox instance — fresh profile, `local_discovery_enabled = 0`, no
+    /// bootstrap nodes — where the ONLY node it ever queries is the candidate.
+    /// toxcore only accepts a nodes response whose sender public key, address
+    /// and ping id match a request we actually sent
+    /// (`DHT.c:sent_nodes_request_to_node`), so on such an instance "any
+    /// `dht_nodes_response` at all" is sound evidence that the candidate
+    /// answered.
+    ///
+    /// This test drives BOTH directions on ONE instance, because a probe that
+    /// always says "unreachable" and a probe that always says "reachable" are
+    /// equally useless and each would satisfy a one-sided assertion.
+    test('isolated probe instance: dead endpoint is silent, live node answers',
+        () async {
+      final ffiInstance = ffi_lib.Tim2ToxFfi.open();
+      final target = await _dhtEndpointOf(nodes[0]);
+      expect(target.$1, greaterThan(0), reason: 'peer-0 needs a UDP port');
+      expect(target.$2.length, 64, reason: 'peer-0 needs a DHT public key');
+
+      final dir = Directory.systemTemp.createTempSync('t2t_node_probe_');
+      final prev = ffiInstance.getCurrentInstanceId();
+      final pathPtr = dir.path.toNativeUtf8();
+      final int handle;
+      try {
+        // local_discovery_enabled = 0: a LAN peer answering a discovery
+        // broadcast would otherwise make a dead candidate look alive.
+        handle = ffiInstance.createTestInstanceExNative(pathPtr, 0, 1);
+      } finally {
+        pkgffi.malloc.free(pathPtr);
+      }
+      expect(handle, isNot(0),
+          reason: 'the probe instance must be creatable at runtime');
+
+      final hits = <String>[];
+      FfiChatService? svc;
+      try {
+        ffiInstance.setCurrentInstance(handle);
+        svc = FfiChatService();
+        svc.setDhtNodesResponseCallback((pk, ip, port) => hits.add(pk));
+        final udp = ffiInstance.getUdpPort(handle);
+        ffiInstance.setCurrentInstance(prev);
+        expect(udp, greaterThan(0),
+            reason: 'a UDP-less probe instance cannot run a DHT probe at all');
+        print('[dht-probe] probe instance handle=$handle udp=$udp '
+            'target=${_short(target.$2)}:${target.$1}');
+
+        // NEGATIVE half: same public key, a port nothing listens on.
+        await _probeRounds(
+            ffiInstance, handle, prev, svc, scenario, target.$2, 1, 8);
+        print('[dht-probe] dead endpoint 127.0.0.1:1 -> ${hits.length} hits');
+        expect(hits, isEmpty,
+            reason: 'an isolated probe instance saw a DHT nodes response with '
+                'no live node to have produced one — the isolation this '
+                'verdict depends on is leaking (local discovery? saved '
+                'bootstrap nodes?), so "reachable" would be a false positive.');
+
+        // POSITIVE half: the SAME probe instance, pointed at real, live DHT
+        // endpoints. Each peer is tried in turn and the first that answers
+        // ends the sweep, so the assertion below is "a live Tox DHT node is
+        // distinguishable from a dead endpoint", not "peer-N specifically
+        // answers within N seconds" (which would be a timing race).
+        final answered = <String>[];
+        for (var pi = 0; pi < numNodes && answered.isEmpty; pi++) {
+          final t = await _dhtEndpointOf(nodes[pi]);
+          if (t.$1 == 0 || t.$2.length != 64) continue;
+          final before = hits.length;
+          await _probeRounds(
+              ffiInstance, handle, prev, svc, scenario, t.$2, t.$1, 8,
+              stopWhen: () => hits.length > before);
+          final got = hits.length - before;
+          print('[dht-probe] live peer$pi ${_short(t.$2)}:${t.$1} -> $got hits');
+          if (got > 0) answered.add('peer$pi');
+        }
+        expect(answered, isNotEmpty,
+            reason: 'NO live Tox DHT node produced a nodes response on the '
+                'isolated probe instance, while the dead endpoint produced '
+                'none either — the probe cannot tell a reachable bootstrap '
+                'node from an unreachable one, so every node would be '
+                'reported unreachable (toxee issue: BootstrapNodeProbe).');
+      } finally {
+        if (svc != null) {
+          ffiInstance.setCurrentInstance(handle);
+          svc.clearDhtNodesResponseCallback();
+          ffiInstance.setCurrentInstance(prev);
+        }
+        ffiInstance.setCurrentInstance(0);
+        ffiInstance.destroyTestInstance(handle);
+        ffiInstance.setCurrentInstance(prev);
+        try {
+          dir.deleteSync(recursive: true);
+        } catch (_) {}
+      }
+    }, timeout: const Timeout(Duration(seconds: 180)));
   });
+}
+
+String _short(String key) => key.length >= 8 ? key.substring(0, 8) : '?';
+
+/// `(udpPort, dhtPublicKey)` of [node], read inside its own instance context.
+///
+/// The DHT public key (`tox_self_get_dht_id`) is NOT the first 64 chars of the
+/// Tox ID: a getnodes request is encrypted to the DHT key, so addressing a node
+/// by its Tox ID produces a packet the node silently drops.
+Future<(int, String)> _dhtEndpointOf(TestNode node) async {
+  return node.runWithInstanceAsync(() async {
+    final f = ffi_lib.Tim2ToxFfi.open();
+    final port = f.getUdpPort(f.getCurrentInstanceId());
+    final buf = pkgffi.malloc.allocate<ffi.Int8>(65);
+    try {
+      final len = f.getDhtIdNative(buf, 65);
+      return (
+        port,
+        (len > 0 && len <= 64)
+            ? buf.cast<pkgffi.Utf8>().toDartString(length: len)
+            : ''
+      );
+    } finally {
+      pkgffi.malloc.free(buf);
+    }
+  });
+}
+
+/// Repeatedly send a getnodes request from the isolated probe instance
+/// [handle] to [host]:[port], iterating that instance so it is driven in both
+/// wall-clock and virtual-clock mode, for up to [seconds].
+///
+/// The instance is made current only around the synchronous FFI call and
+/// restored immediately — `g_current_instance_id` is a process-global, so it
+/// must never stay switched across an await.
+Future<void> _probeRounds(
+  ffi_lib.Tim2ToxFfi ffiInstance,
+  int handle,
+  int prev,
+  FfiChatService svc,
+  TestScenario scenario,
+  String publicKey,
+  int port,
+  int seconds, {
+  bool Function()? stopWhen,
+}) async {
+  for (var round = 0; round < seconds; round++) {
+    if (stopWhen != null && stopWhen()) return;
+    ffiInstance.setCurrentInstance(handle);
+    svc.dhtSendNodesRequest(publicKey, '127.0.0.1', port, publicKey);
+    ffiInstance.setCurrentInstance(prev);
+    for (var i = 0; i < 20; i++) {
+      ffiInstance.iterateInstance(handle);
+    }
+    await pumpTestTick(scenario, advanceMs: 1000, iterationsPerInstance: 20);
+    if (!shouldRunVirtual) {
+      await Future<void>.delayed(const Duration(seconds: 1));
+    }
+  }
 }
 
 /// Virtual-clock variant of configureLinearBootstrap: Peer-i bootstraps from

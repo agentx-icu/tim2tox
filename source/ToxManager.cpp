@@ -11,6 +11,7 @@
 #include <system_error> // For std::system_error
 #include <sstream> // For std::ostringstream
 #include <iomanip> // For std::setw, std::setfill
+#include <algorithm> // For std::min (TOX_UDP_START_PORT range clamp)
 #include <cstring> // For memcmp
 #include <cstdlib> // For std::getenv, std::strtol (TOX_TCP_RELAY_PORT)
 #include <cstdio> // For std::remove
@@ -194,7 +195,13 @@ void ToxManager::initialize(const Tox_Options* options,
     // handed an environment variable by the automation harness.
     if (const std::string relay_env = read_harness_knob("TOX_TCP_RELAY_PORT", "debug.toxee.tcp_relay_port"); !relay_env.empty()) {
         const long parsed = std::strtol(relay_env.c_str(), nullptr, 10);
-        if (parsed > 0 && parsed <= 65535) {
+        if (!tcp_relay_server_allowed_) {
+            // Auxiliary instance in a process whose session Tox already owns the
+            // fixed relay port. Binding it a second time fails tox_new with
+            // TOX_ERR_NEW_PORT_ALLOC and the instance never comes up at all, so
+            // run without a relay server instead. See setTcpRelayServerAllowed.
+            V2TIM_LOG(kInfo, "[ToxManager] initialize: skipping TCP relay server (port {} belongs to the session instance)", relay_env);
+        } else if (parsed > 0 && parsed <= 65535) {
             tox_options_set_tcp_port(opts, static_cast<uint16_t>(parsed));
             V2TIM_LOG(kInfo, "[ToxManager] initialize: TCP relay server enabled on port {}", parsed);
         } else {
@@ -223,6 +230,39 @@ void ToxManager::initialize(const Tox_Options* options,
         if (enable) {
             tox_options_set_udp_enabled(opts, false);
             V2TIM_LOG(kInfo, "[ToxManager] initialize: TCP-only mode enabled (UDP disabled) via TOX_FORCE_TCP_ONLY");
+        }
+    }
+
+    // Optional: move the UDP/DHT socket off toxcore's default 33445..33545
+    // window. Read at the same tox_new chokepoint as the two knobs above, for
+    // the same savedata/restore reason.
+    //
+    // WHY THIS EXISTS (measured 2026-08-15, iOS Simulator, Xcode 26.4):
+    // toxcore binds its DHT socket to the IPv6 wildcard `[::]:33445` when
+    // ipv6_enabled is on (network.c net_new -> set_socket_dualstack). On
+    // macOS/BSD an IPv4-wildcard socket (`0.0.0.0:33445`) owned by an UNRELATED
+    // process may coexist with that dual-stack bind — the bind SUCCEEDS — but
+    // the kernel then delivers every inbound IPv4 datagram to the more specific
+    // IPv4 pcb. The result is a socket that sends fine and is permanently deaf:
+    // `tox_dht_send_nodes_request` returns true, the getnodes packets are on the
+    // wire with source port 33445, and NOT ONE nodes response is ever seen. On
+    // that host BootstrapNodeProbe reported *every* node — a live public one
+    // included — as `unreachable`, and a two-Simulator pair looked like
+    // one-way UDP (the first app grabs the hijacked 33445, the second gets a
+    // clean 33446). toxcore cannot detect this: bind() succeeded.
+    // Giving each harness process its own start port sidesteps the collision
+    // deterministically instead of guessing. Production never sets the knob,
+    // so real clients keep toxcore's default range.
+    // Android property fallback: debug.toxee.udp_start_port.
+    if (const std::string udp_env = read_harness_knob("TOX_UDP_START_PORT", "debug.toxee.udp_start_port"); !udp_env.empty()) {
+        const long parsed = std::strtol(udp_env.c_str(), nullptr, 10);
+        if (parsed > 0 && parsed <= 65535) {
+            const long end = std::min<long>(parsed + 100, 65535);
+            tox_options_set_start_port(opts, static_cast<uint16_t>(parsed));
+            tox_options_set_end_port(opts, static_cast<uint16_t>(end));
+            V2TIM_LOG(kInfo, "[ToxManager] initialize: UDP port range set to {}..{} via TOX_UDP_START_PORT", parsed, end);
+        } else {
+            V2TIM_LOG(kWarning, "[ToxManager] initialize: ignoring out-of-range TOX_UDP_START_PORT='{}' (want 1..65535)", udp_env);
         }
     }
 
