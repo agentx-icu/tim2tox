@@ -1824,14 +1824,32 @@ int tim2tox_ffi_get_friend_applications_for_instance(int64_t instance_id, char* 
 int tim2tox_ffi_accept_friend(const char* user_id) {
     if (!IsCurrentInstanceInited() || !user_id) return 0;
     V2TIMFriendApplication app; app.userID = user_id;
+    // AcceptFriendApplication reports its outcome through the callback
+    // SYNCHRONOUSLY (V2TIMFriendshipManagerImpl invokes OnSuccess/OnError
+    // inline before returning), so the callback's verdict is what this FFI
+    // return code must carry. It used to be discarded: a failed
+    // tox_friend_add_norequest (invalid public key, own key, malloc) came back
+    // as rc=1, the Dart side treated the application as accepted, and the
+    // "friend" existed only as a cached nickname — no Tox friend, so no
+    // presence, no delivery, and a conversation titled with the raw key.
     struct Cb : public V2TIMValueCallback<V2TIMFriendOperationResult> {
+        bool failed = false;
+        int error_code = 0;
         void OnSuccess(const V2TIMFriendOperationResult& r) override {
+            // A per-operation resultCode != 0 is a failure too (the
+            // caller-visible contract is "the friend was added").
+            if (r.resultCode != 0) { failed = true; error_code = r.resultCode; }
         }
         void OnError(int code, const V2TIMString& msg) override {
-            // Error logged via V2TIM_LOG
+            failed = true;
+            error_code = code;
         }
     } cb;
     GetCurrentInstance()->GetFriendshipManager()->AcceptFriendApplication(app, V2TIM_FRIEND_ACCEPT_AGREE_AND_ADD, &cb);
+    if (cb.failed) {
+        V2TIM_LOG(kError, "[tim2tox_ffi_accept_friend] accept failed for {} (code={})", user_id, cb.error_code);
+        return 0;
+    }
     return 1;
 }
 

@@ -426,6 +426,14 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
   String? _selfAvatarPathCache;
   final Map<String, String> _friendAvatarPathCache = {};
 
+  // Sender display-name caches for populating nickName/friendRemark on
+  // V2TimMessages ('' = looked up, nothing stored). ChatMessage carries no
+  // sender name, so without this fill a group bubble's name row renders the
+  // raw 64-hex sender key. Invalidated by _setupNicknameUpdatedListener /
+  // setFriendInfo respectively.
+  final Map<String, String> _friendNicknameCache = {};
+  final Map<String, String> _friendRemarkCache = {};
+
   // Clean up old entries periodically
   void _cleanupPendingForwardTargets() {
     final now = DateTime.now().millisecondsSinceEpoch;
@@ -2397,6 +2405,31 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
       if (path != null && path.isNotEmpty) {
         msg.faceUrl = path;
       }
+      // Sender display name: the UIKit name row above a group bubble resolves
+      // friendRemark → nickName → sender (TencentCloudChatUtils.
+      // getMessageSenderName), and ChatMessage carries neither name — so
+      // without this fill every group message is labeled with the sender's
+      // raw 64-hex key. Same cached-prefs pattern as the avatar path above.
+      if ((msg.friendRemark ?? '').isEmpty) {
+        if (!_friendRemarkCache.containsKey(sender)) {
+          _friendRemarkCache[sender] =
+              await prefs.getFriendRemark(sender) ?? '';
+        }
+        final remark = _friendRemarkCache[sender];
+        if (remark != null && remark.isNotEmpty) {
+          msg.friendRemark = remark;
+        }
+      }
+      if ((msg.nickName ?? '').isEmpty) {
+        if (!_friendNicknameCache.containsKey(sender)) {
+          _friendNicknameCache[sender] =
+              await prefs.getFriendNickname(sender) ?? '';
+        }
+        final nick = _friendNicknameCache[sender];
+        if (nick != null && nick.isNotEmpty) {
+          msg.nickName = nick;
+        }
+      }
     }
   }
 
@@ -2513,6 +2546,9 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
     _nicknameUpdatedSubscription?.cancel();
     _nicknameUpdatedSubscription =
         ffiService.nicknameUpdated.listen((uid) async {
+      // Message-level sender-name fill caches this peer's nickname; drop the
+      // stale entry so the next rendered message re-reads the new name.
+      _friendNicknameCache.remove(uid);
       try {
         final friends = await ffiService.getFriendList();
         final match = friends.where((e) => e.userId == uid).toList();
@@ -2873,6 +2909,11 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
     _pendingForwardTargets.clear();
     _friendAvatarPathCache.clear();
     _selfAvatarPathCache = null;
+    // Same lifetime as the avatar caches: prefs are account-scoped, so a
+    // platform torn down and reused for another account must not carry the
+    // previous account's cached names (or cached empty misses) forward.
+    _friendNicknameCache.clear();
+    _friendRemarkCache.clear();
     _previousFriendOnlineStatus.clear();
     if (_currentInstance == this) {
       _currentInstance = null;
@@ -8503,6 +8544,9 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
         // contact list, search, and chat headers — not just the editing UI's
         // ephemeral state.
         await prefs.setFriendRemark(userID, friendRemark);
+        // Message-level sender-name fill caches this peer's remark; drop the
+        // stale entry so the next rendered message re-reads the new remark.
+        _friendRemarkCache.remove(userID);
       }
 
       // TODO(tim2tox): `friendCustomInfo` requires a structured per-friend

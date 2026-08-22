@@ -871,6 +871,12 @@ class FfiChatService {
   String _selfId = '';
   String get selfId => _selfId;
 
+  /// TEST-ONLY: pin the login user id without a native login, so unit tests
+  /// can exercise the self/other split in the ingestion seams (a self-authored
+  /// group row must not count as unread, must not be receipted, ...). Callers
+  /// must gate this behind a test seam; production never sets it.
+  void debugSetSelfId(String id) => _selfId = id;
+
   /// One-shot cloudCustomData (the V2TIM reply-quote / forward metadata) for the
   /// NEXT [sendText]/[sendGroupText]. The desktop reply flow builds the
   /// `{"messageReply":{...}}` payload and routes the send through
@@ -1197,6 +1203,26 @@ class FfiChatService {
   void debugSetConnected(bool connected) {
     _isConnected = connected;
     _connectionStatus.add(connected);
+  }
+
+  /// TEST-ONLY presence override for seeded peers: friend ids (normalized to
+  /// the 64-hex public key) that [getFriendList] must report as online even
+  /// though toxcore has no link to them. A seeded friend
+  /// (`tox_friend_add_norequest` of a key that is not on the DHT) can never
+  /// come online for real, so without this every product screenshot shows the
+  /// active peer as "Offline". Only the REPORTED presence is overridden: the
+  /// came-online side effects (avatar push, offline-queue drain) key off the
+  /// native flag, so nothing is ever sent to a peer toxcore cannot reach.
+  /// Callers must gate this behind kDebugMode + a test-account seam.
+  final Set<String> _debugOnlineFriends = {};
+
+  void debugSetFriendOnline(String userId, bool online) {
+    final key = _normalizeFriendId(userId);
+    if (online) {
+      _debugOnlineFriends.add(key);
+    } else {
+      _debugOnlineFriends.remove(key);
+    }
   }
 
   final Map<String, ChatMessage> _lastByPeer = {};
@@ -4948,7 +4974,11 @@ class FfiChatService {
         final parts = line.split('\t');
         final uid = parts.isNotEmpty ? parts[0] : '';
         var nick = parts.length > 1 ? parts[1] : '';
-        final online = (parts.length > 2 ? parts[2] : '0') == '1';
+        final nativeOnline = (parts.length > 2 ? parts[2] : '0') == '1';
+        // Reported presence may be a test override (see debugSetFriendOnline);
+        // the came-online side effects below stay keyed to the native flag.
+        final online = nativeOnline ||
+            _debugOnlineFriends.contains(_normalizeFriendId(uid));
         if (uid.isNotEmpty) {
           // If nickname is empty from Tox, try to load from local cache
           if (nick.isEmpty) {
@@ -4977,7 +5007,7 @@ class FfiChatService {
               _friendOnlineStatus[normalizedUid] ?? _friendOnlineStatus[uid];
           _friendOnlineStatus[normalizedUid] = online ? 'online' : 'offline';
           // If friend just came online, send avatar if needed and send pending messages
-          if (online && previousStatus != 'online') {
+          if (nativeOnline && previousStatus != 'online') {
             unawaited(_sendAvatarToFriendIfNeeded(uid));
             // Send pending offline messages - use normalized ID
             unawaited(retryPendingC2cMessages(normalizedUid));
@@ -5587,6 +5617,13 @@ class FfiChatService {
   /// drives the exact dedup → history → unread → stream pipeline real
   /// traffic drives, so persistence and rendering are indistinguishable.
   /// Returns true when the message was ingested (false: quit group / dup).
+  ///
+  /// [epochMs] overrides the row's timestamp (and the timestamp component of
+  /// its minted msgID). Real delivery never passes it; the seed harness uses
+  /// it to back-fill a group thread with realistic spacing instead of every
+  /// line landing in the same minute. A row from [from] == self (our own line
+  /// echoed back by NGC, or a seeded self line) is delivered history — it is
+  /// never counted as unread and never receipted.
   bool ingestInboundGroupText({
     required String gid,
     required String from,
@@ -5594,6 +5631,7 @@ class FfiChatService {
     ChatMessageContentKind contentKind = ChatMessageContentKind.normal,
     int? sourceInstanceId,
     bool forceEmit = false,
+    int? epochMs,
   }) {
     // Check if this group was quit - if so, don't add it back
     if (_quitGroups.contains(gid)) return false;
@@ -5646,14 +5684,14 @@ class FfiChatService {
       unawaited(
           _persistKnownGroups()); // This will call _syncKnownGroupsToNative()
     }
-    final timestamp = DateTime.now().millisecondsSinceEpoch;
+    final timestamp = epochMs ?? DateTime.now().millisecondsSinceEpoch;
     final sequence = _msgIDSequence++;
     final msgID = '${timestamp}_${sequence}_${from}_$gid';
     final msg = ChatMessage(
       text: text,
       fromUserId: from,
       isSelf: from == _selfId,
-      timestamp: DateTime.now(),
+      timestamp: DateTime.fromMillisecondsSinceEpoch(timestamp),
       groupId: gid,
       msgID: msgID,
       contentKind: contentKind,
@@ -5678,11 +5716,15 @@ class FfiChatService {
     // the bump waiting for a listener that never ran, and group unread stayed 0
     // forever — the `C2C=2 / group=0 / total=2` sidebar symptom. Only the
     // `gaction:` paths (forceEmit: true) genuinely emit, and those still defer.
+    //
+    // A self-authored row (NGC echoing our own line, or a seeded self line)
+    // is something the user already read by writing it — it must not bump
+    // unread any more than sendGroupText's own append does.
     if (!groupUnreadHandledExternally || !emitted) {
       final unreadKey = _unreadKey(gid);
       if (_activePeerId == unreadKey) {
         _unreadByPeer[unreadKey] = 0;
-      } else {
+      } else if (!msg.isSelf) {
         _unreadByPeer.update(unreadKey, (v) => v + 1, ifAbsent: () => 1);
       }
     }
