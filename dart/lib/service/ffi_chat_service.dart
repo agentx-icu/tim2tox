@@ -9653,6 +9653,14 @@ class FfiChatService {
     // still-suspended run would wake and touch the freed native instance.
     if (pollDrained) {
       _disposing = false;
+      // _draftDisposing deliberately STAYS latched even after a clean
+      // dispose: the draft path publishes into _conversationDraftChanges — a
+      // FINAL StreamController this method closes below and init() never
+      // recreates — so re-enabling setConversationDraft would persist the
+      // draft and then throw on publish. Unlike the poll loop (whose fields
+      // are all rebuilt by startPolling), stream consumers of a disposed
+      // service are gone for good; callers get a loud StateError instead of
+      // a half-working draft feature.
       // The object is reusable again (init -> login -> startPolling), so the
       // NEXT dispose after a re-init cycle must run a fresh teardown rather
       // than return this completed future. A wedged dispose keeps both the
