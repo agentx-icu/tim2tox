@@ -471,17 +471,40 @@ std::string FriendInfoResultVectorToJson(const V2TIMFriendInfoResultVector& resu
         }
         
         const V2TIMFriendInfoResult& result = results[i];
+        // Field names MUST match V2TimFriendInfoResult.fromJson in the
+        // vendored tencent_cloud_chat_sdk (friendship_friend_info_get_result_*
+        // with the friend info nested under ..._field_info, whose keys are the
+        // friend_profile_* family). The previous shape ({"friendInfo":{...},
+        // "resultCode":...}) matched NOTHING the Dart side reads: every result
+        // deserialized with friendInfo == null and resultCode == -1, which
+        // silently emptied contact search (DartSearchFriends) and
+        // DartGetFriendsInfo on the binary path across ALL platforms — caught
+        // by the mobile_search_contact_back_unbinds real-UI case.
         json << "{";
-        json << "\"friendInfo\":{";
-        std::string user_id = result.friendInfo.userID.CString();
-        json << "\"friend_profile_identifier\":\"" << EscapeJsonString(user_id) << "\",";
-        std::string friend_remark = result.friendInfo.friendRemark.CString();
-        json << "\"friend_profile_remark\":\"" << EscapeJsonString(friend_remark) << "\"";
-        json << "},";
-        json << "\"resultCode\":" << result.resultCode << ",";
-        // Get CString() (has built-in protection)
+        json << "\"friendship_friend_info_get_result_error_code\":"
+             << result.resultCode << ",";
         std::string result_info = result.resultInfo.CString();
-        json << "\"resultInfo\":\"" << EscapeJsonString(result_info) << "\"";
+        json << "\"friendship_friend_info_get_result_error_message\":\""
+             << EscapeJsonString(result_info) << "\",";
+        // Everything these APIs return is an established friend; the C enum
+        // value 3 maps to V2TIM_FRIEND_TYPE_BOTH on the Dart side.
+        json << "\"friendship_friend_info_get_result_relation_type\":3,";
+        json << "\"friendship_friend_info_get_result_field_info\":{";
+        std::string user_id = result.friendInfo.userID.CString();
+        json << "\"friend_profile_identifier\":\"" << EscapeJsonString(user_id)
+             << "\",";
+        std::string friend_remark = result.friendInfo.friendRemark.CString();
+        json << "\"friend_profile_remark\":\""
+             << EscapeJsonString(friend_remark) << "\",";
+        // Nested user profile so nickname/faceUrl render where a caller reads
+        // userProfile instead of the remark.
+        std::string nick = result.friendInfo.userFullInfo.nickName.CString();
+        json << "\"friend_profile_user_profile\":{";
+        json << "\"user_profile_identifier\":\"" << EscapeJsonString(user_id)
+             << "\",";
+        json << "\"user_profile_nick_name\":\"" << EscapeJsonString(nick)
+             << "\"}";
+        json << "}";
         json << "}";
     }
     

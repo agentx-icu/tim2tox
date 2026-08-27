@@ -955,8 +955,19 @@ extern "C" {
         std::string json_str = json_search_friends_param;
         V2TIMFriendSearchParam searchParam;
         
-        // Parse keyword list
-        std::string keyword_list_str = ExtractJsonValue(json_str, "friend_search_param_keyword_list");
+        // Parse keyword list. V2TimFriendSearchParam.toJson (the vendored
+        // tencent_cloud_chat_sdk) emits "friendship_search_param_keyword_list"
+        // — the old "friend_search_param_keyword_list" key was never sent, so
+        // the list always parsed EMPTY and SearchFriends short-circuited to an
+        // empty success: contact search was silently dead on the binary path
+        // (caught by the mobile_search_contact_back_unbinds real-UI case).
+        // The old key stays as a fallback for any out-of-tree caller.
+        std::string keyword_list_str =
+            ExtractJsonValue(json_str, "friendship_search_param_keyword_list");
+        if (keyword_list_str.empty()) {
+            keyword_list_str =
+                ExtractJsonValue(json_str, "friend_search_param_keyword_list");
+        }
         if (!keyword_list_str.empty()) {
             std::vector<std::string> keywords = ParseJsonStringArray(keyword_list_str);
             for (const auto& keyword : keywords) {
@@ -964,10 +975,42 @@ extern "C" {
             }
         }
         
-        // Parse search flags (default to true if not specified)
-        searchParam.isSearchUserID = ExtractJsonBool(json_str, "friend_search_param_is_search_user_id", true);
-        searchParam.isSearchNickName = ExtractJsonBool(json_str, "friend_search_param_is_search_nick_name", true);
-        searchParam.isSearchRemark = ExtractJsonBool(json_str, "friend_search_param_is_search_remark", true);
+        // Parse search flags. The SDK encodes them as a bitmask ARRAY
+        // ("friendship_search_param_search_field_list": e.g. [1,2,4] with
+        // 1=userID, 2=nickname, 4=remark) — the is_search_* booleans the old
+        // code read are never emitted. Missing/empty list keeps the
+        // default-true flags (search everything).
+        std::string field_list_str =
+            ExtractJsonValue(json_str, "friendship_search_param_search_field_list");
+        if (!field_list_str.empty()) {
+            // Whitelist parse: only the three defined field keys (1=userID,
+            // 2=nickname, 4=remark) may set bits, so a malformed entry
+            // (negative, quoted, fractional, overflowing) can widen nothing
+            // and the digit scan cannot mis-merge adjacent characters.
+            int field_mask = 0;
+            const char* pch = field_list_str.c_str();
+            char* end = nullptr;
+            while (*pch) {
+                if (*pch >= '0' && *pch <= '9') {
+                    const long v = std::strtol(pch, &end, 10);
+                    if (v == 1 || v == 2 || v == 4) {
+                        field_mask |= static_cast<int>(v);
+                    }
+                    pch = end;
+                } else {
+                    ++pch;
+                }
+            }
+            if (field_mask != 0) {
+                searchParam.isSearchUserID = (field_mask & 0x01) != 0;
+                searchParam.isSearchNickName = (field_mask & 0x02) != 0;
+                searchParam.isSearchRemark = (field_mask & 0x04) != 0;
+            }
+        } else {
+            searchParam.isSearchUserID = ExtractJsonBool(json_str, "friend_search_param_is_search_user_id", true);
+            searchParam.isSearchNickName = ExtractJsonBool(json_str, "friend_search_param_is_search_nick_name", true);
+            searchParam.isSearchRemark = ExtractJsonBool(json_str, "friend_search_param_is_search_remark", true);
+        }
         
         // Call V2TIM SearchFriends (async)
         SafeGetV2TIMManager()->GetFriendshipManager()->SearchFriends(
