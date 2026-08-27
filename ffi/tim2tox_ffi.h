@@ -636,8 +636,12 @@ int tim2tox_ffi_get_friend_connection_status(int64_t instance_id, uint32_t frien
 // ip: IP address of the node to query (e.g., "127.0.0.1")
 // port: UDP port of the node to query
 // target_public_key: public key of the node we're looking for (32 bytes, hex string)
-// Returns: 1 on success, 0 on failure
 // Note: This function sends a request to the specified node asking for nodes close to target_public_key
+// Returns: 1 when toxcore accepted the request; 0 when the FFI refused before
+// reaching toxcore (SDK not initialized / no usable instance, a NULL argument,
+// or a public key that is not 64 hex chars); -N (N = Tox_Err_Dht_Send_Nodes_Request,
+// e.g. -1 UDP_DISABLED, -3 BAD_PORT, -4 BAD_IP for an unresolvable host) when
+// toxcore refused it. Callers that only care about success keep testing == 1.
 int tim2tox_ffi_dht_send_nodes_request(const char* public_key, const char* ip, uint16_t port, const char* target_public_key);
 
 // DHT nodes response callback type

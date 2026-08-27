@@ -109,7 +109,8 @@ void main() {
       for (final node in nodes) {
         final pair = await node.runWithInstanceAsync(() async {
           final ffiInstance = ffi_lib.Tim2ToxFfi.open();
-          final port = ffiInstance.getUdpPort(ffiInstance.getCurrentInstanceId());
+          final port =
+              ffiInstance.getUdpPort(ffiInstance.getCurrentInstanceId());
           final buf = pkgffi.malloc.allocate<ffi.Int8>(65);
           try {
             final len = ffiInstance.getDhtIdNative(buf, 65);
@@ -124,7 +125,8 @@ void main() {
         udpPorts.add(pair.$1);
         dhtKeys.add(pair.$2);
       }
-      print('[dht-api] dhtKeys=${dhtKeys.map(_short).toList()} ports=$udpPorts');
+      print(
+          '[dht-api] dhtKeys=${dhtKeys.map(_short).toList()} ports=$udpPorts');
       // The node key a getnodes request is ENCRYPTED to must be the peer's DHT
       // public key (`tox_self_get_dht_id`), NOT the first 64 chars of its Tox
       // ID (its long-term key). Addressing a node by its Tox ID makes the
@@ -155,7 +157,8 @@ void main() {
 
       // Allow DHT to respond.
       for (var round = 0; round < 10; round++) {
-        await pumpTestTick(scenario, advanceMs: 5000, iterationsPerInstance: 20);
+        await pumpTestTick(scenario,
+            advanceMs: 5000, iterationsPerInstance: 20);
         if (!shouldRunVirtual) {
           await Future<void>.delayed(const Duration(seconds: 1));
         }
@@ -215,6 +218,73 @@ void main() {
     /// This test drives BOTH directions on ONE instance, because a probe that
     /// always says "unreachable" and a probe that always says "reachable" are
     /// equally useless and each would satisfy a one-sided assertion.
+    test(
+        'send refusal carries its reason: unresolvable host is BAD_IP, '
+        'not a local constraint', () async {
+      // toxee's BootstrapNodeProbe turns "no request ever left" into a
+      // verdict, and it can only do that honestly if the FFI says WHY. Before
+      // tim2tox_ffi_dht_send_nodes_request returned the negated
+      // Tox_Err_Dht_Send_Nodes_Request, an unresolvable host on a UDP-capable
+      // desktop was rendered as "this device is running TCP-only".
+      final ffiInstance = ffi_lib.Tim2ToxFfi.open();
+      final target = await _dhtEndpointOf(nodes[0]);
+      expect(target.$1, greaterThan(0), reason: 'peer-0 needs a UDP port');
+      expect(target.$2.length, 64, reason: 'peer-0 needs a DHT public key');
+
+      final dir = Directory.systemTemp.createTempSync('t2t_send_reason_');
+      final prev = ffiInstance.getCurrentInstanceId();
+      final pathPtr = dir.path.toNativeUtf8();
+      final int handle;
+      try {
+        handle = ffiInstance.createTestInstanceExNative(pathPtr, 0, 1);
+      } finally {
+        pkgffi.malloc.free(pathPtr);
+      }
+      try {
+        expect(handle, isNot(0),
+            reason: 'the probe instance must be creatable at runtime');
+        ffiInstance.setCurrentInstance(handle);
+        final svc = FfiChatService();
+        final udp = ffiInstance.getUdpPort(handle);
+        expect(udp, greaterThan(0),
+            reason: 'this case needs a UDP-capable instance so UDP_DISABLED '
+                'cannot be the reason');
+        // RFC 2606 reserves .invalid: it never resolves, on any resolver.
+        final unresolvable = svc.dhtSendNodesRequestChecked(
+            target.$2, 'no-such-host.invalid', target.$1, target.$2);
+        final badPort = svc.dhtSendNodesRequestChecked(
+            target.$2, '127.0.0.1', 0, target.$2);
+        final accepted = svc.dhtSendNodesRequestChecked(
+            target.$2, '127.0.0.1', target.$1, target.$2);
+        final legacyBool = svc.dhtSendNodesRequest(
+            target.$2, '127.0.0.1', target.$1, target.$2);
+        expect(unresolvable, DhtSendNodesRequestError.badIp,
+            reason: 'an unresolvable host must come back as BAD_IP — the '
+                'descriptor is wrong, this device is not (got '
+                'unresolvable=$unresolvable badPort=$badPort '
+                'accepted=$accepted legacyBool=$legacyBool)');
+        expect(badPort, DhtSendNodesRequestError.badPort);
+        expect(accepted, isNull,
+            reason: 'a well-formed request to a live local endpoint must be '
+                'accepted by toxcore');
+        expect(legacyBool, isTrue,
+            reason: 'the boolean wrapper keeps its == 1 contract');
+      } finally {
+        if (handle != 0) {
+          ffiInstance.setCurrentInstance(0);
+          ffiInstance.destroyTestInstance(handle);
+          ffiInstance.setCurrentInstance(prev);
+        }
+        try {
+          dir.deleteSync(recursive: true);
+        } catch (e) {
+          // Non-fatal for the verdict (the instance is already destroyed), but
+          // a leaked save dir is worth seeing in the output.
+          stderr.writeln('[dht-send-reason] temp dir cleanup failed: $e');
+        }
+      }
+    });
+
     test('isolated probe instance: dead endpoint is silent, live node answers',
         () async {
       final ffiInstance = ffi_lib.Tim2ToxFfi.open();
@@ -273,7 +343,8 @@ void main() {
               ffiInstance, handle, prev, svc, scenario, t.$2, t.$1, 8,
               stopWhen: () => hits.length > before);
           final got = hits.length - before;
-          print('[dht-probe] live peer$pi ${_short(t.$2)}:${t.$1} -> $got hits');
+          print(
+              '[dht-probe] live peer$pi ${_short(t.$2)}:${t.$1} -> $got hits');
           if (got > 0) answered.add('peer$pi');
         }
         expect(answered, isNotEmpty,

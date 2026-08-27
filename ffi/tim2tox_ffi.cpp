@@ -4724,8 +4724,15 @@ int tim2tox_ffi_dht_send_nodes_request(const char* public_key, const char* ip, u
     bool success = tox_dht_send_nodes_request(tox, public_key_bin, ip, port, target_public_key_bin, &error);
     
     if (!success) {
-        V2TIM_LOG(kError, "[ffi] dht_send_nodes_request: tox_dht_send_nodes_request failed with error {}", error);
-        return 0;
+        V2TIM_LOG(kError, "[ffi] dht_send_nodes_request: tox_dht_send_nodes_request failed with error {}",
+                  static_cast<int>(error));
+        // Negative = toxcore refused the request, and the magnitude is the
+        // Tox_Err_Dht_Send_Nodes_Request value. Callers need the reason, not
+        // just the refusal: UDP_DISABLED is a constraint of THIS device, while
+        // BAD_IP (an unresolvable host) / BAD_PORT describe the node, and the
+        // bootstrap probe must not blame one for the other. OK is 0, so a
+        // failure is always strictly negative here.
+        return -static_cast<int>(error);
     }
     
     V2TIM_LOG(kInfo, "[ffi] dht_send_nodes_request: success (ip={}, port={})", ip, port);
