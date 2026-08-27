@@ -444,6 +444,61 @@ DraftPreferencesService? _draftServiceFrom(Object? value) {
   return value is DraftPreferencesService ? value : null;
 }
 
+/// Why toxcore refused a `tox_dht_send_nodes_request`.
+///
+/// Mirrors `Tox_Err_Dht_Send_Nodes_Request` (c-toxcore `tox_private.h`) in
+/// declaration order — `tim2tox_ffi_dht_send_nodes_request` returns the enum
+/// value negated — plus [notReady] for a refusal by the FFI itself, before
+/// toxcore was ever asked (native 0).
+enum DhtSendNodesRequestError {
+  /// The FFI refused before reaching toxcore (native return 0): the SDK is not
+  /// initialized / there is no usable instance, an argument was null, or a
+  /// public key was not 64 hex chars.
+  notReady,
+
+  /// `TOX_ERR_DHT_SEND_NODES_REQUEST_UDP_DISABLED`: this instance has UDP
+  /// disabled, so it cannot query the DHT at all.
+  udpDisabled,
+
+  /// `TOX_ERR_DHT_SEND_NODES_REQUEST_NULL`.
+  nullArgument,
+
+  /// `TOX_ERR_DHT_SEND_NODES_REQUEST_BAD_PORT`.
+  badPort,
+
+  /// `TOX_ERR_DHT_SEND_NODES_REQUEST_BAD_IP`: the host neither parsed as an IP
+  /// nor resolved.
+  badIp,
+
+  /// `TOX_ERR_DHT_SEND_NODES_REQUEST_FAIL`: the packet could not be sent.
+  fail;
+
+  /// Decode a `tim2tox_ffi_dht_send_nodes_request` return value; `null` means
+  /// the request was accepted.
+  static DhtSendNodesRequestError? fromNative(int result) {
+    if (result == 1) return null;
+    if (result == 0) return DhtSendNodesRequestError.notReady;
+    switch (-result) {
+      case 1:
+        return DhtSendNodesRequestError.udpDisabled;
+      case 2:
+        return DhtSendNodesRequestError.nullArgument;
+      case 3:
+        return DhtSendNodesRequestError.badPort;
+      case 4:
+        return DhtSendNodesRequestError.badIp;
+      default:
+        return DhtSendNodesRequestError.fail;
+    }
+  }
+
+  /// True when the refusal describes the node descriptor rather than this
+  /// device — a probe may hold it against the node.
+  bool get isDescriptorProblem =>
+      this == DhtSendNodesRequestError.badIp ||
+      this == DhtSendNodesRequestError.badPort;
+}
+
 class FfiChatService {
   // Static counter for msgID sequence to ensure uniqueness
   static int _msgIDSequence = 0;
@@ -1453,6 +1508,42 @@ class FfiChatService {
   /// Reference to local scheduleNextPoll so [ _scheduleNextPoll] can schedule next poll from async callback.
   void Function()? _scheduleNextPollRef;
 
+  /// Set by [dispose] before the native instance goes away. The poll callback
+  /// is `async` and an in-flight run survives `_poller.cancel()`: it used to
+  /// keep calling `_ffi.pollText` / `avIterate` after `_ffi.uninit()` — or
+  /// against the NEXT account's instance under the same global id — and
+  /// re-arm the timer through [_scheduleNextPoll]. Under logout/login churn
+  /// (three logout→register→quick-login cycles after an account delete +
+  /// switch, macOS real-UI `rui-single-app-optimized`) that is the best-fitting
+  /// cause of the debug app EXITING with no Dart error and no crash report.
+  bool _pollDisposed = false;
+
+  /// True for the whole duration of [dispose] (which awaits several async
+  /// drains AFTER setting [_pollDisposed] and BEFORE `_ffi.uninit()`). A
+  /// [startPolling] arriving in that window must not flip [_pollDisposed]
+  /// back and arm a timer that would poll across uninit — the exact
+  /// use-after-free the teardown flags exist to prevent.
+  bool _disposing = false;
+
+  /// Background tasks the poll/native event handling used to fire-and-forget
+  /// (`_sendAvatarToAllFriendsOnConnect`, `_drainAllPendingGroupMessages`).
+  /// dispose() awaits them like [_activePoll] so a suspended task cannot
+  /// resume into a freed native instance after `_ffi.uninit()`.
+  final Set<Future<void>> _pollDescendants = {};
+
+  void _spawnPollDescendant(Future<void> Function() task) {
+    if (_pollDisposed) return;
+    final f = task().catchError((Object e, StackTrace st) {
+      _logger?.logError(
+          '[FfiChatService] background task failed', e.runtimeType, st);
+    });
+    _pollDescendants.add(f);
+    unawaited(f.whenComplete(() => _pollDescendants.remove(f)));
+  }
+
+  /// The currently running poll, awaited by [dispose] before `uninit`.
+  Future<void>? _activePoll;
+
   /// True while an AV call is being set up or is active — see
   /// [setAvSessionActive]. Forces the fast poll cadence so toxav_iterate is
   /// never starved by the idle heuristics.
@@ -2405,7 +2496,18 @@ class FfiChatService {
           '[FfiChatService] startPolling: already started, ignoring duplicate call');
       return;
     }
+    if (_disposing) {
+      _logger?.log(
+          '[FfiChatService] startPolling: refused — dispose() in progress');
+      return;
+    }
     _pollingStarted = true;
+    // A service object is legitimately re-used after dispose()
+    // (Tim2ToxSdkPlatform: init -> login -> startPolling -> dispose -> init
+    // ...). Every other poll field is rebuilt below; this flag must come back
+    // too, or the re-used service is permanently deaf — the first tick hits
+    // the disposed guard and the loop never re-arms, with no error anywhere.
+    _pollDisposed = false;
     _logger?.log('[FfiChatService] ========== startPolling called ==========');
     _logger?.log(
         '[FfiChatService] startPolling: Service instance type: ${runtimeType}');
@@ -2439,10 +2541,12 @@ class FfiChatService {
       );
       _pollTimerCallback = () async {
         // P2-19: drop overlapping invocations. See _pollBusy doc.
-        if (_pollBusy) {
+        if (_pollBusy || _pollDisposed) {
           return;
         }
         _pollBusy = true;
+        final pollDone = Completer<void>();
+        _activePoll = pollDone.future;
         try {
           // Call toxav_iterate if AV is initialized
           try {
@@ -2478,6 +2582,8 @@ class FfiChatService {
           // Without this, each poll cycle processes ONE event at 50ms intervals, so ~1779 progress
           // chunks for a 2.4MB file would take 1779×50ms = 89 seconds to drain.
           for (int _batchIdx = 0; _batchIdx < 200; _batchIdx++) {
+            // An `await` inside this loop may have outlived the service.
+            if (_pollDisposed) break;
             int n = 0;
             int? sourceInstanceId;
             for (final id in pollOrder) {
@@ -2605,10 +2711,10 @@ class FfiChatService {
                   _isConnected = true;
                   _connectionStatus.add(true);
                   // When connected, send avatar to all online friends
-                  unawaited(_sendAvatarToAllFriendsOnConnect());
+                  _spawnPollDescendant(_sendAvatarToAllFriendsOnConnect);
                   // P0-C1: drain any group messages queued while offline.
                   if (wasOffline) {
-                    unawaited(_drainAllPendingGroupMessages());
+                    _spawnPollDescendant(_drainAllPendingGroupMessages);
                   }
                 } else if (s == 'conn:failed') {
                   _isConnected = false;
@@ -2684,6 +2790,10 @@ class FfiChatService {
                 final request = FfiChatService.parseAvatarRequestEvent(s);
                 if (request != null) {
                   await _handleAvatarRequest(request);
+                  if (_pollDisposed) {
+                    pkgffi.malloc.free(buf);
+                    return; // service disposed while we were away — never touch native again
+                  }
                 }
               } else if (s.startsWith('progress_recv:')) {
                 // progress_recv:[<instance_id>:]<uid>:<received>:<total>:<path>  (new: instance_id first; legacy: no instance_id)
@@ -3129,6 +3239,10 @@ class FfiChatService {
                       instanceId: eventInstanceId,
                       reason: 'blocked sender',
                     );
+                    if (_pollDisposed) {
+                      pkgffi.malloc.free(buf);
+                      return; // service disposed while we were away — never touch native again
+                    }
                     continue;
                   }
                   if (isAvatarTransfer) {
@@ -3137,6 +3251,10 @@ class FfiChatService {
                       fileNumber,
                       eventInstanceId,
                     );
+                    if (_pollDisposed) {
+                      pkgffi.malloc.free(buf);
+                      return; // service disposed while we were away — never touch native again
+                    }
                     continue;
                   }
                   // For non-avatar files, create a pending message immediately to show "receiving" status.
@@ -3214,6 +3332,10 @@ class FfiChatService {
                     final sizeLimitMB =
                         await (_prefs?.getAutoDownloadSizeLimit() ??
                             Future.value(30));
+                    if (_pollDisposed) {
+                      pkgffi.malloc.free(buf);
+                      return; // service disposed while we were away — never touch native again
+                    }
                     final autoAcceptThreshold =
                         sizeLimitMB * 1024 * 1024; // Convert MB to bytes
                     // P0-8: Images bypass the user-configured size limit but are
@@ -3236,6 +3358,10 @@ class FfiChatService {
                       try {
                         await acceptFileTransfer(uid, fileNumber,
                             instanceId: eventInstanceId);
+                        if (_pollDisposed) {
+                          pkgffi.malloc.free(buf);
+                          return; // service disposed while we were away — never touch native again
+                        }
                         _logger?.log(
                             '[FfiChatService] file_request: acceptFileTransfer completed successfully');
                       } catch (e, st) {
@@ -3248,6 +3374,10 @@ class FfiChatService {
                           error: e,
                           stackTrace: st,
                         );
+                        if (_pollDisposed) {
+                          pkgffi.malloc.free(buf);
+                          return; // service disposed while we were away — never touch native again
+                        }
                       }
                     } else {
                       // Large file: don't auto-accept, let UIKit's download button handle it
@@ -3275,7 +3405,12 @@ class FfiChatService {
                   if (!_ownsEventInstance(fileDoneEvent.instanceId)) {
                     continue;
                   }
-                  if (await _handleAvatarFileDone(fileDoneEvent)) {
+                  final avatarDone = await _handleAvatarFileDone(fileDoneEvent);
+                  if (_pollDisposed) {
+                    pkgffi.malloc.free(buf);
+                    return; // service disposed while we were away — never touch native again
+                  }
+                  if (avatarDone) {
                     continue;
                   }
                   final uid = fileDoneEvent.uid;
@@ -3553,6 +3688,8 @@ class FfiChatService {
         } finally {
           // P2-19: release the reentry guard regardless of how we exit.
           _pollBusy = false;
+          _activePoll = null;
+          pollDone.complete();
         }
       };
       _poller = Timer(pollInterval, _pollTimerCallback!);
@@ -3565,6 +3702,7 @@ class FfiChatService {
 
   /// Schedules the next poll. Call from async callback so next poll runs after current one completes.
   void _scheduleNextPoll() {
+    if (_pollDisposed) return;
     _scheduleNextPollRef?.call();
   }
 
@@ -3572,6 +3710,7 @@ class FfiChatService {
   /// so file_request (enqueued in same native OnFileRecv) is consumed promptly and accept runs.
   /// Runs the poll callback immediately (async, not awaited) so the next event loop tick can process it.
   void triggerPollOnce() {
+    if (_pollDisposed) return;
     if (_pollTimerCallback != null) {
       _poller?.cancel();
       _pollTimerCallback!();
@@ -3687,6 +3826,10 @@ class FfiChatService {
       request.instanceId,
       request.sender,
     );
+    // Re-check after the suspension: dispose() may have torn the native
+    // instance down while we were reading the stored hash, and every path
+    // below ends in fileControlNative on the freed instance.
+    if (_pollDisposed) return;
     if (storedHash == request.fileId) {
       await _cancelAvatarTransfer(
         request.sender,
@@ -3713,6 +3856,9 @@ class FfiChatService {
         error.runtimeType,
         stackTrace,
       );
+      // The accept above is itself a suspension point; don't cancel into a
+      // native instance that dispose() freed while it was in flight.
+      if (_pollDisposed) return;
       await _cancelAvatarTransfer(
         request.sender,
         request.fileNumber,
@@ -3778,7 +3924,9 @@ class FfiChatService {
         } catch (_) {}
       }
       _receivedAvatarHashes[(event.instanceId, event.uid)] = receivedHash;
-      _avatarUpdatedCtrl.add(event.uid);
+      // A zombie run resuming after dispose() must not emit into the closed
+      // controller (uncaught StateError on the async path).
+      if (!_pollDisposed) _avatarUpdatedCtrl.add(event.uid);
       return true;
     } catch (_) {
       return true;
@@ -5451,11 +5599,11 @@ class FfiChatService {
       _isConnected = true;
       _connectionStatus.add(true);
       // When connected, send avatar to all online friends
-      unawaited(_sendAvatarToAllFriendsOnConnect());
+      _spawnPollDescendant(_sendAvatarToAllFriendsOnConnect);
       // P0-C1: drain group offline queue on reconnect (parallel to the
       // C2C drain done per-friend in getFriendList).
       if (wasOffline) {
-        unawaited(_drainAllPendingGroupMessages());
+        _spawnPollDescendant(_drainAllPendingGroupMessages);
       }
       return;
     } else if (type == 101) {
@@ -7521,6 +7669,9 @@ class FfiChatService {
             '[FfiChatService] _sendPendingGroupMessages: lost connection mid-drain for $groupId; ${pending.length - pending.indexOf(item)} item(s) kept in queue');
         break;
       }
+      // dispose() may have freed the native instance while the previous
+      // iteration awaited persistence.
+      if (_pollDisposed) return;
       var dispatched = false;
       try {
         _sendGroupTextByKindChecked(groupId, item.text, item.contentKind);
@@ -7613,6 +7764,9 @@ class FfiChatService {
 
   Future<void> _drainAllPendingGroupMessages() async {
     for (final gid in List<String>.from(_knownGroups)) {
+      // Spawned unawaited from the poll body; each retry batch suspends on
+      // persistence, so dispose()/uninit can land between iterations.
+      if (_pollDisposed) return;
       try {
         await retryPendingGroupMessages(gid);
       } catch (e, st) {
@@ -8065,6 +8219,19 @@ class FfiChatService {
   /// targetPublicKey: public key of the node we're looking for (64 hex chars)
   /// Returns true on success, false on failure
   bool dhtSendNodesRequest(
+          String publicKey, String ip, int port, String targetPublicKey) =>
+      dhtSendNodesRequestChecked(publicKey, ip, port, targetPublicKey) == null;
+
+  /// [dhtSendNodesRequest] with the refusal reason.
+  ///
+  /// Returns `null` when toxcore accepted the request, otherwise WHY it was
+  /// refused. The distinction matters to anything that turns a refusal into a
+  /// verdict about the node: [DhtSendNodesRequestError.badIp] (typically an
+  /// unresolvable host) and [DhtSendNodesRequestError.badPort] describe the
+  /// descriptor, while [DhtSendNodesRequestError.udpDisabled] /
+  /// [DhtSendNodesRequestError.notReady] / [DhtSendNodesRequestError.fail]
+  /// describe this device.
+  DhtSendNodesRequestError? dhtSendNodesRequestChecked(
       String publicKey, String ip, int port, String targetPublicKey) {
     final pPublicKey = publicKey.toNativeUtf8();
     final pIp = ip.toNativeUtf8();
@@ -8072,7 +8239,7 @@ class FfiChatService {
     try {
       final result = _ffi.dhtSendNodesRequestNative(
           pPublicKey, pIp, port, pTargetPublicKey);
-      return result == 1;
+      return DhtSendNodesRequestError.fromNative(result);
     } finally {
       pkgffi.malloc.free(pPublicKey);
       pkgffi.malloc.free(pIp);
@@ -8265,6 +8432,8 @@ class FfiChatService {
     if (!_isConnected) return;
 
     final avatarPath = avatarPathOverride ?? await _prefs?.getAvatarPath();
+    // Both branches below dispatch into the native instance.
+    if (_pollDisposed) return;
     if (avatarPath == null || avatarPath.isEmpty) {
       try {
         _sendAvatarDeletion(friendId);
@@ -8280,6 +8449,7 @@ class FfiChatService {
 
     final bytes = await _readAvatarBytes(avatarPath);
     if (bytes == null) return;
+    if (_pollDisposed) return;
     try {
       _sendAvatarBytes(friendId, bytes);
     } catch (error, stackTrace) {
@@ -8295,11 +8465,17 @@ class FfiChatService {
   Future<void> _sendAvatarToAllFriendsOnConnect() async {
     // Wait a bit for friend list to be populated
     await Future.delayed(const Duration(milliseconds: 500));
+    // Spawned unawaited from the poll body, so dispose() does not track it:
+    // re-check after every suspension before touching the native instance.
+    if (_pollDisposed) return;
     // Get all friends and send avatar to those who are online
     final friends = await getFriendList();
     for (final friend in friends) {
+      if (_pollDisposed) return;
       if (friend.online) {
-        unawaited(_sendAvatarToFriendIfNeeded(friend.userId));
+        // Awaited (not fire-and-forget) so it stays inside this TRACKED
+        // task and cannot escape dispose()'s descendant drain.
+        await _sendAvatarToFriendIfNeeded(friend.userId);
       }
     }
   }
@@ -9283,7 +9459,15 @@ class FfiChatService {
     }
   }
 
-  Future<void> dispose() async {
+  Future<void>? _disposeFuture;
+
+  /// Single-flight: concurrent/repeated dispose() calls coalesce onto one
+  /// teardown run, so a second call can never re-observe "drained" state and
+  /// uninit an instance the first call deliberately quarantined.
+  Future<void> dispose() => _disposeFuture ??= _disposeImpl();
+
+  Future<void> _disposeImpl() async {
+    _disposing = true;
     // Order matters here — the previous arrangement had a race where a poll
     // tick or in-flight callback could `appendHistory` between
     // `flushPendingSaves()` and `clearAllCached()`, resurrecting the
@@ -9323,11 +9507,43 @@ class FfiChatService {
       });
     }
 
+    // Stop the poll loop DETERMINISTICALLY before anything native goes away:
+    // flag first (so a run that is mid-await neither re-arms the timer nor
+    // touches the FFI again), drop the scheduler/callback refs, then wait for
+    // an in-flight run to finish. See [_pollDisposed].
+    _pollDisposed = true;
     _poller?.cancel();
     _poller = null;
+    _scheduleNextPollRef = null;
+    _pollTimerCallback = null;
     _pollingStarted = false;
     _profileSaveTimer?.cancel();
     _profileSaveTimer = null;
+    final activePoll = _activePoll;
+    var pollDrained = true;
+    if (activePoll != null) {
+      try {
+        await activePoll.timeout(const Duration(seconds: 10));
+      } on TimeoutException {
+        // The zombie poll is still mid-await somewhere. It must never see
+        // the teardown flags cleared again — see the end of this method.
+        pollDrained = false;
+        _logger?.log(
+            '[FfiChatService] dispose: in-flight poll did not finish in 10s');
+      }
+    }
+    // The poll body used to fire-and-forget these; they are tracked now so a
+    // suspended one cannot resume into freed native state after uninit.
+    if (_pollDescendants.isNotEmpty) {
+      try {
+        await Future.wait(_pollDescendants.toList())
+            .timeout(const Duration(seconds: 10));
+      } on TimeoutException {
+        pollDrained = false;
+        _logger?.log(
+            '[FfiChatService] dispose: background tasks did not finish in 10s');
+      }
+    }
 
     await _drainTrackedHistoryLoadsForDispose();
     // Read-barrier writes are fire-and-forget from setActivePeer; drain them
@@ -9404,7 +9620,24 @@ class FfiChatService {
     await _ircUserListCtrl.close();
     await _ircUserJoinPartCtrl.close();
 
-    _ffi.uninit();
+    if (pollDrained) {
+      _ffi.uninit();
+    } else {
+      // A task outlived the drain window. Freeing the native instance now
+      // would turn its eventual resume into a use-after-free; QUARANTINE the
+      // instance instead (deliberate bounded leak — the _disposing latch
+      // already condemns this service object, so nothing reuses it).
+      // KNOWN LIMITATION (needs a native detach API to close): the C++ side
+      // still counts the quarantined instance as the current inited one, so
+      // a subsequent fresh-service init() on the SAME process can early-return
+      // onto it (ffi/tim2tox_ffi.cpp init guard) instead of minting a new
+      // instance. That is a pre-existing property of the global native state;
+      // acceptable here because this branch has never been observed to fire
+      // (10s drain of dart-side awaits) and the alternative was a UAF.
+      _logger?.log(
+          '[FfiChatService] dispose: leaving native instance allocated — an '
+          'undrained background task could still touch it');
+    }
     await _messages.close();
     await _connectionStatus.close();
     await _progressCtrl.close();
@@ -9413,5 +9646,18 @@ class FfiChatService {
     await _avatarUpdatedCtrl.close();
     await _nicknameUpdatedCtrl.close();
     await _conversationDraftChanges.close();
+    // Object is now fully torn down and safe to re-init (init -> login ->
+    // startPolling). Two deliberate exceptions keep the latch set forever:
+    // a dispose that THREW above, and a zombie in-flight poll that outlived
+    // the 10s drain — if a later startPolling() cleared _pollDisposed, that
+    // still-suspended run would wake and touch the freed native instance.
+    if (pollDrained) {
+      _disposing = false;
+      // The object is reusable again (init -> login -> startPolling), so the
+      // NEXT dispose after a re-init cycle must run a fresh teardown rather
+      // than return this completed future. A wedged dispose keeps both the
+      // latch and the future: the object is condemned either way.
+      _disposeFuture = null;
+    }
   }
 }
