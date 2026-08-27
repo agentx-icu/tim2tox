@@ -467,6 +467,8 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
         String sender,
         String? groupID
       })>? _reactionSubscription;
+  StreamSubscription<({String msgID, String? groupID, int readCount})>?
+      _receiptEventsSubscription;
   StreamSubscription<
       ({
         int instanceId,
@@ -510,6 +512,7 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
     _setupGroupListener();
     // Setup reaction listener
     _setupReactionListener();
+    _setupReceiptListener();
     // Setup progress listener
     _setupProgressListener();
     // Setup avatar updated listener for faceUrl cache
@@ -2230,6 +2233,28 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
     });
   }
 
+  /// Live read-receipt pushes: FfiChatService tallies a READ from a peer and
+  /// emits; UIKit's messageData.onReceiveMessageReadReceipts refreshes the
+  /// bubble label without waiting for a refetch. unreadCount is left null —
+  /// the pull path (getMessageReadReceipts) owns the member-count math.
+  void _setupReceiptListener() {
+    _receiptEventsSubscription?.cancel();
+    _receiptEventsSubscription = ffiService.receiptEvents.listen((event) {
+      if (event.msgID.isEmpty) return;
+      final receipt = V2TimMessageReceipt(
+        userID: '',
+        timestamp: DateTime.now().millisecondsSinceEpoch ~/ 1000,
+        groupID: event.groupID,
+        msgID: event.msgID,
+        readCount: event.readCount,
+        unreadCount: null,
+      );
+      _notifyAdvancedMsgListeners((listener) {
+        listener.onRecvMessageReadReceipts?.call([receipt]);
+      });
+    });
+  }
+
   void _setupProgressListener() {
     _progressSubscription?.cancel();
     _progressSubscription = ffiService.progressUpdates.listen((progress) {
@@ -2456,7 +2481,8 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
     var removed = 0;
     final accountToxId = ffiService.getSelfToxId();
     if (accountToxId != null && accountToxId.isNotEmpty) {
-      removed += await Tim2ToxFailedMessagePersistence.removeFailedMessagesByIDs(
+      removed +=
+          await Tim2ToxFailedMessagePersistence.removeFailedMessagesByIDs(
         messageIDs: ids,
         accountToxId: accountToxId,
       );
@@ -2886,6 +2912,7 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
     _friendDeletedSubscription?.cancel();
     _groupDeletedSubscription?.cancel();
     _reactionSubscription?.cancel();
+    _receiptEventsSubscription?.cancel();
     _progressSubscription?.cancel();
     _avatarUpdatedSubscription?.cancel();
     _nicknameUpdatedSubscription?.cancel();
@@ -5467,6 +5494,20 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
         messageToSend.sender = ffiService.selfId;
       }
       messageToSend.isSelf = true;
+      // Read receipts: stamp the intent on the optimistic/returned message
+      // (the renderer keys the indicator off V2TimMessage.needReadReceipt)
+      // and arm the service so the persisted ChatMessage carries it across a
+      // cold reload (chatMessageToV2TimMessage restores it).
+      // Read receipts: stamp here; ARMING happens at the two text dispatch
+      // sites below (immediately before _sendProviderText, cleared in their
+      // finally) so the one-shot can never leak across provider-null, media,
+      // exception or early-resend paths, nor be stolen by a concurrent send
+      // between stamp and dispatch. Face/location/custom text-transport
+      // payloads deliberately do not arm (receipt intent is a composer-text
+      // contract today).
+      if (needReadReceipt == true) {
+        messageToSend.needReadReceipt = true;
+      }
 
       // Set faceUrl immediately so the list shows correct avatar from the first frame (avoids default→correct flicker)
       await _setFaceUrlForMsg(messageToSend);
@@ -5541,6 +5582,9 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
                 ? cloudCustomData
                 : messageToSend.cloudCustomData,
           );
+          if (needReadReceipt == true) {
+            ffiService.armNextSendNeedReadReceipt(true);
+          }
           try {
             textSendResult = await _sendProviderText(
               provider,
@@ -5550,6 +5594,7 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
               clientMessageID: clientMessageID,
             );
           } finally {
+            ffiService.armNextSendNeedReadReceipt(false);
             // Belt-and-suspenders against an armed-value LEAK: the consuming
             // send clears the armed cloudCustomData at the top of
             // FfiChatService.sendText/sendGroupText, but if provider.sendText
@@ -5612,6 +5657,9 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
                 ? cloudCustomData
                 : messageToSend.cloudCustomData,
           );
+          if (needReadReceipt == true) {
+            ffiService.armNextSendNeedReadReceipt(true);
+          }
           try {
             textSendResult = await _sendProviderText(
               provider,
@@ -5622,6 +5670,7 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
             );
           } finally {
             ffiService.armNextSendCloudCustomData(null);
+            ffiService.armNextSendNeedReadReceipt(false);
           }
           if (_debugLog)
             print('[Tim2ToxSdkPlatform] Merger message sent successfully');
@@ -6699,6 +6748,10 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
         id: msgID,
         receiver: userID ?? '',
         groupID: groupID ?? '',
+        // Restore the read-receipt intent the original send carried; the
+        // text dispatch sites arm/clear the one-shot themselves, so passing
+        // the flag here is leak-free on every elem branch.
+        needReadReceipt: entry['needReadReceipt'] == true,
       );
       // sendMessage normalizes ordinary successful sends to id == msgID for
       // UIKit deduplication. A resend must retain the persisted local id and
@@ -6793,8 +6846,7 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
       if (deletedFromHistory + removedFailed == 0) {
         return V2TimCallback(
           code: 0,
-          desc:
-              'success (already absent: 0 of ${msgIDs.length} requested '
+          desc: 'success (already absent: 0 of ${msgIDs.length} requested '
               'msgIDs were in history or failed-message storage)',
         );
       }
@@ -8037,6 +8089,77 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
       return V2TimCallback(
         code: -1,
         desc: 'sendMessageReadReceipts failed: $e',
+      );
+    }
+  }
+
+  @override
+  Future<V2TimValueCallback<List<V2TimMessageReceipt>>> getMessageReadReceipts({
+    List<String>? messageIDList,
+  }) async {
+    final ids = messageIDList ?? const <String>[];
+    if (ids.isEmpty) {
+      return V2TimValueCallback(
+        code: -1,
+        desc: 'messageIDList is empty',
+        data: const <V2TimMessageReceipt>[],
+      );
+    }
+    final receipts = <V2TimMessageReceipt>[];
+    try {
+      final found = await findMessages(messageIDList: ids);
+      final byId = <String, V2TimMessage>{
+        for (final m in found.data ?? const <V2TimMessage>[])
+          if ((m.msgID ?? '').isNotEmpty) m.msgID!: m,
+      };
+      // Counts come from the live read-receipt tally (see
+      // FfiChatService.getMessageReaders): in-memory, rebuilt from traffic,
+      // deliberately not persisted.
+      final memberCountByGroup = <String, int>{};
+      for (final msgID in ids) {
+        final msg = byId[msgID];
+        final gid = msg?.groupID;
+        if (msg == null || gid == null || gid.isEmpty) continue;
+        var total = memberCountByGroup[gid] ?? -1;
+        if (total < 0) {
+          try {
+            final res = await getGroupMemberList(
+              groupID: gid,
+              // This class's own signature takes the C filter int; 0 = ALL
+              // (kTIMGroupMemberFilterAll), matching the other call sites.
+              filter: 0,
+              nextSeq: '0',
+            );
+            // A failed lookup must not masquerade as an empty group.
+            total = res.code == 0 ? (res.data?.memberInfoList?.length ?? 0) : 0;
+          } catch (_) {
+            total = 0;
+          }
+          memberCountByGroup[gid] = total;
+        }
+        final readCount = ffiService.getMessageReaders(msgID).length;
+        // Unknown membership (failed/empty lookup) -> unreadCount stays null
+        // rather than inventing a zero; readCount alone is still truthful.
+        final int? unread = total > 0
+            ? ((total - 1 - readCount) < 0 ? 0 : total - 1 - readCount)
+            : null;
+        receipts.add(
+          V2TimMessageReceipt(
+            userID: '',
+            timestamp: DateTime.now().millisecondsSinceEpoch ~/ 1000,
+            groupID: gid,
+            msgID: msgID,
+            readCount: readCount,
+            unreadCount: unread,
+          ),
+        );
+      }
+      return V2TimValueCallback(code: 0, desc: 'success', data: receipts);
+    } catch (e) {
+      return V2TimValueCallback(
+        code: -1,
+        desc: 'getMessageReadReceipts failed: $e',
+        data: receipts,
       );
     }
   }

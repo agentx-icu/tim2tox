@@ -181,5 +181,53 @@ void main() {
         isFalse,
       );
     });
+
+    // Group receipts are authorized by the NGC ENVELOPE identity: the gaction
+    // envelope sender is the toxcore-authenticated PER-GROUP key while the
+    // payload sender carries the long-term id, so the strict payload==envelope
+    // binding would reject every legitimate group receipt. senderBound: false
+    // is passed ONLY for gaction+receipt (see _tryConsumeLegacyActionControl).
+    test('senderBound=false consumes a receipt whose payload sender differs',
+        () {
+      expect(
+        BinaryReplacementHistoryHook.shouldConsumeInternalProtocolCustomData(
+          data: '{"type":"receipt","msgID":"known-message",'
+              '"receiptType":"read","sender":"LONGTERM_ID_OF_READER"}',
+          callbackSender: 'PER_GROUP_KEY_OF_READER',
+          conversationId: 'g1',
+          history: history,
+          senderBound: false,
+        ),
+        isTrue,
+      );
+    });
+
+    test('senderBound=false still requires the referenced message to exist',
+        () {
+      expect(
+        BinaryReplacementHistoryHook.shouldConsumeInternalProtocolCustomData(
+          data: '{"type":"receipt","msgID":"missing-message",'
+              '"receiptType":"read","sender":"LONGTERM_ID_OF_READER"}',
+          callbackSender: 'PER_GROUP_KEY_OF_READER',
+          conversationId: 'g1',
+          history: history,
+          senderBound: false,
+        ),
+        isFalse,
+      );
+    });
+
+    test('default stays strictly sender-bound (C2C/reactions unchanged)', () {
+      expect(
+        BinaryReplacementHistoryHook.shouldConsumeInternalProtocolCustomData(
+          data: '{"type":"receipt","msgID":"known-message",'
+              '"receiptType":"read","sender":"SOMEONE_ELSE"}',
+          callbackSender: peerId,
+          conversationId: peerId,
+          history: history,
+        ),
+        isFalse,
+      );
+    });
   });
 }

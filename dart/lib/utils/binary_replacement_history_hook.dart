@@ -420,6 +420,7 @@ class BinaryReplacementHistoryHook {
     required String callbackSender,
     required String conversationId,
     required Iterable<ChatMessage> history,
+    bool senderBound = true,
   }) {
     final internalProtocol = _decodeInternalProtocolCustomData(data);
     return internalProtocol != null &&
@@ -428,6 +429,7 @@ class BinaryReplacementHistoryHook {
           callbackSender: callbackSender,
           conversationId: conversationId,
           history: history,
+          senderBound: senderBound,
         );
   }
 
@@ -436,10 +438,15 @@ class BinaryReplacementHistoryHook {
     required String callbackSender,
     required String conversationId,
     required Iterable<ChatMessage> history,
+    bool senderBound = true,
   }) {
-    if (conversationId.isEmpty ||
-        callbackSender.isEmpty ||
-        callbackSender != internalProtocol['sender']) {
+    if (conversationId.isEmpty || callbackSender.isEmpty) {
+      return false;
+    }
+    // Group receipts pass senderBound=false: the gaction envelope sender is
+    // the toxcore-authenticated PER-GROUP key while the payload carries the
+    // long-term id — binding them would reject every legitimate receipt.
+    if (senderBound && callbackSender != internalProtocol['sender']) {
       return false;
     }
     final referencedMsgId = internalProtocol['msgID']!;

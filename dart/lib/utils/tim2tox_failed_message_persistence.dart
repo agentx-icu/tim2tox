@@ -236,6 +236,8 @@ class Tim2ToxFailedMessagePersistence {
       final messageData = <String, dynamic>{
         'id': message.id,
         'msgID': message.msgID,
+        // Read-receipt intent must survive the failed->resend round trip.
+        if (message.needReadReceipt == true) 'needReadReceipt': true,
         'timestamp': message.timestamp,
         'elemType': message.elemType,
         'text': message.textElem?.text,

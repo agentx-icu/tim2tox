@@ -1099,6 +1099,10 @@ class MessageHistoryPersistence {
       // erased by the merge. Without this, the persisted reply loses its
       // messageReply metadata even though sendText set it (L3-reply-text).
       cloudCustomData: updated.cloudCustomData ?? existing.cloudCustomData,
+      // Read-receipt intent: like cloudCustomData, only ONE cross-path copy
+      // carries it (the FfiChatService send sets it; the binary-replacement
+      // copy does not) — either copy having asked for receipts wins.
+      needReadReceipt: updated.needReadReceipt || existing.needReadReceipt,
     );
   }
 

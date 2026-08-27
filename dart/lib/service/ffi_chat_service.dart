@@ -956,6 +956,23 @@ class FfiChatService {
     return armed;
   }
 
+  /// One-shot read-receipt intent for the NEXT sendText/sendGroupText, armed
+  /// by Tim2ToxSdkPlatform.sendMessage right before it dispatches (same
+  /// pattern as [armNextSendCloudCustomData]). KNOWN GAP: the offline-queue
+  /// early return consumes nothing, so a send that lands in the offline queue
+  /// leaves the flag armed for the next send — benign (one extra indicator)
+  /// and rare; thread it through the queue items to close.
+  bool _armedSendNeedReadReceipt = false;
+  void armNextSendNeedReadReceipt(bool value) {
+    _armedSendNeedReadReceipt = value;
+  }
+
+  bool _consumeArmedNeedReadReceipt() {
+    final v = _armedSendNeedReadReceipt;
+    _armedSendNeedReadReceipt = false;
+    return v;
+  }
+
   /// Returns the 76-hex-char Tox address (self public key + nospam + checksum)
   /// for this account, or `null` when the underlying Tox instance has no
   /// identity yet (before [login] has resolved) or the FFI call fails.
@@ -1446,6 +1463,13 @@ class FfiChatService {
         String sender,
         String? groupID
       })> get reactionEvents => _reactionCtrl.stream;
+  // Read-receipt tally events: emitted when _handleReceipt records a READ
+  // from a group peer, so the platform can push onRecvMessageReadReceipts
+  // live instead of waiting for the next pull.
+  final _receiptEventsCtrl = StreamController<
+      ({String msgID, String? groupID, int readCount})>.broadcast();
+  Stream<({String msgID, String? groupID, int readCount})> get receiptEvents =>
+      _receiptEventsCtrl.stream;
   // Avatar updated events: emits friendId when a friend's avatar is received and saved
   final _avatarUpdatedCtrl = StreamController<String>.broadcast();
   Stream<String> get avatarUpdated => _avatarUpdatedCtrl.stream;
@@ -1667,6 +1691,7 @@ class FfiChatService {
 
   // Track group message receivers: msgID -> Set of userIDs who received it
   final Map<String, Set<String>> _messageReceivers = {};
+  final Map<String, Set<String>> _messageReaders = {};
   void setActivePeer(String? conversationId) {
     if (conversationId == null || conversationId.isEmpty) {
       _activePeerId = null;
@@ -4922,6 +4947,9 @@ class FfiChatService {
     final isOnline = friend.online;
 
     if (!isOnline) {
+      // Offline: consume (drop) the armed read-receipt intent so it cannot
+      // leak onto an unrelated NEXT send; queued items do not carry it yet.
+      _consumeArmedNeedReadReceipt();
       return _queueOfflineText(
         normalizedPeerId,
         text,
@@ -4951,6 +4979,7 @@ class FfiChatService {
       msgID: msgID,
       // Reply quote (sender-side persistence). Null for a plain send.
       cloudCustomData: cloudCustomData,
+      needReadReceipt: _consumeArmedNeedReadReceipt(),
       contentKind: outgoing.contentKind,
     );
     _lastByPeer[normalizedPeerId] = msg;
@@ -6032,11 +6061,21 @@ class FfiChatService {
     final effectiveGroupId =
         payloadGroupId is String ? payloadGroupId : eventGroupId;
     final conversationId = effectiveGroupId ?? _normalizeFriendId(sender);
+    // Group receipts are authorized by the NGC ENVELOPE identity (the
+    // per-group public key toxcore authenticated), not by the advisory
+    // payload sender — a member cannot know its own per-group key cheaply,
+    // and receipts from ANY member are legitimate. C2C and reactions keep
+    // the strict payload==envelope binding. Keyed on the EVENT group (the
+    // transport the packet actually arrived on), never on a payload-supplied
+    // groupID: a crafted C2C ACTION carrying a groupID field must not be
+    // able to shed the sender binding.
+    final senderBound = eventGroupId == null || decoded['type'] != 'receipt';
     if (!BinaryReplacementHistoryHook.shouldConsumeInternalProtocolCustomData(
       data: body,
       callbackSender: sender,
       conversationId: conversationId,
       history: _messageHistoryPersistence.getHistory(conversationId),
+      senderBound: senderBound,
     )) {
       return false;
     }
@@ -6047,7 +6086,9 @@ class FfiChatService {
           decoded['msgID'] as String,
           decoded['receiptType'] as String,
           sender,
-          effectiveGroupId,
+          // STRICTLY the envelope group: a C2C-delivered body carrying a
+          // groupID field must not be able to tally into group counters.
+          eventGroupId,
         ),
       );
     } else {
@@ -7395,10 +7436,33 @@ class FfiChatService {
   // Note: reaction messages should not trigger receipts
   Future<void> _sendReceipt(String peerId, String msgID, String receiptType,
       {String? groupID}) async {
-    if (groupID != null ||
-        msgID.isEmpty ||
+    if (msgID.isEmpty ||
         _selfId.isEmpty ||
         (receiptType != 'received' && receiptType != 'read')) {
+      return;
+    }
+    if (groupID != null) {
+      // Group receipts ride the group ACTION control line: the body is the
+      // EXACT legacy receipt schema (type/msgID/receiptType/sender — no
+      // groupID key, the gaction envelope already carries it), so every
+      // peer's ingestActionEvent consumes it via
+      // _tryConsumeLegacyActionControl instead of rendering an ACTION row.
+      // Wire-only: _sendGroupTextByKindChecked never appends history.
+      try {
+        final json = jsonEncode({
+          'type': 'receipt',
+          'msgID': msgID,
+          'receiptType': receiptType,
+          'sender': normalizeToxId(_selfId),
+        });
+        _sendGroupTextByKindChecked(
+          groupID,
+          json,
+          ChatMessageContentKind.action,
+        );
+      } catch (_) {
+        // Receipt failures must never break message flow (parity with C2C).
+      }
       return;
     }
     try {
@@ -7432,9 +7496,20 @@ class FfiChatService {
   // Handle received receipt (async helper)
   Future<void> _handleReceipt(
       String msgID, String receiptType, String sender, String? groupID) async {
-    // For group messages, track receivers
-    if (groupID != null && receiptType == 'received') {
-      _messageReceivers.putIfAbsent(msgID, () => <String>{}).add(sender);
+    // For group messages, track receivers and readers. Guard against the
+    // sender's own NGC echo: a self-receipt must not inflate either tally.
+    if (groupID != null && sender != normalizeToxId(_selfId)) {
+      if (receiptType == 'received' || receiptType == 'read') {
+        _messageReceivers.putIfAbsent(msgID, () => <String>{}).add(sender);
+      }
+      if (receiptType == 'read') {
+        _messageReaders.putIfAbsent(msgID, () => <String>{}).add(sender);
+        _receiptEventsCtrl.add((
+          msgID: msgID,
+          groupID: groupID,
+          readCount: _messageReaders[msgID]!.length,
+        ));
+      }
     }
 
     // Update message status in history
@@ -7461,6 +7536,13 @@ class FfiChatService {
         }
       }
     }
+  }
+
+  /// Members that sent a READ receipt for a group message (excludes self).
+  /// In-memory tally: counts reset on restart — receipts are re-tallied from
+  /// live traffic, not persisted. See getMessageReadReceipts on the platform.
+  List<String> getMessageReaders(String msgID) {
+    return _messageReaders[msgID]?.toList() ?? [];
   }
 
   // Get list of users who received a group message
@@ -7561,6 +7643,9 @@ class FfiChatService {
     // nowhere. Now: if we're not connected, queue the message and surface
     // it as pending; drain on the next conn:success.
     if (!_isConnected) {
+      // Offline: consume (drop) the armed read-receipt intent so it cannot
+      // leak onto an unrelated NEXT send; queued items do not carry it yet.
+      _consumeArmedNeedReadReceipt();
       return _queueOfflineGroupText(
         groupId,
         text,
@@ -7581,6 +7666,7 @@ class FfiChatService {
       groupId: groupId,
       msgID: msgID,
       cloudCustomData: cloudCustomData,
+      needReadReceipt: _consumeArmedNeedReadReceipt(),
       contentKind: outgoing.contentKind,
     );
     _lastByPeer[groupId] = out;
@@ -9602,6 +9688,7 @@ class FfiChatService {
     _pendingAvatarTransfers.clear();
     _receivedAvatarHashes.clear();
     _messageReceivers.clear();
+    _messageReaders.clear();
     _progressKeyCache.clear();
     _lastProgressEmitTime.clear();
     _lastProgressTs.clear();
@@ -9643,6 +9730,7 @@ class FfiChatService {
     await _progressCtrl.close();
     await _fileRequestCtrl.close();
     await _reactionCtrl.close();
+    await _receiptEventsCtrl.close();
     await _avatarUpdatedCtrl.close();
     await _nicknameUpdatedCtrl.close();
     await _conversationDraftChanges.close();

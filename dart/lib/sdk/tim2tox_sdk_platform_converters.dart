@@ -183,6 +183,9 @@ extension Tim2ToxSdkPlatformConverters on Tim2ToxSdkPlatform {
             msg.cloudCustomData = json.encode(cloudCustomDataMap);
           }
 
+          if (chatMsg.needReadReceipt) {
+            msg.needReadReceipt = true;
+          }
           return msg;
         } catch (e) {
           // If parsing fails, fall through to normal text message handling
@@ -235,6 +238,9 @@ extension Tim2ToxSdkPlatformConverters on Tim2ToxSdkPlatform {
           };
           msg.cloudCustomData = json.encode(cloudCustomDataMap);
 
+          if (chatMsg.needReadReceipt) {
+            msg.needReadReceipt = true;
+          }
           return msg;
         } catch (e) {
           // If parsing fails, fall through to normal text message handling
@@ -477,6 +483,12 @@ extension Tim2ToxSdkPlatformConverters on Tim2ToxSdkPlatform {
         msg.localCustomData,
         ChatMessageContentKind.action,
       );
+    }
+    // Read-receipt intent must survive a cold reload the same way the reply
+    // metadata above does: the renderer keys the indicator entirely off
+    // V2TimMessage.needReadReceipt.
+    if (chatMsg.needReadReceipt) {
+      msg.needReadReceipt = true;
     }
 
     return msg;

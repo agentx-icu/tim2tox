@@ -83,6 +83,7 @@ class ChatMessage {
     this.fileHash, // SHA256 hash of file content (optional)
     this.altMsgIds = const [], // ids of cross-path duplicates absorbed here
     this.cloudCustomData, // structured reply/forward metadata (JSON string)
+    this.needReadReceipt = false, // sender asked for read receipts (groups)
     this.contentKind = ChatMessageContentKind.normal,
     this.sourceInstanceId,
   });
@@ -125,6 +126,7 @@ class ChatMessage {
   /// sender-side record. The peer-receives-the-quote leg needs a Tox
   /// wire-format change (out of scope). Null for plain messages.
   final String? cloudCustomData;
+  final bool needReadReceipt;
 
   final ChatMessageContentKind contentKind;
 
@@ -162,6 +164,9 @@ class ChatMessage {
         // Backward compatible: gated so plain messages serialize byte-identically
         // (existing on-disk history has no cloudCustomData key).
         if (cloudCustomData != null) 'cloudCustomData': cloudCustomData,
+        // Backward compatible: gated like cloudCustomData, so rows without the
+        // flag keep serializing byte-identically.
+        if (needReadReceipt) 'needReadReceipt': true,
       };
 
   factory ChatMessage.fromJson(Map<String, dynamic> json) => ChatMessage(
@@ -189,6 +194,7 @@ class ChatMessage {
                 const [],
         // Backward compatible: pre-existing history has no cloudCustomData key.
         cloudCustomData: json['cloudCustomData'] as String?,
+        needReadReceipt: json['needReadReceipt'] as bool? ?? false,
       );
 
   ChatMessage copyWith({
@@ -202,6 +208,7 @@ class ChatMessage {
     String? fileHash,
     List<String>? altMsgIds,
     String? cloudCustomData,
+    bool? needReadReceipt,
     ChatMessageContentKind? contentKind,
     int? sourceInstanceId,
   }) {
@@ -224,6 +231,7 @@ class ChatMessage {
       fileHash: fileHash ?? this.fileHash,
       altMsgIds: altMsgIds ?? this.altMsgIds,
       cloudCustomData: cloudCustomData ?? this.cloudCustomData,
+      needReadReceipt: needReadReceipt ?? this.needReadReceipt,
       contentKind: contentKind ?? this.contentKind,
       sourceInstanceId: sourceInstanceId ?? this.sourceInstanceId,
     );
