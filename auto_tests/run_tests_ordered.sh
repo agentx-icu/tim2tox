@@ -1,4 +1,14 @@
 #!/bin/bash
+
+# Tox binds UDP 33445 by default. Any long-lived daemon that squats the port
+# (this Mac: the com.bin.gao.toxtunnel-stability-server LaunchAgent, KeepAlive,
+# holds IPv4 *:33445) silently poisons every network scenario: the test node
+# binds the IPv6 wildcard "successfully", tox_self_get_udp_port still reports
+# 33445, and all inbound IPv4 datagrams go to the squatter — nodes look
+# mutually unreachable with no error anywhere (2026-08-24: 9/24 Tier-1 reds).
+# ToxManager already exposes TOX_UDP_START_PORT for exactly this, so pin the
+# suite to a quiet range unless the caller chose one.
+export TOX_UDP_START_PORT="${TOX_UDP_START_PORT:-43445}"
 # Run tim2tox test scenarios in complexity order with 180s timeout per test
 # Usage:
 #   ./run_tests_ordered.sh                         # run all phases (1-14)
