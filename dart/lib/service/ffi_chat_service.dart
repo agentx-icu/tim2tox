@@ -4925,6 +4925,17 @@ class FfiChatService {
     );
   }
 
+  /// A clientMessageID usable as the PERSISTENT msgID. The mobile UIKit
+  /// composer creates optimistic messages with placeholder ids
+  /// (`created_temp_id-N`); persisting one as row identity leaves history /
+  /// search / list-row keys permanently on the placeholder while every
+  /// real-id consumer misses it (live on Android: search-history rows are
+  /// keyed by real ids, so the seeded row was unfindable). The UIKit layer
+  /// already matches its optimistic bubble to the real-id row by content, so
+  /// nothing needs the temp id persisted.
+  static bool _usableClientMessageID(String? id) =>
+      id != null && id.isNotEmpty && !id.startsWith('created_temp_id-');
+
   Future<ChatMessage> sendTextWithResult(String peerId, String text,
       {String? cloudCustomData, String? clientMessageID}) async {
     final outgoing = parseOutgoingChatText(text);
@@ -4966,8 +4977,8 @@ class FfiChatService {
     // produce an identical `${ms}_$_selfId` msgID — the history-dedup path
     // treats msgID as primary identity and would silently drop the second send.
     // Mirrors the file-send fix below and the inbound format `${ms}_${seq}_x`.
-    final msgID = clientMessageID != null && clientMessageID.isNotEmpty
-        ? clientMessageID
+    final msgID = _usableClientMessageID(clientMessageID)
+        ? clientMessageID!
         : '${DateTime.now().millisecondsSinceEpoch}_${_msgIDSequence++}_$_selfId';
     final msg = ChatMessage(
       text: text,
@@ -5051,8 +5062,8 @@ class FfiChatService {
     // Compute the pending row's msgID BEFORE enqueuing so the queue item can
     // carry it (durable identity — the drain matchers prefer it over the
     // exact-ms timestamp fallback).
-    final msgID = clientMessageID != null && clientMessageID.isNotEmpty
-        ? clientMessageID
+    final msgID = _usableClientMessageID(clientMessageID)
+        ? clientMessageID!
         : '${now.millisecondsSinceEpoch}_${_msgIDSequence++}_$_selfId';
     await _addToOfflineQueue(normalizedPeerId, (
       kind: 'text',
@@ -7655,8 +7666,8 @@ class FfiChatService {
       );
     }
     _sendGroupTextByKindChecked(groupId, text, outgoing.contentKind);
-    final msgID = clientMessageID != null && clientMessageID.isNotEmpty
-        ? clientMessageID
+    final msgID = _usableClientMessageID(clientMessageID)
+        ? clientMessageID!
         : '${DateTime.now().millisecondsSinceEpoch}_${_msgIDSequence++}_${_selfId}_$groupId';
     final out = ChatMessage(
       text: text,
@@ -7690,8 +7701,8 @@ class FfiChatService {
     final now = DateTime.now();
     final storageKey = _groupOfflineQueueKey(groupId);
     // Compute msgID before enqueuing so the queue item carries the durable id.
-    final msgID = clientMessageID != null && clientMessageID.isNotEmpty
-        ? clientMessageID
+    final msgID = _usableClientMessageID(clientMessageID)
+        ? clientMessageID!
         : '${now.millisecondsSinceEpoch}_${_msgIDSequence++}_${_selfId}_$groupId';
     await _addToOfflineQueue(storageKey, (
       kind: 'text',
