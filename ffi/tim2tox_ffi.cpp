@@ -1306,11 +1306,93 @@ static V2TIMManagerImpl* GetExactInstanceFromId(int64_t instance_id) {
     return nullptr;
 }
 
+// Serializes default-instance lifecycle transitions (detach vs init):
+// without it a concurrent init could pass the inited check, re-mark the
+// instance, and then have detach tear its fresh manager down (codex HIGH).
+static std::mutex g_default_lifecycle_mutex;
+// Session EPOCH for the default instance: bumped by every successful init
+// and by tim2tox_ffi_claim_default_epoch. Quarantine authorization is BOUND
+// to the epoch of the session being condemned, so a late quarantine from an
+// old session can never condemn a newer healthy one, and a stale flag dies
+// with its epoch (codex HIGH: unversioned-flag ABC race).
+static std::atomic<uint64_t> g_default_epoch{1};
+static std::atomic<uint64_t> g_default_quarantined_epoch{0};
+
+int tim2tox_ffi_debug_sdk_listener_count(void) {
+    V2TIMManagerImpl* manager = V2TIMManagerImpl::GetInstance();
+    if (!manager) return -1;
+    return (int)manager->DebugSDKListenerCountForTest();
+}
+
+uint64_t tim2tox_ffi_default_epoch(void) {
+    return g_default_epoch.load();
+}
+
+uint64_t tim2tox_ffi_claim_default_epoch(void) {
+    // Adopt path: a service that proceeds onto an existing inited instance
+    // claims a fresh epoch so any quarantine recorded for the PREVIOUS
+    // session becomes stale.
+    return g_default_epoch.fetch_add(1) + 1;
+}
+
+int tim2tox_ffi_quarantine_default_instance(uint64_t epoch) {
+    const uint64_t current = g_default_epoch.load();
+    if (epoch != current) {
+        V2TIM_LOG(kWarning,
+                  "[ffi] quarantine_default_instance: stale epoch — the "
+                  "condemned session is already gone; ignoring");
+        return 0;
+    }
+    g_default_quarantined_epoch.store(epoch);
+    V2TIM_LOG(kWarning,
+              "[ffi] quarantine_default_instance: default instance flagged "
+              "(an undrained task outlived dispose)");
+    return 1;
+}
+
+int tim2tox_ffi_detach_default_instance(void) {
+    std::lock_guard<std::mutex> lifecycle(g_default_lifecycle_mutex);
+    if (!IsInstanceInited(0)) {
+        g_default_quarantined_epoch.store(0);
+        return 1;
+    }
+    if (g_default_quarantined_epoch.load() != g_default_epoch.load()) {
+        V2TIM_LOG(kWarning,
+                  "[ffi] detach_default_instance: refused — instance 0 is "
+                  "inited but not quarantined for THIS session epoch");
+        return 0;
+    }
+    // Close the init gate FIRST so nothing new attaches mid-teardown (init
+    // takes the same lifecycle mutex, so gate+teardown are atomic to it).
+    MarkInstanceUninited(0);
+    V2TIMManagerImpl* manager = V2TIMManagerImpl::GetInstance();
+    // REALLY unregister the per-instance listeners from the retained
+    // singleton's managers (map-erasure alone leaves dangling pointers that
+    // would double-fire after re-init), plus the two init-added globals.
+    extern void DetachDefaultInstanceListeners();
+    DetachDefaultInstanceListeners();
+    if (manager) {
+        manager->RemoveSDKListener(&G.sdk_listener);
+        manager->RemoveSimpleMsgListener(&G.simple_listener);
+        manager->UnInitSDK();
+    }
+    EraseRecvContextsForInstance(0);
+    EraseSendContextsForInstance(0);
+    g_default_quarantined_epoch.store(0);
+    g_default_epoch.fetch_add(1);
+    V2TIM_LOG(kWarning,
+              "[ffi] detach_default_instance: quarantined default instance "
+              "detached (UnInitSDK on the retained singleton); a fresh init "
+              "may now proceed");
+    return 1;
+}
+
 int tim2tox_ffi_init(void) {
     return tim2tox_ffi_init_with_path(nullptr);
 }
 
 int tim2tox_ffi_init_with_path(const char* init_path) {
+    std::lock_guard<std::mutex> lifecycle(g_default_lifecycle_mutex);
     if (IsInstanceInited(0)) return 1;
     V2TIMSDKConfig cfg;
     if (init_path && init_path[0] != '\0') {
@@ -1327,6 +1409,7 @@ int tim2tox_ffi_init_with_path(const char* init_path) {
     // Hook typing and file callbacks on this instance's ToxManager (per-instance so file recv routes correctly)
     RegisterToxManagerFileCallbacks(manager_impl);
     MarkInstanceInited(0);
+    g_default_epoch.fetch_add(1);
     return 1;
 }
 

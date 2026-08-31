@@ -99,6 +99,9 @@ typedef _send_c2c_control_c = ffi.Int32 Function(
   ffi.Int32,
   ffi.Int32,
 );
+typedef _detach_default_instance_c = ffi.Int32 Function();
+typedef _quarantine_default_instance_c = ffi.Int32 Function(ffi.Uint64);
+typedef _default_epoch_c = ffi.Uint64 Function();
 typedef _send_c2c_text_ex_c = ffi.Int32 Function(
   ffi.Pointer<pkgffi.Utf8>,
   ffi.Pointer<pkgffi.Utf8>,
@@ -475,6 +478,15 @@ class Tim2ToxFfi {
 
   final ffi.DynamicLibrary _lib;
 
+  /// TEST SEAM: the underlying dynamic library, for lifecycle tests that
+  /// must poke raw compat exports (e.g. registering a distinct per-instance
+  /// listener to prove detach unwiring).
+  ffi.DynamicLibrary get rawLibraryForTest => _lib;
+
+  /// TEST SEAM: a null void pointer (avoids each test importing dart:ffi
+  /// internals for it).
+  static ffi.Pointer<ffi.Void> get nullPtr => ffi.nullptr;
+
   static String? _libraryPathOverride;
   static bool _libraryPathConfigured = false;
   static bool _libraryOpened = false;
@@ -670,6 +682,21 @@ class Tim2ToxFfi {
         int,
         int,
       )>('tim2tox_ffi_send_c2c_control');
+  late final int Function() detachDefaultInstance =
+      _lib.lookupFunction<_detach_default_instance_c, int Function()>(
+          'tim2tox_ffi_detach_default_instance');
+  late final int Function(int) quarantineDefaultInstance =
+      _lib.lookupFunction<_quarantine_default_instance_c, int Function(int)>(
+          'tim2tox_ffi_quarantine_default_instance');
+  late final int Function() debugSdkListenerCount =
+      _lib.lookupFunction<_detach_default_instance_c, int Function()>(
+          'tim2tox_ffi_debug_sdk_listener_count');
+  late final int Function() defaultEpoch =
+      _lib.lookupFunction<_default_epoch_c, int Function()>(
+          'tim2tox_ffi_default_epoch');
+  late final int Function() claimDefaultEpoch =
+      _lib.lookupFunction<_default_epoch_c, int Function()>(
+          'tim2tox_ffi_claim_default_epoch');
   late final int Function(
     ffi.Pointer<pkgffi.Utf8>,
     ffi.Pointer<pkgffi.Utf8>,

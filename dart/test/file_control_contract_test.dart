@@ -219,5 +219,4 @@ void main() {
         )));
     expect(cancelBody, contains('// Clean up mapping after cancellation'));
   });
-
 }

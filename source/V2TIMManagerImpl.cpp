@@ -369,6 +369,11 @@ void V2TIMManagerImpl::RemoveSDKListener(V2TIMSDKListener* listener) {
     sdk_listeners_.erase(listener);
 }
 
+size_t V2TIMManagerImpl::DebugSDKListenerCountForTest() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return sdk_listeners_.size();
+}
+
 // SDK initialization and shutdown
 bool V2TIMManagerImpl::InitSDK(uint32_t sdkAppID, const V2TIMSDKConfig& config) {
     int64_t this_instance_id = GetInstanceIdFromManager(this);

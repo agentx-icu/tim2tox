@@ -3215,6 +3215,63 @@ void ReplayListenersForNewInstance(int64_t instance_id, V2TIMManagerImpl* manage
 // Helper function to cleanup listeners for a specific instance
 // Note: This should be called before destroying the instance to remove listeners from managers
 // This function is defined here (not in dart_compat_utils.cpp) because it needs access to the complete listener class definitions
+// Detach the DEFAULT instance's per-instance listeners FROM THE MANAGERS
+// (CleanupInstanceListeners only erases the maps; the retained singleton's
+// listener sets would otherwise keep dangling pointers and double-fire after
+// a re-init — codex). Objects are leaked deliberately, same policy as the
+// quarantine itself.
+void DetachDefaultInstanceListeners() {
+    V2TIMManagerImpl* manager = V2TIMManagerImpl::GetInstance();
+    if (!manager) return;
+    // SNAPSHOT under the global lock, Remove* OUTSIDE it (codex HIGH: the
+    // managers' dispatch paths take their own locks and then re-enter
+    // g_listeners_mutex via the Dart callbacks — holding it here across
+    // Remove* is an ABBA deadlock), then erase under the lock again.
+    DartSDKListenerImpl* sdk = nullptr;
+    DartAdvancedMsgListenerImpl* adv = nullptr;
+    DartConversationListenerImpl* conv = nullptr;
+    DartGroupListenerImpl* grp = nullptr;
+    DartFriendshipListenerImpl* fr = nullptr;
+    DartSignalingListenerImpl* sig = nullptr;
+    DartCommunityListenerImpl* comm = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_listeners_mutex);
+        auto pick = [](auto& map, auto*& out) {
+            auto it = map.find((int64_t)0);
+            if (it != map.end()) out = it->second;
+        };
+        pick(g_sdk_listeners, sdk);
+        pick(g_advanced_msg_listeners, adv);
+        pick(g_conversation_listeners, conv);
+        pick(g_group_listeners, grp);
+        pick(g_friendship_listeners, fr);
+        pick(g_signaling_listeners, sig);
+        pick(g_community_listeners, comm);
+    }
+    if (sdk) manager->RemoveSDKListener(sdk);
+    if (adv && manager->GetMessageManager())
+        manager->GetMessageManager()->RemoveAdvancedMsgListener(adv);
+    if (conv && manager->GetConversationManager())
+        manager->GetConversationManager()->RemoveConversationListener(conv);
+    if (grp) manager->RemoveGroupListener(grp);
+    if (fr && manager->GetFriendshipManager())
+        manager->GetFriendshipManager()->RemoveFriendListener(fr);
+    if (sig && manager->GetSignalingManager())
+        manager->GetSignalingManager()->RemoveSignalingListener(sig);
+    if (comm && manager->GetCommunityManager())
+        manager->GetCommunityManager()->RemoveCommunityListener(comm);
+    {
+        std::lock_guard<std::mutex> lock(g_listeners_mutex);
+        g_sdk_listeners.erase(0);
+        g_advanced_msg_listeners.erase(0);
+        g_conversation_listeners.erase(0);
+        g_group_listeners.erase(0);
+        g_friendship_listeners.erase(0);
+        g_signaling_listeners.erase(0);
+        g_community_listeners.erase(0);
+    }
+}
+
 void CleanupInstanceListeners(int64_t instance_id) {
     // Forward declarations
     extern int64_t GetCurrentInstanceId();

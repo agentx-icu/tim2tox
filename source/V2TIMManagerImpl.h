@@ -62,6 +62,10 @@ public:
     // SDK Listener Management
     void AddSDKListener(V2TIMSDKListener* listener) override;
     void RemoveSDKListener(V2TIMSDKListener* listener) override;
+    // TEST SEAM: current SDK-listener registration count — lets the native
+    // lifecycle test prove detach -> re-init registers callbacks exactly
+    // once (no dangling duplicate wiring).
+    size_t DebugSDKListenerCountForTest();
 
     // SDK Initialization and Cleanup
     bool InitSDK(uint32_t sdkAppID, const V2TIMSDKConfig& config) override;

@@ -325,6 +325,27 @@ int tim2tox_ffi_add_bootstrap_node(int64_t instance_id, const char* host, int po
 // message id (the one the toxcore delivery-ACK path reports) into
 // msg_id_out (NUL-terminated; pass >= 64 bytes).
 int tim2tox_ffi_send_c2c_text_ex(const char* user_id, const char* text, char* msg_id_out, int msg_id_out_len);
+
+// TEST SEAM: SDK-listener registration count on the default singleton.
+int tim2tox_ffi_debug_sdk_listener_count(void);
+// Session epoch of the default instance (bumped by init / claim / detach).
+uint64_t tim2tox_ffi_default_epoch(void);
+// Claim a fresh epoch (adopt path: a service proceeding onto an existing
+// inited instance invalidates any quarantine recorded for its predecessor).
+uint64_t tim2tox_ffi_claim_default_epoch(void);
+// Flag the default instance as QUARANTINED for the given session epoch (set
+// ONLY by the Dart dispose path when an undrained task outlives the drain
+// window; a stale epoch is ignored). Pure flag set — no teardown — so it is
+// safe while that task is still live.
+int tim2tox_ffi_quarantine_default_instance(uint64_t epoch);
+
+// Detach a QUARANTINED default instance so a fresh init can proceed: closes
+// the inited gate FIRST, strips listeners + per-instance contexts, then
+// UnInitSDK (resets the ToxManager on the retained singleton). Called by the
+// Dart side at the NEXT init() when it finds instance 0 still marked inited
+// (a prior dispose left it quarantined because a background task outlived
+// the drain window). Returns 1 on success.
+int tim2tox_ffi_detach_default_instance(void);
 int tim2tox_ffi_send_c2c_action_ex(const char* user_id, const char* text, char* msg_id_out, int msg_id_out_len);
 
 // Callback-based notification (called from background native thread):

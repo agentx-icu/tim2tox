@@ -108,7 +108,8 @@ void main() {
     test('rejects the V2TIM login alias toxee passes to login()', () {
       // THE regression this whole change exists to prevent. Before the fix the
       // alias flowed straight through into the persistence scope.
-      expect(FfiChatService.accountScopeFromToxId('FlutterUIKitClient'), isNull);
+      expect(
+          FfiChatService.accountScopeFromToxId('FlutterUIKitClient'), isNull);
     });
 
     test('rejects any other non-Tox-shaped identifier', () {

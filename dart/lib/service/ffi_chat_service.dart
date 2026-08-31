@@ -2143,10 +2143,47 @@ class FfiChatService {
     }
   }
 
+  /// Whether THIS service object has run [init] before (guards the stale-
+  /// instance detach below to genuinely fresh services).
+  bool _didInit = false;
+
+  /// The native default-instance session epoch captured at [init]; a later
+  /// quarantine is authorized ONLY for this epoch.
+  int _sessionEpoch = 0;
+
   Future<void> init({String? profileDirectory}) async {
     // A different profile may be about to be opened on this object; anything
     // latched from a previous one is now wrong. See [_selfToxIdCache].
     _selfToxIdCache = null;
+    // A FRESH service finding instance 0 still inited means a prior dispose
+    // QUARANTINED it (a background task outlived the drain window and
+    // freeing then would have been a UAF). Detach it NOW — the inter-session
+    // gap has let those tasks die — so this init mints a clean session
+    // instead of early-returning onto the old account's instance.
+    if (!_didInit) {
+      try {
+        if (_ffi.isInstanceInitialized(0) == 1) {
+          _logger?.logWarning(
+            '[FfiChatService] init: default instance already inited on a '
+            'fresh service — requesting detach (native refuses unless the '
+            'prior dispose actually quarantined it)',
+          );
+          final rc = _ffi.detachDefaultInstance();
+          if (rc != 1) {
+            _logger?.logWarning(
+              '[FfiChatService] init: detach refused (rc=$rc) — instance '
+              'not quarantined; proceeding onto the existing instance',
+            );
+            // Adopting invalidates any quarantine a predecessor might yet
+            // record for its dead epoch (codex: unversioned-flag ABC race).
+            _ffi.claimDefaultEpoch();
+          }
+        }
+      } on Object catch (_) {
+        // Older native lib without the export: keep the legacy behavior.
+      }
+    }
+    _didInit = true;
     if (profileDirectory != null && profileDirectory.isNotEmpty) {
       final pathPtr = profileDirectory.toNativeUtf8();
       try {
@@ -2159,6 +2196,13 @@ class FfiChatService {
       }
     } else {
       _ffi.init();
+    }
+    // Capture the session epoch AFTER the native init (a fresh init bumps
+    // it); quarantine authorization is bound to this value.
+    try {
+      _sessionEpoch = _ffi.defaultEpoch();
+    } on Object catch (_) {
+      _sessionEpoch = 0; // older native lib
     }
     // Set file receive directory: per-account when _fileRecvPath is set, else
     // ask the injected resolver (X6), else fall back to app support file_recv.
@@ -10024,16 +10068,25 @@ class FfiChatService {
       // would turn its eventual resume into a use-after-free; QUARANTINE the
       // instance instead (deliberate bounded leak — the _disposing latch
       // already condemns this service object, so nothing reuses it).
-      // KNOWN LIMITATION (needs a native detach API to close): the C++ side
-      // still counts the quarantined instance as the current inited one, so
-      // a subsequent fresh-service init() on the SAME process can early-return
-      // onto it (ffi/tim2tox_ffi.cpp init guard) instead of minting a new
-      // instance. That is a pre-existing property of the global native state;
-      // acceptable here because this branch has never been observed to fire
-      // (10s drain of dart-side awaits) and the alternative was a UAF.
+      // The NEXT fresh service's init() detaches this quarantined instance
+      // (tim2tox_ffi_detach_default_instance: gate-first, listeners/contexts
+      // stripped, UnInitSDK on the retained singleton) instead of
+      // early-returning onto the old account. Detaching HERE would recreate
+      // the very UAF the quarantine avoids — the undrained task is still
+      // live at this moment; by the next init it has had the whole
+      // inter-session gap to die. Residual (documented) window: a task that
+      // survives INTO the next session's detach.
       _logger?.log(
           '[FfiChatService] dispose: leaving native instance allocated — an '
           'undrained background task could still touch it');
+      try {
+        // Provenance flag for the NEXT init's detach, BOUND to this
+        // session's epoch: only this branch may authorize tearing the stale
+        // instance down, and never a successor session (codex).
+        _ffi.quarantineDefaultInstance(_sessionEpoch);
+      } on Object catch (_) {
+        // Older native lib without the export: legacy behavior stands.
+      }
     }
     await _messages.close();
     await _connectionStatus.close();
