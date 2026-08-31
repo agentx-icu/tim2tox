@@ -309,6 +309,55 @@ void ToxManager::initialize(const Tox_Options* options,
     if (group_message_cb_) {
         tox_callback_conference_message(tox_.get(), onGroupMessage);
     }
+    // FRIEND-level callbacks can equally be stored BEFORE initialize (the
+    // manager wires them at InitSDK, before login creates tox_) — without
+    // this block a stored callback silently never reaches toxcore. Measured
+    // 2026-08-31 on the Android pair: friend_lossless_packet was never
+    // registered on the real instance, so EVERY 0xA1 control frame
+    // (receipts, reactions, msgid binds) was dropped inside tox.c while
+    // plain messages survived via a later re-wire of their own setter.
+    if (self_connection_status_cb_) {
+        tox_callback_self_connection_status(tox_.get(), onSelfConnectionStatus);
+    }
+    if (friend_request_cb_) {
+        tox_callback_friend_request(tox_.get(), onFriendRequest);
+    }
+    if (friend_message_cb_) {
+        tox_callback_friend_message(tox_.get(), onFriendMessage);
+    }
+    if (friend_name_cb_) {
+        tox_callback_friend_name(tox_.get(), onFriendName);
+    }
+    if (friend_status_message_cb_) {
+        tox_callback_friend_status_message(tox_.get(), onFriendStatusMessage);
+    }
+    if (friend_status_cb_) {
+        tox_callback_friend_status(tox_.get(), onFriendStatus);
+    }
+    if (friend_connection_status_cb_) {
+        tox_callback_friend_connection_status(tox_.get(), onFriendConnectionStatus);
+    }
+    if (friend_read_receipt_cb_) {
+        tox_callback_friend_read_receipt(tox_.get(), onFriendReadReceipt);
+    }
+    if (friend_typing_cb_) {
+        tox_callback_friend_typing(tox_.get(), onFriendTyping);
+    }
+    if (file_recv_cb_) {
+        tox_callback_file_recv(tox_.get(), onFileRecv);
+    }
+    if (file_control_cb_) {
+        tox_callback_file_recv_control(tox_.get(), onFileControl);
+    }
+    if (file_chunk_request_cb_) {
+        tox_callback_file_chunk_request(tox_.get(), onFileChunkRequest);
+    }
+    if (friend_lossless_packet_cb_) {
+        tox_callback_friend_lossless_packet(tox_.get(), onFriendLosslessPacket);
+    }
+    if (friend_lossy_packet_cb_) {
+        tox_callback_friend_lossy_packet(tox_.get(), onFriendLossyPacket);
+    }
 
     // Store the instance pointer for use in iterate
     // tox_self_set_user_data(tox_.get(), this);

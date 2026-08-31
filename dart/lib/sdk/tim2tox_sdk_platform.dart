@@ -2175,15 +2175,23 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
         }
       }
 
-      // Check if message status changed (received/read) and notify listeners
-      if (chatMsg.isSelf && chatMsg.isReceived) {
-        // Message was received by peer
+      // Peer-READ synthesis for the own-bubble double-tick. STRICTLY isRead:
+      // the old isReceived condition conflated delivered with read (it was
+      // dead code until the receipt round-trip landed — the receipt userID
+      // never matched UIKit's peer-keyed map — and instantly flipped ticks
+      // on mere delivery once fixed).
+      if (chatMsg.isSelf && chatMsg.isRead) {
+        // Message was READ by the peer
         _notifyAdvancedMsgListeners(
           (listener) {
             // Create a receipt for C2C messages
             if (chatMsg.groupId == null) {
+              // UIKit's onReceiveC2CMessageReadReceipts keys its message map
+              // by the PEER (conversation) id; a self row's fromUserId is
+              // SELF, which never matches — resolve the real peer.
+              final peer = ffiService.c2cPeerOfSelfRow(chatMsg.msgID ?? '');
               final receipt = V2TimMessageReceipt(
-                userID: chatMsg.fromUserId,
+                userID: peer ?? chatMsg.fromUserId,
                 msgID: chatMsg.msgID ?? '',
                 timestamp: chatMsg.timestamp.millisecondsSinceEpoch ~/ 1000,
               );
@@ -3300,6 +3308,15 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
               },
               dispatchInstanceId: instanceId,
             );
+            // Toxcore delivery ACKs carry the NATIVE msg id; resolve them to
+            // the sender's own rows via the send-time alias (delivery leg of
+            // the receipt fix — the READ leg rides hash-echo receipts).
+            for (final r in receipts) {
+              final mid = r.msgID;
+              if (mid != null && mid.isNotEmpty && r.userID.isNotEmpty) {
+                ffiService.applyNativeDeliveryAck(r.userID, mid);
+              }
+            }
           }
         }
         break;

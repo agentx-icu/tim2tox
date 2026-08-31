@@ -821,7 +821,8 @@ class FfiChatService {
         bytes[i ~/ 2] = int.parse(hexPayload.substring(i, i + 2), radix: 16);
       }
       final route = bytes.first;
-      if (route > 3) return null;
+      // 4 is tolerated (a briefly-shipped experiment id) — see ingest.
+      if (route > 4) return null;
       return (
         sender: sender,
         route: route,
@@ -1710,6 +1711,10 @@ class FfiChatService {
     // Tracked, not bare-`unawaited`: dispose() must be able to drain this or a
     // logout right after opening a conversation loses the read barrier. See
     // [_readBarrierWrites].
+    // Wire READ receipts BEFORE the barrier flags the rows (this — the
+    // setActivePeer path — is what a real chat OPEN drives; the row-menu
+    // mark-read runs through markConversationRead below).
+    _sendC2cReadReceiptsOnView(normalizedId);
     _trackReadBarrierWrite(
         _messageHistoryPersistence.markConversationViewed(conversationId));
     _unreadByPeer[normalizedId] = 0;
@@ -1744,7 +1749,51 @@ class FfiChatService {
     if (_unreadByPeer.containsKey(normalizedId)) {
       _unreadByPeer[normalizedId] = 0;
     }
+    // Wire receipts FIRST: markConversationViewed itself flags the non-self
+    // rows isRead, so a post-barrier scan would find nothing unread.
+    _sendC2cReadReceiptsOnView(normalizedId);
     await _messageHistoryPersistence.markConversationViewed(conversationId);
+  }
+
+  /// Wire READ receipts for a C2C conversation the user just viewed — the
+  /// product half of the double-tick (previously chat-open was LOCAL-only:
+  /// no wire receipt ever left the reader). Bounded to the most recent 50
+  /// unread inbound rows; group ids never match the 64-hex gate.
+  void _sendC2cReadReceiptsOnView(String normalizedId) {
+    if (normalizedId.length != 64 ||
+        !RegExp(r'^[0-9A-Fa-f]{64}$').hasMatch(normalizedId) ||
+        _knownGroups.contains(normalizedId)) {
+      return;
+    }
+    final history = _historyById[normalizedId];
+    if (history == null || history.isEmpty) return;
+    // OFFLINE gate (codex P1): the native control send retries a friend that
+    // is offline with a SYNCHRONOUS 2s sleep per call — 50 rows would block
+    // the UI isolate for minutes. The peer cannot receive receipts while
+    // offline anyway; the rows still flip isRead locally (product read
+    // state), and the lost wire receipts are a recorded protocol limit.
+    final peerOnline = _friendOnlineStatus[normalizedId] != 'offline';
+    // Explicit newest-first by TIMESTAMP (codex P1): startup reverses the
+    // shared cache, so index order is not a recency order.
+    final candidates = <int>[];
+    for (var i = 0; i < history.length; i++) {
+      final msg = history[i];
+      if (!msg.isSelf && !msg.isRead) candidates.add(i);
+    }
+    candidates.sort(
+      (a, b) => history[b].timestamp.compareTo(history[a].timestamp),
+    );
+    var sent = 0;
+    for (final i in candidates.take(50)) {
+      final msg = history[i];
+      history[i] = msg.copyWith(isRead: true);
+      final rowMsgID = msg.msgID;
+      if (peerOnline && rowMsgID != null && rowMsgID.isNotEmpty) {
+        unawaited(_sendReceipt(normalizedId, rowMsgID, 'read'));
+      }
+      sent++;
+    }
+    if (sent > 0) unawaited(_saveHistory(normalizedId));
   }
 
   /// Unread count for the product sidebar / conversation list.
@@ -4970,8 +5019,14 @@ class FfiChatService {
       );
     }
 
-    // Friend is online - send immediately.
-    _sendC2cTextByKindChecked(normalizedPeerId, text, outgoing.contentKind);
+    // Friend is online - send immediately (via the _ex export so the NATIVE
+    // send id — which the toxcore delivery-ACK path reports — can be
+    // aliased onto this row).
+    final nativeMsgID = _sendC2cTextByKindCheckedEx(
+      normalizedPeerId,
+      text,
+      outgoing.contentKind,
+    );
     // P1-1 (text-send): include the monotonic `_msgIDSequence` like the inbound
     // and file-send paths, so two C2C texts sent in the same millisecond don't
     // produce an identical `${ms}_$_selfId` msgID — the history-dedup path
@@ -4988,6 +5043,7 @@ class FfiChatService {
       groupId: null,
       isPending: false,
       msgID: msgID,
+      altMsgIds: [if (nativeMsgID != null) nativeMsgID],
       // Reply quote (sender-side persistence). Null for a plain send.
       cloudCustomData: cloudCustomData,
       needReadReceipt: _consumeArmedNeedReadReceipt(),
@@ -4996,6 +5052,7 @@ class FfiChatService {
     _lastByPeer[normalizedPeerId] = msg;
     _appendHistory(normalizedPeerId, msg);
     _messages.add(msg);
+    _drainUnmatchedDeliveryAcks(normalizedPeerId);
     return msg;
   }
 
@@ -5951,6 +6008,10 @@ class FfiChatService {
     }
 
     switch (parsed.route) {
+      case 4:
+        // Reserved (a briefly-shipped msgid-bind experiment): tolerated and
+        // dropped so a dev build that sent them never renders garbage.
+        return true;
       case 0:
         if (_isExactReceiptControl(decoded, parsed.sender)) {
           _applyC2cReceipt(decoded!, parsed.sender);
@@ -6138,7 +6199,20 @@ class FfiChatService {
             message.text == text &&
             message.contentKind == contentKind &&
             message.timestamp.difference(now).abs() <= dedupWindow);
-    if (duplicate) return true;
+    if (duplicate) {
+      // The hook (SDK-callback path) won the ingest race for this text and
+      // it NEVER sends receipts — receipt duty stays here on the poll path,
+      // which always delivers exactly once. The hash echo needs only the
+      // text, so no row/id coordination with the hook's copy is required.
+      if (normalizedFrom != _selfId && !_isReactionMessage(text)) {
+        unawaited(
+          _sendReceipt(
+              normalizedFrom, 'dup:$text'.hashCode.toString(), 'received',
+              inboundText: text),
+        );
+      }
+      return true;
+    }
 
     final msgID =
         '${now.millisecondsSinceEpoch}_${_msgIDSequence++}_$normalizedFrom';
@@ -6162,7 +6236,9 @@ class FfiChatService {
     _appendHistory(normalizedFrom, msg);
     _emitInboundMessage(msg, force: forceEmit || _isControlSignalText(text));
     if (!msg.isSelf && !_isReactionMessage(text)) {
-      unawaited(_sendReceipt(from, msgID, 'received'));
+      unawaited(
+        _sendReceipt(normalizedFrom, msgID, 'received', inboundText: text),
+      );
     }
     return true;
   }
@@ -6219,6 +6295,7 @@ class FfiChatService {
   }
 
   void _applyC2cReceipt(Map<String, dynamic> data, String sender) {
+    _bumpDiag('receiptsIn');
     unawaited(
       _handleReceipt(
         data['msgID'] as String,
@@ -6873,6 +6950,176 @@ class FfiChatService {
     }
   }
 
+  /// The SELF identity for WIRE control payloads (receipts / reactions):
+  /// peers validate `sender == envelope sender` (the Tox pubkey), and
+  /// `_selfId` is only the LOGIN ALIAS — on Android it is the literal
+  /// 'FlutterUIKitClient', which made every receipt fail the peer's
+  /// validator silently (measured 2026-08-31: 'Rejected malformed typed
+  /// c2cbin receipt' on every receipt — receipts NEVER applied on Android).
+  String _wireSelfSender() => normalizeToxId(getSelfToxId() ?? _selfId);
+
+  /// SHA-256 hex over the FIRST 1024 UTF-8 bytes of the wire text — the
+  /// CONTENT correlator C2C hash-echo receipts carry (`bind:<hash>` in the
+  /// free-form msgID field). Prefix-bounded so native FRAGMENTATION (texts
+  /// split above ~1322 bytes arrive as separate messages) still correlates:
+  /// fragment 1 shares the full text's first KiB, so its receipt flips the
+  /// sender's row; later fragments' receipts simply miss. The digest itself
+  /// stays full-length.
+  static String _c2cTextHash(String text) {
+    final bytes = utf8.encode(text);
+    final bounded = bytes.length > 1024 ? bytes.sublist(0, 1024) : bytes;
+    return sha256.convert(bounded).toString();
+  }
+
+  /// Receipt-path diagnostics (read through l3_dump_state.receiptDiag):
+  /// deterministic cross-instance evidence — device log files rotate away
+  /// under campaign retries.
+  final Map<String, int> receiptDiag = {
+    'receiptsHashOut': 0,
+    'receiptsLocalOut': 0,
+    'receiptsIn': 0,
+    'receiptsRowMatched': 0,
+  };
+  void _bumpDiag(String k) => receiptDiag[k] = (receiptDiag[k] ?? 0) + 1;
+
+  /// The C2C PEER a SELF row belongs to (the conversation key its list
+  /// lives under), or null. Rare-path helper for the platform's read-receipt
+  /// synthesis — UIKit keys its message map by the PEER id, and a self row's
+  /// fromUserId is SELF.
+  String? c2cPeerOfSelfRow(String msgID) {
+    if (msgID.isEmpty) return null;
+    for (final entry in _historyById.entries) {
+      final key = entry.key;
+      if (key.length != 64 || _knownGroups.contains(key)) continue;
+      for (final msg in entry.value) {
+        if (msg.isSelf &&
+            (msg.msgID == msgID || msg.altMsgIds.contains(msgID))) {
+          return key;
+        }
+      }
+    }
+    return null;
+  }
+
+  /// C2C history row by primary or alias id (altMsgIds carries the NATIVE
+  /// send id and cross-path merge aliases).
+  ChatMessage? _findC2cRow(String peerId, String msgID) {
+    final history =
+        _historyById[_normalizeFriendId(peerId)] ?? _historyById[peerId];
+    if (history == null) return null;
+    for (var i = history.length - 1; i >= 0; i--) {
+      final msg = history[i];
+      if (msg.msgID == msgID || msg.altMsgIds.contains(msgID)) return msg;
+    }
+    return null;
+  }
+
+  /// Unmatched toxcore delivery ACKs: an ACK can race the row append right
+  /// after a synchronous send — buffer briefly, drained on append.
+  final List<({String peer, String nativeMsgID, DateTime expires})>
+      _unmatchedDeliveryAcks = [];
+
+  /// Resolve a toxcore delivery ACK (NATIVE msg id) to the sender's own row
+  /// via the altMsgIds alias recorded at send time, and flip isReceived —
+  /// the genuine DELIVERED signal (the READ leg rides hash-echo receipts).
+  void applyNativeDeliveryAck(String peerUserID, String nativeMsgID) {
+    if (nativeMsgID.isEmpty) return;
+    final peer = _normalizeFriendId(peerUserID);
+    final history = _historyById[peer];
+    if (history != null) {
+      for (var i = history.length - 1; i >= 0; i--) {
+        final msg = history[i];
+        if (msg.isSelf && msg.altMsgIds.contains(nativeMsgID)) {
+          if (!msg.isReceived) {
+            final updated = msg.copyWith(isReceived: true);
+            history[i] = updated;
+            unawaited(_saveHistory(peer));
+            _messages.add(updated);
+          }
+          return;
+        }
+      }
+    }
+    final now = DateTime.now();
+    _unmatchedDeliveryAcks.removeWhere((e) => e.expires.isBefore(now));
+    if (_unmatchedDeliveryAcks.length >= 16) {
+      _unmatchedDeliveryAcks.removeAt(0);
+    }
+    _unmatchedDeliveryAcks.add((
+      peer: peer,
+      nativeMsgID: nativeMsgID,
+      expires: now.add(const Duration(seconds: 10)),
+    ));
+  }
+
+  void _drainUnmatchedDeliveryAcks(String peer) {
+    if (_unmatchedDeliveryAcks.isEmpty) return;
+    final now = DateTime.now();
+    _unmatchedDeliveryAcks.removeWhere((e) => e.expires.isBefore(now));
+    final pending =
+        _unmatchedDeliveryAcks.where((e) => e.peer == peer).toList();
+    for (final e in pending) {
+      _unmatchedDeliveryAcks.remove(e);
+      applyNativeDeliveryAck(e.peer, e.nativeMsgID);
+    }
+  }
+
+  /// _ex send: like [_sendC2cTextByKindChecked] but returns the NATIVE msg
+  /// id (null when the loaded native lib predates the _ex exports — the
+  /// send then falls back to the classic path, losing only the delivery
+  /// alias).
+  String? _sendC2cTextByKindCheckedEx(
+    String normalizedPeerId,
+    String text,
+    ChatMessageContentKind contentKind,
+  ) {
+    try {
+      return _sendC2cNativeCheckedEx(
+        normalizedPeerId,
+        text,
+        action: contentKind == ChatMessageContentKind.action,
+      );
+    } on _TextTransportSendError {
+      rethrow;
+    } on _InvalidTextTransportPayload {
+      rethrow;
+    } on Object {
+      _sendC2cTextByKindChecked(normalizedPeerId, text, contentKind);
+      return null;
+    }
+  }
+
+  String? _sendC2cNativeCheckedEx(
+    String normalizedPeerId,
+    String text, {
+    required bool action,
+  }) {
+    _validateTextTransportPayload(text);
+    if (action && text.isEmpty) {
+      throw _InvalidTextTransportPayload('ACTION payload must not be empty.');
+    }
+    final pto = normalizedPeerId.toNativeUtf8();
+    final pmsg = text.toNativeUtf8();
+    final out = pkgffi.malloc.allocate<ffi.Int8>(128);
+    try {
+      final result = action
+          ? _ffi.sendC2CActionEx(pto, pmsg, out, 128)
+          : _ffi.sendTextEx(pto, pmsg, out, 128);
+      if (result != 1) {
+        throw _TextTransportSendError(
+          'send${action ? 'C2CActionEx' : 'TextEx'} failed (rc=$result) '
+          'for $normalizedPeerId',
+        );
+      }
+      final id = out.cast<pkgffi.Utf8>().toDartString();
+      return id.isEmpty ? null : id;
+    } finally {
+      pkgffi.malloc.free(pto);
+      pkgffi.malloc.free(pmsg);
+      pkgffi.malloc.free(out);
+    }
+  }
+
   void _sendC2cTextNativeChecked(String normalizedPeerId, String text) {
     _validateTextTransportPayload(text);
     final pto = normalizedPeerId.toNativeUtf8();
@@ -7446,7 +7693,7 @@ class FfiChatService {
   // receiptType: 'received' or 'read'
   // Note: reaction messages should not trigger receipts
   Future<void> _sendReceipt(String peerId, String msgID, String receiptType,
-      {String? groupID}) async {
+      {String? groupID, String? inboundText}) async {
     if (msgID.isEmpty ||
         _selfId.isEmpty ||
         (receiptType != 'received' && receiptType != 'read')) {
@@ -7464,7 +7711,7 @@ class FfiChatService {
           'type': 'receipt',
           'msgID': msgID,
           'receiptType': receiptType,
-          'sender': normalizeToxId(_selfId),
+          'sender': _wireSelfSender(),
         });
         _sendGroupTextByKindChecked(
           groupID,
@@ -7477,11 +7724,27 @@ class FfiChatService {
       return;
     }
     try {
+      // C2C receipts echo a CONTENT-derived correlator instead of any id:
+      // `bind:<sha256(text)>` in the (free-form) msgID field. The receiver
+      // always HAS the text in hand, so no cross-instance id hand-off is
+      // needed at all — receiver-minted ids can never match the sender's
+      // rows, and a sender-id bind protocol loses a race on the binary send
+      // path, whose real-id callback can lag its own wire send by 30-80s
+      // (both measured live). Old receivers never produce the prefix; old
+      // senders miss the match exactly as before — 4-key schema unchanged.
+      final row = _findC2cRow(peerId, msgID);
+      final echoText = row != null && !row.isSelf ? row.text : inboundText;
+      final wireMsgID = echoText != null && echoText.isNotEmpty
+          ? 'bind:${_c2cTextHash(echoText)}'
+          : msgID;
+      _bumpDiag(
+        wireMsgID.startsWith('bind:') ? 'receiptsHashOut' : 'receiptsLocalOut',
+      );
       final json = {
         'type': 'receipt',
-        'msgID': msgID,
+        'msgID': wireMsgID,
         'receiptType': receiptType, // 'received' or 'read'
-        'sender': normalizeToxId(_selfId),
+        'sender': _wireSelfSender(),
       };
       final jsonString = jsonEncode(json);
       final jsonBytes = utf8.encode(jsonString);
@@ -7509,7 +7772,7 @@ class FfiChatService {
       String msgID, String receiptType, String sender, String? groupID) async {
     // For group messages, track receivers and readers. Guard against the
     // sender's own NGC echo: a self-receipt must not inflate either tally.
-    if (groupID != null && sender != normalizeToxId(_selfId)) {
+    if (groupID != null && sender != _wireSelfSender()) {
       if (receiptType == 'received' || receiptType == 'read') {
         _messageReceivers.putIfAbsent(msgID, () => <String>{}).add(sender);
       }
@@ -7523,13 +7786,49 @@ class FfiChatService {
       }
     }
 
-    // Update message status in history
+    // Update message status in history. A `bind:<sha256(text)>` correlator
+    // (C2C hash-echo receipts) matches by CONTENT, oldest-unflagged-first so
+    // identical texts pair 1:1 in send order; a plain id keeps the exact
+    // legacy match.
     final id = groupID ?? sender;
     final history = _historyById[id];
+    final hashWanted = msgID.startsWith('bind:') ? msgID.substring(5) : null;
     if (history != null) {
-      for (int i = 0; i < history.length; i++) {
+      // Oldest-by-TIMESTAMP first for hash matches (codex P1: index order
+      // inverts after a restart reverses the cache) so identical texts pair
+      // 1:1 in true send order.
+      var order = List<int>.generate(history.length, (i) => i);
+      if (hashWanted != null) {
+        order.sort(
+          (a, b) => history[a].timestamp.compareTo(history[b].timestamp),
+        );
+      }
+      for (final i in order) {
         final msg = history[i];
-        if (msg.msgID == msgID && msg.isSelf) {
+        final matched = hashWanted != null
+            ? (msg.isSelf &&
+                !(receiptType == 'received' ? msg.isReceived : msg.isRead) &&
+                _c2cTextHash(msg.text) == hashWanted)
+            : (msg.msgID == msgID && msg.isSelf);
+        if (hashWanted != null &&
+            msg.isSelf &&
+            !matched &&
+            i >= history.length - 4) {
+          _logger?.log(
+            '[FfiChatService] hash-receipt unmatched: want=' +
+                hashWanted.substring(0, 12) +
+                ' row=' +
+                _c2cTextHash(msg.text).substring(0, 12) +
+                ' flags r=' +
+                msg.isReceived.toString() +
+                '/rd=' +
+                msg.isRead.toString() +
+                ' txt=' +
+                msg.text.substring(0, msg.text.length.clamp(0, 24)),
+          );
+        }
+        if (matched) {
+          _bumpDiag('receiptsRowMatched');
           // Update self-sent message receipt status
           ChatMessage updatedMsg;
           if (receiptType == 'received') {
@@ -7605,7 +7904,7 @@ class FfiChatService {
         'msgID': msgID,
         'reactionID': reactionID,
         'action': action, // 'add' or 'remove'
-        'sender': normalizeToxId(_selfId),
+        'sender': _wireSelfSender(),
       };
       final jsonString = jsonEncode(json);
       final jsonBytes = utf8.encode(jsonString);

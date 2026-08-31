@@ -1587,6 +1587,58 @@ int tim2tox_ffi_send_c2c_action(const char* user_id, const char* text) {
     return msg_id.Empty() ? 0 : 1;
 }
 
+// Copy a native message id into a caller buffer (always NUL-terminated;
+// truncates silently — ids are ~40 chars, callers pass 128).
+static void CopyMsgIdOut(const V2TIMString& msg_id, char* out, int out_len) {
+    if (!out || out_len <= 0) return;
+    const char* src = msg_id.CString();
+    if (!src) { out[0] = '\0'; return; }
+    size_t n = strlen(src);
+    if (n > static_cast<size_t>(out_len - 1)) n = static_cast<size_t>(out_len - 1);
+    memcpy(out, src, n);
+    out[n] = '\0';
+}
+
+// _ex variants: same send as the non-_ex exports but surface the NATIVE
+// msg_id (previously discarded), so Dart can alias its row to the id the
+// toxcore delivery-ACK path reports. NEW exports — the existing symbols and
+// the Dart* compat ABI are untouched.
+int tim2tox_ffi_send_c2c_text_ex(
+    const char* user_id, const char* text, char* msg_id_out, int msg_id_out_len) {
+    if (msg_id_out && msg_id_out_len > 0) msg_id_out[0] = '\0';
+    if (!IsCurrentInstanceInited() || !user_id || !text) return 0;
+    struct SendCb : public V2TIMSendCallback {
+        void OnSuccess(const V2TIMMessage&) override {}
+        void OnError(int, const V2TIMString&) override {}
+        void OnProgress(uint32_t) override {}
+    } sendcb;
+    V2TIMManagerImpl* manager_impl = GetCurrentInstance();
+    if (!manager_impl) return 0;
+    const V2TIMString msg_id =
+        manager_impl->SendC2CTextMessage(text, user_id, &sendcb);
+    if (msg_id.Empty()) return 0;
+    CopyMsgIdOut(msg_id, msg_id_out, msg_id_out_len);
+    return 1;
+}
+
+int tim2tox_ffi_send_c2c_action_ex(
+    const char* user_id, const char* text, char* msg_id_out, int msg_id_out_len) {
+    if (msg_id_out && msg_id_out_len > 0) msg_id_out[0] = '\0';
+    if (!IsCurrentInstanceInited() || !user_id || !text) return 0;
+    struct SendCb : public V2TIMSendCallback {
+        void OnSuccess(const V2TIMMessage&) override {}
+        void OnError(int, const V2TIMString&) override {}
+        void OnProgress(uint32_t) override {}
+    } sendcb;
+    V2TIMManagerImpl* manager_impl = GetCurrentInstance();
+    if (!manager_impl) return 0;
+    const V2TIMString msg_id =
+        manager_impl->SendC2CActionMessage(text, user_id, &sendcb);
+    if (msg_id.Empty()) return 0;
+    CopyMsgIdOut(msg_id, msg_id_out, msg_id_out_len);
+    return 1;
+}
+
 int tim2tox_ffi_send_c2c_custom(const char* user_id, const unsigned char* data, int data_len) {
     if (!IsCurrentInstanceInited() || !user_id || !data || data_len <= 0) return 0;
     struct SendCb : public V2TIMSendCallback {

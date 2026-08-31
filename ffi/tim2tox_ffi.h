@@ -321,6 +321,12 @@ int tim2tox_ffi_get_dht_id_for_instance(int64_t instance_id, char* out_dht_id, i
 // Returns 1 on success, 0 on failure
 int tim2tox_ffi_add_bootstrap_node(int64_t instance_id, const char* host, int port, const char* public_key_hex);
 
+// _ex sends: like tim2tox_ffi_send_c2c_text/_action but also copy the NATIVE
+// message id (the one the toxcore delivery-ACK path reports) into
+// msg_id_out (NUL-terminated; pass >= 64 bytes).
+int tim2tox_ffi_send_c2c_text_ex(const char* user_id, const char* text, char* msg_id_out, int msg_id_out_len);
+int tim2tox_ffi_send_c2c_action_ex(const char* user_id, const char* text, char* msg_id_out, int msg_id_out_len);
+
 // Callback-based notification (called from background native thread):
 // event_type: 0=text, 1=custom
 // sender: null-terminated UTF-8

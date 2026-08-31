@@ -99,6 +99,12 @@ typedef _send_c2c_control_c = ffi.Int32 Function(
   ffi.Int32,
   ffi.Int32,
 );
+typedef _send_c2c_text_ex_c = ffi.Int32 Function(
+  ffi.Pointer<pkgffi.Utf8>,
+  ffi.Pointer<pkgffi.Utf8>,
+  ffi.Pointer<ffi.Int8>,
+  ffi.Int32,
+);
 typedef _send_group_custom_c = ffi.Int32 Function(
     ffi.Pointer<pkgffi.Utf8>, ffi.Pointer<ffi.Uint8>, ffi.Int32);
 typedef _send_file_c = ffi.Int32 Function(
@@ -664,6 +670,32 @@ class Tim2ToxFfi {
         int,
         int,
       )>('tim2tox_ffi_send_c2c_control');
+  late final int Function(
+    ffi.Pointer<pkgffi.Utf8>,
+    ffi.Pointer<pkgffi.Utf8>,
+    ffi.Pointer<ffi.Int8>,
+    int,
+  ) sendTextEx = _lib.lookupFunction<
+      _send_c2c_text_ex_c,
+      int Function(
+        ffi.Pointer<pkgffi.Utf8>,
+        ffi.Pointer<pkgffi.Utf8>,
+        ffi.Pointer<ffi.Int8>,
+        int,
+      )>('tim2tox_ffi_send_c2c_text_ex');
+  late final int Function(
+    ffi.Pointer<pkgffi.Utf8>,
+    ffi.Pointer<pkgffi.Utf8>,
+    ffi.Pointer<ffi.Int8>,
+    int,
+  ) sendC2CActionEx = _lib.lookupFunction<
+      _send_c2c_text_ex_c,
+      int Function(
+        ffi.Pointer<pkgffi.Utf8>,
+        ffi.Pointer<pkgffi.Utf8>,
+        ffi.Pointer<ffi.Int8>,
+        int,
+      )>('tim2tox_ffi_send_c2c_action_ex');
   late final int Function(ffi.Pointer<pkgffi.Utf8>, ffi.Pointer<ffi.Uint8>, int)
       sendGroupCustomNative = _lib.lookupFunction<
           _send_group_custom_c,

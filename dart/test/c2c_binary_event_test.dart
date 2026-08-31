@@ -30,6 +30,11 @@ void main() {
             '"action":"add"}',
       ),
       (3, '{"type":"third-party","text":"visible custom"}'),
+      (
+        4,
+        '{"type":"msgidbind","msgID":"m1","textHash":"ab12",'
+            '"sender":"$_sender"}',
+      ),
     ]) {
       test('extracts route ${entry.$1} before decoding JSON payload', () {
         final parsed = FfiChatService.parseC2cBinaryEvent(
@@ -42,9 +47,9 @@ void main() {
       });
     }
 
-    test('rejects route bytes outside the internal 0..3 contract', () {
+    test('rejects route bytes outside the internal 0..4 contract', () {
       expect(
-        FfiChatService.parseC2cBinaryEvent(_event('{}', route: 4)),
+        FfiChatService.parseC2cBinaryEvent(_event('{}', route: 5)),
         isNull,
       );
     });
@@ -114,11 +119,35 @@ void main() {
     final reaction = source.substring(reactionStart, reactionEnd);
     expect(receipt, contains('.sendC2CControlNative('));
     expect(receipt, matches(RegExp(r'jsonBytes\.length,\s*1\s*\)')));
-    expect(receipt, contains("'sender': normalizeToxId(_selfId)"));
+    expect(receipt, contains("'sender': _wireSelfSender()"));
     expect(receipt, isNot(contains('.sendC2CCustomNative(')));
     expect(reaction, contains('.sendC2CControlNative('));
     expect(reaction, matches(RegExp(r'jsonBytes\.length,\s*2\s*\)')));
-    expect(reaction, contains("'sender': normalizeToxId(_selfId)"));
+    expect(reaction, contains("'sender': _wireSelfSender()"));
     expect(reaction, isNot(contains('.sendC2CCustomNative(')));
+  });
+
+  test('C2C receipts hash-echo the content correlator', () {
+    final source = File('lib/service/ffi_chat_service.dart').readAsStringSync();
+    final receiptStart = source.indexOf('Future<void> _sendReceipt(');
+    final receiptEnd =
+        source.indexOf('Future<void> _handleReceipt(', receiptStart);
+    final receipt = source.substring(receiptStart, receiptEnd);
+    // The wire receipt carries `bind:<sha256(text)>` in the free-form msgID
+    // field (4-key schema unchanged; old peers unaffected), and the sender
+    // field is the real Tox identity, never the login alias.
+    expect(receipt, contains("'bind:"));
+    expect(receipt, contains('_c2cTextHash(echoText)'));
+    expect(receipt, contains("'msgID': wireMsgID"));
+    expect(receipt, contains("'sender': _wireSelfSender()"));
+    expect(receipt, isNot(contains('normalizeToxId(_selfId)')));
+
+    final handleStart = source.indexOf('Future<void> _handleReceipt(');
+    final handleEnd = source.indexOf('List<String> getMessageReaders(');
+    final handle = source.substring(handleStart, handleEnd);
+    // Sender-side: hash correlators match by content, oldest-unflagged
+    // first; plain ids keep the exact legacy match.
+    expect(handle, contains("msgID.startsWith('bind:')"));
+    expect(handle, contains('_c2cTextHash(msg.text) == hashWanted'));
   });
 }

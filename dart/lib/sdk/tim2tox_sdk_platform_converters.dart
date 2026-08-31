@@ -156,6 +156,11 @@ extension Tim2ToxSdkPlatformConverters on Tim2ToxSdkPlatform {
               (chatMsg.groupId == null ? chatMsg.fromUserId : null);
           msg.groupID = forwardTargetGroupID ?? chatMsg.groupId;
           msg.isSelf = chatMsg.isSelf;
+          // Peer-read state for the own-bubble double-tick: on a SELF row
+          // our isRead flag means "the PEER read it" (set by the hash-echo
+          // READ receipt) — exactly V2TIM's isPeerRead. Without this a
+          // reopened chat rebuilt from history always rendered ':sent'.
+          msg.isPeerRead = chatMsg.isSelf && chatMsg.isRead;
           // Set message status - CRITICAL: For sent messages, default to SEND_SUCC unless explicitly pending or failed
           if (chatMsg.isPending) {
             msg.status = MessageStatus.V2TIM_MSG_STATUS_SENDING;
@@ -216,6 +221,11 @@ extension Tim2ToxSdkPlatformConverters on Tim2ToxSdkPlatform {
               (chatMsg.groupId == null ? chatMsg.fromUserId : null);
           msg.groupID = forwardTargetGroupID ?? chatMsg.groupId;
           msg.isSelf = chatMsg.isSelf;
+          // Peer-read state for the own-bubble double-tick: on a SELF row
+          // our isRead flag means "the PEER read it" (set by the hash-echo
+          // READ receipt) — exactly V2TIM's isPeerRead. Without this a
+          // reopened chat rebuilt from history always rendered ':sent'.
+          msg.isPeerRead = chatMsg.isSelf && chatMsg.isRead;
           // Set message status - CRITICAL: For sent messages, default to SEND_SUCC unless explicitly pending or failed
           if (chatMsg.isPending) {
             msg.status = MessageStatus.V2TIM_MSG_STATUS_SENDING;
@@ -308,6 +318,10 @@ extension Tim2ToxSdkPlatformConverters on Tim2ToxSdkPlatform {
       }
     }
     msg.isSelf = chatMsg.isSelf;
+    // Peer-read state for the own-bubble double-tick (same mapping as the
+    // merger/reply branches above): on a SELF row our isRead means "the
+    // PEER read it" — V2TIM's isPeerRead.
+    msg.isPeerRead = chatMsg.isSelf && chatMsg.isRead;
     // Set message status - CRITICAL: For sent messages, default to SEND_SUCC unless explicitly pending or failed
     // The logic should be:
     // - If isPending=true: SENDING (message is still being sent)
