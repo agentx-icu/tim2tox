@@ -989,7 +989,8 @@ class FfiChatService {
   /// flowed through `Prefs.addAccount(toxId: '')` and downstream string
   /// comparisons as if it were a valid identifier.
   String? getSelfToxId() {
-    final cached = _selfToxIdCache;
+    final instanceId = _ffi.getCurrentInstanceId();
+    final cached = _selfToxIdCacheByInstance[instanceId];
     if (cached != null) return cached;
     final buf = pkgffi.malloc.allocate<ffi.Int8>(256);
     try {
@@ -997,8 +998,10 @@ class FfiChatService {
       if (n <= 0) return null;
       final s = buf.cast<pkgffi.Utf8>().toDartString();
       if (s.isEmpty) return null;
-      // Only a WELL-FORMED address is latched — see [_selfToxIdCache].
-      if (_accountScopeToxIdPattern.hasMatch(s)) _selfToxIdCache = s;
+      // Only a WELL-FORMED address is latched — see [_selfToxIdCacheByInstance].
+      if (_accountScopeToxIdPattern.hasMatch(s)) {
+        _selfToxIdCacheByInstance[instanceId] = s;
+      }
       return s;
     } finally {
       pkgffi.malloc.free(buf);
@@ -1031,7 +1034,16 @@ class FfiChatService {
   /// WHY IT EXISTS AT ALL: [prefsAccountScopeToxId] is consulted on per-message
   /// (`_setFaceUrlForMsg`) and per-conversation (`_mapConv`, rebuilt every few
   /// seconds) paths. Each uncached call is a 256-byte malloc + FFI hop + free.
-  String? _selfToxIdCache;
+  ///
+  /// WHY IT IS KEYED BY INSTANCE: the auto_tests harness routes MANY tox
+  /// instances through ONE shared service (runWithInstance switches the
+  /// process-global current instance). A single latched string served the
+  /// FIRST caller's address to every other instance — so a wire receipt's
+  /// `sender` field carried the wrong identity, failed the receiver's
+  /// sender==envelope validator, and every receipt the shared service sent
+  /// was silently rejected. Production uses one instance (the default, id 0)
+  /// and behaves exactly as the single-string cache did.
+  final Map<int, String> _selfToxIdCacheByInstance = {};
 
   /// The account identity that must be handed to the `userToxId` parameter of
   /// [ExtendedPreferencesService]'s per-account key families (blacklist,
@@ -1771,7 +1783,12 @@ class FfiChatService {
     // is offline with a SYNCHRONOUS 2s sleep per call — 50 rows would block
     // the UI isolate for minutes. The peer cannot receive receipts while
     // offline anyway; the rows still flip isRead locally (product read
-    // state), and the lost wire receipts are a recorded protocol limit.
+    // state). The wire receipts are QUEUED per peer (persisted via _prefs)
+    // and flushed by [_flushPendingReadReceipts] on the peer's came-online
+    // transition — the queue exists because the local isRead flip below also
+    // removes the row from every future on-view scan, so a dropped receipt
+    // here was dropped FOREVER (recorded limit of the receipt round-trip,
+    // now closed).
     final peerOnline = _friendOnlineStatus[normalizedId] != 'offline';
     // Explicit newest-first by TIMESTAMP (codex P1): startup reverses the
     // shared cache, so index order is not a recency order.
@@ -1784,16 +1801,130 @@ class FfiChatService {
       (a, b) => history[b].timestamp.compareTo(history[a].timestamp),
     );
     var sent = 0;
+    final deferred = <String>[];
     for (final i in candidates.take(50)) {
       final msg = history[i];
       history[i] = msg.copyWith(isRead: true);
       final rowMsgID = msg.msgID;
-      if (peerOnline && rowMsgID != null && rowMsgID.isNotEmpty) {
-        unawaited(_sendReceipt(normalizedId, rowMsgID, 'read'));
+      if (rowMsgID != null && rowMsgID.isNotEmpty) {
+        if (peerOnline) {
+          unawaited(_sendReceipt(normalizedId, rowMsgID, 'read'));
+        } else {
+          deferred.add(rowMsgID);
+        }
       }
       sent++;
     }
+    if (deferred.isNotEmpty) {
+      unawaited(_queuePendingReadReceipts(normalizedId, deferred));
+    }
     if (sent > 0) unawaited(_saveHistory(normalizedId));
+  }
+
+  /// Preferences key for the per-peer queue of READ receipts that could not
+  /// be sent because the peer was offline at chat-open time.
+  ///
+  /// ACCOUNT-SCOPED (codex): a raw per-peer key would be shared across every
+  /// account on the device and never collected on account deletion. When no
+  /// account scope is available the caller must skip persistence entirely
+  /// (the in-memory half still works) rather than fall back to a shared
+  /// global slot — same discipline as the blacklist key family.
+  static String _pendingReadReceiptsKey(String accountScope, String peerId) =>
+      'pending_read_receipts_${accountScope}_$peerId';
+
+  /// In-memory half of the pending READ-receipt queue (peer -> row msgIDs).
+  /// Always maintained so the offline->online flush works even when no
+  /// preferences service is injected; [_prefs] (when present) mirrors it so
+  /// the queue survives a restart.
+  final Map<String, Set<String>> _pendingReadReceiptsMem = {};
+
+  /// Record [msgIDs] into the peer's pending READ-receipt queue.
+  ///
+  /// The queue holds row msgIDs only — the hash-echo correlator is derived
+  /// from the row TEXT at send time ([_sendReceipt] resolves the row via
+  /// _findC2cRow), and the row survives in persisted history, so the queue
+  /// stays valid across a restart. Bounded to the newest 200 entries per
+  /// peer; a backlog beyond that is more identical-text ambiguity than the
+  /// sender's oldest-unflagged-first hash matching can pair meaningfully.
+  Future<void> _queuePendingReadReceipts(
+      String peerId, List<String> msgIDs) async {
+    final mem = _pendingReadReceiptsMem.putIfAbsent(peerId, () => <String>{});
+    mem.addAll(msgIDs);
+    while (mem.length > 200) {
+      mem.remove(mem.first);
+    }
+    _bumpDiag('receiptsReadQueuedOffline');
+    final prefs = _prefs;
+    final scope = prefsAccountScopeToxId;
+    if (prefs == null || scope == null) return;
+    try {
+      await prefs.setStringList(
+        _pendingReadReceiptsKey(scope, peerId),
+        mem.toList(),
+      );
+    } catch (_) {
+      // Receipt bookkeeping must never break the read path.
+    }
+  }
+
+  /// Send (and clear) the queued READ receipts for [peerId], called on its
+  /// offline -> online transition. Both queue halves are cleared BEFORE
+  /// sending: a re-sent 'read' hash-receipt would flip the sender's NEXT
+  /// unflagged row with identical text (oldest-unflagged-first matching), so
+  /// losing a receipt on a crash mid-flush is strictly safer than
+  /// double-sending.
+  ///
+  /// [instanceId] pins the native sends to the instance the came-online
+  /// transition was observed on. The caller launches this unawaited from
+  /// inside a `runWithInstance*` scope, so by the time the post-prefs-await
+  /// continuation sends, that scope has already restored the previous
+  /// instance — in multi-instance test harnesses the receipt would otherwise
+  /// leave on the wrong instance. Production runs the default instance (0)
+  /// and never switches. The switch wraps only the synchronous body of
+  /// [_sendReceipt] (its native call precedes any await), mirroring the
+  /// never-hold-across-await discipline.
+  Future<void> _flushPendingReadReceipts(String peerId,
+      {int instanceId = 0}) async {
+    final pending = <String>[];
+    final mem = _pendingReadReceiptsMem.remove(peerId);
+    if (mem != null) pending.addAll(mem);
+    final prefs = _prefs;
+    final scope = prefsAccountScopeToxId;
+    if (prefs != null && scope != null) {
+      try {
+        final key = _pendingReadReceiptsKey(scope, peerId);
+        final stored = await prefs.getStringList(key);
+        if (stored != null && stored.isNotEmpty) {
+          for (final msgID in stored) {
+            if (!pending.contains(msgID)) pending.add(msgID);
+          }
+          await prefs.setStringList(key, const <String>[]);
+        }
+      } catch (_) {
+        // Prefs unusable mid-flush (codex): sending anyway would leave the
+        // DURABLE half uncleared, and a later flush would re-send it — a
+        // duplicated 'read' hash-receipt can flip the sender's NEXT
+        // unflagged row with identical text. Put the in-memory half back
+        // and retry the whole flush on a later came-online transition.
+        if (mem != null && mem.isNotEmpty) {
+          _pendingReadReceiptsMem
+              .putIfAbsent(peerId, () => <String>{})
+              .addAll(mem);
+        }
+        return;
+      }
+    }
+    if (pending.isEmpty) return;
+    for (final msgID in pending) {
+      final prev = instanceId != 0 ? _ffi.getCurrentInstanceId() : 0;
+      if (instanceId != 0) _ffi.setCurrentInstance(instanceId);
+      try {
+        await _sendReceipt(peerId, msgID, 'read');
+      } finally {
+        if (instanceId != 0) _ffi.setCurrentInstance(prev);
+      }
+    }
+    _bumpDiag('receiptsReadFlushedOnline');
   }
 
   /// Unread count for the product sidebar / conversation list.
@@ -2153,8 +2284,8 @@ class FfiChatService {
 
   Future<void> init({String? profileDirectory}) async {
     // A different profile may be about to be opened on this object; anything
-    // latched from a previous one is now wrong. See [_selfToxIdCache].
-    _selfToxIdCache = null;
+    // latched from a previous one is now wrong. See [_selfToxIdCacheByInstance].
+    _selfToxIdCacheByInstance.clear();
     // A FRESH service finding instance 0 still inited means a prior dispose
     // QUARANTINED it (a background task outlived the drain window and
     // freeing then would have been a UAF). Detach it NOW — the inter-session
@@ -2445,7 +2576,7 @@ class FfiChatService {
     // both the point where "no identity" becomes an identity AND the point
     // where a previously latched identity could be superseded. Clear before
     // the call so nothing observes a stale value mid-login.
-    _selfToxIdCache = null;
+    _selfToxIdCacheByInstance.clear();
     _pendingLoginCompleter =
         Completer<({int success, int code, String message})>();
     _loginNativeCallable ??=
@@ -5300,6 +5431,15 @@ class FfiChatService {
             unawaited(_sendAvatarToFriendIfNeeded(uid));
             // Send pending offline messages - use normalized ID
             unawaited(retryPendingC2cMessages(normalizedUid));
+            // Flush READ receipts that were queued while this peer was
+            // offline (chat opened -> rows flipped isRead locally -> the wire
+            // receipt had nowhere to go and would otherwise be lost forever).
+            // Instance captured HERE, synchronously: the flush's post-await
+            // continuations outlive this runWithInstance* scope.
+            unawaited(_flushPendingReadReceipts(
+              normalizedUid,
+              instanceId: _ffi.getCurrentInstanceId(),
+            ));
             // Update nickname from Tox when friend comes online
             if (nick.isNotEmpty) {
               await _prefs?.setFriendNickname(uid, nick);
@@ -9941,8 +10081,8 @@ class FfiChatService {
     _draftDisposing = true;
     // The Tox instance behind the latched address is going away; a service
     // object that is re-init'ed after dispose must re-probe. See
-    // [_selfToxIdCache].
-    _selfToxIdCache = null;
+    // [_selfToxIdCacheByInstance].
+    _selfToxIdCacheByInstance.clear();
     if (_globalService == this) {
       _globalService = null;
     }
