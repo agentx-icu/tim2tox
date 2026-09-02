@@ -929,6 +929,19 @@ run_single_test() {
       test_timeout=600 ;;
   esac
 
+  # scenario_lan_discovery is the ONE test whose semantics require toxcore's
+  # LAN discovery window: lan_discovery_send only probes 33445 plus the
+  # 33446..33545 walk (friend_connection.c), so the suite-wide quiet range
+  # (43445, see the header) leaves LAN peers permanently undiscoverable — the
+  # test times out waiting for a connection it can never get (nightly red
+  # since 2026-08-28). Pin it to 33446: inside the discovery walk, while still
+  # off the squat-prone default port 33445. Note BUNDLE mode cannot apply a
+  # per-file env, so a bundle containing this test keeps the global range.
+  local per_test_env=""
+  case "$test_basekey" in
+    scenario_lan_discovery) per_test_env="TOX_UDP_START_PORT=33446" ;;
+  esac
+
   # Retry loop: attempt 0 is the first run; attempts 1..RETRY_COUNT are retries.
   # On a retry pass, count PASSED + record in FLAKY_TESTS. On all-attempts-fail,
   # fall through to the legacy FAILED accounting using the LAST attempt's output.
@@ -945,7 +958,7 @@ run_single_test() {
     local start_time=$(date +%s)
     local output_file="/tmp/test_${test_name}_$(date +%s)_${attempt}_$$.log"
 
-    if timeout ${test_timeout}s flutter test "$test_file" > "$output_file" 2>&1; then
+    if env $per_test_env timeout ${test_timeout}s flutter test "$test_file" > "$output_file" 2>&1; then
       local end_time=$(date +%s)
       local duration=$((end_time - start_time))
       echo -e "${GREEN}✅ PASSED: $test_name (${duration}s)${NC}" | tee -a "$RESULTS_FILE"
@@ -1063,6 +1076,35 @@ run_phase_bundled() {
   echo -e "${GREEN}═══════════════════════════════════════════════════════════${NC}" | tee -a "$RESULTS_FILE"
   echo -e "${GREEN}  Phase: $phase_name (${#test_files[@]} tests, BUNDLED)${NC}" | tee -a "$RESULTS_FILE"
   echo -e "${GREEN}═══════════════════════════════════════════════════════════${NC}" | tee -a "$RESULTS_FILE"
+
+  # scenario_lan_discovery needs the per-test TOX_UDP_START_PORT override
+  # that only run_single_test applies (a single bundled process has ONE
+  # environment, and the rest of the bundle must keep the quiet range), so
+  # it is split out of the bundle and dispatched individually — with the
+  # override — before the bundled invocation.
+  local bundle_input=()
+  local lan_file=""
+  local tf_base
+  for tf in "${test_files[@]}"; do
+    tf_base="$(basename "$tf")"
+    if [ "$tf_base" = "scenario_lan_discovery_test.dart" ] ||
+       [ "$tf_base" = "scenario_lan_discovery_virtual_test.dart" ]; then
+      lan_file="$tf"
+    else
+      bundle_input+=("$tf")
+    fi
+  done
+  if [ -n "$lan_file" ]; then
+    echo -e "${BLUE}[Bundle] scenario_lan_discovery runs unbundled (needs the LAN-discovery port window)${NC}" | tee -a "$RESULTS_FILE"
+    run_single_test "$lan_file" "$phase_name" "lan" "${#test_files[@]}" || true
+    test_files=()
+    if [ ${#bundle_input[@]} -gt 0 ]; then
+      test_files=("${bundle_input[@]}")
+    fi
+    if [ ${#test_files[@]} -eq 0 ]; then
+      return 0
+    fi
+  fi
 
   # Resolve each test_file through the same RUN_VIRTUAL swap that
   # run_single_test does, so bundle mode honours the same flag.

@@ -184,23 +184,138 @@ void main() {
               '-> on_dht_nodes_response_internal -> NativeCallable trampoline '
               '-> FfiChatService) is broken.');
 
-      // CONTRACT PIN. toxcore reports the nodes CONTAINED IN the response (the
-      // responder's neighbours), never the responder itself — see
-      // DHT.c:handle_nodes_response, which loops over `plain_nodes[i]`. A node
-      // never lists itself among its own close nodes, so the key we queried can
-      // never come back. Any consumer that waits for a callback keyed by the
-      // QUERIED node's public key therefore waits forever. toxee's
-      // BootstrapNodeProbe did exactly that and reported every node — live or
-      // dead — as unreachable.
-      for (var i = 1; i < numNodes; i++) {
-        if (discoveredNodes[i].isEmpty) continue;
-        expect(discoveredNodes[i].map((k) => k.toUpperCase()),
-            isNot(contains(dhtKeys[i - 1].toUpperCase())),
-            reason: 'node$i queried ${_short(dhtKeys[i - 1])} and the callback '
-                'reported that same key back. If this ever passes, the event '
-                'semantics changed and responder-keyed matching became viable; '
-                'revisit BootstrapNodeProbe.');
+      // The "responder never reports itself" contract pin used to live here as
+      // `discoveredNodes[i] must not contain dhtKeys[i-1]`, but on a LIVE mesh
+      // that assertion cannot attribute responses: the callback carries only
+      // the CONTAINED nodes, never the responder, and under wall clock toxcore
+      // crawls the DHT autonomously — so node i receives responses from peers
+      // the TEST never queried, and a response from node i+1 legitimately
+      // lists node i-1 among its neighbours (nightly-only red since
+      // 2026-08-28). The pin needs a vantage where every response has exactly
+      // one possible responder; see the dedicated isolated single-target test
+      // below.
+    }, timeout: const Timeout(Duration(seconds: 180)));
+
+    /// CONTRACT PIN. toxcore reports the nodes CONTAINED IN a response (the
+    /// responder's neighbours), never the responder itself — see
+    /// DHT.c:handle_nodes_response, which loops over `plain_nodes[i]`. A node
+    /// never lists itself among its own close nodes, so the key we queried can
+    /// never come back. Any consumer that waits for a callback keyed by the
+    /// QUERIED node's public key therefore waits forever. toxee's
+    /// BootstrapNodeProbe did exactly that and reported every node — live or
+    /// dead — as unreachable.
+    ///
+    /// Attribution discipline (two layers, both required):
+    /// 1. INSTANCE: each candidate peer gets a FRESH isolated instance that
+    ///    only ever queries that single peer — toxcore drops responses that
+    ///    match no sent request (DHT.c: sent_nodes_request_to_node).
+    /// 2. TIME: the assertion covers only the FIRST iterate in which any
+    ///    response was processed, and the probe instance is never iterated
+    ///    again afterwards. After the first response, toxcore's autonomous
+    ///    crawl queries the nodes it just learned (DHT.c: do_dht), and THEIR
+    ///    later responses can legitimately contain the candidate — but an
+    ///    autonomous request cannot have been sent before the first response
+    ///    existed (no bootstrap, no LAN discovery, nothing to learn from), so
+    ///    everything processed up to and including that first iterate is
+    ///    provably from the candidate.
+    /// If this ever fails, the event semantics changed and responder-keyed
+    /// matching became viable; revisit BootstrapNodeProbe.
+    test('nodes response never contains the responder itself (isolated pin)',
+        () async {
+      final ffiInstance = ffi_lib.Tim2ToxFfi.open();
+      String? answeredPeer;
+      for (var pi = 0; pi < numNodes && answeredPeer == null; pi++) {
+        final t = await _dhtEndpointOf(nodes[pi]);
+        if (t.$1 == 0 || t.$2.length != 64) continue;
+
+        final dir = Directory.systemTemp.createTempSync('t2t_self_pin_');
+        try {
+          final prev = ffiInstance.getCurrentInstanceId();
+          final pathPtr = dir.path.toNativeUtf8();
+          final int handle;
+          try {
+            handle = ffiInstance.createTestInstanceExNative(pathPtr, 0, 1);
+          } finally {
+            pkgffi.malloc.free(pathPtr);
+          }
+          expect(handle, isNot(0),
+              reason: 'the pin instance must be creatable at runtime');
+
+          final hits = <String>[];
+          final firstBatch = <String>[];
+          FfiChatService? svc;
+          try {
+            ffiInstance.setCurrentInstance(handle);
+            svc = FfiChatService();
+            svc.setDhtNodesResponseCallback((pk, ip, port) => hits.add(pk));
+            final udp = ffiInstance.getUdpPort(handle);
+            ffiInstance.setCurrentInstance(prev);
+            expect(udp, greaterThan(0),
+                reason: 'a UDP-less pin instance cannot query the DHT at all');
+
+            // Single-step iteration: one iterateInstance, then drain the
+            // event loop (the dht_nodes_response callback arrives via a
+            // NativeCallable.listener port message, not synchronously), then
+            // decide. The probe is NEVER iterated again once hits appear.
+            outer:
+            for (var round = 0; round < 8; round++) {
+              ffiInstance.setCurrentInstance(handle);
+              svc.dhtSendNodesRequest(t.$2, '127.0.0.1', t.$1, t.$2);
+              ffiInstance.setCurrentInstance(prev);
+              for (var i = 0; i < 40; i++) {
+                ffiInstance.iterateInstance(handle);
+                await Future<void>.delayed(Duration.zero);
+                await Future<void>.delayed(Duration.zero);
+                if (hits.isNotEmpty) {
+                  firstBatch.addAll(hits);
+                  break outer;
+                }
+                // Keep the mesh (scenario nodes only — the probe handle is
+                // not part of the scenario) responsive between probe steps.
+                await pumpTestTick(scenario,
+                    advanceMs: 250, iterationsPerInstance: 5);
+                if (!shouldRunVirtual) {
+                  await Future<void>.delayed(const Duration(milliseconds: 250));
+                }
+              }
+            }
+            print('[dht-self-pin] peer$pi ${_short(t.$2)}:${t.$1} -> '
+                '${firstBatch.length} first-iterate hits '
+                '${firstBatch.map(_short).toList()}');
+            if (firstBatch.isNotEmpty) {
+              answeredPeer = 'peer$pi';
+              expect(firstBatch.map((k) => k.toUpperCase()),
+                  isNot(contains(t.$2.toUpperCase())),
+                  reason:
+                      'every response processed before the first-hit iterate '
+                      'is provably from ${_short(t.$2)} (the only node this '
+                      'instance ever queried, before any autonomous crawl '
+                      'could exist) — and it reported its OWN key back. The '
+                      'nodes-response semantics changed; revisit '
+                      'BootstrapNodeProbe.');
+            }
+          } finally {
+            if (svc != null) {
+              ffiInstance.setCurrentInstance(handle);
+              svc.clearDhtNodesResponseCallback();
+              ffiInstance.setCurrentInstance(prev);
+            }
+            ffiInstance.setCurrentInstance(0);
+            ffiInstance.destroyTestInstance(handle);
+            ffiInstance.setCurrentInstance(prev);
+          }
+        } finally {
+          try {
+            dir.deleteSync(recursive: true);
+          } catch (e) {
+            print('[dht-self-pin] temp dir cleanup failed (${dir.path}): $e');
+          }
+        }
       }
+      expect(answeredPeer, isNotNull,
+          reason: 'NO live peer answered a single-target isolated query, so '
+              'the contract pin could not be exercised at all — same failure '
+              'surface as the isolated-probe positive half.');
     }, timeout: const Timeout(Duration(seconds: 180)));
 
     /// Pins the exact contract toxee's `BootstrapNodeProbe` now relies on.

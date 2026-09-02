@@ -6370,10 +6370,20 @@ class FfiChatService {
   /// customElem.data is stored as [ChatMessage.text] with mediaKind=custom so
   /// SDK conversion produces a real V2TIM custom elem for UIKit menus.
   /// Returns true when the message was ingested (false: blocked sender).
+  ///
+  /// [forceEmit] mirrors [ingestInboundGroupText]: the wire caller (`c2cbin:`
+  /// route 3) leaves it false so [_emitInboundMessage] suppresses the stream
+  /// add whenever the native advanced-listener surface is live — in hybrid
+  /// mode C++ already notified those listeners for the same delivery, and a
+  /// direct `_messages.add` here presented ONE inbound custom message TWICE
+  /// (nightly scenario_qtox_action_and_splitting: `received.single` → "Too
+  /// many elements"). Injection seams with no native counterpart
+  /// (l3_inject_c2c_custom) pass true so the injected row still renders live.
   bool ingestInboundC2cCustom({
     required String from,
     required String data,
     int? sourceInstanceId,
+    bool forceEmit = false,
   }) {
     final normalizedFrom = from.length > 64 ? _normalizeFriendId(from) : from;
     // Compare the NORMALIZED sender against _selfId for the self-skip guards: a
@@ -6411,7 +6421,7 @@ class FfiChatService {
       _unreadByPeer.update(normalizedFrom, (v) => v + 1, ifAbsent: () => 1);
     }
     _appendHistory(normalizedFrom, msg);
-    _messages.add(msg);
+    _emitInboundMessage(msg, force: forceEmit);
     return true;
   }
 
