@@ -57,6 +57,31 @@ void main() {
     }
   });
 
+  /// Waits until the group's history file on disk satisfies [predicate].
+  ///
+  /// Several paths under test persist through an UNAWAITED `_saveHistory`, so
+  /// the observable state (a tally, an alias) is visible before the write
+  /// lands. Ending the test there lets tearDown delete the directory under the
+  /// in-flight writer, and the rename fails with PathNotFound — reported
+  /// against the test as "failed after test completion". A fixed delay only
+  /// hides that on a fast machine: this is exactly how the test passed on macOS
+  /// and failed on the CI Linux runner. Wait for the write itself instead.
+  Future<void> waitForHistoryFile(
+    bool Function(String contents) predicate, {
+    Duration timeout = const Duration(seconds: 10),
+  }) async {
+    final file = File('${tempDir.path}/history/$_groupId.json');
+    final deadline = DateTime.now().add(timeout);
+    while (DateTime.now().isBefore(deadline)) {
+      if (await file.exists()) {
+        final contents = await file.readAsString();
+        if (predicate(contents)) return;
+      }
+      await Future<void>.delayed(const Duration(milliseconds: 20));
+    }
+    fail('history file never reached the expected state within $timeout');
+  }
+
   group('group event header', () {
     test('parses the pseudo id segment', () {
       final parsed = FfiChatService.parseGroupHeader('$_groupId|$_authorKey|m42');
@@ -171,7 +196,8 @@ void main() {
       pseudoMsgId: 9001,
     );
     expect(service.getHistory(_groupId).single.altMsgIds, [alias]);
-    await Future<void>.delayed(const Duration(milliseconds: 150));
+    // The merge persists through an unawaited save; let it land.
+    await waitForHistoryFile((contents) => contents.contains(alias));
   });
 
   test('a row without a pseudo id keeps the legacy shape', () {
@@ -231,9 +257,9 @@ void main() {
     expect(service.getHistory(_groupId).where((m) => !m.isSelf), isEmpty,
         reason: 'the receipt must not materialise as a row');
 
-    // The tally is observable before _handleReceipt's persist finishes; let it
-    // land, or tearDown deletes the history directory underneath the in-flight
-    // save and the failure is reported against this test.
-    await Future<void>.delayed(const Duration(milliseconds: 150));
+    // The tally is observable before _handleReceipt's persist finishes; wait
+    // for the flip it writes, or tearDown deletes the history directory
+    // underneath the in-flight save.
+    await waitForHistoryFile((contents) => contents.contains('"isRead":true'));
   });
 }
