@@ -654,6 +654,22 @@ class Tim2ToxFfi {
           _send_group_text_c,
           int Function(ffi.Pointer<pkgffi.Utf8>,
               ffi.Pointer<pkgffi.Utf8>)>('tim2tox_ffi_send_group_action');
+  /// Cross-peer id (Tox_Group_Message_Id) of the group message most recently
+  /// sent on THIS thread, or -1 when the last send produced none. Only
+  /// meaningful immediately after a successful group send — see the C header.
+  late final int Function() lastGroupSendMessageId = _lib.lookupFunction<
+      ffi.Int64 Function(),
+      int Function()>('tim2tox_ffi_last_group_send_message_id');
+
+  /// Per-group public key the author is known by inside the group it just sent
+  /// to (hex), or empty. NGC identities are per-group, so this — not the
+  /// long-term Tox ID — is the sender component peers can agree on. The
+  /// pointer is owned by native thread-local storage; copy it immediately.
+  late final ffi.Pointer<pkgffi.Utf8> Function() lastGroupSendSelfKey =
+      _lib.lookupFunction<
+          ffi.Pointer<pkgffi.Utf8> Function(),
+          ffi.Pointer<pkgffi.Utf8>
+              Function()>('tim2tox_ffi_last_group_send_self_key');
   late final int Function(int, ffi.Pointer<pkgffi.Utf8>) dismissGroupNative =
       _lib.lookupFunction<_dismiss_group_c,
           int Function(int, ffi.Pointer<pkgffi.Utf8>)>(

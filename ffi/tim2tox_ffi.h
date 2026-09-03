@@ -207,6 +207,14 @@ int tim2tox_ffi_set_typing(const char* user_id, int typing_on);
 int tim2tox_ffi_create_group(const char* group_name, const char* group_type, char* out_group_id, int out_len);
 int tim2tox_ffi_join_group(const char* group_id, const char* request_msg);
 int tim2tox_ffi_send_group_text(const char* group_id, const char* text);
+// Tox NGC pseudo message id of the group message most recently sent on this
+// thread (first fragment), or -1 if the last send produced none. Valid only
+// immediately after a successful group send on the same thread.
+int64_t tim2tox_ffi_last_group_send_message_id(void);
+// Author's per-group public key (hex) for the group most recently sent to on
+// this thread, or "" when unavailable. Valid until the next group send on the
+// same thread.
+const char* tim2tox_ffi_last_group_send_self_key(void);
 int tim2tox_ffi_send_group_action(const char* group_id, const char* text);
 // Dismiss a group through the exact instance's V2TIMManagerImpl.
 // Returns 1 only when the native callback reports one successful terminal result.

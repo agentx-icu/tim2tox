@@ -866,6 +866,54 @@ class FfiChatService {
     }
   }
 
+  /// Splits a `gtext:` / `gaction:` header into its parts.
+  ///
+  /// The header is `<groupId>|<sender>` with an OPTIONAL trailing
+  /// `|m<pseudoId>` segment carrying toxcore's `Tox_Group_Message_Id` — the
+  /// one identity a group message shares across peers (the sender mints it and
+  /// packs it into the broadcast). Routes that have no such id (legacy
+  /// conference, custom packets) emit the two-segment form, and so does any
+  /// older native library, so BOTH forms must keep parsing forever.
+  ///
+  /// Returns null when the header is malformed. A present-but-unparsable
+  /// pseudo id segment is treated as absent rather than as a parse failure —
+  /// a garbled id must never cost us the message itself.
+  static ({String groupId, String sender, int? pseudoMsgId})? parseGroupHeader(
+    String header,
+  ) {
+    final firstSeparator = header.indexOf('|');
+    if (firstSeparator <= 0 || firstSeparator == header.length - 1) return null;
+    final groupId = header.substring(0, firstSeparator);
+    final rest = header.substring(firstSeparator + 1);
+
+    final secondSeparator = rest.indexOf('|');
+    if (secondSeparator < 0) {
+      return (groupId: groupId, sender: rest, pseudoMsgId: null);
+    }
+    final sender = rest.substring(0, secondSeparator);
+    if (sender.isEmpty) return null;
+    final tail = rest.substring(secondSeparator + 1);
+    if (!tail.startsWith('m')) {
+      // Unknown future segment: keep the sender, ignore what we don't know.
+      return (groupId: groupId, sender: sender, pseudoMsgId: null);
+    }
+    final parsed = int.tryParse(tail.substring(1));
+    return (
+      groupId: groupId,
+      sender: sender,
+      pseudoMsgId: (parsed != null && parsed >= 0) ? parsed : null,
+    );
+  }
+
+  /// The cross-peer alias for one group message, scoped so that a 32-bit
+  /// random pseudo id cannot collide across groups or authors.
+  static String groupMessageAlias({
+    required String groupId,
+    required String senderPk,
+    required int pseudoMsgId,
+  }) =>
+      'gmid:$groupId|${senderPk.toUpperCase()}|$pseudoMsgId';
+
   /// Parses an event emitted as either
   /// `progress_recv:<uid>:<received>:<total>:<path>` or
   /// `progress_recv:<instance_id>:<uid>:<received>:<total>:<path>`.
@@ -2997,21 +3045,22 @@ class FfiChatService {
                   );
                 }
               } else if (s.startsWith('gtext:')) {
-                // gtext:<groupID>|<sender>:<text>
+                // gtext:<groupID>|<sender>[|m<pseudoId>]:<text>
                 final headerEnd = s.indexOf(':', 6);
                 if (headerEnd > 6) {
                   final header = s.substring(6, headerEnd);
                   final text = s.substring(headerEnd + 1);
-                  final sep = header.indexOf('|');
-                  if (sep > 0) {
-                    final gid = header.substring(0, sep);
-                    final from = header.substring(sep + 1);
+                  final parsed = parseGroupHeader(header);
+                  if (parsed != null) {
+                    final gid = parsed.groupId;
+                    final from = parsed.sender;
                     // Check if this group was quit - if so, don't add it back
                     if (!_quitGroups.contains(gid)) {
                       final ingested = ingestInboundGroupText(
                         gid: gid,
                         from: from,
                         text: text,
+                        pseudoMsgId: parsed.pseudoMsgId,
                         sourceInstanceId: sourceInstanceId,
                       );
                       if (ingested && !_quitGroups.contains(gid)) {
@@ -6061,6 +6110,7 @@ class FfiChatService {
     int? sourceInstanceId,
     bool forceEmit = false,
     int? epochMs,
+    int? pseudoMsgId,
   }) {
     // Check if this group was quit - if so, don't add it back
     if (_quitGroups.contains(gid)) return false;
@@ -6068,6 +6118,21 @@ class FfiChatService {
     final duplicate =
         _findRecentGroupHistoryMessage(gid, from, text, contentKind);
     if (duplicate != null) {
+      // THE PRODUCT'S NORMAL PATH LANDS HERE. In hybrid mode the native
+      // advanced listener persists the row first (MessageConverter has no
+      // cross-peer alias to give it), and this polled copy — the only one that
+      // carries the pseudo id — arrives second. Returning early without
+      // merging would leave the row alias-less forever, so every later receipt
+      // would fail to resolve and be dropped: the whole correlation would work
+      // in auto_tests (Platform path owns history there) and silently do
+      // nothing in the app. Merge the alias, and receipt the row exactly once.
+      final mergedAlias = _mergeGroupAliasIntoRow(gid, duplicate, from,
+          pseudoMsgId: pseudoMsgId);
+      if (mergedAlias != null &&
+          !duplicate.isSelf &&
+          !_isReactionMessage(text)) {
+        unawaited(_sendReceipt(from, mergedAlias, 'received', groupID: gid));
+      }
       final last = _lastByPeer[gid];
       final alreadyReflected = last != null &&
           last.fromUserId == duplicate.fromUserId &&
@@ -6116,6 +6181,16 @@ class FfiChatService {
     final timestamp = epochMs ?? DateTime.now().millisecondsSinceEpoch;
     final sequence = _msgIDSequence++;
     final msgID = '${timestamp}_${sequence}_${from}_$gid';
+    // The primary id is receiver-local (every peer mints its own), so the
+    // cross-peer alias is what lets a receipt from another member resolve to
+    // THIS row. Absent for routes with no Tox_Group_Message_Id.
+    final alias = pseudoMsgId == null
+        ? null
+        : groupMessageAlias(
+            groupId: gid,
+            senderPk: from,
+            pseudoMsgId: pseudoMsgId,
+          );
     final msg = ChatMessage(
       text: text,
       fromUserId: from,
@@ -6125,6 +6200,7 @@ class FfiChatService {
       msgID: msgID,
       contentKind: contentKind,
       sourceInstanceId: sourceInstanceId,
+      altMsgIds: [if (alias != null) alias],
     );
     _lastByPeer[gid] = msg; // reuse for group last message
     _appendHistory(gid, msg);
@@ -6160,7 +6236,10 @@ class FfiChatService {
     // Auto-send received receipt for received group messages (not self-sent)
     // Note: reaction messages are sent via custom messages and should not trigger receipts
     if (!msg.isSelf && !_isReactionMessage(text)) {
-      unawaited(_sendReceipt(from, msgID, 'received', groupID: gid));
+      // Echo the alias, not our local id: the author has never seen the id we
+      // just minted, so a local-id receipt can neither tally nor even be
+      // recognised as a control on the author's side.
+      unawaited(_sendReceipt(from, alias ?? msgID, 'received', groupID: gid));
     }
     return true;
   }
@@ -6239,8 +6318,9 @@ class FfiChatService {
   ///
   /// Accepted forms are `c2caction:<64hex>:<body>` and
   /// `gaction:<group>|<sender>:<body>`. Exact legacy receipt/reaction JSON is
-  /// consumed only when it is sender-bound and references an existing row;
-  /// all other bodies remain visible ACTION text.
+  /// APPLIED only when it is sender-bound and references an existing row, and
+  /// is DROPPED (never rendered) otherwise; all other bodies remain visible
+  /// ACTION text.
   bool ingestActionEvent(String event, {int? sourceInstanceId}) {
     const c2cPrefix = 'c2caction:';
     if (event.startsWith(c2cPrefix)) {
@@ -6265,10 +6345,10 @@ class FfiChatService {
       final headerEnd = event.indexOf(':', groupPrefix.length);
       if (headerEnd <= groupPrefix.length) return false;
       final header = event.substring(groupPrefix.length, headerEnd);
-      final separator = header.indexOf('|');
-      if (separator <= 0 || separator == header.length - 1) return false;
-      final groupId = header.substring(0, separator);
-      final sender = header.substring(separator + 1);
+      final parsedHeader = parseGroupHeader(header);
+      if (parsedHeader == null) return false;
+      final groupId = parsedHeader.groupId;
+      final sender = parsedHeader.sender;
       final body = event.substring(headerEnd + 1);
       if (body.isEmpty) return false;
       if (_tryConsumeLegacyActionControl(
@@ -6283,6 +6363,7 @@ class FfiChatService {
         from: sender,
         text: body,
         contentKind: ChatMessageContentKind.action,
+        pseudoMsgId: parsedHeader.pseudoMsgId,
         sourceInstanceId: sourceInstanceId,
         forceEmit: true,
       );
@@ -6304,15 +6385,27 @@ class FfiChatService {
     }
     if (decoded == null) return false;
 
+    // A body that carries tim2tox's OWN control signature is never content,
+    // even when we end up refusing to apply it. Every "not authorized" exit
+    // below must therefore SWALLOW it: the alternative — falling through to
+    // ingestInbound*Text — appends the raw JSON to history and renders it as
+    // an ACTION row. That is not hypothetical: a group receipt echoes the
+    // RECEIVER's locally-minted msgID, which no other member has in history,
+    // so the authorization gate fails on every peer and each receipt used to
+    // materialize as a garbage row (auto_tests
+    // scenario_group_receipt_control_row_test pins this).
+    final isControlPayload =
+        BinaryReplacementHistoryHook.isInternalProtocolCustomData(body);
+
     final payloadGroupId = decoded['groupID'];
     if (payloadGroupId != null &&
         (payloadGroupId is! String || payloadGroupId.isEmpty)) {
-      return false;
+      return isControlPayload;
     }
     if (eventGroupId != null &&
         payloadGroupId != null &&
         payloadGroupId != eventGroupId) {
-      return false;
+      return isControlPayload;
     }
     final effectiveGroupId =
         payloadGroupId is String ? payloadGroupId : eventGroupId;
@@ -6333,6 +6426,17 @@ class FfiChatService {
       history: _messageHistoryPersistence.getHistory(conversationId),
       senderBound: senderBound,
     )) {
+      if (isControlPayload) {
+        // Refused, not content: drop it. Applying it would let a peer flip
+        // rows it never saw; rendering it would put raw protocol JSON in the
+        // chat. Dropping is the only safe third option.
+        _bumpDiag('controlsDroppedUnresolved');
+        _logger?.log(
+          '[FfiChatService] dropped unresolved control: type=${decoded['type']} '
+          'conv=$conversationId msgID=${decoded['msgID']}',
+        );
+        return true;
+      }
       return false;
     }
 
@@ -7407,6 +7511,33 @@ class FfiChatService {
     }
   }
 
+  /// The cross-peer alias for the group message just sent from this thread,
+  /// or null when the route produced no Tox_Group_Message_Id (conference, or
+  /// a native library predating the export). Must be called immediately after
+  /// the synchronous send — the underlying value is thread-local and describes
+  /// only the most recent send.
+  String? _groupSendAlias(String groupId) {
+    final int pseudoId;
+    final String selfGroupKey;
+    try {
+      pseudoId = _ffi.lastGroupSendMessageId();
+      selfGroupKey = _ffi.lastGroupSendSelfKey().toDartString();
+    } on ArgumentError {
+      // Older native library without the exports: no alias, everything else
+      // keeps working exactly as before.
+      return null;
+    }
+    if (pseudoId < 0 || selfGroupKey.isEmpty) return null;
+    // Scope by the PER-GROUP key, which is what receivers see as the sender of
+    // this message; our long-term Tox ID would produce an alias no peer could
+    // reproduce.
+    return groupMessageAlias(
+      groupId: groupId,
+      senderPk: selfGroupKey,
+      pseudoMsgId: pseudoId,
+    );
+  }
+
   void _sendGroupTextByKindChecked(
     String groupId,
     String text,
@@ -7961,21 +8092,78 @@ class FfiChatService {
     }
   }
 
+  /// Stamps the cross-peer alias onto an already-persisted group row.
+  ///
+  /// Returns the alias only when it was NEWLY added, so the caller can send
+  /// the automatic receipt exactly once no matter how many times the same
+  /// message is re-delivered through the duplicate path.
+  String? _mergeGroupAliasIntoRow(
+    String gid,
+    ChatMessage row,
+    String from, {
+    required int? pseudoMsgId,
+  }) {
+    if (pseudoMsgId == null) return null;
+    final alias = groupMessageAlias(
+      groupId: gid,
+      senderPk: from,
+      pseudoMsgId: pseudoMsgId,
+    );
+    if (row.altMsgIds.contains(alias)) return null;
+    final history = _historyById[gid];
+    if (history == null) return null;
+    for (var i = 0; i < history.length; i++) {
+      if (!identical(history[i], row) && history[i].msgID != row.msgID) {
+        continue;
+      }
+      if (history[i].altMsgIds.contains(alias)) return null;
+      history[i] = history[i].copyWith(
+        altMsgIds: [...history[i].altMsgIds, alias],
+      );
+      unawaited(_saveHistory(gid));
+      return alias;
+    }
+    return null;
+  }
+
+  /// Our LOCAL id for the row a group receipt refers to.
+  ///
+  /// Group message ids are per-device: every peer mints its own for the same
+  /// wire message, so a receipt can only reach our row through the cross-peer
+  /// alias (`gmid:<gid>|<senderPk>|<pseudoId>`) that both sides stamp into
+  /// [ChatMessage.altMsgIds]. Everything downstream — the reader/receiver
+  /// tallies AND the live receiptEvents the UI keys by — must use the local
+  /// id, or `getMessageReaders(<the id UIKit holds>)` can never match.
+  /// Falls back to the wire id when nothing resolves, which reproduces the
+  /// pre-alias behaviour instead of dropping the receipt.
+  String _localGroupRowId(String wireMsgID, String groupID) {
+    final history = _historyById[groupID];
+    if (history == null) return wireMsgID;
+    for (final msg in history) {
+      if (!msg.isSelf) continue;
+      if (msg.msgID == wireMsgID || msg.altMsgIds.contains(wireMsgID)) {
+        return msg.msgID ?? wireMsgID;
+      }
+    }
+    return wireMsgID;
+  }
+
   // Handle received receipt (async helper)
   Future<void> _handleReceipt(
       String msgID, String receiptType, String sender, String? groupID) async {
     // For group messages, track receivers and readers. Guard against the
     // sender's own NGC echo: a self-receipt must not inflate either tally.
     if (groupID != null && sender != _wireSelfSender()) {
+      final tallyKey = _localGroupRowId(msgID, groupID);
       if (receiptType == 'received' || receiptType == 'read') {
-        _messageReceivers.putIfAbsent(msgID, () => <String>{}).add(sender);
+        _messageReceivers.putIfAbsent(tallyKey, () => <String>{}).add(sender);
       }
       if (receiptType == 'read') {
-        _messageReaders.putIfAbsent(msgID, () => <String>{}).add(sender);
+        _messageReaders.putIfAbsent(tallyKey, () => <String>{}).add(sender);
         _receiptEventsCtrl.add((
-          msgID: msgID,
+          msgID: tallyKey,
           groupID: groupID,
-          readCount: _messageReaders[msgID]!.length,
+          readCount: _messageReaders[tallyKey]!.length,
         ));
       }
     }
@@ -8003,7 +8191,10 @@ class FfiChatService {
             ? (msg.isSelf &&
                 !(receiptType == 'received' ? msg.isReceived : msg.isRead) &&
                 _c2cTextHash(msg.text) == hashWanted)
-            : (msg.msgID == msgID && msg.isSelf);
+            // Alias-aware: a group receipt carries the cross-peer id, which
+            // lives in altMsgIds, never in msgID.
+            : ((msg.msgID == msgID || msg.altMsgIds.contains(msgID)) &&
+                msg.isSelf);
         if (hashWanted != null &&
             msg.isSelf &&
             !matched &&
@@ -8073,8 +8264,16 @@ class FfiChatService {
           final updatedMsg = msg.copyWith(isRead: true);
           history[i] = updatedMsg;
           await _saveHistory(id);
-          // Send read receipt
-          await _sendReceipt(peerId, msgID, 'read', groupID: groupID);
+          // Send read receipt. In a group the author has never seen OUR msgID,
+          // so echo the cross-peer alias when the row carries one — same rule
+          // as the automatic 'received' receipt in ingestInboundGroupText.
+          final wireMsgID = groupID == null
+              ? msgID
+              : msg.altMsgIds.firstWhere(
+                  (id) => id.startsWith('gmid:'),
+                  orElse: () => msgID,
+                );
+          await _sendReceipt(peerId, wireMsgID, 'read', groupID: groupID);
           break;
         }
       }
@@ -8159,6 +8358,9 @@ class FfiChatService {
       );
     }
     _sendGroupTextByKindChecked(groupId, text, outgoing.contentKind);
+    // Read the cross-peer id IMMEDIATELY after the synchronous send: it is
+    // thread-local and only describes the send that just happened.
+    final alias = _groupSendAlias(groupId);
     final msgID = _usableClientMessageID(clientMessageID)
         ? clientMessageID!
         : '${DateTime.now().millisecondsSinceEpoch}_${_msgIDSequence++}_${_selfId}_$groupId';
@@ -8172,6 +8374,7 @@ class FfiChatService {
       cloudCustomData: cloudCustomData,
       needReadReceipt: _consumeArmedNeedReadReceipt(),
       contentKind: outgoing.contentKind,
+      altMsgIds: [if (alias != null) alias],
     );
     _lastByPeer[groupId] = out;
     _unreadByPeer[_unreadKey(groupId)] = 0;
@@ -8265,6 +8468,36 @@ class FfiChatService {
       var dispatched = false;
       try {
         _sendGroupTextByKindChecked(groupId, item.text, item.contentKind);
+        // The row was created while offline, so it has no cross-peer alias:
+        // the pseudo id only exists once the message is actually on the wire.
+        // Capture it now, immediately after the synchronous send, and stamp it
+        // onto the existing row below — a queued group message must be able to
+        // collect read receipts exactly like a directly-sent one.
+        final drainedAlias = _groupSendAlias(groupId);
+        // Stamp the alias BEFORE the first await. A peer can receipt this
+        // message while we are still persisting the queue removal, and a
+        // receipt that arrives against an alias-less row now resolves to
+        // nothing and is DROPPED by the unresolved-control path — the flip
+        // side of the pollution fix. The durable queue-clear ordering below is
+        // unchanged; this only moves an in-memory field write earlier.
+        if (drainedAlias != null && history != null) {
+          final itemMs = item.timestamp.millisecondsSinceEpoch;
+          for (int i = history.length - 1; i >= 0; i--) {
+            final msg = history[i];
+            if (msg.isSelf &&
+                msg.isPending &&
+                msg.filePath == null &&
+                msg.text == item.text &&
+                msg.contentKind == item.contentKind &&
+                !msg.altMsgIds.contains(drainedAlias) &&
+                _offlineRowMatchesItem(msg, item, itemMs)) {
+              history[i] = msg.copyWith(
+                altMsgIds: [...msg.altMsgIds, drainedAlias],
+              );
+              break;
+            }
+          }
+        }
         // #25 Option B: durably clear the queue entry NOW (after send, before
         // the history reconcile) so a crash can't make the next drain re-send.
         // Same reorder as the C2C drain paths.
@@ -8289,6 +8522,8 @@ class FfiChatService {
                 msg.text == item.text &&
                 msg.contentKind == item.contentKind &&
                 _offlineRowMatchesItem(msg, item, itemMs)) {
+              // The alias was stamped before the awaits above; this only
+              // clears the pending flag.
               history[i] = msg.copyWith(isPending: false);
               _lastByPeer[groupId] = history[i];
               try {

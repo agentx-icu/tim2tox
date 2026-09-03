@@ -80,6 +80,11 @@ extern void ClearReceiverCustomRouteOverride(void);
 extern int GetReceiverTextKindOverride(void);
 extern void SetReceiverTextKindOverride(int kind);
 extern void ClearReceiverTextKindOverride(void);
+extern int64_t GetReceiverGroupMessageIdOverride(void);
+extern void SetReceiverGroupMessageIdOverride(int64_t id);
+extern void ClearReceiverGroupMessageIdOverride(void);
+extern void SetLastGroupSendMessageId(int64_t id);
+extern void SetLastGroupSendSelfKey(const char* hex);
 #include <string> // For std::string
 #include <filesystem>
 #include <sys/stat.h>
@@ -150,6 +155,29 @@ public:
 
 private:
     int previous_route_;
+};
+
+/// Publishes the Tox NGC pseudo message id of the group message being
+/// delivered, so the FFI simple listener can put it in the polled event line.
+/// Thread-local and scope-bound like its siblings; -1 restores "absent".
+class ReceiverGroupMessageIdOverrideGuard {
+public:
+    explicit ReceiverGroupMessageIdOverrideGuard(int64_t id)
+        : previous_id_(GetReceiverGroupMessageIdOverride()) {
+        SetReceiverGroupMessageIdOverride(id);
+    }
+
+    ~ReceiverGroupMessageIdOverrideGuard() noexcept {
+        SetReceiverGroupMessageIdOverride(previous_id_);
+    }
+
+    ReceiverGroupMessageIdOverrideGuard(
+        const ReceiverGroupMessageIdOverrideGuard&) = delete;
+    ReceiverGroupMessageIdOverrideGuard& operator=(
+        const ReceiverGroupMessageIdOverrideGuard&) = delete;
+
+private:
+    const int64_t previous_id_;
 };
 
 class ReceiverTextKindOverrideGuard {
@@ -2469,6 +2497,29 @@ V2TIMString V2TIMManagerImpl::SendGroupTextMessageWithType(
     }
 
     Tox_Group_Message_Id message_id = 0;
+    // Publish the FIRST fragment's cross-peer id for the Dart caller. Reset up
+    // front so a conference send or a failure cannot leave a stale id behind
+    // for the next caller to mis-stamp onto its row.
+    bool first_pseudo_id_published = false;
+    SetLastGroupSendMessageId(-1);
+    // Publish the identity peers will attribute this message to. An NGC peer
+    // is known by a PER-GROUP key, not by its long-term Tox ID, so the author
+    // must scope its own alias by the same key the receivers will see in the
+    // event line — otherwise the two sides derive different aliases for the
+    // very same message and nothing correlates.
+    SetLastGroupSendSelfKey("");
+    if (tox) {
+        uint8_t self_group_pubkey[TOX_PUBLIC_KEY_SIZE];
+        Tox_Err_Group_Self_Query err_self_key = TOX_ERR_GROUP_SELF_QUERY_OK;
+        if (tox_group_self_get_public_key(tox, group_number, self_group_pubkey,
+                                          &err_self_key) &&
+            err_self_key == TOX_ERR_GROUP_SELF_QUERY_OK) {
+            SetLastGroupSendSelfKey(
+                ToxUtil::tox_bytes_to_hex(self_group_pubkey,
+                                          TOX_PUBLIC_KEY_SIZE)
+                    .c_str());
+        }
+    }
     Tox_Err_Group_Send_Message send_err = TOX_ERR_GROUP_SEND_MESSAGE_OK;
     V2TIM_LOG(kInfo, "[V2TIMManagerImpl::SendGroupTextMessage] About to send {} fragments to group_number={} group_type='{}'",
              fragments->size(), group_number, group_type_val);
@@ -2505,7 +2556,13 @@ V2TIMString V2TIMManagerImpl::SendGroupTextMessageWithType(
             fragment.size(),
             &message_id,
             &send_err);
-        if (success) continue;
+        if (success) {
+            if (!first_pseudo_id_published) {
+                SetLastGroupSendMessageId(static_cast<int64_t>(message_id));
+                first_pseudo_id_published = true;
+            }
+            continue;
+        }
 
         if (send_err == TOX_ERR_GROUP_SEND_MESSAGE_GROUP_NOT_FOUND && tox) {
             Tox_Err_Conference_Peer_Query conference_query_error;
@@ -4759,6 +4816,13 @@ void V2TIMManagerImpl::SetAutoAcceptGroupInvites(bool enabled) {
 // --- Implementation of Internal Handlers ---
 
 void V2TIMManagerImpl::HandleGroupMessageGroup(Tox_Group_Number group_number, Tox_Group_Peer_Number peer_id, TOX_MESSAGE_TYPE type, const uint8_t* message_data, size_t length, Tox_Group_Message_Id message_id) {
+    // Publish the shared pseudo id for the whole synchronous delivery below:
+    // BOTH the ACTION branch (NotifyGroupActionMessage) and the normal-text
+    // branch notify the FFI simple listener, which stamps it into the polled
+    // event line. Scope-bound and thread-local, so nothing leaks to the next
+    // message on this thread.
+    ReceiverGroupMessageIdOverrideGuard group_msg_id_guard(
+        static_cast<int64_t>(message_id));
     V2TIM_LOG(kInfo, "[V2TIMManagerImpl::HandleGroupMessageGroup] ========== ENTRY ==========");
     V2TIM_LOG(kInfo, "[V2TIMManagerImpl::HandleGroupMessageGroup] group_number={}, peer_id={}, type={}, length={}, message_id={}", 
              group_number, peer_id, static_cast<int>(type), length, message_id);

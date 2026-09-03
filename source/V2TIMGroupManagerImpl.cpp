@@ -1,3 +1,4 @@
+#include <set>
 #include "V2TIMGroupManagerImpl.h"
 #include "ToxManager.h"
 #include "V2TIMLog.h"
@@ -56,6 +57,43 @@ static ToxManager* GetToxManagerFromImpl(V2TIMManagerImpl* manager_impl) {
         return manager_impl->GetToxManager();
     }
     return ToxManager::getDefaultInstance();
+}
+
+// The live NGC group name, or "" when it cannot be read.
+//
+// WHY THIS EXISTS: `group_info_` only learns a real name on the node that
+// CREATED the group (CreateGroup caches it) or after something explicitly
+// fetches group info. A node that JOINED holds whatever EnsureGroupInfoExists
+// seeded — `groupName = groupID` — so searching by the name every member can
+// plainly see in the UI matched nothing, and the group only surfaced through
+// the conversation fallback section (the product debt recorded in toxee
+// PR #80). toxcore has had the real name the entire time; read it.
+// Takes the group NUMBER rather than the id: `group_id_to_group_number_` is
+// private to V2TIMManagerImpl and only its friends (the member functions of
+// this class) may look it up, so the caller resolves it.
+static std::string GetLiveGroupName(V2TIMManagerImpl* manager_impl,
+                                    Tox_Group_Number group_number) {
+    ToxManager* tox_manager = GetToxManagerFromImpl(manager_impl);
+    if (!tox_manager) return std::string();
+    // Call toxcore directly instead of ToxManager::getGroupName: that wrapper
+    // takes ToxManager's mutex, which this call path can already hold, and the
+    // search then deadlocks (observed: searchGroups never returned). Every
+    // other tox_* use in this file goes through the raw handle the same way.
+    Tox* tox = tox_manager->getTox();
+    if (!tox) return std::string();
+    Tox_Err_Group_State_Query err = TOX_ERR_GROUP_STATE_QUERY_OK;
+    const size_t name_size = tox_group_get_name_size(tox, group_number, &err);
+    if (err != TOX_ERR_GROUP_STATE_QUERY_OK || name_size == 0 ||
+        name_size > TOX_GROUP_MAX_GROUP_NAME_LENGTH) {
+        return std::string();
+    }
+    std::vector<uint8_t> name_buf(name_size);
+    if (!tox_group_get_name(tox, group_number, name_buf.data(), &err) ||
+        err != TOX_ERR_GROUP_STATE_QUERY_OK) {
+        return std::string();
+    }
+    return std::string(reinterpret_cast<const char*>(name_buf.data()),
+                       name_size);
 }
 
 ////////////////////////////// 群组管理接口 //////////////////////////////
@@ -1173,52 +1211,50 @@ void V2TIMGroupManagerImpl::SearchGroups(const V2TIMGroupSearchParam& searchPara
     // Otherwise fall back to groups_ map
     std::vector<std::string> groupIDs;
     
-    if (manager_impl_) {
-        // Get group IDs from V2TIMManagerImpl's group_id_to_group_number_ mapping
-        // We need to access it through a public method or friend class
-        // For now, we'll use groups_ map and also check manager_impl_ if needed
+    // The candidate set is the UNION of both registries, not "groups_ unless
+    // it happens to be empty".
+    //
+    // `groups_` is written by CreateGroup; a group this node JOINED is only
+    // registered in the manager's group_id_to_group_number_ mapping. Consulting
+    // the manager just when `groups_` was empty therefore hid every joined
+    // group from a node that had also created one — the empty case was the only
+    // reason the joiner path ever worked.
+    std::set<std::string> seen;
+    {
         std::lock_guard<std::mutex> lock(group_mutex_);
         for (const auto& groupPair : groups_) {
-            groupIDs.push_back(groupPair.first);
-        }
-    } else {
-        // Fall back to groups_ map
-        std::lock_guard<std::mutex> lock(group_mutex_);
-        for (const auto& groupPair : groups_) {
-            groupIDs.push_back(groupPair.first);
-        }
-    }
-    
-    // If groups_ is empty, try to get groups from Tox directly
-    if (groupIDs.empty()) {
-        size_t group_count = GetToxManagerFromImpl(manager_impl_)->getGroupListSize();
-        V2TIM_LOG(kInfo, "SearchGroups: found {} groups in Tox", group_count);
-        if (group_count > 0) {
-            // Allocate array for group numbers
-            std::vector<Tox_Group_Number> group_list(group_count);
-            GetToxManagerFromImpl(manager_impl_)->getGroupList(group_list.data(), group_count);
-            
-            // Look up group IDs from manager_impl_'s mapping instead of generating from group_number
-            // This ensures we use the correct IDs (from next_group_id_counter_) instead of
-            // directly generating from group_number (which may be reused)
-            if (manager_impl_) {
-                std::vector<V2TIMString> managerGroupIDs = manager_impl_->GetAllGroupIDs();
-                for (const auto& gid : managerGroupIDs) {
-                    groupIDs.push_back(gid.CString());
-                }
-                V2TIM_LOG(kInfo, "SearchGroups: got {} groups from manager_impl_ mapping", managerGroupIDs.size());
-            } else {
-                // Fallback: if manager_impl_ is not available, we can't safely generate IDs
-                // Log a warning and skip these groups
-                V2TIM_LOG(kWarning, "SearchGroups: manager_impl_ not available, cannot safely map groups to group IDs");
+            if (seen.insert(groupPair.first).second) {
+                groupIDs.push_back(groupPair.first);
             }
         }
+    }
+    if (manager_impl_) {
+        // GetAllGroupIDs takes the manager's own lock internally.
+        for (const auto& gid : manager_impl_->GetAllGroupIDs()) {
+            const std::string id = gid.CString();
+            if (seen.insert(id).second) {
+                groupIDs.push_back(id);
+            }
+        }
+    } else {
+        V2TIM_LOG(kWarning,
+                  "SearchGroups: manager_impl_ not available; only created groups are searchable");
     }
     
     V2TIM_LOG(kInfo, "SearchGroups: searching through {} groups", groupIDs.size());
     
     // Search through all groups
     for (const std::string& groupID : groupIDs) {
+        // `tox_inv_<friend>_<ms>` is an internal placeholder an invitee holds
+        // until the invite is promoted to a stable id; it maps to the same tox
+        // group, so resolving live names made it match the same keyword as the
+        // real entry and the user saw the group twice. It is never something to
+        // offer as a search result.
+        if (manager_impl_ &&
+            manager_impl_->IsTemporaryInviteGroupID(
+                V2TIMString(groupID.c_str()))) {
+            continue;
+        }
         bool matched = false;
         
         // Check each keyword
@@ -1240,15 +1276,15 @@ void V2TIMGroupManagerImpl::SearchGroups(const V2TIMGroupSearchParam& searchPara
             // For now, we'll search by ID as a fallback when name is not available
             // Also search by group ID even when searching by name, as group ID might match
             if (searchParam.isSearchGroupName || !searchParam.isSearchGroupID) {
-                // Try to get group name from group_info_ if available
-                auto it = group_info_.find(groupID);
-                if (it != group_info_.end()) {
-                    const V2TIMGroupInfo& info = it->second;
-                    const std::string groupName = info.groupName.CString();
-                    if (!groupName.empty() && groupName.find(keywordStr) != std::string::npos) {
-                        matched = true;
-                        break;
-                    }
+                // Cached name first, then the LIVE tox name. A node that joined
+                // rather than created the group holds only the
+                // EnsureGroupInfoExists placeholder (`groupName == groupID`),
+                // which would silently reduce a name search to an id search.
+                const std::string resolvedName = ResolveGroupName(groupID);
+                if (!resolvedName.empty() &&
+                    resolvedName.find(keywordStr) != std::string::npos) {
+                    matched = true;
+                    break;
                 }
                 // Also check if group ID matches (as fallback when name is not available)
                 if (groupID.find(keywordStr) != std::string::npos) {
@@ -1262,14 +1298,25 @@ void V2TIMGroupManagerImpl::SearchGroups(const V2TIMGroupSearchParam& searchPara
             V2TIMGroupInfo groupInfo;
             groupInfo.groupID = V2TIMString(groupID.c_str());
             
-            // Try to get group info from cache
-            auto it = group_info_.find(groupID);
-            if (it != group_info_.end()) {
-                groupInfo = it->second;
-            } else {
-                // Create minimal group info
-                groupInfo.groupID = V2TIMString(groupID.c_str());
-                groupInfo.groupName = V2TIMString(groupID.c_str()); // Use groupID as default name
+            // Copy the cached info UNDER the lock — group_info_ is mutated by
+            // the join/topic/info paths while a search can be running.
+            {
+                std::lock_guard<std::mutex> lock(group_mutex_);
+                auto it = group_info_.find(groupID);
+                if (it != group_info_.end()) {
+                    groupInfo = it->second;
+                } else {
+                    // Create minimal group info
+                    groupInfo.groupID = V2TIMString(groupID.c_str());
+                    groupInfo.groupName = V2TIMString(groupID.c_str()); // default
+                }
+            }
+            // Report the name the user actually sees, not the placeholder: a
+            // result row labelled with the raw group id is indistinguishable
+            // from a different group to whoever is reading the search list.
+            const std::string resolvedName = ResolveGroupName(groupID);
+            if (!resolvedName.empty()) {
+                groupInfo.groupName = V2TIMString(resolvedName.c_str());
             }
             
             resultList.PushBack(groupInfo);
@@ -1408,6 +1455,35 @@ void V2TIMGroupManagerImpl::UpdateGroupInfoFromTopic(const V2TIMString& groupID,
         group_info_[groupID.CString()] = info;
         V2TIM_LOG(kInfo, "UpdateGroupInfoFromTopic: added group info for {}", groupID.CString());
     }
+}
+
+// Best-known display name for a group: the cached one when it is a REAL name,
+// otherwise the live NGC name. EnsureGroupInfoExists seeds `groupName ==
+// groupID` as a placeholder, so treating the cache as authoritative turns a
+// name search into an id search on every node that joined instead of created.
+std::string V2TIMGroupManagerImpl::ResolveGroupName(const std::string& groupID) {
+    std::string cached;
+    {
+        std::lock_guard<std::mutex> lock(group_mutex_);
+        auto it = group_info_.find(groupID);
+        if (it != group_info_.end()) {
+            cached = it->second.groupName.CString();
+        }
+    }
+    if (!cached.empty() && cached != groupID) {
+        return cached;
+    }
+    if (!manager_impl_) return cached;
+    // Through the locked accessor, not the raw map: join/quit/invite promotion
+    // mutate group_id_to_group_number_ under the manager's mutex, and a search
+    // running concurrently would otherwise race an unordered_map.
+    Tox_Group_Number group_number = 0;
+    if (!manager_impl_->GetGroupNumberFromID(V2TIMString(groupID.c_str()),
+                                             group_number)) {
+        return cached;
+    }
+    const std::string live = GetLiveGroupName(manager_impl_, group_number);
+    return live.empty() ? cached : live;
 }
 
 void V2TIMGroupManagerImpl::EnsureGroupInfoExists(const V2TIMString& groupID) {

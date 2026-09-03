@@ -383,7 +383,15 @@ void main() {
     await messageSubscription.cancel();
   });
 
-  test('exact-looking ACTION control with absent target stays visible',
+  // Refusing to APPLY a control is not a reason to RENDER it. Rendering was the
+  // old behaviour and it was actively harmful: a group receipt references the
+  // sender's own per-device msgID, which no other member has, so the target is
+  // absent on every peer and each receipt materialised as a raw-JSON row (see
+  // scenario_group_receipt_control_row_test). Dropping is the only safe third
+  // option — applying would let a peer touch rows it never saw. The same rule
+  // is applied to C2C for coherence: whether the referenced row happens to
+  // exist must not decide whether protocol JSON shows up in the chat.
+  test('exact-looking ACTION control with absent target is dropped, not shown',
       () async {
     final reaction = jsonEncode(<String, Object?>{
       'type': 'reaction',
@@ -398,14 +406,25 @@ void main() {
     expect(service.ingestActionEvent(_actionEvent(reaction)), isTrue);
     await Future<void>.delayed(Duration.zero);
 
-    expect(reactions, isEmpty);
+    expect(reactions, isEmpty, reason: 'an unresolved control is not applied');
+    expect(service.getHistory(_peer), isEmpty,
+        reason: 'an unresolved control must not become a visible row');
+    await subscription.cancel();
+  });
+
+  test('a non-control ACTION body is still rendered', () async {
+    // The drop above is keyed on tim2tox's OWN control signature, not on
+    // "looks like JSON": ordinary ACTION content must keep flowing.
+    const body = '{"note":"not a control","msgID":"missing-target"}';
+    expect(service.ingestActionEvent(_actionEvent(body)), isTrue);
+    await Future<void>.delayed(Duration.zero);
+
     expect(service.getHistory(_peer), hasLength(1));
-    expect(service.getHistory(_peer).single.text, reaction);
+    expect(service.getHistory(_peer).single.text, body);
     expect(
       service.getHistory(_peer).single.contentKind,
       ChatMessageContentKind.action,
     );
-    await subscription.cancel();
   });
 
   test('route 3 is ignored when binary replacement owns inbound history',

@@ -34,6 +34,10 @@ public:
     void UpdateGroupInfoFromTopic(const V2TIMString& groupID, const std::string& topic_value);
     /// Ensure group_info_ has an entry for groupID (e.g. when joining so GetGroupsInfo finds it before topic arrives).
     void EnsureGroupInfoExists(const V2TIMString& groupID);
+
+    // Best-known display name for a group: cached when real, live NGC name
+    // otherwise. See the definition for why the cache alone is not enough.
+    std::string ResolveGroupName(const std::string& groupID);
     void InitGroupAttributes(const V2TIMString& groupID,
                             const V2TIMGroupAttributeMap& attributes,
                             V2TIMCallback* callback) override;

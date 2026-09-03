@@ -552,6 +552,10 @@ PHASE4_GROUP=(
   "test/scenarios/scenario_group_topic_test.dart"
   "test/scenarios/scenario_group_topic_revert_test.dart"
   "test/scenarios/scenario_group_moderation_test.dart"
+  "test/scenarios/scenario_group_receipt_control_row_test.dart"
+  # Group search by NAME from a node that JOINED (native SearchGroups resolves
+  # the live NGC name instead of the EnsureGroupInfoExists placeholder).
+  "test/scenarios/scenario_group_search_by_name_test.dart"
 )
 
 PHASE5_TOXAV=(
@@ -654,6 +658,9 @@ PHASE14_UNIT=(
   "test/unit_tests/ffi_chat_service_scratch_test.dart"
   "test/unit_tests/qtox_action_and_splitting_state_test.dart"
   "test/unit_tests/ffi_chat_service_c2c_binary_event_test.dart"
+  # Cross-peer group message alias: header parsing (new + legacy forms),
+  # alias stamping, persistence round-trip, receipt->local-row correlation.
+  "test/unit_tests/ffi_chat_service_group_alias_test.dart"
   "test/unit_tests/message_history_persistence_test.dart"
   # CR-05/CR-06/CR-07 + S17/S18 cloudCustomData reply persistence + the
   # cross-path history de-duplication invariant. 19 tests, pure Dart.

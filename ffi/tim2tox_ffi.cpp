@@ -123,6 +123,20 @@ void ClearReceiverCustomRouteOverride(void);
 int GetReceiverTextKindOverride(void);
 void SetReceiverTextKindOverride(int kind);
 void ClearReceiverTextKindOverride(void);
+// Tox NGC pseudo message id of the group message currently being delivered.
+// -1 means "absent" (routes with no Tox_Group_Message_Id, e.g. legacy
+// conference or custom packets). See the gtext:/gaction: line format below.
+int64_t GetReceiverGroupMessageIdOverride(void);
+void SetReceiverGroupMessageIdOverride(int64_t id);
+void ClearReceiverGroupMessageIdOverride(void);
+// Pseudo message id of the FIRST fragment of the group message this thread is
+// currently sending; -1 when the last send produced none (conference route,
+// or a failure). Read via tim2tox_ffi_last_group_send_message_id().
+void SetLastGroupSendMessageId(int64_t id);
+// Hex per-group public key the author is known by INSIDE the group it just
+// sent to. Peers see this key as the message sender (NGC identities are
+// per-group), so it is the only sender component both sides can agree on.
+void SetLastGroupSendSelfKey(const char* hex);
 
 // Test instance management (for multi-instance testing) - moved outside namespace for GetCurrentInstance access
 static std::mutex g_test_instances_mutex;
@@ -399,7 +413,19 @@ public:
         const char* prefix = GetReceiverTextKindOverride() == 1
             ? "gaction:"
             : "gtext:";
-        std::string header = std::string(prefix) + groupID.CString() + "|" + sender.userID.CString() + ":";
+        // Header is `<gid>|<sender>` plus an OPTIONAL `|m<pseudoId>` segment.
+        // The pseudo id is toxcore's Tox_Group_Message_Id: the sender mints one
+        // random_u32 per group message and packs it INTO the broadcast, so every
+        // member decodes the same value — it is the only cross-peer identity a
+        // group message has. Routes without one (legacy conference, custom
+        // packets) simply omit the segment, and the Dart parser falls back to
+        // the two-segment form, so old/new parsers and producers interoperate.
+        const int64_t pseudo_id = GetReceiverGroupMessageIdOverride();
+        std::string header = std::string(prefix) + groupID.CString() + "|" + sender.userID.CString();
+        if (pseudo_id >= 0) {
+            header += "|m" + std::to_string(static_cast<uint32_t>(pseudo_id));
+        }
+        header += ":";
         std::string line = header + text.CString();
         enqueue_text_line(line);
     }
@@ -1116,6 +1142,16 @@ static thread_local int g_receiver_text_kind_override = -1;
 int GetReceiverTextKindOverride(void) { return g_receiver_text_kind_override; }
 void SetReceiverTextKindOverride(int kind) { g_receiver_text_kind_override = kind; }
 void ClearReceiverTextKindOverride(void) { g_receiver_text_kind_override = -1; }
+static thread_local int64_t g_receiver_group_msgid_override = -1;
+int64_t GetReceiverGroupMessageIdOverride(void) { return g_receiver_group_msgid_override; }
+void SetReceiverGroupMessageIdOverride(int64_t id) { g_receiver_group_msgid_override = id; }
+void ClearReceiverGroupMessageIdOverride(void) { g_receiver_group_msgid_override = -1; }
+static thread_local int64_t g_last_group_send_msgid = -1;
+void SetLastGroupSendMessageId(int64_t id) { g_last_group_send_msgid = id; }
+static thread_local std::string g_last_group_send_self_key;
+void SetLastGroupSendSelfKey(const char* hex) {
+    g_last_group_send_self_key = hex ? hex : "";
+}
 
 // Get current instance ID (for listener management)
 int64_t GetCurrentInstanceId() {
@@ -2102,6 +2138,25 @@ int tim2tox_ffi_join_group(const char* group_id, const char* request_msg) {
     const char* wording = request_msg ? request_msg : "";
     GetCurrentInstance()->JoinGroup(group_id, wording, &cb);
     return 1;
+}
+
+// Cross-peer id of the group message most recently sent from THIS thread.
+// Returns -1 when the last send had none (conference route, send failure), or
+// when nothing has been sent yet. The value is only meaningful immediately
+// after a successful tim2tox_ffi_send_group_text/action on the same thread —
+// the send is synchronous, so there is no window for another send to overwrite
+// it. Fragmented messages report the FIRST fragment's id: that is the fragment
+// the receiver renders as the first row, which is the one receipts reference.
+extern "C" int64_t tim2tox_ffi_last_group_send_message_id(void) {
+    return g_last_group_send_msgid;
+}
+
+// Companion to the id above: the author's per-group public key (hex) for the
+// group it just sent to, or "" when unavailable. The pointer is owned by a
+// thread_local string and stays valid until the next group send on this
+// thread — copy it immediately.
+extern "C" const char* tim2tox_ffi_last_group_send_self_key(void) {
+    return g_last_group_send_self_key.c_str();
 }
 
 int tim2tox_ffi_send_group_text(const char* group_id, const char* text) {
