@@ -216,7 +216,10 @@ public:
         if constexpr (std::is_same_v<U, bool>) {
             out.text = value ? "true" : "false";
         } else if constexpr (std::is_same_v<U, char*> || std::is_same_v<U, const char*>) {
-            out.text = value ? "<str:" + std::to_string(std::strlen(value)) + ">" : "(null)";
+            // Decay first: for a string literal `value` is an array reference,
+            // whose address GCC knows is never null (-Werror=address).
+            const char* const cstr = value;
+            out.text = cstr ? "<str:" + std::to_string(std::strlen(cstr)) + ">" : "(null)";
         } else if constexpr (std::is_same_v<U, std::string> || std::is_same_v<U, std::string_view>) {
             out.text = "<str:" + std::to_string(value.size()) + ">";
         } else if constexpr (std::is_enum_v<U>) {
@@ -243,7 +246,8 @@ public:
             out.text = "(null)";
         } else if constexpr (std::is_pointer_v<U>) {
             // void*, object, function pointers alike: the address is never logged.
-            out.text = value ? "<ptr>" : "(null)";
+            const U ptr = value;  // decay arrays (see the C-string branch)
+            out.text = ptr ? "<ptr>" : "(null)";
         } else {
             out.text = "<obj>";  // arbitrary objects are not rendered (contract)
         }
