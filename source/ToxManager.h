@@ -4,6 +4,7 @@
 #include <atomic>
 #include <memory>
 #include <mutex>
+#include <thread>
 #include <unordered_map>
 #include "toxcore/tox.h"
 #include <functional>
@@ -45,6 +46,20 @@ public:
     Tox* getTox() const;
     void iterate(uint32_t timeout = 0);
     bool isShuttingDown() const;
+    // Serialize a toxcore entry point that BYPASSES the per-instance lock
+    // (tox_callback_* registration, toxav_new/toxav_kill's per-pktid handler
+    // registration) with tox_iterate(). NOT for ordinary tox_*() calls — those
+    // are serialized inside toxcore (experimental_thread_safety, see
+    // initialize()). Never call from a tox callback: the event thread holds
+    // this NON-recursive mutex for the whole iterate — so when called ON that
+    // thread (from inside a tox callback) it returns an unowned lock: the
+    // caller is already serialized with the iterate by construction.
+    std::unique_lock<std::mutex> lockIterate() {
+        if (iterate_owner_.load(std::memory_order_acquire) == std::this_thread::get_id()) {
+            return std::unique_lock<std::mutex>();
+        }
+        return std::unique_lock<std::mutex>(iterate_mutex_);
+    }
 
     // 数据保存和加载
     std::vector<uint8_t> getSaveData() const;
@@ -305,6 +320,7 @@ private:
     std::unique_ptr<Tox, decltype(&toxDeleter)> tox_;
     mutable std::mutex mutex_;
     std::mutex iterate_mutex_;  // Serialize tox_iterate - toxcore requires single-threaded access per instance
+    std::atomic<std::thread::id> iterate_owner_{};  // thread holding iterate_mutex_ inside iterate()/shutdown() (see lockIterate)
     std::atomic<bool> is_shutting_down_{false};  // Flag to prevent double cleanup; atomic for lock-free read in iterate()
     bool tcp_relay_server_allowed_{true};  // see setTcpRelayServerAllowed
 

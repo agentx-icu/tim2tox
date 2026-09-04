@@ -1375,6 +1375,12 @@ class FfiChatService {
   String? _activePeerId;
   String? get activePeerId => _activePeerId; // Expose activePeerId for FakeIM
   final Map<String, DateTime> _typingUntil = {}; // peerId -> expiry
+
+  /// tox typing is STATE, not a heartbeat: toxcore transmits it only when the
+  /// sender flips it, so a receiver that expired the flag after 3 s dropped a
+  /// still-typing peer as soon as the UI got slow (Windows real-UI VM). Keep it
+  /// until the peer clears it or goes offline, with a generous safety cap.
+  static const Duration _typingSafetyCap = Duration(seconds: 30);
   final Set<String> _knownGroups = {};
   Set<String> get knownGroups => Set.unmodifiable(_knownGroups);
   Set<String> _quitGroups =
@@ -1715,6 +1721,20 @@ class FfiChatService {
   Future<void> _clearGroupOfflineQueue(String groupId) {
     return _clearOfflineQueue(_groupOfflineQueueKey(groupId));
   }
+
+  /// A usable local file path from native: non-empty and absolute for THIS
+  /// platform (`C:\...` on Windows, `/...` elsewhere). The old
+  /// `startsWith('/')` test rejected every Windows path, so a received file was
+  /// never attached to its message there (progress_recv/file_done: "actualPath
+  /// is invalid" / "Invalid local path") and the image bubble stayed on the
+  /// error placeholder (Windows real-UI, 2026-09-04).
+  /// A source file we own and may delete after copying it out: anything under
+  /// a `file_recv` directory or the POSIX `/tmp` fallback (separator-agnostic).
+  static bool _isTransientSourcePath(String path) =>
+      p.split(p.dirname(path)).contains('file_recv') || path.startsWith('/tmp/');
+
+  static bool _isAbsoluteLocalPath(String? path) =>
+      path != null && path.isNotEmpty && p.isAbsolute(path);
 
   /// Returns true if [messageFilePath] (e.g. temp path like /tmp/receiving_foo.txt in history)
   /// and [progressPath] (actual path from native progress) refer to the same received file.
@@ -3023,8 +3043,7 @@ class FfiChatService {
                   final from = parts[1];
                   final on = parts[2] == '1';
                   if (on) {
-                    _typingUntil[from] =
-                        DateTime.now().add(const Duration(seconds: 3));
+                    _typingUntil[from] = DateTime.now().add(_typingSafetyCap);
                   } else {
                     _typingUntil.remove(from);
                   }
@@ -3269,7 +3288,7 @@ class FfiChatService {
                         '[FfiChatService] progress_recv: File transfer 100% complete, triggering file_done handling immediately');
                     // Get the actual path from progress tracking if path is truncated or empty
                     String? actualPath = path;
-                    if (actualPath.isEmpty || !actualPath.startsWith('/')) {
+                    if (!_isAbsoluteLocalPath(actualPath)) {
                       // Path may be truncated, try to get it from progress tracking
                       if (foundFileNumber != null) {
                         final normalizedUid =
@@ -3294,9 +3313,7 @@ class FfiChatService {
                         }
                       }
                     }
-                    if (actualPath != null &&
-                        actualPath.isNotEmpty &&
-                        actualPath.startsWith('/')) {
+                    if (_isAbsoluteLocalPath(actualPath)) {
                       // Call _handleFileDone with the same parameters as file_done event
                       _logger?.log(
                           '[FfiChatService] progress_recv: completing fileNumber=$foundFileNumber');
@@ -3306,7 +3323,7 @@ class FfiChatService {
                       // mark the in-flight transfer as failed so the UI can
                       // recover instead of waiting.
                       unawaited(_handleFileDone(
-                              uid, 0, actualPath, foundFileNumber, foundMsgID,
+                              uid, 0, actualPath!, foundFileNumber, foundMsgID,
                               instanceId: instanceId)
                           .catchError((e, StackTrace st) {
                         _logger?.logError(
@@ -3325,7 +3342,7 @@ class FfiChatService {
                     // Try to extract fileNumber from path and use _fileNumberToMsgID mapping
                     int? extractedFileNumber;
                     String? extractedFileName;
-                    if (path.isNotEmpty && path.startsWith('/')) {
+                    if (_isAbsoluteLocalPath(path)) {
                       final pathBasename = p.basename(path);
                       // Check path format: <uid>_<fileKind>_<fileNumber>_<originalFileName>
                       if (pathBasename.contains('_') &&
@@ -3404,7 +3421,7 @@ class FfiChatService {
                           _logger?.log(
                               '[FfiChatService] progress_recv: Found valid msgID by fileNumber mapping: fileNumber=$extractedFileNumber, msgID=$foundMsgID, filenameMatches=$filenameMatches');
                           // Trigger file_done handling with found msgID
-                          if (path.isNotEmpty && path.startsWith('/')) {
+                          if (_isAbsoluteLocalPath(path)) {
                             _logger?.log(
                                 '[FfiChatService] progress_recv: Calling _handleFileDone with extracted fileNumber=$extractedFileNumber, msgID=$foundMsgID');
                             // P1-3: catch async failures so they don't vanish
@@ -3727,7 +3744,7 @@ class FfiChatService {
 
                   // Extract fileNumber from path if path format contains it
                   // Format: <uid>_<fileKind>_<fileNumber>_<originalFileName>
-                  if (path.isNotEmpty && path.startsWith('/')) {
+                  if (_isAbsoluteLocalPath(path)) {
                     final pathBasename = p.basename(path);
                     // Check path format: <uid>_<fileKind>_<fileNumber>_<originalFileName>
                     if (pathBasename.contains('_') &&
@@ -3791,9 +3808,7 @@ class FfiChatService {
 
                   // Priority 2: If msgID still null, try basename matching
                   if (msgID == null &&
-                      actualPath != null &&
-                      actualPath.isNotEmpty &&
-                      actualPath.startsWith('/')) {
+                      _isAbsoluteLocalPath(actualPath)) {
                     final pathBasename = p.basename(actualPath);
                     for (final entry in _fileReceiveProgress.entries) {
                       if (entry.key.$1 == normalizedUid ||
@@ -3816,7 +3831,7 @@ class FfiChatService {
                         }
                       }
                     }
-                  } else if (path.isEmpty || !path.startsWith('/')) {
+                  } else if (!_isAbsoluteLocalPath(path)) {
                     // Path is invalid, try to find from progress tracking by basename
                     _logger?.log(
                         '[FfiChatService] file_done: Path is empty or invalid, searching progress tracking');
@@ -3847,9 +3862,7 @@ class FfiChatService {
                       }
                     }
                   }
-                  if (actualPath != null &&
-                      actualPath.isNotEmpty &&
-                      actualPath.startsWith('/')) {
+                  if (_isAbsoluteLocalPath(actualPath)) {
                     if (fileKind == 0) {
                       _logger?.log(
                           '[FfiChatService] file_done: Detected as REGULAR file (kind=0), calling _handleFileDone');
@@ -3884,7 +3897,7 @@ class FfiChatService {
                       // stuck pending.
                       try {
                         unawaited(_handleFileDone(
-                                uid, fileKind, actualPath, fileNumber, msgID,
+                                uid, fileKind, actualPath!, fileNumber, msgID,
                                 instanceId: fileDoneEvent.instanceId)
                             .catchError((e, StackTrace st) {
                           _logger?.logError(
@@ -4247,7 +4260,7 @@ class FfiChatService {
       _logger?.log('[FfiChatService] _handleFileDone: Starting processing...');
 
       // CRITICAL: Check if path is valid (not truncated)
-      if (path.isEmpty || !path.startsWith('/')) {
+      if (!_isAbsoluteLocalPath(path)) {
         _logger?.log(
             '[FfiChatService] _handleFileDone: ERROR - Invalid path (empty or not absolute)');
         return;
@@ -4401,7 +4414,7 @@ class FfiChatService {
               return path;
             }
             await sourceFile.copy(destPath);
-            if (path.contains('/file_recv/') || path.contains('/tmp/')) {
+            if (_isTransientSourcePath(path)) {
               try {
                 await sourceFile.delete();
               } catch (e) {}
@@ -5381,7 +5394,9 @@ class FfiChatService {
 
   // Enqueue a file send for a friend that is offline (or that flipped offline
   // mid-send). Surfaces a pending file bubble; drain replays via sendFile().
-  Future<void> _queueOfflineFile(
+  /// Queue an offline file send and surface its pending row; returns that row
+  /// so [sendFile] can hand its identity back to the caller.
+  Future<ChatMessage> _queueOfflineFile(
       String normalizedPeerId, String filePath, int fileSize) async {
     // INVARIANT (drain depends on this): the queue item and the pending row
     // MUST share this one `now` — `_drainFileItem` / `_markPendingItemFailed`
@@ -5419,6 +5434,7 @@ class FfiChatService {
     _lastByPeer[normalizedPeerId] = msg;
     _appendHistory(normalizedPeerId, msg);
     _messages.add(msg);
+    return msg;
   }
 
   Future<void> updateSelfProfile(
@@ -5475,6 +5491,11 @@ class FfiChatService {
           final previousStatus =
               _friendOnlineStatus[normalizedUid] ?? _friendOnlineStatus[uid];
           _friendOnlineStatus[normalizedUid] = online ? 'online' : 'offline';
+          if (!online) {
+            // An offline peer cannot be typing; drop a flag it never cleared.
+            _typingUntil.remove(normalizedUid);
+            _typingUntil.remove(uid);
+          }
           // If friend just came online, send avatar if needed and send pending messages
           if (nativeOnline && previousStatus != 'online') {
             unawaited(_sendAvatarToFriendIfNeeded(uid));
@@ -5994,7 +6015,7 @@ class FfiChatService {
       }
     } else if (type == 2) {
       // typing
-      _typingUntil[sender] = DateTime.now().add(const Duration(seconds: 3));
+      _typingUntil[sender] = DateTime.now().add(_typingSafetyCap);
       // Don't add empty message for typing indicator - UI will show it separately
     } else if (type == 21) {
       // recv progress: payload "received\t total\t path"
@@ -8680,7 +8701,18 @@ class FfiChatService {
     }
   }
 
-  Future<void> sendFile(
+  /// Send [filePath] to [peerId] over a Tox file transfer.
+  ///
+  /// Returns the local echo `ChatMessage` this send produced — the delivered
+  /// row on the online path, the `isPending` row queued by
+  /// [_queueOfflineFile] when the friend is offline — or `null` when
+  /// [addToChatHistory] is false (no echo). The echo's `msgID` is the
+  /// identity the UI layer must adopt for its optimistic message: without
+  /// it the UIKit's `created_temp_id-*` bubble and the echo arriving on
+  /// [messages] were two different rows, and every image / file send showed
+  /// twice (one stuck "sending", one delivered). Text sends have always
+  /// returned their echo via [sendTextWithResult]; this is the same contract.
+  Future<ChatMessage?> sendFile(
     String peerId,
     String filePath, {
     bool addToChatHistory = true,
@@ -8718,9 +8750,9 @@ class FfiChatService {
       // Friend is offline - queue the file send and surface a pending bubble.
       // Drain happens on the next online transition (see _sendPendingMessages).
       if (addToChatHistory) {
-        await _queueOfflineFile(normalizedPeerId, filePath, fileSize);
+        return _queueOfflineFile(normalizedPeerId, filePath, fileSize);
       }
-      return;
+      return null;
     }
 
     // H-B: if the basename exceeds tox's 255-UTF-8-byte filename limit,
@@ -8744,8 +8776,7 @@ class FfiChatService {
           throw const _OfflineDuringDrain();
         }
         if (addToChatHistory) {
-          await _queueOfflineFile(normalizedPeerId, filePath, fileSize);
-          return;
+          return _queueOfflineFile(normalizedPeerId, filePath, fileSize);
         }
       }
       final message = switch (result) {
@@ -8761,7 +8792,7 @@ class FfiChatService {
       throw Exception(message);
     }
     if (!addToChatHistory) {
-      return;
+      return null;
     }
 
     // add a local outgoing message immediately
@@ -8805,6 +8836,7 @@ class FfiChatService {
     _appendHistory(normalizedPeerId, out);
     // Trigger stream update - listener will refresh from getHistory()
     _messages.add(out);
+    return out;
   }
 
   // File transfer control methods
@@ -9545,7 +9577,7 @@ class FfiChatService {
           '[FfiChatService] _moveFileToDownloads: copying basename=${p.basename(finalPath)}');
       await sourceFile.copy(finalPath);
       // Delete source file if it's in a temporary location
-      if (sourcePath.contains('/file_recv/') || sourcePath.contains('/tmp/')) {
+      if (_isTransientSourcePath(sourcePath)) {
         try {
           await sourceFile.delete();
         } catch (e) {

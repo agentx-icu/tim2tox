@@ -15,6 +15,7 @@ library tim2tox_sdk_platform;
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'package:path/path.dart' as p;
 import 'dart:math';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/painting.dart';
@@ -2409,7 +2410,7 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
     if (msg.isSelf == true) {
       if (_selfAvatarPathCache == null) {
         _selfAvatarPathCache = await prefs.getAvatarPath();
-      } else if (_selfAvatarPathCache!.startsWith('/') &&
+      } else if (p.isAbsolute(_selfAvatarPathCache!) &&
           !File(_selfAvatarPathCache!).existsSync()) {
         _selfAvatarPathCache = await prefs.getAvatarPath();
       }
@@ -5628,26 +5629,49 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
             print('[Tim2ToxSdkPlatform] Text message sent successfully');
         } else if (messageToSend.imageElem != null &&
             messageToSend.imageElem!.path != null) {
-          // Image message
+          // Image message. Same identity contract as text: when the provider
+          // can report the transport's echo (real msgID + pending state),
+          // take it so the reconciliation below rewrites the UIKit's
+          // `created_temp_id-*` optimistic bubble to the real id. Without it
+          // the echo arriving on the message stream was a SECOND bubble
+          // (one stuck "sending", one delivered) on every image/file send.
           print('[Tim2ToxSdkPlatform] Sending image message');
-          await provider.sendImage(
-            userID: userID,
-            groupID: groupID.isNotEmpty ? groupID : null,
-            imagePath: messageToSend.imageElem!.path!,
-            imageName: messageToSend.imageElem!.path,
-          );
+          if (provider is ChatMessageProviderWithSendResult) {
+            textSendResult = await provider.sendImageWithResult(
+              userID: userID,
+              groupID: groupID.isNotEmpty ? groupID : null,
+              imagePath: messageToSend.imageElem!.path!,
+              imageName: messageToSend.imageElem!.path,
+            );
+          } else {
+            await provider.sendImage(
+              userID: userID,
+              groupID: groupID.isNotEmpty ? groupID : null,
+              imagePath: messageToSend.imageElem!.path!,
+              imageName: messageToSend.imageElem!.path,
+            );
+          }
           if (_debugLog)
             print('[Tim2ToxSdkPlatform] Image message sent successfully');
         } else if (messageToSend.fileElem != null &&
             messageToSend.fileElem!.path != null) {
-          // File message
+          // File message — see the image branch for the identity contract.
           print('[Tim2ToxSdkPlatform] Sending file message');
-          await provider.sendFile(
-            userID: userID,
-            groupID: groupID.isNotEmpty ? groupID : null,
-            filePath: messageToSend.fileElem!.path!,
-            fileName: messageToSend.fileElem!.fileName,
-          );
+          if (provider is ChatMessageProviderWithSendResult) {
+            textSendResult = await provider.sendFileWithResult(
+              userID: userID,
+              groupID: groupID.isNotEmpty ? groupID : null,
+              filePath: messageToSend.fileElem!.path!,
+              fileName: messageToSend.fileElem!.fileName,
+            );
+          } else {
+            await provider.sendFile(
+              userID: userID,
+              groupID: groupID.isNotEmpty ? groupID : null,
+              filePath: messageToSend.fileElem!.path!,
+              fileName: messageToSend.fileElem!.fileName,
+            );
+          }
           if (_debugLog)
             print('[Tim2ToxSdkPlatform] File message sent successfully');
         } else if (messageToSend.mergerElem != null) {
@@ -5896,8 +5920,9 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
               ? MessageStatus.V2TIM_MSG_STATUS_SENDING
               : MessageStatus.V2TIM_MSG_STATUS_SEND_SUCC;
         } else {
-          // Media and local-only group tips preserve their existing success
-          // behavior because their provider contracts do not return pending state.
+          // Local-only group tips, media sent through a legacy provider
+          // (no WithSendResult contract) and media the transport produced
+          // no echo for keep their existing immediate-success behaviour.
           messageToSend.status = MessageStatus.V2TIM_MSG_STATUS_SEND_SUCC;
         }
         if (_debugLog)

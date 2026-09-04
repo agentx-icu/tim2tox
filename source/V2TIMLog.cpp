@@ -73,7 +73,7 @@ void V2TIMLog::setLogLevel(LogLevel level) {
     if (destroyed_.load()) return;
     std::lock_guard<std::mutex> lock(mutex_);
     if (destroyed_.load()) return;
-    min_level_ = level;
+    min_level_.store(level, std::memory_order_relaxed);
 }
 
 // Enable or disable logging to the console
@@ -91,7 +91,7 @@ void V2TIMLog::writeLog(LogLevel level, const char* component, const char* event
     // mutex released, so it must be unlockable early.
     std::unique_lock<std::mutex> lock(mutex_);
     if (destroyed_.load()) return;
-    if (level < min_level_) return;
+    if (level < min_level_.load(std::memory_order_relaxed)) return;
 
     std::stringstream line;
     line << "[" << getLevelString(level) << "] component="

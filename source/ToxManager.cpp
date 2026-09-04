@@ -176,6 +176,22 @@ void ToxManager::initialize(const Tox_Options* options,
     // Enable Toxcore internal logging (WARNING + ERROR) to capture conference events
     tox_options_set_log_callback(opts, toxcore_log_callback);
 
+    // Serialize every tox_*() call with tox_iterate() INSIDE toxcore. A Tox
+    // instance is single-threaded by contract (tox.h: "no more than one API
+    // function may operate on one instance at a time"), but tim2tox drives
+    // tox_iterate() from event_thread_ while the FFI caller (the Dart main
+    // thread) calls tox_friend_delete / tox_friend_add / group and file APIs
+    // directly. Without this, a friend deletion frees friend_connection state
+    // that a concurrent iterate is walking: reproduced on the Windows real-UI
+    // VM as 0xc0000005 in tim2tox_ffi.dll and 0xc0000374 (heap corruption)
+    // right after DeleteFromFriendList (2026-09-04). toxcore's lock is taken
+    // per API call and RELEASED around every user callback (tox.c
+    // trampolines), so callbacks may call tox APIs and may take tim2tox
+    // mutexes without any lock-order cycle; the log callback is the one
+    // callback invoked under the lock and only logs. iterate_mutex_ / mutex_
+    // above still guard the tox_ pointer against shutdown.
+    tox_options_set_experimental_thread_safety(opts, true);
+
     // Optional: run a TCP relay (server) on a fixed port. Disabled by default
     // (tcp_port=0). When TOX_TCP_RELAY_PORT is set (>0) this node listens for
     // incoming TCP relay connections, letting peers that cannot reach it over
@@ -386,6 +402,11 @@ void ToxManager::initialize(const Tox_Options* options,
 // 关闭实现：与 iterate() 使用相同锁顺序 (iterate_mutex_ 再 mutex_) 避免 UAF 竞态
 void ToxManager::shutdown() {
     std::scoped_lock lock(iterate_mutex_, mutex_);
+    iterate_owner_.store(std::this_thread::get_id(), std::memory_order_release);
+    struct OwnerReset {
+        std::atomic<std::thread::id>& owner;
+        ~OwnerReset() { owner.store(std::thread::id(), std::memory_order_release); }
+    } owner_reset{iterate_owner_};
 
     if (is_shutting_down_.load(std::memory_order_acquire) || !tox_) {
         return;
@@ -436,6 +457,11 @@ bool ToxManager::isShuttingDown() const {
 // 迭代实现：先取 iterate_mutex_ 再 mutex_，与 shutdown() 一致；不在锁外使用裸 tox 指针
 void ToxManager::iterate(uint32_t /*timeout*/) {
     std::unique_lock<std::mutex> iter_lock(iterate_mutex_);
+    iterate_owner_.store(std::this_thread::get_id(), std::memory_order_release);
+    struct OwnerReset {
+        std::atomic<std::thread::id>& owner;
+        ~OwnerReset() { owner.store(std::thread::id(), std::memory_order_release); }
+    } owner_reset{iterate_owner_};
     Tox* tox_ptr = nullptr;
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -661,6 +687,7 @@ void ToxManager::onFriendLosslessPacket(Tox* tox, uint32_t friend_number, const 
 
 // 更新回调设置方法
 void ToxManager::setSelfConnectionStatusCallback(SelfConnectionStatusCallback cb) {
+    auto iterate_lock = lockIterate();  // tox_callback_* bypasses toxcore's lock; keep it out of tox_iterate
     std::lock_guard<std::mutex> lock(mutex_);
     self_connection_status_cb_ = std::move(cb);
     if (tox_) {
@@ -672,8 +699,9 @@ void ToxManager::setSelfConnectionStatusCallback(SelfConnectionStatusCallback cb
 }
 
 void ToxManager::setFriendRequestCallback(FriendRequestCallback cb) {
-    V2TIM_LOG(kDebug, "[ToxManager::setFriendRequestCallback] ENTRY - this={}, has_cb={}, tox_={}", (void*)this, cb ? 1 : 0, (void*)tox_.get());
+    auto iterate_lock = lockIterate();  // tox_callback_* bypasses toxcore's lock; keep it out of tox_iterate
     std::lock_guard<std::mutex> lock(mutex_);
+    V2TIM_LOG(kDebug, "[ToxManager::setFriendRequestCallback] ENTRY - this={}, has_cb={}, tox_={}", (void*)this, cb ? 1 : 0, (void*)tox_.get());
     friend_request_cb_ = std::move(cb);
     if (tox_) {
         V2TIM_LOG(kDebug, "[ToxManager::setFriendRequestCallback] Registering tox_callback_friend_request");
@@ -686,36 +714,42 @@ void ToxManager::setFriendRequestCallback(FriendRequestCallback cb) {
 }
 
 void ToxManager::setFriendMessageCallback(FriendMessageCallback cb) {
+    auto iterate_lock = lockIterate();  // tox_callback_* bypasses toxcore's lock; keep it out of tox_iterate
     std::lock_guard<std::mutex> lock(mutex_);
     friend_message_cb_ = std::move(cb);
     if (tox_) tox_callback_friend_message(tox_.get(), onFriendMessage);
 }
 
 void ToxManager::setFriendNameCallback(FriendNameCallback cb) {
+    auto iterate_lock = lockIterate();  // tox_callback_* bypasses toxcore's lock; keep it out of tox_iterate
     std::lock_guard<std::mutex> lock(mutex_);
     friend_name_cb_ = std::move(cb);
     if (tox_) tox_callback_friend_name(tox_.get(), onFriendName);
 }
 
 void ToxManager::setFriendStatusMessageCallback(FriendStatusMessageCallback cb) {
+    auto iterate_lock = lockIterate();  // tox_callback_* bypasses toxcore's lock; keep it out of tox_iterate
     std::lock_guard<std::mutex> lock(mutex_);
     friend_status_message_cb_ = std::move(cb);
     if (tox_) tox_callback_friend_status_message(tox_.get(), onFriendStatusMessage);
 }
 
 void ToxManager::setFriendStatusCallback(FriendStatusCallback cb) {
+    auto iterate_lock = lockIterate();  // tox_callback_* bypasses toxcore's lock; keep it out of tox_iterate
     std::lock_guard<std::mutex> lock(mutex_);
     friend_status_cb_ = std::move(cb);
     if (tox_) tox_callback_friend_status(tox_.get(), onFriendStatus);
 }
 
 void ToxManager::setFriendConnectionStatusCallback(FriendConnectionStatusCallback cb) {
+    auto iterate_lock = lockIterate();  // tox_callback_* bypasses toxcore's lock; keep it out of tox_iterate
     std::lock_guard<std::mutex> lock(mutex_);
     friend_connection_status_cb_ = std::move(cb);
     if (tox_) tox_callback_friend_connection_status(tox_.get(), onFriendConnectionStatus);
 }
 
 void ToxManager::setFriendReadReceiptCallback(FriendReadReceiptCallback cb) {
+    auto iterate_lock = lockIterate();  // tox_callback_* bypasses toxcore's lock; keep it out of tox_iterate
     std::lock_guard<std::mutex> lock(mutex_);
     friend_read_receipt_cb_ = std::move(cb);
     if (tox_) tox_callback_friend_read_receipt(tox_.get(), onFriendReadReceipt);
@@ -724,30 +758,35 @@ void ToxManager::setFriendReadReceiptCallback(FriendReadReceiptCallback cb) {
 }
 
 void ToxManager::setFriendTypingCallback(FriendTypingCallback cb) {
+    auto iterate_lock = lockIterate();  // tox_callback_* bypasses toxcore's lock; keep it out of tox_iterate
     std::lock_guard<std::mutex> lock(mutex_);
     friend_typing_cb_ = std::move(cb);
     if (tox_) tox_callback_friend_typing(tox_.get(), onFriendTyping);
 }
 
 void ToxManager::setFileRecvCallback(FileRecvCallback cb) {
+    auto iterate_lock = lockIterate();  // tox_callback_* bypasses toxcore's lock; keep it out of tox_iterate
     std::lock_guard<std::mutex> lock(mutex_);
     file_recv_cb_ = std::move(cb);
     if (tox_) tox_callback_file_recv(tox_.get(), onFileRecv);
 }
 
 void ToxManager::setFileControlCallback(FileControlCallback cb) {
+    auto iterate_lock = lockIterate();  // tox_callback_* bypasses toxcore's lock; keep it out of tox_iterate
     std::lock_guard<std::mutex> lock(mutex_);
     file_control_cb_ = std::move(cb);
     if (tox_) tox_callback_file_recv_control(tox_.get(), onFileControl);
 }
 
 void ToxManager::setFileChunkRequestCallback(FileChunkRequestCallback cb) {
+    auto iterate_lock = lockIterate();  // tox_callback_* bypasses toxcore's lock; keep it out of tox_iterate
     std::lock_guard<std::mutex> lock(mutex_);
     file_chunk_request_cb_ = std::move(cb);
     if (tox_) tox_callback_file_chunk_request(tox_.get(), onFileChunkRequest);
 }
 
 void ToxManager::setFileRecvChunkCallback(FileRecvChunkCallback cb) {
+    auto iterate_lock = lockIterate();  // tox_callback_* bypasses toxcore's lock; keep it out of tox_iterate
     std::lock_guard<std::mutex> lock(mutex_);
     file_recv_chunk_cb_ = std::move(cb);
     // Register callback with Tox if instance exists
@@ -757,42 +796,49 @@ void ToxManager::setFileRecvChunkCallback(FileRecvChunkCallback cb) {
 }
 
 void ToxManager::setGroupInviteCallback(GroupInviteCallback cb) {
+    auto iterate_lock = lockIterate();  // tox_callback_* bypasses toxcore's lock; keep it out of tox_iterate
     std::lock_guard<std::mutex> lock(mutex_);
     group_invite_cb_ = std::move(cb);
     if (tox_) tox_callback_conference_invite(tox_.get(), onGroupInvite);
 }
 
 void ToxManager::setGroupMessageCallback(GroupMessageCallback cb) {
+    auto iterate_lock = lockIterate();  // tox_callback_* bypasses toxcore's lock; keep it out of tox_iterate
     std::lock_guard<std::mutex> lock(mutex_);
     group_message_cb_ = std::move(cb);
     if (tox_) tox_callback_conference_message(tox_.get(), onGroupMessage);
 }
 
 void ToxManager::setGroupTitleCallback(GroupTitleCallback cb) {
+    auto iterate_lock = lockIterate();  // tox_callback_* bypasses toxcore's lock; keep it out of tox_iterate
     std::lock_guard<std::mutex> lock(mutex_);
     group_title_cb_ = std::move(cb);
     if (tox_) tox_callback_conference_title(tox_.get(), onGroupTitle);
 }
 
 void ToxManager::setGroupPeerNameCallback(GroupPeerNameCallback cb) {
+    auto iterate_lock = lockIterate();  // tox_callback_* bypasses toxcore's lock; keep it out of tox_iterate
     std::lock_guard<std::mutex> lock(mutex_);
     group_peer_name_cb_ = std::move(cb);
     if (tox_) tox_callback_conference_peer_name(tox_.get(), onGroupPeerName);
 }
 
 void ToxManager::setGroupPeerListChangedCallback(GroupPeerListChangedCallback cb) {
+    auto iterate_lock = lockIterate();  // tox_callback_* bypasses toxcore's lock; keep it out of tox_iterate
     std::lock_guard<std::mutex> lock(mutex_);
     group_peer_list_changed_cb_ = std::move(cb);
     if (tox_) tox_callback_conference_peer_list_changed(tox_.get(), onGroupPeerListChanged);
 }
 
 void ToxManager::setGroupConnectedCallback(GroupConnectedCallback cb) {
+    auto iterate_lock = lockIterate();  // tox_callback_* bypasses toxcore's lock; keep it out of tox_iterate
     std::lock_guard<std::mutex> lock(mutex_);
     group_connected_cb_ = std::move(cb);
     if (tox_) tox_callback_conference_connected(tox_.get(), onGroupConnected);
 }
 
 void ToxManager::setFriendLossyPacketCallback(FriendLossyPacketCallback cb) {
+    auto iterate_lock = lockIterate();  // tox_callback_* bypasses toxcore's lock; keep it out of tox_iterate
     std::lock_guard<std::mutex> lock(mutex_);
     friend_lossy_packet_cb_ = std::move(cb);
     // Registration moved to initialize
@@ -800,6 +846,7 @@ void ToxManager::setFriendLossyPacketCallback(FriendLossyPacketCallback cb) {
 }
 
 void ToxManager::setFriendLosslessPacketCallback(FriendLosslessPacketCallback cb) {
+    auto iterate_lock = lockIterate();  // tox_callback_* bypasses toxcore's lock; keep it out of tox_iterate
     std::lock_guard<std::mutex> lock(mutex_);
     friend_lossless_packet_cb_ = std::move(cb);
     if (tox_) tox_callback_friend_lossless_packet(tox_.get(), onFriendLosslessPacket);
@@ -1940,12 +1987,14 @@ void ToxManager::onGroupPeerStatus(Tox* tox, Tox_Group_Number group_number, Tox_
 
 // Tox group 回调设置函数
 void ToxManager::setGroupInviteGroupCallback(GroupInviteGroupCallback cb) {
+    auto iterate_lock = lockIterate();  // tox_callback_* bypasses toxcore's lock; keep it out of tox_iterate
     std::lock_guard<std::mutex> lock(mutex_);
     group_invite_group_cb_ = std::move(cb);
     if (tox_) tox_callback_group_invite(tox_.get(), onGroupInviteGroup);
 }
 
 void ToxManager::setGroupMessageGroupCallback(GroupMessageGroupCallback cb) {
+    auto iterate_lock = lockIterate();  // tox_callback_* bypasses toxcore's lock; keep it out of tox_iterate
     std::lock_guard<std::mutex> lock(mutex_);
     group_message_group_cb_ = std::move(cb);
     V2TIM_LOG(kDebug, "[ToxManager] setGroupMessageGroupCallback: ENTRY - tox_={}, callback={}", (void*)tox_.get(), group_message_group_cb_ ? (void*)1 : (void*)0);
@@ -1959,6 +2008,7 @@ void ToxManager::setGroupMessageGroupCallback(GroupMessageGroupCallback cb) {
 }
 
 void ToxManager::setGroupCustomPacketCallback(GroupCustomPacketCallback cb) {
+    auto iterate_lock = lockIterate();  // tox_callback_* bypasses toxcore's lock; keep it out of tox_iterate
     std::lock_guard<std::mutex> lock(mutex_);
     group_custom_packet_cb_ = std::move(cb);
     if (tox_) {
@@ -1967,6 +2017,7 @@ void ToxManager::setGroupCustomPacketCallback(GroupCustomPacketCallback cb) {
 }
 
 void ToxManager::setGroupPrivateMessageGroupCallback(GroupPrivateMessageGroupCallback cb) {
+    auto iterate_lock = lockIterate();  // tox_callback_* bypasses toxcore's lock; keep it out of tox_iterate
     std::lock_guard<std::mutex> lock(mutex_);
     group_private_message_group_cb_ = std::move(cb);
     if (tox_) {
@@ -1975,18 +2026,21 @@ void ToxManager::setGroupPrivateMessageGroupCallback(GroupPrivateMessageGroupCal
 }
 
 void ToxManager::setGroupTopicCallback(GroupTopicCallback cb) {
+    auto iterate_lock = lockIterate();  // tox_callback_* bypasses toxcore's lock; keep it out of tox_iterate
     std::lock_guard<std::mutex> lock(mutex_);
     group_topic_cb_ = std::move(cb);
     if (tox_) tox_callback_group_topic(tox_.get(), onGroupTopic);
 }
 
 void ToxManager::setGroupPeerNameGroupCallback(GroupPeerNameGroupCallback cb) {
+    auto iterate_lock = lockIterate();  // tox_callback_* bypasses toxcore's lock; keep it out of tox_iterate
     std::lock_guard<std::mutex> lock(mutex_);
     group_peer_name_group_cb_ = std::move(cb);
     if (tox_) tox_callback_group_peer_name(tox_.get(), onGroupPeerNameGroup);
 }
 
 void ToxManager::setGroupPeerJoinCallback(GroupPeerJoinCallback cb) {
+    auto iterate_lock = lockIterate();  // tox_callback_* bypasses toxcore's lock; keep it out of tox_iterate
     std::lock_guard<std::mutex> lock(mutex_);
     group_peer_join_cb_ = std::move(cb);
     V2TIM_LOG(kDebug, "[ToxManager] setGroupPeerJoinCallback: ENTRY - cb={}, tox_={}", cb ? (void*)1 : (void*)0, (void*)tox_.get());
@@ -2000,18 +2054,21 @@ void ToxManager::setGroupPeerJoinCallback(GroupPeerJoinCallback cb) {
 }
 
 void ToxManager::setGroupPeerExitCallback(GroupPeerExitCallback cb) {
+    auto iterate_lock = lockIterate();  // tox_callback_* bypasses toxcore's lock; keep it out of tox_iterate
     std::lock_guard<std::mutex> lock(mutex_);
     group_peer_exit_cb_ = std::move(cb);
     if (tox_) tox_callback_group_peer_exit(tox_.get(), onGroupPeerExit);
 }
 
 void ToxManager::setGroupModerationCallback(GroupModerationCallback cb) {
+    auto iterate_lock = lockIterate();  // tox_callback_* bypasses toxcore's lock; keep it out of tox_iterate
     std::lock_guard<std::mutex> lock(mutex_);
     group_moderation_cb_ = std::move(cb);
     if (tox_) tox_callback_group_moderation(tox_.get(), onGroupModeration);
 }
 
 void ToxManager::setGroupSelfJoinCallback(GroupSelfJoinCallback cb) {
+    auto iterate_lock = lockIterate();  // tox_callback_* bypasses toxcore's lock; keep it out of tox_iterate
     std::lock_guard<std::mutex> lock(mutex_);
     group_self_join_cb_ = std::move(cb);
     V2TIM_LOG(kDebug, "[ToxManager] setGroupSelfJoinCallback: ENTRY - cb={}, tox_={}", cb ? (void*)1 : (void*)0, (void*)tox_.get());
@@ -2025,6 +2082,7 @@ void ToxManager::setGroupSelfJoinCallback(GroupSelfJoinCallback cb) {
 }
 
 void ToxManager::setGroupJoinFailCallback(GroupJoinFailCallback cb) {
+    auto iterate_lock = lockIterate();  // tox_callback_* bypasses toxcore's lock; keep it out of tox_iterate
     std::lock_guard<std::mutex> lock(mutex_);
     group_join_fail_cb_ = std::move(cb);
     V2TIM_LOG(kDebug, "[ToxManager] setGroupJoinFailCallback: ENTRY - cb={}, tox_={}", cb ? (void*)1 : (void*)0, (void*)tox_.get());
@@ -2038,18 +2096,21 @@ void ToxManager::setGroupJoinFailCallback(GroupJoinFailCallback cb) {
 }
 
 void ToxManager::setGroupPrivacyStateCallback(GroupPrivacyStateCallback cb) {
+    auto iterate_lock = lockIterate();  // tox_callback_* bypasses toxcore's lock; keep it out of tox_iterate
     std::lock_guard<std::mutex> lock(mutex_);
     group_privacy_state_cb_ = std::move(cb);
     if (tox_) tox_callback_group_privacy_state(tox_.get(), onGroupPrivacyState);
 }
 
 void ToxManager::setGroupVoiceStateCallback(GroupVoiceStateCallback cb) {
+    auto iterate_lock = lockIterate();  // tox_callback_* bypasses toxcore's lock; keep it out of tox_iterate
     std::lock_guard<std::mutex> lock(mutex_);
     group_voice_state_cb_ = std::move(cb);
     if (tox_) tox_callback_group_voice_state(tox_.get(), onGroupVoiceState);
 }
 
 void ToxManager::setGroupPeerStatusCallback(GroupPeerStatusCallback cb) {
+    auto iterate_lock = lockIterate();  // tox_callback_* bypasses toxcore's lock; keep it out of tox_iterate
     std::lock_guard<std::mutex> lock(mutex_);
     group_peer_status_cb_ = std::move(cb);
     if (tox_) tox_callback_group_peer_status(tox_.get(), onGroupPeerStatus);

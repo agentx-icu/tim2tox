@@ -4961,6 +4961,10 @@ void tim2tox_ffi_set_dht_nodes_response_callback(int64_t instance_id, tim2tox_dh
     if (manager) {
         ToxManager* tox_manager = manager->GetToxManager();
         if (tox_manager) {
+            // tox_callback_* setters bypass toxcore's instance lock; keep the
+            // write out of a concurrent tox_iterate (ToxManager::lockIterate),
+            // and only fetch the pointer once the lock excludes shutdown().
+            auto iterate_lock = tox_manager->lockIterate();
             Tox* tox = tox_manager->getTox();
             if (tox) {
                 if (callback) {
@@ -5100,6 +5104,9 @@ int tim2tox_ffi_extract_tox_id_from_profile(
     tox_options_set_savedata_type(options, TOX_SAVEDATA_TYPE_TOX_SAVE);
     tox_options_set_savedata_data(options, data_to_load, data_len);
     tox_options_set_savedata_length(options, data_len);
+    // Single-threaded throwaway instance; same option as ToxManager::initialize
+    // so every tox_new in the tree carries the toxcore instance lock.
+    tox_options_set_experimental_thread_safety(options, true);
     
     TOX_ERR_NEW error_new;
     Tox* tox = tox_new(options, &error_new);

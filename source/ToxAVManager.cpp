@@ -36,6 +36,14 @@ void ToxAVManager::ToxAVDeleter::operator()(ToxAV* toxav) const {
 
 // 初始化实现：使用调用方传入的 manager_impl，避免内部再次调用 GetCurrentInstance() 导致多实例竞态或段错误
 void ToxAVManager::initialize(V2TIMManagerImpl* manager_impl) {
+    // toxav_new() registers its lossy-packet handlers through toxcore's
+    // private, UNLOCKED setters while event_thread_ may be inside
+    // tox_iterate(); hold ToxManager's iterate lock across it (taken BEFORE
+    // mutex_, the order a tox callback reaching this manager would use).
+    std::unique_lock<std::mutex> iterate_lock;
+    if (manager_impl && manager_impl->GetToxManager()) {
+        iterate_lock = manager_impl->GetToxManager()->lockIterate();
+    }
     std::lock_guard<std::mutex> lock(mutex_);
     V2TIMLog::getInstance().Info("[ToxAVManager] initialize() called");
     if (toxav_) {
@@ -143,7 +151,27 @@ void ToxAVManager::initialize(V2TIMManagerImpl* manager_impl) {
 
 // 关闭实现
 void ToxAVManager::shutdown() {
-    std::lock_guard<std::mutex> lock(mutex_);
+    // toxav_kill() unregisters the per-pktid handlers unlocked (see
+    // initialize()); same iterate-lock-then-mutex_ order. The manager is
+    // snapshotted outside mutex_, so re-validate under it and retry until the
+    // snapshot holds: an initialize() that raced in between would otherwise
+    // leave a toxav_ we kill without the iterate lock. No capped fallback —
+    // every exit of this loop holds mutex_ AND the matching iterate lock.
+    ToxManager* tox_manager = nullptr;
+    std::unique_lock<std::mutex> iterate_lock;
+    std::unique_lock<std::mutex> lock;
+    for (;;) {
+        {
+            std::lock_guard<std::mutex> snapshot(mutex_);
+            tox_manager = manager_impl_ ? manager_impl_->GetToxManager() : nullptr;
+        }
+        iterate_lock = tox_manager ? tox_manager->lockIterate() : std::unique_lock<std::mutex>();
+        lock = std::unique_lock<std::mutex>(mutex_);
+        ToxManager* now = manager_impl_ ? manager_impl_->GetToxManager() : nullptr;
+        if (now == tox_manager) break;
+        lock.unlock();
+        iterate_lock = std::unique_lock<std::mutex>();
+    }
     V2TIMLog::getInstance().Info("[ToxAVManager] shutdown() called");
     toxav_.reset();
     tox_ = nullptr;

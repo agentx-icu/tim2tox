@@ -87,6 +87,18 @@ class BinaryReplacementHistoryHook {
     bool isSelf,
   })? applyInboundControlSignal;
 
+  /// Fired after an INBOUND (non-self) message was persisted by this hook,
+  /// with the raw conversation id (`groupID ?? userID`) and the persisted row.
+  /// The app's conversation-list owner subscribes to refresh that ONE entry:
+  /// this direct-persist path bypasses `FfiChatService._appendHistory`, and
+  /// `FfiChatService.messages` stays silent while the hook owns inbound
+  /// history, so nothing app-side otherwise learns that a conversation just
+  /// gained a message until a periodic rebuild — which a tombstoned (deleted)
+  /// conversation never gets. Runs only when the row was actually appended
+  /// (not for dedup'd cross-path copies, blocked senders, or a stale session).
+  static void Function(String conversationId, ChatMessage message)?
+      onInboundMessagePersisted;
+
   /// Initialize the hook with persistence service and self ID
   static void initialize(MessageHistoryPersistence persistence, String selfId,
       {LoggerService? logger}) {
@@ -166,6 +178,7 @@ class BinaryReplacementHistoryHook {
     // S29: clear the block predicate so it can't reference the torn-down
     // session's FfiChatService across a logout→login (stale block list).
     isBlockedPredicate = null;
+    onInboundMessagePersisted = null;
     // Same reasoning as isBlockedPredicate above: this closure captures the
     // torn-down session's platform + FfiChatService, so leaving it installed
     // would apply a control signal against the PREVIOUS account's history
@@ -384,6 +397,17 @@ class BinaryReplacementHistoryHook {
       // save inside the try block so disk-quota / permission failures land in
       // the catch path instead of becoming silent uncaught Future errors.
       await capturedPersistence.appendHistory(conversationId, chatMsg);
+      if (!chatMsg.isSelf && _generation == capturedGeneration) {
+        final notify = onInboundMessagePersisted;
+        if (notify != null) {
+          try {
+            notify(conversationId, chatMsg);
+          } catch (_) {
+            _logFallback(
+                'BinaryReplacementHistoryHook.onInboundMessagePersisted threw');
+          }
+        }
+      }
     } catch (_) {
       _logFallback('BinaryReplacementHistoryHook.saveMessage failed');
     }

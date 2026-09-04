@@ -1,0 +1,49 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: tim2tox-bootstrap <bootstrap@local>
+Date: Fri, 4 Sep 2026 12:00:00 -0700
+Subject: [PATCH 19/19] NativeLibraryManager: accept an already-decoded
+ friend_id_array in the DeleteFriend callback
+
+The DeleteFriend global callback did `json.decode(dataFromNativeMap[
+"friend_id_array"])`, but tim2tox hands the array over already decoded
+(a List), so the dispatch threw `type 'List<dynamic>' is not a subtype of
+type 'String'` (seen on every friend deletion on the Windows real-UI VM;
+platform-independent) and the friendship listener never got
+onFriendListDeleted. Accept a List directly, decode a non-empty JSON
+string, and treat an absent payload as an empty list.
+---
+ lib/native_im/bindings/native_library_manager.dart | 19 +++++++++++--
+ 1 file changed, 14 insertions(+), 5 deletions(-)
+
+diff --git a/lib/native_im/bindings/native_library_manager.dart b/lib/native_im/bindings/native_library_manager.dart
+--- a/lib/native_im/bindings/native_library_manager.dart
++++ b/lib/native_im/bindings/native_library_manager.dart
+@@ -1019,11 +1019,20 @@
+       }
+ 
+         break;
+-      case GlobalCallbackType.DeleteFriend: {
+-        final friendIDList = json.decode(dataFromNativeMap["friend_id_array"]);
+-
+-        _friendshipListener?.onFriendListDeleted(friendIDList.whereType<String>().toList());
+-      }
++      case GlobalCallbackType.DeleteFriend: {
++        // tim2tox delivers `friend_id_array` already decoded (a List), not a
++        // JSON string; json.decode on it threw "List<dynamic> is not a subtype
++        // of String" and the deletion never reached the friendship listener.
++        // Accept both shapes; an absent/empty payload is an empty list.
++        final rawFriendIds = dataFromNativeMap["friend_id_array"];
++        final List<dynamic> friendIDList = rawFriendIds is List
++            ? rawFriendIds
++            : (rawFriendIds is String && rawFriendIds.isNotEmpty
++                ? (json.decode(rawFriendIds) as List<dynamic>)
++                : const <dynamic>[]);
++
++        _friendshipListener?.onFriendListDeleted(friendIDList.whereType<String>().toList());
++      }
+ 
+         break;
+       case GlobalCallbackType.UpdateFriendProfile: {
+-- 
+2.39.0
+

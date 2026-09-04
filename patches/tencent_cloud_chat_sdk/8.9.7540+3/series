@@ -29,3 +29,4 @@
 0016-ios-native-lib-loader-resolve-embedded-FFI-by-absolu.patch
 0017-global-callback-dispatch-crash-safety.patch
 0018-immutable-explicit-native-library-path.patch
+0019-delete-friend-callback-decode.patch

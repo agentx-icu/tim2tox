@@ -1,3 +1,4 @@
+import 'package:path/path.dart' as p;
 import 'dart:convert';
 import 'dart:io';
 
@@ -269,11 +270,13 @@ class ChatMessage {
     }
   }
 
-  /// Check if file path is a temporary path
+  /// Check if file path is a temporary path. Separator-agnostic (Windows
+  /// paths mix `\` and `/`): a `receiving_*` basename, a `file_recv` segment,
+  /// or the POSIX `/tmp` fallback.
   bool get isTempPath {
     if (filePath == null) return false;
-    return filePath!.startsWith('/tmp/receiving_') ||
-        filePath!.contains('/file_recv/') ||
+    return p.basename(filePath!).startsWith('receiving_') ||
+        _hasDirSegment(filePath!, 'file_recv') ||
         filePath!.startsWith('/tmp/');
   }
 
@@ -281,8 +284,13 @@ class ChatMessage {
   bool get isFinalPath {
     if (filePath == null) return false;
     return !isTempPath &&
-        (filePath!.contains('/avatars/') ||
-            filePath!.contains('/Downloads/') ||
-            filePath!.contains('/file_recv/'));
+        (_hasDirSegment(filePath!, 'avatars') ||
+            _hasDirSegment(filePath!, 'Downloads') ||
+            _hasDirSegment(filePath!, 'file_recv'));
+  }
+
+  static bool _hasDirSegment(String path, String segment) {
+    final parts = p.split(path);
+    return parts.length > 1 && parts.sublist(0, parts.length - 1).contains(segment);
   }
 }

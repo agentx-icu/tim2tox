@@ -8,6 +8,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 import '../interfaces/logger_service.dart';
 import '../models/chat_message.dart';
@@ -208,14 +209,19 @@ class MessageHistoryPersistence {
     final appSupport = roots.appSupport;
     final documents = roots.documents;
     final userDownloads = roots.userDownloads;
-    if (appSupport != null &&
-        absolutePath.startsWith('$appSupport/file_recv/')) {
-      final tail = absolutePath.substring('$appSupport/file_recv/'.length);
-      return '{{fileRecv}}/$tail';
+    // Separator-agnostic (Windows): compare through package:path so
+    // `C:\...\app_support\file_recv\x` tokenizes like `/.../file_recv/x`.
+    String? tailWithin(String root) {
+      if (!p.isWithin(root, absolutePath)) return null;
+      return p.relative(absolutePath, from: root).replaceAll('\\', '/');
     }
-    if (appSupport != null && absolutePath.startsWith('$appSupport/avatars/')) {
-      final tail = absolutePath.substring('$appSupport/avatars/'.length);
-      return '{{avatars}}/$tail';
+    if (appSupport != null) {
+      final tail = tailWithin(p.join(appSupport, 'file_recv'));
+      if (tail != null) return '{{fileRecv}}/$tail';
+    }
+    if (appSupport != null) {
+      final tail = tailWithin(p.join(appSupport, 'avatars'));
+      if (tail != null) return '{{avatars}}/$tail';
     }
     // R-5: keep the precise `documents/Downloads/` match BEFORE the
     // broader userDownloads check. On platforms where the user-level
@@ -240,11 +246,15 @@ class MessageHistoryPersistence {
     final appSupport = roots.appSupport;
     final documents = roots.documents;
     final userDownloads = roots.userDownloads;
+    // Inverse of the package:path tokenization above: rebuild with the
+    // platform separator so the round-trip is string-stable on Windows too.
     if (storedPath.startsWith('{{fileRecv}}/') && appSupport != null) {
-      return '$appSupport/file_recv/${storedPath.substring('{{fileRecv}}/'.length)}';
+      final tail = storedPath.substring('{{fileRecv}}/'.length).split('/');
+      return p.joinAll([appSupport, 'file_recv', ...tail]);
     }
     if (storedPath.startsWith('{{avatars}}/') && appSupport != null) {
-      return '$appSupport/avatars/${storedPath.substring('{{avatars}}/'.length)}';
+      final tail = storedPath.substring('{{avatars}}/'.length).split('/');
+      return p.joinAll([appSupport, 'avatars', ...tail]);
     }
     if (storedPath.startsWith('{{downloads}}/') && documents != null) {
       return '$documents/Downloads/${storedPath.substring('{{downloads}}/'.length)}';
