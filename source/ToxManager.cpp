@@ -329,7 +329,7 @@ void ToxManager::initialize(const Tox_Options* options,
     // manager wires them at InitSDK, before login creates tox_) — without
     // this block a stored callback silently never reaches toxcore. Measured
     // 2026-08-31 on the Android pair: friend_lossless_packet was never
-    // registered on the real instance, so EVERY 0xA1 control frame
+    // registered on the real instance, so EVERY tim2tox control frame
     // (receipts, reactions, msgid binds) was dropped inside tox.c while
     // plain messages survived via a later re-wire of their own setter.
     if (self_connection_status_cb_) {

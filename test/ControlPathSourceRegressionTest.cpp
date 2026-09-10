@@ -110,7 +110,7 @@ TEST(ControlPathSourceRegressionTest,
     const std::string callback = SourceSection(
         manager,
         "if (data[0] == tim2tox::control::kPacketId)",
-        "if (data[0] == 0xA0)");
+        "if (data[0] == tim2tox::packet_ids::kSignaling)");
     const std::string typed_receive = SourceSection(
         manager,
         "V2TIMManagerImpl::HandleFriendControlMessage(",
@@ -118,6 +118,12 @@ TEST(ControlPathSourceRegressionTest,
 
     EXPECT_NE(callback.find("packet->type == Type::kGenericCustom"),
               std::string::npos);
+    // Both dispatch branches must key on the named packet IDs; a bare literal
+    // is how 160/161 collided with toxic / ToxPhone (agentx-icu/toxee#98).
+    EXPECT_EQ(manager.find("data[0] == 0xA0"), std::string::npos);
+    EXPECT_EQ(manager.find("data[0] == 0xA1"), std::string::npos);
+    EXPECT_EQ(manager.find("data[0] == 160"), std::string::npos);
+    EXPECT_EQ(manager.find("data[0] == 161"), std::string::npos);
     EXPECT_NE(
         callback.find(
             "friend_number, packet->type, body, packet->body.size()"),

@@ -1,5 +1,6 @@
 #include "V2TIMSignalingManagerImpl.h"
 #include "toxcore/tox.h"
+#include "Tim2ToxPacketIds.h"
 #include <algorithm>
 #include <chrono>
 #include <cstring>
@@ -18,9 +19,11 @@
 #define ERR_USER_OFFLINE 10001
 #define ERR_INVITE_NOT_FOUND 10002
 
-// Tox requires the first byte of lossless custom packets to be in [160, 191].
-// Our signaling type (SIGNALING_INVITE=0x01 etc.) is used inside the payload; we use a fixed packet_id here.
-static const uint8_t kToxSignalingPacketId = 160;  // PACKET_ID_RANGE_LOSSLESS_CUSTOM_START
+// First byte of every lossless custom packet is the Tox packet ID; the value
+// (and the registry that keeps it from colliding with other clients) lives in
+// Tim2ToxPacketIds.h. Our signaling type (SIGNALING_INVITE=0x01 etc.) is
+// carried inside the payload that follows it.
+static const uint8_t kToxSignalingPacketId = tim2tox::packet_ids::kSignaling;
 
 // Defined in ffi/tim2tox_ffi.cpp; returns the process-global virtual clock in ms.
 // V2TIMManagerImpl.cpp also uses this for mono_time injection.

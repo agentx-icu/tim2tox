@@ -2,6 +2,7 @@
 #include "PathUtils.h"
 #include "V2TIMUtils.h"
 #include "Tim2ToxControlPacket.h"
+#include "Tim2ToxPacketIds.h"
 #include "QToxMessageFragmenter.h"
 #include "version.h"
 #include <V2TIMErrorCode.h>
@@ -1549,7 +1550,7 @@ bool V2TIMManagerImpl::InitSDK(uint32_t sdkAppID, const V2TIMSDKConfig& config) 
                 }
                 return;
             }
-            if (data[0] == 0xA0) {
+            if (data[0] == tim2tox::packet_ids::kSignaling) {
                 V2TIMSignalingManager* sig = GetSignalingManager();
                 if (sig) {
                     static_cast<V2TIMSignalingManagerImpl*>(sig)->OnToxMessage(friend_number, data, length);

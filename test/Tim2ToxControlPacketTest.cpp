@@ -1,9 +1,11 @@
 #include "Tim2ToxControlPacket.h"
+#include "Tim2ToxPacketIds.h"
 
 #include <gtest/gtest.h>
 
 #include <cstddef>
 #include <cstdint>
+#include <initializer_list>
 #include <span>
 #include <string>
 #include <vector>
@@ -15,6 +17,7 @@ namespace {
 using tim2tox::control::Decode;
 using tim2tox::control::Encode;
 using tim2tox::control::Type;
+using tim2tox::control::kPacketId;
 
 constexpr std::size_t kHeaderSize = 10;
 
@@ -34,7 +37,7 @@ TEST(Tim2ToxControlPacketTest, EncodesVersionedLosslessFrame) {
 
     ASSERT_TRUE(encoded.has_value());
     ASSERT_EQ(encoded->size(), kHeaderSize + body.size());
-    EXPECT_EQ((*encoded)[0], 0xA1);
+    EXPECT_EQ((*encoded)[0], kPacketId);
     EXPECT_EQ(std::string(encoded->begin() + 1, encoded->begin() + 5), "T2TC");
     EXPECT_EQ((*encoded)[5], 1);
     EXPECT_EQ((*encoded)[6], static_cast<uint8_t>(Type::kReceipt));
@@ -62,7 +65,7 @@ TEST(Tim2ToxControlPacketTest, EncodesGenericCustomWithTim2ToxPacketId) {
 
     ASSERT_TRUE(encoded.has_value());
     ASSERT_EQ(encoded->size(), kHeaderSize + body.size());
-    EXPECT_EQ((*encoded)[0], 0xA1);
+    EXPECT_EQ((*encoded)[0], kPacketId);
     EXPECT_EQ((*encoded)[6], static_cast<uint8_t>(Type::kGenericCustom));
 
     const auto decoded = Decode(*encoded);
@@ -73,8 +76,14 @@ TEST(Tim2ToxControlPacketTest, EncodesGenericCustomWithTim2ToxPacketId) {
 
 TEST(Tim2ToxControlPacketTest, RejectsMalformedMagicAndPacketId) {
     auto wrong_id = ValidReceiptFrame();
-    wrong_id[0] = 0xA0;
+    wrong_id[0] = tim2tox::packet_ids::kSignaling;
     EXPECT_FALSE(Decode(wrong_id).has_value());
+
+    // The IDs tim2tox used before 2026-09-10 (agentx-icu/toxee#98) now belong
+    // to toxic / ToxPhone traffic and must not be accepted as ours.
+    auto legacy_control_id = ValidReceiptFrame();
+    legacy_control_id[0] = 0xA1;
+    EXPECT_FALSE(Decode(legacy_control_id).has_value());
 
     auto wrong_magic = ValidReceiptFrame();
     wrong_magic[3] = 'X';
@@ -135,6 +144,27 @@ TEST(Tim2ToxControlPacketTest, EnforcesToxcorePacketLengthBound) {
     ASSERT_TRUE(at_limit.has_value());
     EXPECT_EQ(at_limit->size(), TOX_MAX_CUSTOM_PACKET_SIZE);
     EXPECT_FALSE(Encode(Type::kReaction, oversized_body).has_value());
+}
+
+// The packet IDs are wire-protocol constants registered in
+// https://github.com/zoff99/toxcore_custom_packets_registry . Pin them so a
+// "just take the next number" edit cannot silently re-introduce a collision.
+TEST(Tim2ToxPacketIdsTest, PinsRegisteredIdsOutsideEveryClaimedSlot) {
+    using tim2tox::packet_ids::kControl;
+    using tim2tox::packet_ids::kSignaling;
+
+    EXPECT_EQ(kSignaling, 183);
+    EXPECT_EQ(kControl, 184);
+    EXPECT_EQ(kPacketId, kControl);
+
+    // Lossless IDs claimed by other clients as of 2026-09-10 (160/161 were
+    // ours until agentx-icu/toxee#98 and now belong to toxic / ToxPhone).
+    const std::initializer_list<uint8_t> claimed_by_others = {
+        160, 161, 162, 169, 170, 172, 174, 175, 176, 177, 179, 181, 182};
+    for (const uint8_t id : claimed_by_others) {
+        EXPECT_NE(kSignaling, id) << "signaling ID collides with " << int{id};
+        EXPECT_NE(kControl, id) << "control ID collides with " << int{id};
+    }
 }
 
 }
