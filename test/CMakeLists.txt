@@ -87,6 +87,7 @@ target_compile_definitions(file_transfer_security_source_regression_test PRIVATE
     TIM2TOX_FFI_SOURCE_PATH="${CMAKE_SOURCE_DIR}/ffi/tim2tox_ffi.cpp"
     TIM2TOX_MANAGER_SOURCE_PATH="${CMAKE_SOURCE_DIR}/source/ToxManager.cpp")
 add_executable(tim2tox_control_packet_test Tim2ToxControlPacketTest.cpp)
+add_executable(tox_profile_encryption_at_rest_test ToxProfileEncryptionAtRestTest.cpp)
 add_executable(qtox_message_fragmenter_test QToxMessageFragmenterTest.cpp)
 add_executable(qtox_transport_source_regression_test
     QToxTransportSourceRegressionTest.cpp)
@@ -203,6 +204,10 @@ target_link_libraries(tim2tox_control_packet_test PRIVATE
     tim2tox
     toxcore_static
     ${TIM2TOX_GTEST_MAIN_TARGET})
+target_link_libraries(tox_profile_encryption_at_rest_test PRIVATE
+    tim2tox
+    toxcore_static
+    ${TIM2TOX_GTEST_MAIN_TARGET})
 target_link_libraries(qtox_message_fragmenter_test PRIVATE
     tim2tox
     toxcore_static
@@ -252,6 +257,7 @@ add_test(NAME dart_send_message_contract_test
 add_test(NAME file_transfer_security_source_regression_test
     COMMAND file_transfer_security_source_regression_test)
 gtest_discover_tests(tim2tox_control_packet_test)
+gtest_discover_tests(tox_profile_encryption_at_rest_test)
 gtest_discover_tests(qtox_message_fragmenter_test)
 add_test(NAME qtox_transport_source_regression_test
     COMMAND qtox_transport_source_regression_test)

@@ -3,6 +3,11 @@
 #include "ToxManager.h"
 #include "V2TIMLog.h"
 #include "toxcore/tox.h"
+// Savedata encryption at the persistence boundary. Same container
+// ("toxEsave" magic) the Dart-side AccountExportService already writes, so the
+// on-disk format is unchanged and an older build still opens a profile written
+// by a newer one.
+#include "../third_party/c-toxcore/toxencryptsave/toxencryptsave.h"
 #include <fstream>
 #include <filesystem> // For std::filesystem::rename (Windows atomic-replace fallback)
 #include <chrono>
@@ -24,6 +29,25 @@
 #ifdef __ANDROID__
 #include <sys/system_properties.h> // For __system_property_get (debug.toxee.* automation knobs)
 #endif
+
+namespace {
+// Zeroes a byte buffer when the scope exits, INCLUDING on the exception path --
+// a plain end-of-function wipe is skipped by a throw, which is exactly when a
+// half-processed secret is most likely to be sitting in the buffer.
+class ScopedSecretWipe {
+public:
+    explicit ScopedSecretWipe(std::vector<uint8_t>& buf) : buf_(buf) {}
+    ~ScopedSecretWipe() {
+        volatile uint8_t* p = buf_.data();
+        for (size_t i = 0; i < buf_.size(); ++i) p[i] = 0;
+    }
+    ScopedSecretWipe(const ScopedSecretWipe&) = delete;
+    ScopedSecretWipe& operator=(const ScopedSecretWipe&) = delete;
+
+private:
+    std::vector<uint8_t>& buf_;
+};
+}  // namespace
 
 // Read a test-harness knob: the process environment first, then (Android only)
 // the `debug.toxee.*` system property of the same meaning. Android apps cannot
@@ -127,6 +151,11 @@ ToxManager::ToxManager() = default;
 
 // 析构函数
 ToxManager::~ToxManager() {
+    // Erase the stored passphrase before the vector hands its pages back.
+    {
+        volatile uint8_t* p = profile_passphrase_.data();
+        for (size_t i = 0; i < profile_passphrase_.size(); ++i) p[i] = 0;
+    }
     // Explicitly shutdown to ensure proper cleanup order
     // This prevents issues during static destruction at application termination
     // Use try-catch to prevent exceptions during termination from causing crashes
@@ -1980,6 +2009,32 @@ std::vector<uint8_t> ToxManager::readSaveDataQuiesced() const {
     return data;
 }
 
+void ToxManager::setProfilePassphrase(const uint8_t* passphrase, size_t length) {
+    // save_mutex_ FIRST (see the lock-order note on save_mutex_): a save that is
+    // already in flight snapshotted the previous passphrase, so re-keying while
+    // it runs could let the older write land last and undo the re-key. Blocking
+    // here until that save has finished makes "re-key, then save" atomic from
+    // the caller's point of view.
+    std::lock_guard<std::mutex> save_lock(save_mutex_);
+    std::lock_guard<std::mutex> lock(mutex_);
+    // Wipe the old secret before the vector reallocates/shrinks away from it.
+    if (!profile_passphrase_.empty()) {
+        volatile uint8_t* p = profile_passphrase_.data();
+        for (size_t i = 0; i < profile_passphrase_.size(); ++i) p[i] = 0;
+    }
+    if (!passphrase || length == 0) {
+        profile_passphrase_.clear();
+        profile_passphrase_.shrink_to_fit();
+        return;
+    }
+    profile_passphrase_.assign(passphrase, passphrase + length);
+}
+
+bool ToxManager::hasProfilePassphrase() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return !profile_passphrase_.empty();
+}
+
 bool ToxManager::saveTo(const std::string& path, bool* queued, bool final_save) const {
     if (queued) *queued = false;
     // A save reached from inside a tox callback is the one case the quiesce
@@ -2030,9 +2085,50 @@ bool ToxManager::saveTo(const std::string& path, bool* queued, bool final_save) 
                   "[ToxManager] saveTo: called from a tox callback with no iterate scope; "
                   "saving inline (the quiesce may have to time out)");
     }
+    // One save at a time, for the whole snapshot -> encrypt -> write -> rename
+    // sequence. Two concurrent saves could otherwise interleave so that the one
+    // that snapshotted the OLDER passphrase renames last, silently downgrading
+    // the file (to the previous password, or to plaintext) after a re-key.
+    std::lock_guard<std::mutex> save_lock(save_mutex_);
     try {
         auto data = getSaveData(final_save ? kFinalSaveQuiesceAttempts : 2);
         if (data.empty()) return false;
+        // `data` holds the plaintext savedata until the swap below, and the
+        // ciphertext afterwards; wiping either on the way out costs nothing.
+        ScopedSecretWipe wipe_data(data);
+
+        // Encrypt at the persistence boundary when a passphrase is set, so the
+        // bytes that reach the filesystem are never the plaintext savedata.
+        // A failure here is FATAL to the save: falling back to a plaintext
+        // write would silently reintroduce exactly the weakness this exists to
+        // close, and would also leave a plaintext file where the next startup
+        // expects ciphertext.
+        {
+            std::vector<uint8_t> passphrase;
+            ScopedSecretWipe wipe_passphrase(passphrase);
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                passphrase = profile_passphrase_;
+            }
+            if (!passphrase.empty()) {
+                std::vector<uint8_t> encrypted(data.size() + TOX_PASS_ENCRYPTION_EXTRA_LENGTH);
+                // After the swap below `encrypted` owns the PLAINTEXT buffer, so
+                // this guard is what actually erases it.
+                ScopedSecretWipe wipe_plaintext(encrypted);
+                Tox_Err_Encryption enc_err = TOX_ERR_ENCRYPTION_OK;
+                const bool ok = tox_pass_encrypt(data.data(), data.size(),
+                                                 passphrase.data(), passphrase.size(),
+                                                 encrypted.data(), &enc_err);
+                if (!ok || enc_err != TOX_ERR_ENCRYPTION_OK) {
+                    V2TIM_LOG(kError,
+                              "[ToxManager] saveTo: savedata encryption failed (err={}); "
+                              "refusing to write a plaintext profile",
+                              static_cast<int>(enc_err));
+                    return false;
+                }
+                data.swap(encrypted);
+            }
+        }
 
         // Atomic, durable save: write to a temp file, flush to disk, restrict
         // permissions to 0600, then atomically rename over the destination. On any
@@ -2140,16 +2236,93 @@ bool ToxManager::saveTo(const std::string& path, bool* queued, bool final_save) 
 }
 
 bool ToxManager::loadFrom(const std::string& path) {
+    return loadFromEx(path) == LoadOutcome::kOk;
+}
+
+ToxManager::LoadOutcome ToxManager::loadFromEx(const std::string& path) {
+    // Sticky for the whole function, including the catch: once we know the file
+    // on disk is an encrypted profile, NO failure below may report kCorrupt.
+    // kCorrupt sends the caller into rename-aside-and-mint-a-new-identity
+    // recovery, and an out-of-memory or a transient tox_new failure is not a
+    // reason to make someone's account look lost.
+    bool source_was_encrypted = false;
     try {
         std::ifstream file(path, std::ios::binary | std::ios::ate);
-        if (!file) return false;
+        if (!file) return LoadOutcome::kUnreadable;
 
         auto size = file.tellg();
-        if (size <= 0) return false;
+        if (size <= 0) return LoadOutcome::kUnreadable;
+
+        // Classify from a FIXED-SIZE header read, BEFORE allocating the whole
+        // file. A std::bad_alloc from the full-size vector below would
+        // otherwise leave source_was_encrypted false, so an intact encrypted
+        // profile would come back as kCorrupt -- and get renamed aside and
+        // replaced by a brand-new identity over a transient memory failure.
+        if (static_cast<uint64_t>(size) >= TOX_PASS_ENCRYPTION_EXTRA_LENGTH) {
+            uint8_t header[TOX_PASS_ENCRYPTION_EXTRA_LENGTH];
+            file.seekg(0);
+            file.read(reinterpret_cast<char*>(header), sizeof(header));
+            const bool full_header =
+                file.gcount() == static_cast<std::streamsize>(sizeof(header));
+            file.clear();
+            if (!full_header) {
+                // We could not classify a file that IS big enough to be an
+                // encrypted profile. Carrying on would skip the decrypt branch,
+                // hand ciphertext to toxcore, and come back as kCorrupt -- which
+                // renames the account aside. An unreadable header is an IO
+                // problem, so bail out with a preserve-the-file outcome.
+                V2TIM_LOG(kError,
+                          "[ToxManager] loadFromEx: could not read the profile header; "
+                          "leaving the file untouched");
+                return LoadOutcome::kEncryptedLoadFailed;
+            }
+            if (tox_is_data_encrypted(header)) {
+                source_was_encrypted = true;
+            }
+        }
 
         std::vector<uint8_t> data(size);
         file.seekg(0);
         file.read(reinterpret_cast<char*>(data.data()), size);
+
+        // Transparently open an encrypted profile written by saveTo() (or by
+        // the Dart-side AccountExportService — identical container). The two
+        // encrypted failure modes are reported distinctly because the caller
+        // must NOT treat them like a corrupt blob: the file is intact and
+        // renaming it aside would look like data loss to its owner.
+        // `data` holds the ciphertext until the swap below and the decrypted
+        // savedata afterwards; this guard erases the plaintext on every exit.
+        ScopedSecretWipe wipe_data(data);
+        if (source_was_encrypted) {
+            std::vector<uint8_t> passphrase;
+            ScopedSecretWipe wipe_passphrase(passphrase);
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                passphrase = profile_passphrase_;
+            }
+            if (passphrase.empty()) {
+                V2TIM_LOG(kError,
+                          "[ToxManager] loadFromEx: profile is encrypted but no passphrase is "
+                          "set; leaving the file untouched");
+                return LoadOutcome::kNeedsPassphrase;
+            }
+            std::vector<uint8_t> decrypted(data.size() - TOX_PASS_ENCRYPTION_EXTRA_LENGTH);
+            // After the swap `decrypted` owns the ciphertext (harmless), but on
+            // every path before it this buffer holds plaintext savedata.
+            ScopedSecretWipe wipe_decrypted(decrypted);
+            Tox_Err_Decryption dec_err = TOX_ERR_DECRYPTION_OK;
+            const bool ok = tox_pass_decrypt(data.data(), data.size(),
+                                             passphrase.data(), passphrase.size(),
+                                             decrypted.data(), &dec_err);
+            if (!ok || dec_err != TOX_ERR_DECRYPTION_OK) {
+                V2TIM_LOG(kError,
+                          "[ToxManager] loadFromEx: profile decryption failed (err={}); "
+                          "leaving the file untouched",
+                          static_cast<int>(dec_err));
+                return LoadOutcome::kBadPassphrase;
+            }
+            data.swap(decrypted);
+        }
 
         // 创建新的 Tox 选项。
         // 必须零初始化：新版 c-toxcore 的 tox_options_default() 在赋默认值之前
@@ -2163,11 +2336,14 @@ bool ToxManager::loadFrom(const std::string& path) {
         options.savedata_data = data.data();
         options.savedata_length = data.size();
 
-        // 初始化 Tox（若存档加密或损坏会抛异常，此处捕获并返回 false）
+        // 初始化 Tox（若存档损坏会抛异常，此处捕获并返回 kCorrupt）
         initialize(&options, data.data(), data.size());
-        return getTox() != nullptr;
+        if (getTox() != nullptr) return LoadOutcome::kOk;
+        return source_was_encrypted ? LoadOutcome::kEncryptedLoadFailed
+                                    : LoadOutcome::kCorrupt;
     } catch (const std::exception&) {
-        return false;
+        return source_was_encrypted ? LoadOutcome::kEncryptedLoadFailed
+                                    : LoadOutcome::kCorrupt;
     }
 }
 

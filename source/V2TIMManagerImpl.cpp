@@ -687,9 +687,50 @@ size_t V2TIMManagerImpl::DebugSDKListenerCountForTest() {
 }
 
 // SDK initialization and shutdown
+namespace {
+// Zeroes a byte buffer on every scope exit, including the exception path.
+class ScopedSecretWipe {
+public:
+    explicit ScopedSecretWipe(std::vector<uint8_t>& buf) : buf_(buf) {}
+    ~ScopedSecretWipe() {
+        volatile uint8_t* p = buf_.data();
+        for (size_t i = 0; i < buf_.size(); ++i) p[i] = 0;
+    }
+    ScopedSecretWipe(const ScopedSecretWipe&) = delete;
+    ScopedSecretWipe& operator=(const ScopedSecretWipe&) = delete;
+
+private:
+    std::vector<uint8_t>& buf_;
+};
+}  // namespace
+
 bool V2TIMManagerImpl::InitSDK(uint32_t sdkAppID, const V2TIMSDKConfig& config) {
     int64_t this_instance_id = GetInstanceIdFromManager(this);
+
+    // CONSUME the staged passphrase up front, so EVERY return below -- success,
+    // no-op, or any early failure (a data dir we cannot create, a profile we
+    // cannot open, a tox_new that throws) -- leaves the staging slot empty.
+    // Doing this per-return has already been wrong twice; doing it once here is
+    // the only version that stays correct when someone adds a new early exit.
+    //
+    // Single use is the safety property: a staged value belongs to exactly one
+    // init attempt on this manager. If it survived, the NEXT account opened on
+    // this instance would silently be keyed with the PREVIOUS account's
+    // password -- or, worse, the previous account's profile would be re-saved
+    // under the new one's. A host that stages and then abandons the init must
+    // call ClearStagedProfilePassphrase().
+    std::vector<uint8_t> staged_passphrase;
+    ScopedSecretWipe wipe_staged(staged_passphrase);
+    {
+        std::lock_guard<std::mutex> lock(profile_passphrase_mutex_);
+        staged_passphrase.swap(profile_passphrase_);
+        profile_passphrase_.clear();
+        profile_passphrase_.shrink_to_fit();
+    }
+
     if (tox_manager_) {
+        // No-op init onto an already-running session: the staged value is
+        // already consumed above, which is all this branch needs.
         return true;
     }
     // An UnInitSDK that ran ON the event thread could not join it (see there);
@@ -862,10 +903,50 @@ bool V2TIMManagerImpl::InitSDK(uint32_t sdkAppID, const V2TIMSDKConfig& config) 
         }
     );
     
+    // Hand the session passphrase (if any) to the manager BEFORE the first load
+    // or save, so an encrypted profile can be opened and every subsequent
+    // persist writes ciphertext. Empty => plaintext savedata, exactly as before.
+    // Hand the consumed passphrase to this session's manager, BEFORE the first
+    // load or save. Empty => plaintext savedata, exactly as before.
+    if (!staged_passphrase.empty()) {
+        tox_manager_->setProfilePassphrase(staged_passphrase.data(),
+                                           staged_passphrase.size());
+    }
+
     if (loaded) {
         V2TIM_LOG(kInfo, "[InitSDK] Profile exists, loading from {}", save_path);
-        if (!tox_manager_->loadFrom(save_path)) {
-            V2TIM_LOG(kWarning, "[InitSDK] Profile load failed (encrypted or corrupted), creating new profile and backing up old file");
+        const ToxManager::LoadOutcome outcome = tox_manager_->loadFromEx(save_path);
+        // An ENCRYPTED profile we cannot open is not a corrupt profile. The
+        // bytes are intact and the user's account is recoverable with the right
+        // passphrase, so renaming the file aside and minting a brand-new
+        // identity here would be indistinguishable from losing their account.
+        // Fail the init instead and leave the file exactly where it is; the
+        // caller surfaces this as a startup failure the user can act on.
+        if (ToxManager::LoadOutcomeMustPreserveFile(outcome)) {
+            V2TIM_LOG(kError,
+                      "[InitSDK] Profile is encrypted and could not be opened ({}); "
+                      "refusing to replace it — init fails and the file is preserved",
+                      outcome == ToxManager::LoadOutcome::kNeedsPassphrase
+                          ? "no passphrase set"
+                          : (outcome == ToxManager::LoadOutcome::kBadPassphrase
+                                 ? "passphrase rejected"
+                                 : "load failed for another reason"));
+            if (tox_options) tox_options_free(tox_options);
+            running_.store(false, std::memory_order_release);
+            // Tear the half-built instance down. InitSDK short-circuits with
+            // `if (tox_manager_) return true;` at its top, so leaving these
+            // alive would make the NEXT init (e.g. the retry after the user
+            // types the right password) report success without ever loading
+            // the profile or starting the event thread.
+            save_path_.clear();
+#ifdef BUILD_TOXAV
+            toxav_manager_.reset();
+#endif
+            tox_manager_.reset();
+            return false;
+        }
+        if (outcome != ToxManager::LoadOutcome::kOk) {
+            V2TIM_LOG(kWarning, "[InitSDK] Profile load failed (corrupted), creating new profile and backing up old file");
             std::string backup_path = save_path + ".corrupted";
             if (std::rename(save_path.c_str(), backup_path.c_str()) == 0) {
                 V2TIM_LOG(kInfo, "[InitSDK] Backed up unloadable profile to {}", backup_path);
@@ -2213,6 +2294,11 @@ void V2TIMManagerImpl::UnInitSDK() {
     // the next session of this instance id.
     DiscardDurableCallbacksForInstance(GetInstanceIdFromManager(this));
     session_epoch_.store(0, std::memory_order_release);
+    // NOTE: the staged passphrase is deliberately NOT cleared here. InitSDK
+    // consumes it (single use), and an uninit can be triggered by the NEXT
+    // account's init detaching a quarantined predecessor -- clearing here would
+    // wipe the value that init is about to need. Nothing survives either way:
+    // after a successful init the staged slot is already empty.
 }
 
 // The default instance is a process singleton that is never destroyed, so an
@@ -2272,10 +2358,58 @@ void V2TIMManagerImpl::ResetGroupSessionState() {
     ForgetCrossInstanceGroupIdentities(GetInstanceIdFromManager(this));
 }
 
+void V2TIMManagerImpl::SetProfilePassphrase(const uint8_t* passphrase, size_t length) {
+    std::lock_guard<std::mutex> lock(profile_passphrase_mutex_);
+    if (!profile_passphrase_.empty()) {
+        volatile uint8_t* p = profile_passphrase_.data();
+        for (size_t i = 0; i < profile_passphrase_.size(); ++i) p[i] = 0;
+    }
+    if (!passphrase || length == 0) {
+        profile_passphrase_.clear();
+        profile_passphrase_.shrink_to_fit();
+    } else {
+        profile_passphrase_.assign(passphrase, passphrase + length);
+    }
+    // DELIBERATELY does not touch a live ToxManager. A previous account's
+    // instance can still be alive here (dispose() quarantines rather than stops
+    // it when a background task outlived the drain window); pushing the NEXT
+    // account's passphrase into it would make its final save -- triggered when
+    // the next init detaches it -- write account A's profile under account B's
+    // password, or in plaintext if B has none. Re-keying a live session is a
+    // separate, explicit call.
+}
+
+bool V2TIMManagerImpl::ReKeyLiveProfilePassphrase(const uint8_t* passphrase, size_t length) {
+    std::lock_guard<std::mutex> lock(profile_passphrase_mutex_);
+    if (!tox_manager_) return false;
+    tox_manager_->setProfilePassphrase((passphrase && length > 0) ? passphrase : nullptr,
+                                       (passphrase && length > 0) ? length : 0);
+    return true;
+}
+
+bool V2TIMManagerImpl::HasProfilePassphrase() const {
+    std::lock_guard<std::mutex> lock(profile_passphrase_mutex_);
+    return !profile_passphrase_.empty();
+}
+
+void V2TIMManagerImpl::ClearStagedProfilePassphrase() {
+    std::lock_guard<std::mutex> lock(profile_passphrase_mutex_);
+    if (!profile_passphrase_.empty()) {
+        volatile uint8_t* p = profile_passphrase_.data();
+        for (size_t i = 0; i < profile_passphrase_.size(); ++i) p[i] = 0;
+    }
+    profile_passphrase_.clear();
+    profile_passphrase_.shrink_to_fit();
+}
+
 void V2TIMManagerImpl::SaveToxProfile() {
+    (void)PersistToxProfile();
+}
+
+bool V2TIMManagerImpl::PersistToxProfile() {
     if (!tox_manager_) {
         V2TIM_LOG(kWarning, "[SaveToxProfile] tox_manager_ is null, skipping");
-        return;
+        return false;
     }
     std::string save_path = save_path_;
     if (save_path.empty()) {
@@ -2285,16 +2419,21 @@ void V2TIMManagerImpl::SaveToxProfile() {
         save_path = tim2tox::path::BuildProfilePath(save_dir, GetInstanceIdFromManager(this)).string();
     }
     bool queued = false;
-    if (!tox_manager_->saveTo(save_path, &queued)) {
-        V2TIM_LOG(kError, "[SaveToxProfile] Failed to save tox profile to {}", save_path);
-    } else if (queued) {
-        // Reached from inside a tox callback: the write runs when the iterate
-        // returns and logs its own result. Saying "saved" here would claim a
-        // durability this call does not have.
-        V2TIM_LOG(kInfo, "[SaveToxProfile] Queued tox profile save to {}", save_path);
-    } else {
+    if (tox_manager_->saveTo(save_path, &queued)) {
+        if (queued) {
+            // Reached from inside a tox callback: the write runs when the
+            // iterate returns and logs its own result. Neither "saved" nor
+            // "failed" is true yet, so a caller that needs the bytes on disk
+            // (a re-key, see ReKeyLiveProfilePassphrase) gets false and must
+            // not report success; SaveToxProfile itself discards the result.
+            V2TIM_LOG(kInfo, "[SaveToxProfile] Queued tox profile save to {}", save_path);
+            return false;
+        }
         V2TIM_LOG(kInfo, "[SaveToxProfile] Saved tox profile to {}", save_path);
+        return true;
     }
+    V2TIM_LOG(kError, "[SaveToxProfile] Failed to save tox profile to {}", save_path);
+    return false;
 }
 
 // SDK Information

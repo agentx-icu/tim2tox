@@ -1972,7 +1972,17 @@ int tim2tox_ffi_init(void) {
 
 int tim2tox_ffi_init_with_path(const char* init_path) {
     std::lock_guard<std::mutex> lifecycle(g_default_lifecycle_mutex);
-    if (IsInstanceInited(0)) return 1;
+    if (IsInstanceInited(0)) {
+        // Already-inited short-circuit: this never reaches InitSDK, so it must
+        // consume the staged passphrase itself. Leaving it staged would let the
+        // NEXT account's init (after this session is uninited) pick up THIS
+        // account's password and key the wrong profile with it. Staging is
+        // single-use by contract -- one init attempt, success or no-op.
+        if (V2TIMManagerImpl* impl = GetCurrentInstance()) {
+            impl->ClearStagedProfilePassphrase();
+        }
+        return 1;
+    }
     V2TIMSDKConfig cfg;
     if (init_path && init_path[0] != '\0') {
         cfg.initPath = V2TIMString(init_path);
@@ -2420,6 +2430,49 @@ void tim2tox_ffi_save_tox_profile(void) {
     if (manager_impl) {
         manager_impl->SaveToxProfile();
     }
+}
+
+int tim2tox_ffi_set_profile_passphrase(const uint8_t* passphrase, size_t passphrase_len) {
+    // Deliberately NOT gated on IsCurrentInstanceInited(): the whole point is
+    // to be callable BEFORE tim2tox_ffi_init_with_path(), so the very first
+    // load and the very first save already use it. GetCurrentInstance()
+    // returns the default V2TIMManagerImpl whether or not InitSDK has run.
+    V2TIMManagerImpl* manager_impl = GetCurrentInstance();
+    if (!manager_impl) return 0;
+    V2TIM_LOG(kInfo,
+              "[ffi] tim2tox_ffi_set_profile_passphrase: event=configure status={}",
+              (passphrase && passphrase_len > 0) ? "set" : "cleared");
+    manager_impl->SetProfilePassphrase(
+        (passphrase && passphrase_len > 0) ? passphrase : nullptr,
+        (passphrase && passphrase_len > 0) ? passphrase_len : 0);
+    return 1;
+}
+
+int tim2tox_ffi_get_profile_passphrase_state(void) {
+    V2TIMManagerImpl* manager_impl = GetCurrentInstance();
+    if (!manager_impl) return -1;
+    return manager_impl->HasProfilePassphrase() ? 1 : 0;
+}
+
+int tim2tox_ffi_rekey_live_profile_passphrase(const uint8_t* passphrase, size_t passphrase_len) {
+    // Requires a LIVE session on the default instance. Gated on
+    // IsCurrentInstanceInited() precisely because it is the dangerous one: it
+    // must never reach a quarantined predecessor account's manager.
+    if (!IsCurrentInstanceInited()) return 0;
+    V2TIMManagerImpl* manager_impl = GetCurrentInstance();
+    if (!manager_impl) return 0;
+    const bool has_pass = (passphrase && passphrase_len > 0);
+    if (!manager_impl->ReKeyLiveProfilePassphrase(has_pass ? passphrase : nullptr,
+                                                  has_pass ? passphrase_len : 0)) {
+        return 0;
+    }
+    // The file on disk still carries the OLD passphrase until something saves,
+    // so report success only when the re-keyed bytes actually reached disk.
+    // Returning 1 on a failed write would tell the host the profile is
+    // protected by the new password when it is still protected by the old one
+    // -- or, when the new passphrase is empty, still encrypted rather than
+    // plaintext.
+    return manager_impl->PersistToxProfile() ? 1 : 0;
 }
 
 void tim2tox_ffi_set_callback(tim2tox_event_cb cb, void* user_data) {
