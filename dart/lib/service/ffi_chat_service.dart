@@ -1616,6 +1616,24 @@ class FfiChatService {
   /// use-after-free the teardown flags exist to prevent.
   bool _disposing = false;
 
+  /// Whether the most recent completed [dispose] actually stopped the native
+  /// instance, i.e. reached `_ffi.uninit()`.
+  ///
+  /// Null until a dispose has completed. False means the drain window expired
+  /// and the instance was QUARANTINED instead of freed: `dispose()` returned
+  /// NORMALLY, but an undrained background task — including the profile-save
+  /// path — can still write through it.
+  ///
+  /// Hosts need this to decide whether post-teardown work that assumes "no
+  /// more native writes" is safe. toxee re-encrypts `tox_profile.tox` after
+  /// teardown; doing that behind a quarantined instance lets a later autosave
+  /// overwrite the ciphertext with plaintext, leaving the profile unencrypted
+  /// while the account's stored verifier says it is protected. "dispose did not
+  /// throw" is NOT sufficient to rule that out, which is why this is exposed
+  /// separately rather than folded into the returned future.
+  bool? get nativeInstanceStopped => _nativeInstanceStopped;
+  bool? _nativeInstanceStopped;
+
   /// Background tasks the poll/native event handling used to fire-and-forget
   /// (`_sendAvatarToAllFriendsOnConnect`, `_drainAllPendingGroupMessages`).
   /// dispose() awaits them like [_activePoll] so a suspended task cannot
@@ -10478,6 +10496,10 @@ class FfiChatService {
     await _ircUserListCtrl.close();
     await _ircUserJoinPartCtrl.close();
 
+    // Publish the outcome BEFORE the branch acts on it, so a host reading
+    // `nativeInstanceStopped` after `dispose()` completes always sees the truth
+    // about this run regardless of which branch it took.
+    _nativeInstanceStopped = pollDrained;
     if (pollDrained) {
       _ffi.uninit();
     } else {
