@@ -31,6 +31,19 @@ int64_t tim2tox_ffi_create_test_instance_ex(const char* init_path, int local_dis
 // Uses default options (local_discovery_enabled=1, ipv6_enabled=1)
 int64_t tim2tox_ffi_create_test_instance(const char* init_path);
 
+// Create a HEADLESS DHT-only instance (a LAN bootstrap node). Unlike the
+// test-instance creators it is wired to no process-wide SDK / message
+// listener and receives no Dart listener replay, so its own DHT
+// connection-status transitions cannot masquerade as the session's
+// `conn:success` / `conn:failed` events. It still iterates on its own event
+// thread and answers tim2tox_ffi_get_udp_port / get_dht_id_for_instance.
+// init_path: profile path for the node's savedata
+// udp_start_port: preferred UDP port (binds the first free port in
+//                 [udp_start_port, udp_start_port + 100]); 0 = toxcore default
+// Returns: instance handle on success, 0 on failure. Destroy with
+// tim2tox_ffi_destroy_test_instance.
+int64_t tim2tox_ffi_create_bootstrap_instance(const char* init_path, int udp_start_port);
+
 // Test-only: Set current instance for FFI operations
 // instance_handle: handle returned by tim2tox_ffi_create_test_instance
 // Returns: 1 on success, 0 on failure
@@ -336,6 +349,8 @@ int tim2tox_ffi_send_c2c_text_ex(const char* user_id, const char* text, char* ms
 
 // TEST SEAM: SDK-listener registration count on the default singleton.
 int tim2tox_ffi_debug_sdk_listener_count(void);
+// TEST SEAM: same, for any instance id (0 = default). -1 when unknown.
+int tim2tox_ffi_debug_sdk_listener_count_for_instance(int64_t instance_id);
 // Session epoch of the default instance (bumped by init / claim / detach).
 uint64_t tim2tox_ffi_default_epoch(void);
 // Claim a fresh epoch (adopt path: a service proceeding onto an existing

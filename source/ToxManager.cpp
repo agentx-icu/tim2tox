@@ -270,6 +270,17 @@ void ToxManager::initialize(const Tox_Options* options,
     // deterministically instead of guessing. Production never sets the knob,
     // so real clients keep toxcore's default range.
     // Android property fallback: debug.toxee.udp_start_port.
+    //
+    // Per-instance range first (setUdpPortRange — a LAN bootstrap node honouring
+    // the user's port), then the harness knob, which deliberately wins so a
+    // test process keeps its deterministic per-process range.
+    if (udp_start_port_ != 0) {
+        const uint16_t end = udp_end_port_ >= udp_start_port_ ? udp_end_port_ : udp_start_port_;
+        tox_options_set_start_port(opts, udp_start_port_);
+        tox_options_set_end_port(opts, end);
+        V2TIM_LOG(kInfo, "[ToxManager] initialize: UDP port range set to {}..{} via setUdpPortRange",
+                  (unsigned)udp_start_port_, (unsigned)end);
+    }
     if (const std::string udp_env = read_harness_knob("TOX_UDP_START_PORT", "debug.toxee.udp_start_port"); !udp_env.empty()) {
         const long parsed = std::strtol(udp_env.c_str(), nullptr, 10);
         if (parsed > 0 && parsed <= 65535) {

@@ -42,6 +42,18 @@ public:
     // single-instance path is unchanged.
     void setTcpRelayServerAllowed(bool allowed) { tcp_relay_server_allowed_ = allowed; }
 
+    // Preferred UDP bind range for this instance's tox_new (start..end,
+    // inclusive; toxcore binds the first free port). 0/0 = toxcore default.
+    // Lives HERE, next to the other tox_new-time knobs, because both
+    // initialize() and loadFrom() reach tox_new and loadFrom builds its own
+    // Tox_Options — an option set only on the caller's Tox_Options would be
+    // dropped on every profile reload. Used by LAN bootstrap nodes to honour
+    // the user's chosen port.
+    void setUdpPortRange(uint16_t start_port, uint16_t end_port) {
+        udp_start_port_ = start_port;
+        udp_end_port_ = end_port;
+    }
+
     // 核心功能接口
     Tox* getTox() const;
     void iterate(uint32_t timeout = 0);
@@ -323,6 +335,8 @@ private:
     std::atomic<std::thread::id> iterate_owner_{};  // thread holding iterate_mutex_ inside iterate()/shutdown() (see lockIterate)
     std::atomic<bool> is_shutting_down_{false};  // Flag to prevent double cleanup; atomic for lock-free read in iterate()
     bool tcp_relay_server_allowed_{true};  // see setTcpRelayServerAllowed
+    uint16_t udp_start_port_{0};  // see setUdpPortRange
+    uint16_t udp_end_port_{0};
 
     // 回调存储
     SelfConnectionStatusCallback self_connection_status_cb_;

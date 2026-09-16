@@ -48,6 +48,8 @@ static void RememberCrossInstanceGroupIdentity(
 
 // Forward declaration for GetTestInstanceOptions (defined in tim2tox_ffi.cpp with extern "C" linkage)
 extern "C" bool GetTestInstanceOptions(int64_t instance_id, int* out_local_discovery, int* out_ipv6);
+// Per-instance UDP bind range (defined in tim2tox_ffi.cpp); false = keep toxcore defaults.
+extern "C" bool GetTestInstanceUdpPortRange(int64_t instance_id, int* out_start_port, int* out_end_port);
 
 // Forward declaration for DartNotifyGroupQuit (defined in ffi/dart_compat_group.cpp
 // with extern "C" linkage). Posts a "groupQuitNotification" callback that the
@@ -417,6 +419,18 @@ bool V2TIMManagerImpl::InitSDK(uint32_t sdkAppID, const V2TIMSDKConfig& config) 
     // its fixed port; an auxiliary instance that tried would fail tox_new with
     // TOX_ERR_NEW_PORT_ALLOC and never come up at all.
     tox_manager_->setTcpRelayServerAllowed(this_instance_id == 0);
+    // A creator may pin the UDP bind range (LAN bootstrap node honouring the
+    // user's port). Applied on the ToxManager rather than on the Tox_Options
+    // built below because loadFrom() builds its own options on profile reload.
+    {
+        int udp_start = 0;
+        int udp_end = 0;
+        if (this_instance_id > 0 && GetTestInstanceUdpPortRange(this_instance_id, &udp_start, &udp_end)) {
+            tox_manager_->setUdpPortRange(static_cast<uint16_t>(udp_start), static_cast<uint16_t>(udp_end));
+            V2TIM_LOG(kInfo, "[InitSDK] instance_id={} UDP port range pinned to {}..{}",
+                      (long long)this_instance_id, udp_start, udp_end);
+        }
+    }
     V2TIM_LOG(kInfo, "[InitSDK] Created ToxManager={} for this={} (instance_id={})",
               (void*)tox_manager_.get(), (void*)this, (long long)this_instance_id);
 #ifdef BUILD_TOXAV

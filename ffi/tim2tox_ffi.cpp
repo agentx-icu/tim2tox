@@ -153,6 +153,13 @@ static constexpr uint64_t kAvatarMaxBytes = 10ULL * 1024ULL * 1024ULL;
 struct TestInstanceOptions {
     int local_discovery_enabled;
     int ipv6_enabled;
+    // UDP bind range handed to ToxManager::initialize for THIS instance.
+    // 0/0 keeps toxcore's default range (33445..33545). Set by
+    // tim2tox_ffi_create_bootstrap_instance so a LAN bootstrap node can honour
+    // the port the user asked for instead of silently landing on the first
+    // free default port.
+    int udp_start_port = 0;
+    int udp_end_port = 0;
 };
 
 // Global test instance options (accessible from V2TIMManagerImpl)
@@ -1002,25 +1009,49 @@ static void RegisterToxManagerFileCallbacks(V2TIMManagerImpl* manager_impl) {
 }
 
 // Test instance management functions - defined outside namespace so they can be called from C/Dart
-// Extended version with options support
-int64_t tim2tox_ffi_create_test_instance_ex(const char* init_path, int local_discovery_enabled, int ipv6_enabled) {
+
+// Shared body of tim2tox_ffi_create_test_instance_ex and
+// tim2tox_ffi_create_bootstrap_instance.
+//
+// `headless` distinguishes a DHT-only helper (a LAN bootstrap node) from a
+// full chat peer. A headless instance is registered, InitSDK'd and iterated
+// exactly like a test peer, but it is wired to NO process-wide listener:
+//   - not G.sdk_listener   → its self-connection transitions never become
+//                            `conn:success` / `conn:failed` text events. Those
+//                            lines carry no instance id (event_line_parser.cpp
+//                            routes only file/avatar prefixes) and the
+//                            receiver override is unset on a connection
+//                            callback, so they would land in the BROADCAST
+//                            (id 0) queue and flip the user session's
+//                            _isConnected in Dart (toxee LAN review 2026-09-15).
+//   - not G.simple_listener / file callbacks → nothing to receive anyway.
+//   - no ReplayListenersForNewInstance → the Dart-side SDK/NetworkStatus
+//                            listeners are not mirrored onto it either (the
+//                            second leak path, via the singleton globalCallback).
+// Everything a bootstrap node needs (tox_iterate on event_thread_, UDP port,
+// DHT id, destroy) is unaffected.
+static int64_t CreateManagedInstance(const char* init_path,
+                                     const TestInstanceOptions& options,
+                                     bool headless,
+                                     const char* tag) {
     if (!init_path) {
-        V2TIM_LOG(kError, "[ffi] create_test_instance_ex: event=entry status=invalid_init_path init_path_length=0");
+        V2TIM_LOG(kError, "[ffi] {}: event=entry status=invalid_init_path init_path_length=0", tag);
         return 0;
     }
 
     V2TIM_LOG(kInfo,
-              "[ffi] create_test_instance_ex: event=entry status=start init_path_length={} local_discovery_enabled={} ipv6_enabled={}",
-              SafeCStringLength(init_path), BoolMetadata(local_discovery_enabled != 0),
-              BoolMetadata(ipv6_enabled != 0));
+              "[ffi] {}: event=entry status=start init_path_length={} local_discovery_enabled={} ipv6_enabled={} udp_port_range={}..{} headless={}",
+              tag, SafeCStringLength(init_path), BoolMetadata(options.local_discovery_enabled != 0),
+              BoolMetadata(options.ipv6_enabled != 0), options.udp_start_port, options.udp_end_port,
+              BoolMetadata(headless));
 
     V2TIMManagerImpl* instance = new V2TIMManagerImpl();
     if (!instance) {
-        V2TIM_LOG(kError, "[ffi] create_test_instance_ex: event=allocate status=failure");
+        V2TIM_LOG(kError, "[ffi] {}: event=allocate status=failure", tag);
         return 0;
     }
-    V2TIM_LOG(kInfo, "[ffi] create_test_instance_ex: event=allocate status=success");
-    
+    V2TIM_LOG(kInfo, "[ffi] {}: event=allocate status=success", tag);
+
     // CRITICAL: Register instance BEFORE InitSDK so that GetInstanceIdFromManager can find it
     // This ensures that InitSDK can correctly identify which instance it's initializing
     int64_t instance_id;
@@ -1030,26 +1061,28 @@ int64_t tim2tox_ffi_create_test_instance_ex(const char* init_path, int local_dis
         g_test_instances[instance_id] = instance;
         g_instance_to_id[instance] = instance_id; // Update reverse map
         V2TIM_LOG(kInfo,
-                  "[ffi] create_test_instance_ex: event=register status=success total_instances={}",
-                  g_test_instances.size());
+                  "[ffi] {}: event=register status=success total_instances={}",
+                  tag, g_test_instances.size());
     }
 
     {
         std::lock_guard<std::mutex> lock(g_test_instance_options_mutex);
-        g_test_instance_options[instance_id] = {local_discovery_enabled, ipv6_enabled};
+        g_test_instance_options[instance_id] = options;
         V2TIM_LOG(kInfo,
-                  "[ffi] create_test_instance_ex: event=store_options status=success option_count={}",
-                  g_test_instance_options.size());
+                  "[ffi] {}: event=store_options status=success option_count={}",
+                  tag, g_test_instance_options.size());
     }
 
     V2TIMSDKConfig cfg;
     cfg.initPath = V2TIMString(init_path);
 
-    instance->AddSDKListener(&G.sdk_listener);
-    V2TIM_LOG(kInfo, "[ffi] create_test_instance_ex: event=init_sdk status=start");
+    if (!headless) {
+        instance->AddSDKListener(&G.sdk_listener);
+    }
+    V2TIM_LOG(kInfo, "[ffi] {}: event=init_sdk status=start", tag);
     bool ok = instance->InitSDK(0, cfg);
     if (!ok) {
-        V2TIM_LOG(kError, "[ffi] create_test_instance_ex: event=init_sdk status=failure");
+        V2TIM_LOG(kError, "[ffi] {}: event=init_sdk status=failure", tag);
         // Clean up registration on failure
         {
             std::lock_guard<std::mutex> lock(g_test_instances_mutex);
@@ -1063,12 +1096,18 @@ int64_t tim2tox_ffi_create_test_instance_ex(const char* init_path, int local_dis
         delete instance;
         return 0;
     }
-    instance->AddSimpleMsgListener(&G.simple_listener);
-    RegisterToxManagerFileCallbacks(instance);
+    if (!headless) {
+        instance->AddSimpleMsgListener(&G.simple_listener);
+        RegisterToxManagerFileCallbacks(instance);
+    }
 
-    V2TIM_LOG(kInfo, "[ffi] create_test_instance_ex: event=init_sdk status=success");
+    V2TIM_LOG(kInfo, "[ffi] {}: event=init_sdk status=success", tag);
 
     MarkInstanceInited(instance_id);
+
+    if (headless) {
+        return instance_id;
+    }
 
     // Replay any previously-registered listener callbacks on this new instance.
     // The Tencent SDK's TIMManager.initSDK early-returns when _isInitSDK is true, so
@@ -1085,10 +1124,49 @@ int64_t tim2tox_ffi_create_test_instance_ex(const char* init_path, int local_dis
     return instance_id;
 }
 
+// Extended version with options support
+int64_t tim2tox_ffi_create_test_instance_ex(const char* init_path, int local_discovery_enabled, int ipv6_enabled) {
+    TestInstanceOptions options;
+    options.local_discovery_enabled = local_discovery_enabled;
+    options.ipv6_enabled = ipv6_enabled;
+    return CreateManagedInstance(init_path, options, /*headless=*/false, "create_test_instance_ex");
+}
+
 // Backward compatibility version (uses default options)
 int64_t tim2tox_ffi_create_test_instance(const char* init_path) {
     // Default: local_discovery_enabled=1, ipv6_enabled=1
     return tim2tox_ffi_create_test_instance_ex(init_path, 1, 1);
+}
+
+// Headless DHT-only instance for a LAN bootstrap node. See CreateManagedInstance.
+// udp_start_port: preferred UDP port; the node binds the first free port in
+// [udp_start_port, udp_start_port + 100] (toxcore semantics), 0 = default range.
+// Rejecting an exact-port bind outright would make the default (33445) fail
+// every time the user's own session already holds it in this process.
+int64_t tim2tox_ffi_create_bootstrap_instance(const char* init_path, int udp_start_port) {
+    TestInstanceOptions options;
+    options.local_discovery_enabled = 1;
+    options.ipv6_enabled = 1;
+    if (udp_start_port > 0 && udp_start_port <= 65535) {
+        options.udp_start_port = udp_start_port;
+        options.udp_end_port = static_cast<int>(std::min<long>(static_cast<long>(udp_start_port) + 100, 65535));
+    } else if (udp_start_port != 0) {
+        V2TIM_LOG(kWarning, "[ffi] create_bootstrap_instance: ignoring out-of-range udp_start_port={} (want 0 or 1..65535)", udp_start_port);
+    }
+    return CreateManagedInstance(init_path, options, /*headless=*/true, "create_bootstrap_instance");
+}
+
+// Per-instance UDP bind range chosen at creation (see TestInstanceOptions).
+// Returns true when the instance has an explicit range, false to keep defaults.
+extern "C" bool GetTestInstanceUdpPortRange(int64_t instance_id, int* out_start_port, int* out_end_port) {
+    std::lock_guard<std::mutex> lock(g_test_instance_options_mutex);
+    auto it = g_test_instance_options.find(instance_id);
+    if (it == g_test_instance_options.end() || it->second.udp_start_port <= 0) {
+        return false;
+    }
+    if (out_start_port) *out_start_port = it->second.udp_start_port;
+    if (out_end_port) *out_end_port = it->second.udp_end_port;
+    return true;
 }
 
 // Helper function to get test instance options (for V2TIMManagerImpl access)
@@ -1356,6 +1434,12 @@ static std::atomic<uint64_t> g_default_quarantined_epoch{0};
 
 int tim2tox_ffi_debug_sdk_listener_count(void) {
     V2TIMManagerImpl* manager = V2TIMManagerImpl::GetInstance();
+    if (!manager) return -1;
+    return (int)manager->DebugSDKListenerCountForTest();
+}
+
+int tim2tox_ffi_debug_sdk_listener_count_for_instance(int64_t instance_id) {
+    V2TIMManagerImpl* manager = static_cast<V2TIMManagerImpl*>(GetManagerForInstanceId(instance_id));
     if (!manager) return -1;
     return (int)manager->DebugSDKListenerCountForTest();
 }

@@ -137,6 +137,10 @@ typedef _add_bootstrap_node_c = ffi.Int32 Function(
 typedef _create_test_instance_c = ffi.Int64 Function(ffi.Pointer<pkgffi.Utf8>);
 typedef _create_test_instance_ex_c = ffi.Int64 Function(
     ffi.Pointer<pkgffi.Utf8>, ffi.Int32, ffi.Int32);
+typedef _create_bootstrap_instance_c = ffi.Int64 Function(
+    ffi.Pointer<pkgffi.Utf8>, ffi.Int32);
+typedef _debug_sdk_listener_count_for_instance_c = ffi.Int32 Function(
+    ffi.Int64);
 typedef _set_current_instance_c = ffi.Int32 Function(ffi.Int64);
 typedef _destroy_test_instance_c = ffi.Int32 Function(ffi.Int64);
 typedef _get_current_instance_id_c = ffi.Int64 Function();
@@ -707,6 +711,10 @@ class Tim2ToxFfi {
   late final int Function() debugSdkListenerCount =
       _lib.lookupFunction<_detach_default_instance_c, int Function()>(
           'tim2tox_ffi_debug_sdk_listener_count');
+  late final int Function(int) debugSdkListenerCountForInstance =
+      _lib.lookupFunction<_debug_sdk_listener_count_for_instance_c,
+              int Function(int)>(
+          'tim2tox_ffi_debug_sdk_listener_count_for_instance');
   late final int Function() defaultEpoch =
       _lib.lookupFunction<_default_epoch_c, int Function()>(
           'tim2tox_ffi_default_epoch');
@@ -823,6 +831,14 @@ class Tim2ToxFfi {
           _create_test_instance_ex_c,
           int Function(ffi.Pointer<pkgffi.Utf8>, int,
               int)>('tim2tox_ffi_create_test_instance_ex');
+  /// Headless DHT-only instance (LAN bootstrap node): no process-wide
+  /// listeners, so its connection transitions never reach the session's
+  /// `conn:` event queue. `udpStartPort` 0 keeps toxcore's default range.
+  late final int Function(ffi.Pointer<pkgffi.Utf8>, int)
+      createBootstrapInstanceNative = _lib.lookupFunction<
+          _create_bootstrap_instance_c,
+          int Function(ffi.Pointer<pkgffi.Utf8>,
+              int)>('tim2tox_ffi_create_bootstrap_instance');
   late final int Function(int) setCurrentInstance =
       _lib.lookupFunction<_set_current_instance_c, int Function(int)>(
           'tim2tox_ffi_set_current_instance');
