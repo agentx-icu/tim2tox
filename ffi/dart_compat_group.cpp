@@ -494,15 +494,29 @@ extern "C" {
         std::string role_str = ExtractJsonValue(json_str, "group_modify_member_info_member_role");
         std::string name_card = ExtractJsonValue(json_str, "group_modify_member_info_name_card");
         if (name_card == "null") name_card.clear();
-        int seconds_val = ExtractJsonInt(json_str, "group_modify_member_info_shutup_time", 0);
-        if (seconds_val == 0) {
+        // shutup_time is a uint32 in V2TIM (0 = unmute, UINT32_MAX = forever),
+        // which ExtractJsonInt's int cannot hold; parse the literal instead.
+        // muteGroupMember(seconds: 0) must reach MuteGroupMember as an unmute:
+        // the SDK marks the field with the ShutupTime modify flag, while
+        // setGroupMemberInfo leaves shutup_time null.
+        constexpr int kTIMGroupMemberModifyFlag_ShutupTime = 0x01 << 2;
+        const int modify_flag = ExtractJsonInt(json_str, "group_modify_member_info_modify_flag", 0);
+        bool has_shutup_time = false;
+        uint32_t seconds_val = 0;
+        {
             std::string seconds_str = ExtractJsonValue(json_str, "group_modify_member_info_shutup_time");
-            if (!seconds_str.empty() && seconds_str != "null") {
-                try { seconds_val = static_cast<int>(std::stoul(seconds_str)); } catch (...) {}
+            if (!seconds_str.empty() && seconds_str != "null" && seconds_str[0] != '-') {
+                try {
+                    const unsigned long long v = std::stoull(seconds_str);
+                    seconds_val = v > UINT32_MAX ? UINT32_MAX : static_cast<uint32_t>(v);
+                    has_shutup_time = true;
+                } catch (...) {}
             }
         }
-        V2TIM_LOG(kInfo, "DartModifyGroupMemberInfo: group_id=%s, user_id=%s, name_card_len=%zu, role=%s, seconds=%d",
-                  group_id.c_str(), user_id.c_str(), name_card.size(), role_str.c_str(), seconds_val);
+        const bool mute_requested =
+            has_shutup_time && (seconds_val > 0 || (modify_flag & kTIMGroupMemberModifyFlag_ShutupTime) != 0);
+        V2TIM_LOG(kInfo, "DartModifyGroupMemberInfo: group_id=%s, user_id=%s, name_card_len=%zu, role=%s, seconds=%u, mute=%d",
+                  group_id.c_str(), user_id.c_str(), name_card.size(), role_str.c_str(), seconds_val, mute_requested ? 1 : 0);
         if (group_id.empty() || user_id.empty()) {
             V2TIM_LOG(kWarning, "DartModifyGroupMemberInfo: missing group_id or user_id (group_id=%s, user_id=%s)",
                       group_id.c_str(), user_id.c_str());
@@ -546,11 +560,11 @@ extern "C" {
             );
             return 0;
         }
-        if (seconds_val > 0) {
+        if (mute_requested) {
             grp_mgr->MuteGroupMember(
                 V2TIMString(group_id.c_str()),
                 V2TIMString(user_id.c_str()),
-                static_cast<uint32_t>(seconds_val),
+                seconds_val,
                 new DartCallback(
                     user_data,
                     [user_data]() { SendApiCallbackResult(user_data, 0, ""); },
@@ -632,23 +646,39 @@ extern "C" {
         return 0; // TIM_SUCC (request accepted)
     }
     
+    // Session stamp shared by every DartNotifyGroup* JSON. These notifications
+    // carry no user_data and land in ONE process-global Dart handler
+    // (Tim2ToxSdkPlatform._handleCustomCallback), so without the stamp a
+    // multi-instance process could not tell which node emitted one, and a
+    // notification the previous account's session emitted (queued at the port,
+    // or durable-held) would be applied to the next account after a switch on
+    // the same instance id. Dart accepts one only when it owns instance_id AND
+    // session_epoch is that instance's live epoch (tim2tox_ffi_get_session_epoch).
+    static void AppendGroupNotifySessionStamp(std::ostringstream& json,
+                                              int64_t instance_id,
+                                              int64_t session_epoch) {
+        json << ",\"instance_id\":" << instance_id
+             << ",\"session_epoch\":" << session_epoch;
+    }
+
     // DartNotifyGroupQuit: Notify Dart layer to clean up group state after quit
     // This is called from C++ layer after QuitGroup completes successfully
-    // Signature: void DartNotifyGroupQuit(const char* group_id)
-    void DartNotifyGroupQuit(const char* group_id) {
+    // Signature: void DartNotifyGroupQuit(const char* group_id, int64_t instance_id, int64_t session_epoch)
+    void DartNotifyGroupQuit(const char* group_id, int64_t instance_id, int64_t session_epoch) {
         if (!group_id) {
             V2TIM_LOG(kWarning, "DartNotifyGroupQuit: group_id is null");
             return;
         }
-        
+
         std::string group_id_str = CStringToString(group_id);
         V2TIM_LOG(kInfo, "DartNotifyGroupQuit: Notifying Dart layer to clean up group %s", group_id_str.c_str());
-        
+
         // Build JSON message for Dart layer
         std::ostringstream json;
         json << "{";
         json << "\"callback\":\"groupQuitNotification\",";
         json << "\"group_id\":\"" << EscapeJsonString(group_id_str) << "\"";
+        AppendGroupNotifySessionStamp(json, instance_id, session_epoch);
         json << "}";
         
         // Send notification to Dart layer
@@ -661,8 +691,8 @@ extern "C" {
     // tox_group_invite_accept + HandleGroupSelfJoin, but the Dart _knownGroups is
     // only updated on the Dart-initiated joinGroup path, so an invite auto-join
     // never surfaces in knownGroups). Mirrors DartNotifyGroupQuit (inverse).
-    // Signature: void DartNotifyGroupJoin(const char* group_id)
-    void DartNotifyGroupJoin(const char* group_id) {
+    // Signature: void DartNotifyGroupJoin(const char* group_id, int64_t instance_id, int64_t session_epoch)
+    void DartNotifyGroupJoin(const char* group_id, int64_t instance_id, int64_t session_epoch) {
         if (!group_id) {
             V2TIM_LOG(kWarning, "DartNotifyGroupJoin: group_id is null");
             return;
@@ -676,11 +706,113 @@ extern "C" {
         json << "{";
         json << "\"callback\":\"groupJoinNotification\",";
         json << "\"group_id\":\"" << EscapeJsonString(group_id_str) << "\"";
+        AppendGroupNotifySessionStamp(json, instance_id, session_epoch);
         json << "}";
 
         // Send notification to Dart layer
         SendCallbackToDart("groupJoinNotification", json.str(), nullptr);
         V2TIM_LOG(kInfo, "DartNotifyGroupJoin: Notification sent for group %s", group_id_str.c_str());
+    }
+
+    // DartNotifyGroupIdentityStored / DartNotifyGroupTypeStored: the native
+    // side learned (or changed) a group's stable identity or kind. The Dart
+    // layer persists them per account so a restart can rebind every group by
+    // identity; before this only opening the group profile page persisted the
+    // chat_id, and the kind was never persisted at all.
+    // Native learns most of these during login-time restore / rejoin, before
+    // Dart has registered its SendPort, so they are sent durably (held and
+    // replayed on registration). Dart additionally pulls the full set with
+    // tim2tox_ffi_get_group_identity_snapshot once it can persist, because a
+    // registered port may still have no handler for these callbacks.
+    // The held copy is the JSON built here, so a replay carries the emitting
+    // session's stamp; the dedupe key is per instance (group ids like
+    // tox_group_0 repeat across test nodes), and the held entries of a session
+    // are discarded when it ends (DiscardDurableCallbacksForInstance).
+    void DartNotifyGroupIdentityStored(const char* group_id, const char* chat_id_hex,
+                                       int64_t instance_id, int64_t session_epoch) {
+        if (!group_id || !chat_id_hex) return;
+        const std::string group_id_str = CStringToString(group_id);
+        std::ostringstream json;
+        json << "{";
+        json << "\"callback\":\"groupChatIdStored\",";
+        json << "\"group_id\":\"" << EscapeJsonString(group_id_str) << "\",";
+        json << "\"chat_id\":\"" << EscapeJsonString(CStringToString(chat_id_hex)) << "\"";
+        AppendGroupNotifySessionStamp(json, instance_id, session_epoch);
+        json << "}";
+        SendDurableCallbackToDart("groupChatIdStored", json.str(),
+                                  "groupChatIdStored|" + std::to_string(instance_id) + "|" + group_id_str,
+                                  instance_id);
+    }
+
+    void DartNotifyGroupTypeStored(const char* group_id, const char* group_type,
+                                   int64_t instance_id, int64_t session_epoch) {
+        if (!group_id || !group_type) return;
+        const std::string group_id_str = CStringToString(group_id);
+        std::ostringstream json;
+        json << "{";
+        json << "\"callback\":\"groupTypeStored\",";
+        json << "\"group_id\":\"" << EscapeJsonString(group_id_str) << "\",";
+        json << "\"group_type\":\"" << EscapeJsonString(CStringToString(group_type)) << "\"";
+        AppendGroupNotifySessionStamp(json, instance_id, session_epoch);
+        json << "}";
+        SendDurableCallbackToDart("groupTypeStored", json.str(),
+                                  "groupTypeStored|" + std::to_string(instance_id) + "|" + group_id_str,
+                                  instance_id);
+    }
+
+    // DartNotifyGroupJoinFailed: the group refused our join (see
+    // V2TIMManagerImpl::HandleGroupJoinFail). The Dart layer drops the group
+    // and tells the user why; chat_id lets it offer a retry with a password.
+    void DartNotifyGroupJoinFailed(const char* group_id, const char* chat_id_hex, const char* reason, bool established, const char* invite_id,
+                                   int64_t instance_id, int64_t session_epoch) {
+        if (!group_id || !reason) return;
+        std::ostringstream json;
+        json << "{";
+        json << "\"callback\":\"groupJoinFailedNotification\",";
+        json << "\"group_id\":\"" << EscapeJsonString(CStringToString(group_id)) << "\",";
+        json << "\"chat_id\":\"" << EscapeJsonString(chat_id_hex ? CStringToString(chat_id_hex) : std::string()) << "\",";
+        json << "\"reason\":\"" << EscapeJsonString(CStringToString(reason)) << "\",";
+        json << "\"established\":" << (established ? "true" : "false") << ",";
+        json << "\"invite_id\":\"" << EscapeJsonString(invite_id ? CStringToString(invite_id) : std::string()) << "\"";
+        AppendGroupNotifySessionStamp(json, instance_id, session_epoch);
+        json << "}";
+        SendCallbackToDart("groupJoinFailedNotification", json.str(), nullptr);
+    }
+
+    // DartNotifyGroupKicked: WE were removed from the group by a moderator.
+    // Same "groupQuitNotification" the voluntary-quit path sends — the Dart
+    // membership cleanup is identical — plus reason=kicked, so the client can
+    // tell a remote-triggered removal from the user's own decision (it must
+    // not destroy the user's local history on someone else's say-so).
+    // Signature: void DartNotifyGroupKicked(const char* group_id, int64_t instance_id, int64_t session_epoch)
+    void DartNotifyGroupKicked(const char* group_id, int64_t instance_id, int64_t session_epoch) {
+        if (!group_id) return;
+        std::string group_id_str = CStringToString(group_id);
+        std::ostringstream json;
+        json << "{";
+        json << "\"callback\":\"groupQuitNotification\",";
+        json << "\"group_id\":\"" << EscapeJsonString(group_id_str) << "\",";
+        json << "\"reason\":\"kicked\"";
+        AppendGroupNotifySessionStamp(json, instance_id, session_epoch);
+        json << "}";
+        SendCallbackToDart("groupQuitNotification", json.str(), nullptr);
+        V2TIM_LOG(kInfo, "DartNotifyGroupKicked: Notification sent for group %s", group_id_str.c_str());
+    }
+
+    // DartNotifyGroupInvite: a group invite is waiting for the user's answer
+    // (auto-accept is off). Carries only the pending id; the Dart layer reads
+    // the details through tim2tox_ffi_get_pending_group_invites.
+    // Signature: void DartNotifyGroupInvite(const char* invite_id, int64_t instance_id, int64_t session_epoch)
+    void DartNotifyGroupInvite(const char* invite_id, int64_t instance_id, int64_t session_epoch) {
+        if (!invite_id) return;
+        std::string invite_id_str = CStringToString(invite_id);
+        std::ostringstream json;
+        json << "{";
+        json << "\"callback\":\"groupInviteNotification\",";
+        json << "\"invite_id\":\"" << EscapeJsonString(invite_id_str) << "\"";
+        AppendGroupNotifySessionStamp(json, instance_id, session_epoch);
+        json << "}";
+        SendCallbackToDart("groupInviteNotification", json.str(), nullptr);
     }
 
     // DartDeleteGroup: Delete group (dismiss group)
@@ -1189,6 +1321,24 @@ extern "C" {
             fflush(stderr);
             SendApiCallbackResult(user_data, ERR_INVALID_PARAMETERS, "group_id is required");
             return 1; // Error
+        }
+
+        // The Dart adapter's transferGroupOwner is SetGroupInfo with only the
+        // owner field. It used to be dropped here, so a transfer reported
+        // success and did nothing. Route it to TransferGroupOwner, which asks
+        // toxcore — and toxcore refuses to hand over FOUNDER, so the caller
+        // gets the real answer.
+        std::string new_owner = ExtractJsonValue(json_str, "group_modify_info_param_owner");
+        if (!new_owner.empty() && new_owner != "null") {
+            SafeGetV2TIMManager()->GetGroupManager()->TransferGroupOwner(
+                V2TIMString(group_id.c_str()), V2TIMString(new_owner.c_str()),
+                new DartCallback(
+                    user_data,
+                    [user_data]() { SendApiCallbackResult(user_data, 0, ""); },
+                    [user_data](int error_code, const V2TIMString& error_message) {
+                        SendApiCallbackResult(user_data, error_code, std::string(error_message.CString()));
+                    }));
+            return 0; // TIM_SUCC (request accepted)
         }
         
         // Create V2TIMGroupInfo

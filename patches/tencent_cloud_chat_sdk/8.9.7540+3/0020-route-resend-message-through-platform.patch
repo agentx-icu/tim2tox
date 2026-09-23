@@ -1,0 +1,39 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: tim2tox-bootstrap <bootstrap@local>
+Date: Thu, 17 Sep 2026 00:00:00 -0700
+Subject: [PATCH] V2TIMMessageManager.reSendMessage: route through the
+ platform like sendMessage
+
+0003 routed `sendMessage`, `createForwardMessage`, `findMessages`,
+`downloadMessage`, ... through `TencentCloudChatSdkPlatform` whenever
+`isPlatformRouted` is true, but left `reSendMessage` on its upstream
+`kIsWeb`-only branch. With a custom platform installed (Tim2ToxSdkPlatform)
+a resend therefore took the binary-replacement path:
+
+  TIMMessageManager.reSendMessage -> findMessages -> DartFindMessages
+    -> V2TIMMessageManagerImpl::FindMessages (always empty: C++ keeps no
+       history) -> "message not found", data == null
+
+so tapping the retry glyph on ANY failed bubble (C2C or group, text or
+media) always failed, and UIKit, which had already swapped the failed row
+for a SENDING copy and only reconciles when `data != null`, left the
+bubble spinning forever. The platform has a complete `reSendMessage`
+(rebuilds the message, including media, from the failed-message store);
+it was simply unreachable.
+
+diff --git a/lib/manager/v2_tim_message_manager.dart b/lib/manager/v2_tim_message_manager.dart
+index d257a16..1957a8b 100644
+--- a/lib/manager/v2_tim_message_manager.dart
++++ b/lib/manager/v2_tim_message_manager.dart
+@@ -1910,7 +1910,7 @@ class V2TIMMessageManager {
+     bool onlineUserOnly = false,
+     Object? webMessageInstatnce
+   }) async {
+-    if (kIsWeb) {
++    if (TencentCloudChatSdkPlatform.instance.isPlatformRouted) {
+       return await TencentCloudChatSdkPlatform.instance
+           .reSendMessage(msgID: msgID, onlineUserOnly: onlineUserOnly, webMessageInstatnce: webMessageInstatnce);
+     }
+-- 
+2.39.0
+

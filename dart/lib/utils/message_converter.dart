@@ -19,8 +19,12 @@ class MessageConverter {
   ///
   /// Extracts relevant fields from V2TimMessage and creates a ChatMessage.
   /// Handles different message types (text, image, video, audio, file).
+  ///
+  /// [receivedAt] is the live-delivery instant (defaults to now); see
+  /// [timestampOf].
   static ChatMessage v2TimMessageToChatMessage(
-      V2TimMessage v2Msg, String selfId) {
+      V2TimMessage v2Msg, String selfId,
+      {DateTime? receivedAt}) {
     // Determine media kind and extract content
     String text = '';
     String? filePath;
@@ -98,13 +102,29 @@ class MessageConverter {
     final isReceived = v2Msg.status == MessageStatus.V2TIM_MSG_STATUS_SEND_SUCC;
     final isRead = v2Msg.isRead ?? false;
 
-    // Get timestamp (convert from seconds to milliseconds)
-    final timestamp = v2Msg.timestamp != null
-        ? DateTime.fromMillisecondsSinceEpoch(v2Msg.timestamp! * 1000)
-        : DateTime.now();
+    final timestamp = timestampOf(v2Msg, receivedAt ?? DateTime.now());
 
     // Get sender ID
     final fromUserId = v2Msg.sender ?? v2Msg.userID ?? '';
+
+    // GH-4: an inbound NGC group message carries toxcore's
+    // Tox_Group_Message_Id in localCustomData. Stamp the same cross-path
+    // alias the poll path derives from its `gtext:` header (both paths see the
+    // sender's per-group public key), so the two copies dedupe EXACTLY and two
+    // genuine identical messages ("ok", "ok") never collapse by content.
+    final groupId = v2Msg.groupID;
+    final toxGroupMsgId =
+        toxGroupMsgIdFromLocalCustomData(v2Msg.localCustomData);
+    final groupAlias = groupId != null &&
+            groupId.isNotEmpty &&
+            fromUserId.isNotEmpty &&
+            toxGroupMsgId != null
+        ? toxGroupMessageAlias(
+            groupId: groupId,
+            senderPk: fromUserId,
+            pseudoMsgId: toxGroupMsgId,
+          )
+        : null;
 
     // Create ChatMessage
     return ChatMessage(
@@ -124,6 +144,28 @@ class MessageConverter {
       cloudCustomData: v2Msg.cloudCustomData,
       contentKind:
           chatMessageContentKindFromLocalCustomData(v2Msg.localCustomData),
+      altMsgIds: [if (groupAlias != null) groupAlias],
     );
+  }
+
+  /// Row timestamp for a V2TIM message. The V2TIM timestamp is whole SECONDS
+  /// (the native layer stamps an inbound message with its receive second),
+  /// while rows minted in Dart are millisecond-precise; truncating put every
+  /// inbound row at `.000` and sorted it BEFORE a self row sent later in the
+  /// same second. When [receivedAt] falls inside (or just past) that second,
+  /// i.e. this is the live delivery, use the receive instant clamped into the
+  /// native second so the stamp never contradicts it. Anything else (a
+  /// replay, an old message) keeps the exact native second.
+  static DateTime timestampOf(V2TimMessage v2Msg, DateTime receivedAt) {
+    final seconds = v2Msg.timestamp;
+    if (seconds == null || seconds <= 0) return receivedAt;
+    final baseMs = seconds * 1000;
+    final receivedMs = receivedAt.millisecondsSinceEpoch;
+    if (receivedMs >= baseMs && receivedMs < baseMs + 2000) {
+      return DateTime.fromMillisecondsSinceEpoch(
+        receivedMs < baseMs + 999 ? receivedMs : baseMs + 999,
+      );
+    }
+    return DateTime.fromMillisecondsSinceEpoch(baseMs);
   }
 }

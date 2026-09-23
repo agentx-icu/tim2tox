@@ -30,6 +30,15 @@ struct SignalingInviteInfo {
     uint64_t deadline_mono_ms;
 };
 
+// Receiver-side record of an invitation (kept until Accept / Reject / Cancel /
+// timeout). The deadline makes an unanswered ring end on the callee even when
+// the caller's expiry packet (SIGNALING_CANCEL) never arrives (caller offline).
+struct ReceivedInviteInfo {
+    uint32_t inviter_friend_number;
+    // Monotonic deadline (ms) derived from the INVITE's timeout; 0 = none.
+    uint64_t deadline_mono_ms;
+};
+
 class V2TIMSignalingManagerImpl : public V2TIMSignalingManager {
 public:
     V2TIMSignalingManagerImpl();
@@ -62,14 +71,25 @@ public:
     uint32_t GetFriendNumber(const V2TIMString& userID);
 
     /**
+     * Drops every per-session invite (sent and received). Called when the
+     * owning V2TIMManagerImpl is un-initialised: the manager object is reused
+     * by the next login, and a stale received invite would otherwise let an
+     * Accept/Reject of the old invite ID address the previous account's
+     * friend number (friend numbers restart per profile).
+     */
+    void ResetSessionState();
+
+    /**
      * Iterate-driven timeout dispatcher.
      *
      * Called from the V2TIMManagerImpl event-thread loop (wall mode) and from
-     * the FFI iterate hook (test mode / virtual clock). Walks active_invites_,
-     * fires OnInvitationTimeout for any whose deadline has passed, then erases
-     * them. Uses the monotonic clock (virtual when test_mode is on) so the
-     * timer advances with the simulator instead of wall time. Safe to call
-     * frequently; no-op when there are no active invites.
+     * the FFI iterate hook (test mode / virtual clock). Walks active_invites_
+     * (sender side: fires OnInvitationTimeout locally AND sends
+     * SIGNALING_TIMEOUT to the invitee) and received_invites_ (receiver side:
+     * fires OnInvitationTimeout locally), erasing expired entries. Uses the
+     * monotonic clock (virtual when test_mode is on) so the timer advances
+     * with the simulator instead of wall time. Safe to call frequently; no-op
+     * when there are no invites with a deadline.
      *
      * Replaces the previous per-invite std::thread + std::this_thread::sleep_for
      * scheme, which blocked the event thread inside Invite() when a previous
@@ -93,8 +113,8 @@ private:
     std::vector<V2TIMSignalingListener*> listeners_;
     // 邀请信息表 (inviteID -> 信息) — 发送方维护
     std::unordered_map<std::string, SignalingInviteInfo> active_invites_;
-    // 接收到的邀请 (inviteID -> inviter_friend_number) — 接收方维护，用于 Accept/Reject
-    std::unordered_map<std::string, uint32_t> received_invites_;
+    // 接收到的邀请 (inviteID -> inviter friend_number + deadline) — 接收方维护，用于 Accept/Reject/超时
+    std::unordered_map<std::string, ReceivedInviteInfo> received_invites_;
     std::mutex mutex_;
     
     // Reference to V2TIMManagerImpl for multi-instance support

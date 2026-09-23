@@ -18,6 +18,10 @@ enum class Type : uint8_t {
     kReceipt = 1,
     kReaction = 2,
     kGenericCustom = 3,
+    // Group identity announcement to a friend: N x 32-byte digests, each
+    // sha256(group chat_id || our per-group public key). See
+    // V2TIMManagerImpl::AnnounceGroupIdentities.
+    kGroupIdentity = 4,
 };
 
 struct Packet {

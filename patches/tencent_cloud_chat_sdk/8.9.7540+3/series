@@ -30,3 +30,6 @@
 0017-global-callback-dispatch-crash-safety.patch
 0018-immutable-explicit-native-library-path.patch
 0019-delete-friend-callback-decode.patch
+0020-route-resend-message-through-platform.patch
+0021-group-private-message-receiver.patch
+0022-send-message-buffer-lifetime.patch

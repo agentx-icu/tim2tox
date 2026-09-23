@@ -293,13 +293,16 @@ void main() {
           advanceMs: 5000, iterationsPerInstance: 1);
 
       final privateMessageText = 'Don\'t spill yer beans';
+      // A whisper keeps its place in the group conversation but is marked
+      // private in its text, so it can never pass for a public line.
+      final receivedText = '\u{1F512} $privateMessageText';
       final completer = Completer<V2TimMessage>();
 
       // Set up message listener on member1's instance
       final listener = V2TimAdvancedMsgListener(
         onRecvNewMessage: (V2TimMessage message) {
           if (message.groupID == groupId &&
-              message.textElem?.text == privateMessageText) {
+              message.textElem?.text == receivedText) {
             member1.addReceivedMessage(message);
             if (!completer.isCompleted) {
               completer.complete(message);
@@ -358,13 +361,66 @@ void main() {
         );
         final receivedMessage = await completer.future;
         expect(receivedMessage.groupID, equals(groupId));
-        expect(receivedMessage.textElem?.text, equals(privateMessageText));
+        expect(receivedMessage.textElem?.text, equals(receivedText));
       } finally {
         member1.runWithInstance(() {
           TIMMessageManager.instance.removeAdvancedMsgListener(listener: listener);
         });
       }
     }, timeout: const Timeout(Duration(seconds: 90)));
+
+    test('Group private media and custom messages are refused', () async {
+      // receiver + groupID is a group-private message: the receiver is the
+      // member's per-group key, not a friend. Media and custom elements have
+      // no group-private transport, so they must be refused with
+      // ERR_SDK_INTERFACE_NOT_SUPPORT — never turned into a C2C stand-in
+      // addressed to that per-group key.
+      const errSdkInterfaceNotSupport = 7013;
+      final memberListResult = await founder.runWithInstanceAsync(() async =>
+          TIMGroupManager.instance.getGroupMemberList(
+            groupID: groupId!,
+            filter: GroupMemberFilterTypeEnum.V2TIM_GROUP_MEMBER_FILTER_ALL,
+            nextSeq: '0',
+            count: 100,
+          ));
+      expect(memberListResult.code, equals(0),
+          reason: 'getGroupMemberList failed: ${memberListResult.code}');
+      final founderPublicKey = founder.getToxId().substring(0, 64);
+      final others = (memberListResult.data?.memberInfoList ?? [])
+          .where((m) => m.userID != founderPublicKey)
+          .toList();
+      final receiverUserID =
+          others.isNotEmpty ? others.first.userID : member1.getPublicKey();
+
+      final fileResult = await founder.runWithInstanceAsync(() async {
+        final created = TIMMessageManager.instance.createFileMessage(
+            filePath: '/tmp/tim2tox_group_private_media.bin',
+            fileName: 'tim2tox_group_private_media.bin');
+        return TIMMessageManager.instance.sendMessage(
+          message: created.messageInfo!,
+          receiver: receiverUserID,
+          groupID: groupId!,
+          onlineUserOnly: false,
+        );
+      });
+      expect(fileResult.code, equals(errSdkInterfaceNotSupport),
+          reason: 'group-private file must be refused, got '
+              '${fileResult.code} ${fileResult.desc}');
+
+      final customResult = await founder.runWithInstanceAsync(() async {
+        final created = TIMMessageManager.instance.createCustomMessage(
+            data: '{"type":"group_private_custom"}');
+        return TIMMessageManager.instance.sendMessage(
+          message: created.messageInfo!,
+          receiver: receiverUserID,
+          groupID: groupId!,
+          onlineUserOnly: false,
+        );
+      });
+      expect(customResult.code, equals(errSdkInterfaceNotSupport),
+          reason: 'group-private custom must be refused, got '
+              '${customResult.code} ${customResult.desc}');
+    }, timeout: const Timeout(Duration(seconds: 60)));
 
     test('Group custom message', () async {
       // Wait for group to be ready (virtual)

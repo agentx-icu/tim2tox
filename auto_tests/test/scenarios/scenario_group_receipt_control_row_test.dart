@@ -19,7 +19,10 @@
 
 import 'dart:convert';
 
+import 'package:ffi/ffi.dart' as pkgffi;
 import 'package:test/test.dart';
+import 'package:tencent_cloud_chat_sdk/enum/group_member_filter_enum.dart';
+import 'package:tim2tox_dart/ffi/tim2tox_ffi.dart' as ffi_lib;
 import 'package:tencent_cloud_chat_sdk/native_im/adapter/tim_manager.dart';
 import 'package:tencent_cloud_chat_sdk/native_im/adapter/tim_group_manager.dart';
 import 'package:tencent_cloud_chat_sdk/native_im/adapter/tim_message_manager.dart';
@@ -156,6 +159,139 @@ void main() {
       await scenario.dispose();
       await teardownTestEnvironment();
     });
+
+    /// The founder's view of the group: member key -> proven friend (upper
+    /// case), for every member except the founder itself.
+    Future<Map<String, String?>> founderMemberFriends() async {
+      final svc =
+          (TencentCloudChatSdkPlatform.instance as Tim2ToxSdkPlatform)
+              .ffiService;
+      final founderPk = founder.getPublicKey().toUpperCase();
+      final list = await founder.runWithInstanceAsync(() async =>
+          TIMGroupManager.instance.getGroupMemberList(
+            groupID: groupId!,
+            filter: GroupMemberFilterTypeEnum.V2TIM_GROUP_MEMBER_FILTER_ALL,
+            nextSeq: '0',
+            count: 100,
+          ));
+      final out = <String, String?>{};
+      for (final m in list.data?.memberInfoList ?? const []) {
+        final key = m.userID;
+        if (key.length < 64 || key.toUpperCase().startsWith(founderPk)) {
+          continue;
+        }
+        out[key] = founder
+            .runWithInstance(() => svc.friendForGroupMemberKey(key))
+            ?.toUpperCase();
+      }
+      return out;
+    }
+
+    // MM-6 end to end: the founder is friends with both members, so each
+    // member's per-group key must resolve to that friend (hint over the friend
+    // channel -> challenge -> NGC private proof). Pins that the bounded,
+    // index-based matcher still finds every legitimate member.
+    test('MM-6: the founder resolves each member key to its friend', () async {
+      final expected = {
+        member1.getPublicKey().toUpperCase(),
+        member2.getPublicKey().toUpperCase(),
+      };
+      var resolved = <String, String?>{};
+      final deadline = DateTime.now().add(const Duration(seconds: 90));
+      while (DateTime.now().isBefore(deadline)) {
+        resolved = await founderMemberFriends();
+        if (resolved.values.whereType<String>().toSet().containsAll(expected)) {
+          break;
+        }
+        await pumpTestTick(scenario, advanceMs: 500, iterationsPerInstance: 2);
+        if (!shouldRunVirtual) {
+          await Future<void>.delayed(const Duration(milliseconds: 250));
+        }
+      }
+      // ignore: avoid_print
+      print('[mm6] founder member->friend: $resolved');
+      expect(resolved.values.whereType<String>().toSet(), equals(expected),
+          reason: 'every member key must be proven to exactly its friend');
+    }, timeout: const Timeout(Duration(seconds: 150)));
+
+    // A member can replay one valid kind-2 receipt as often as it likes. The
+    // receiving native side must forward it ONCE (per group, authenticated
+    // sender, msgID and receipt type); a different type or msgID is not a
+    // replay. Counted at Dart's control ingest, before any authorization gate.
+    test('a replayed private group receipt reaches Dart once', () async {
+      final svc =
+          (TencentCloudChatSdkPlatform.instance as Tim2ToxSdkPlatform)
+              .ffiService;
+      final member1Pk = member1.getPublicKey().toUpperCase();
+      final member1Key = (await founderMemberFriends())
+          .entries
+          .where((e) => e.value == member1Pk)
+          .map((e) => e.key)
+          .firstOrNull;
+      expect(member1Key, isNotNull,
+          reason: 'needs the member key the MM-6 test proved');
+
+      final lib = ffi_lib.Tim2ToxFfi.open();
+      int sendReceipt(String msgId, String type) =>
+          founder.runWithInstance(() {
+            final gid = groupId!.toNativeUtf8();
+            final author = member1Key!.toNativeUtf8();
+            final id = msgId.toNativeUtf8();
+            final kind = type.toNativeUtf8();
+            try {
+              return lib.sendGroupReceiptNative(0, gid, author, id, kind);
+            } finally {
+              pkgffi.malloc.free(gid);
+              pkgffi.malloc.free(author);
+              pkgffi.malloc.free(id);
+              pkgffi.malloc.free(kind);
+            }
+          });
+      int received() => svc.receiptDiag['groupReceiptsIn'] ?? 0;
+      Future<void> settle() async {
+        for (var i = 0; i < 12; i++) {
+          await pumpTestTick(scenario, advanceMs: 250, iterationsPerInstance: 2);
+          if (!shouldRunVirtual) {
+            await Future<void>.delayed(const Duration(milliseconds: 100));
+          }
+        }
+      }
+
+      await settle(); // drain whatever earlier traffic is still in flight
+      final before = received();
+      final msgId = 'replay-probe-${DateTime.now().microsecondsSinceEpoch}';
+      for (var i = 0; i < 4; i++) {
+        expect(sendReceipt(msgId, 'read'), equals(1),
+            reason: 'copy ${i + 1} must leave the sender');
+      }
+      await waitUntilWithVirtualPump(
+        scenario,
+        () => received() > before,
+        timeout: const Duration(seconds: 30),
+        description: 'the first copy reaches Dart',
+        advanceMs: 100,
+        iterationsPerInstance: 2,
+      );
+      await settle();
+      expect(received() - before, equals(1),
+          reason: 'three replays of the same receipt must be dropped natively');
+
+      expect(sendReceipt(msgId, 'received'), equals(1));
+      expect(sendReceipt('$msgId-b', 'read'), equals(1));
+      await waitUntilWithVirtualPump(
+        scenario,
+        () => received() >= before + 3,
+        timeout: const Duration(seconds: 30),
+        description: 'distinct receipts are all forwarded',
+        advanceMs: 100,
+        iterationsPerInstance: 2,
+      );
+      await settle();
+      // ignore: avoid_print
+      print('[replay] groupReceiptsIn delta=${received() - before}');
+      expect(received() - before, equals(3),
+          reason: 'another type or msgID is a new receipt, not a replay');
+    }, timeout: const Timeout(Duration(seconds: 150)));
 
     test('group traffic never leaves a control-JSON row in history', () async {
       final platform =

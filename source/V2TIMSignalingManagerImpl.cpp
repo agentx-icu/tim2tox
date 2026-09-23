@@ -73,6 +73,7 @@ void V2TIMSignalingManagerImpl::OnToxMessage(uint32_t friend_number,
             std::string invite_id_copy = packet.inviteID;
             uint32_t fn = friend_number;
             std::string data_copy = packet.data;
+            uint32_t timeout_s = packet.timeout;
             V2TIMManagerImpl* manager_impl = nullptr;
             {
                 std::lock_guard<std::mutex> lock(manager_impl_mutex_);
@@ -81,7 +82,7 @@ void V2TIMSignalingManagerImpl::OnToxMessage(uint32_t friend_number,
             V2TIM_LOG(kInfo, "[Signaling] OnToxMessage INVITE received: manager_impl={}, friend_number={}, invite_id={}",
                       (void*)manager_impl, (unsigned)friend_number, packet.inviteID);
             if (manager_impl) {
-                manager_impl->PostToEventThread([this, invite_id_copy, fn, data_copy, manager_impl]() {
+                manager_impl->PostToEventThread([this, invite_id_copy, fn, data_copy, timeout_s, manager_impl]() {
                     std::string inviter_str = GetUserIDFromFriendNumber(fn);
                     V2TIMString info_inviteID(invite_id_copy.c_str());
                     V2TIMString info_inviter(inviter_str.c_str());
@@ -102,9 +103,16 @@ void V2TIMSignalingManagerImpl::OnToxMessage(uint32_t friend_number,
                     V2TIMString info_groupID(group_id_parsed.c_str());
                     V2TIMString info_data(data_parsed.c_str());
                     V2TIMStringVector empty_vec;
+                    // Callee-side deadline from the invite's own timeout, so a
+                    // ring ends even if the caller's TIMEOUT packet never comes.
+                    ReceivedInviteInfo received{fn, 0};
+                    if (timeout_s > 0) {
+                        received.deadline_mono_ms =
+                            NowMonoMs(manager_impl) + static_cast<uint64_t>(timeout_s) * 1000ULL;
+                    }
                     {
                         std::lock_guard<std::mutex> lock(mutex_);
-                        received_invites_[invite_id_copy] = fn;  // 接收方保存 invite_id -> inviter friend_number，供 Accept/Reject 使用
+                        received_invites_[invite_id_copy] = received;  // 接收方保存 invite_id -> inviter friend_number(+超时)，供 Accept/Reject 使用
                         size_t n_listeners = listeners_.size();
                         V2TIM_LOG(kInfo, "[Signaling] Task running: signaling_impl={}, manager_impl={}, listeners_.size()={}",
                                   (void*)this, (void*)manager_impl, n_listeners);
@@ -189,7 +197,38 @@ void V2TIMSignalingManagerImpl::OnToxMessage(uint32_t friend_number,
             break;
         }
         case SIGNALING_TIMEOUT: {
-            // 处理超时信令
+            // The inviter's deadline passed: end the ring here too. Only an
+            // invite still pending on this side (not yet accepted / rejected /
+            // cancelled) fires, and only from its inviter.
+            // CheckTimeouts() itself sends CANCEL rather than this type (older
+            // peers ignore TIMEOUT — see the comment there); this handler stays
+            // so a peer that does send it is understood.
+            std::string invite_id_copy = packet.inviteID;
+            uint32_t fn = friend_number;
+            V2TIMManagerImpl* manager_impl = nullptr;
+            {
+                std::lock_guard<std::mutex> lock(manager_impl_mutex_);
+                manager_impl = manager_impl_;
+            }
+            if (manager_impl) {
+                manager_impl->PostToEventThread([this, invite_id_copy, fn]() {
+                    std::vector<V2TIMSignalingListener*> listeners_copy;
+                    {
+                        std::lock_guard<std::mutex> lock(mutex_);
+                        auto it = received_invites_.find(invite_id_copy);
+                        if (it == received_invites_.end() || it->second.inviter_friend_number != fn) {
+                            return;
+                        }
+                        received_invites_.erase(it);
+                        listeners_copy = listeners_;
+                    }
+                    V2TIMString info_inviteID(invite_id_copy.c_str());
+                    V2TIMStringVector empty_vec;
+                    for (auto* listener : listeners_copy) {
+                        if (listener) listener->OnInvitationTimeout(info_inviteID, empty_vec);
+                    }
+                });
+            }
             break;
         }
         // ... 其他类型
@@ -213,13 +252,18 @@ void V2TIMSignalingManagerImpl::SetManagerImpl(V2TIMManagerImpl* manager_impl) {
         old_impl = manager_impl_;
     }
     if (manager_impl != old_impl) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        active_invites_.clear();
+        ResetSessionState();
     }
     {
         std::lock_guard<std::mutex> lock(manager_impl_mutex_);
         manager_impl_ = manager_impl;
     }
+}
+
+void V2TIMSignalingManagerImpl::ResetSessionState() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    active_invites_.clear();
+    received_invites_.clear();
 }
 
 V2TIMSignalingManagerImpl::~V2TIMSignalingManagerImpl() {
@@ -228,17 +272,23 @@ V2TIMSignalingManagerImpl::~V2TIMSignalingManagerImpl() {
     // are dropped along with the map when this manager is destroyed.
 }
 
+// Idempotent: the dart_compat layer registers the same per-instance listener
+// once per callback setter (six of them), and every re-login registers it
+// again. A duplicate entry would deliver every signaling event once per
+// registration (six busy rejects for one invite, six timeouts, ...).
 void V2TIMSignalingManagerImpl::AddSignalingListener(V2TIMSignalingListener* listener) {
+    if (!listener) return;
     std::lock_guard<std::mutex> lock(mutex_);
+    if (std::find(listeners_.begin(), listeners_.end(), listener) != listeners_.end()) {
+        return;
+    }
     listeners_.push_back(listener);
 }
 
+// Removes every occurrence, so no stale registration can survive a remove.
 void V2TIMSignalingManagerImpl::RemoveSignalingListener(V2TIMSignalingListener* listener) {
     std::lock_guard<std::mutex> lock(mutex_);
-    auto it = std::find(listeners_.begin(), listeners_.end(), listener);
-    if (it != listeners_.end()) {
-        listeners_.erase(it);
-    }
+    listeners_.erase(std::remove(listeners_.begin(), listeners_.end(), listener), listeners_.end());
 }
 
 V2TIMString V2TIMSignalingManagerImpl::Invite(const V2TIMString& invitee, const V2TIMString& data,
@@ -339,33 +389,65 @@ void V2TIMSignalingManagerImpl::CheckTimeouts() {
         manager_impl = manager_impl_;
     }
     const uint64_t now_ms = NowMonoMs(manager_impl);
-    std::vector<std::string> expired_ids;
+    // Sender side: (inviteID, invitee friend number) whose ring expired.
+    std::vector<std::pair<std::string, uint32_t>> expired_sent;
+    // Receiver side: invites whose caller never ended them (caller offline /
+    // TIMEOUT packet lost) — the callee must stop ringing on its own.
+    std::vector<std::string> expired_received;
     std::vector<V2TIMSignalingListener*> listeners_copy;
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (active_invites_.empty()) return;
+        if (active_invites_.empty() && received_invites_.empty()) return;
         for (auto& kv : active_invites_) {
             const SignalingInviteInfo& info = kv.second;
             if (info.deadline_mono_ms == 0) continue;  // no timeout requested
             if (now_ms >= info.deadline_mono_ms) {
-                expired_ids.push_back(kv.first);
+                expired_sent.emplace_back(kv.first, info.sender_friend_number);
             }
         }
-        if (expired_ids.empty()) return;
+        for (auto& kv : received_invites_) {
+            if (kv.second.deadline_mono_ms != 0 && now_ms >= kv.second.deadline_mono_ms) {
+                expired_received.push_back(kv.first);
+            }
+        }
+        if (expired_sent.empty() && expired_received.empty()) return;
         // Erase before dispatching so a re-entrant Cancel/Accept from the
         // listener can't double-erase or hit a stale entry.
-        for (const auto& id : expired_ids) {
-            active_invites_.erase(id);
+        for (const auto& entry : expired_sent) {
+            active_invites_.erase(entry.first);
+        }
+        for (const auto& id : expired_received) {
+            received_invites_.erase(id);
         }
         listeners_copy = listeners_;
     }
-    for (const auto& id : expired_ids) {
+    // Tell each invitee its ring is over (outside mutex_, like Cancel's send
+    // but without holding the lock across the Tox call). Best effort: if it
+    // is lost the invitee's own deadline above still ends the ring.
+    //
+    // CANCEL, not SIGNALING_TIMEOUT, deliberately: a peer built before the
+    // callee-side deadline existed has an EMPTY handler for TIMEOUT (it only
+    // ever logged it) and no deadline of its own, so its phone would ring
+    // until the user answered a call that no longer exists. CANCEL is
+    // understood by every build — it is the invitee-visible meaning of "the
+    // caller gave up" — and a current peer treats either as the end of the
+    // ring (whichever of the packet and its own deadline lands first).
+    for (const auto& entry : expired_sent) {
+        SignalingPacket packet;
+        packet.type = SIGNALING_CANCEL;
+        packet.inviteID = entry.first;
+        packet.timeout = 0;
+        SendToxPacket(entry.second, packet);
+    }
+    auto dispatch = [&listeners_copy](const std::string& id) {
         V2TIMString info_inviteID(id.c_str());
         V2TIMStringVector empty_vec;
         for (auto* listener : listeners_copy) {
             if (listener) listener->OnInvitationTimeout(info_inviteID, empty_vec);
         }
-    }
+    };
+    for (const auto& entry : expired_sent) dispatch(entry.first);
+    for (const auto& id : expired_received) dispatch(id);
 }
 
 V2TIMString V2TIMSignalingManagerImpl::InviteInGroup(const V2TIMString& groupID,
@@ -433,7 +515,7 @@ void V2TIMSignalingManagerImpl::Accept(const V2TIMString& inviteID, const V2TIMS
         packet.type = SIGNALING_ACCEPT;
         packet.inviteID = id_str;
         packet.data = data.CString() ? data.CString() : "";
-        SendToxPacket(recv_it->second, packet);
+        SendToxPacket(recv_it->second.inviter_friend_number, packet);
         received_invites_.erase(recv_it);
         if (callback) callback->OnSuccess();
         return;
@@ -463,7 +545,7 @@ void V2TIMSignalingManagerImpl::Reject(const V2TIMString& inviteID, const V2TIMS
         packet.type = SIGNALING_REJECT;
         packet.inviteID = id_str;
         packet.data = data.CString() ? data.CString() : "";
-        SendToxPacket(recv_it->second, packet);
+        SendToxPacket(recv_it->second.inviter_friend_number, packet);
         received_invites_.erase(recv_it);
         if (callback) callback->OnSuccess();
         return;

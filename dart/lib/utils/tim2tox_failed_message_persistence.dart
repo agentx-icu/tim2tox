@@ -43,6 +43,20 @@ class Tim2ToxFailedMessagePersistence {
     return '${_persistenceKey}_$accountToxId';
   }
 
+  /// The account's own key, or null when there is no account.
+  ///
+  /// Normal reads and writes NEVER fall back to the unsuffixed
+  /// `tencent_cloud_chat_failed_messages` key. Rows there were written
+  /// before account scoping and carry no owner, so any account reading them
+  /// could show — and resend, as itself — another account's failed messages
+  /// (pre #5 / #2). Nothing writes that key any more; it is left untouched
+  /// for an explicit, provenance-aware migration (and
+  /// [clearAllFailedMessages] with no account still clears it).
+  static String? _accountKey(String? accountToxId) {
+    if (accountToxId == null || accountToxId.isEmpty) return null;
+    return _storageKey(accountToxId);
+  }
+
   /// Legacy (pre-H12) storage key — first 16 chars of Tox ID. Returns null
   /// if the account has no legacy key (no accountToxId, or shorter than the
   /// legacy prefix length — those were stored verbatim under the new key).
@@ -283,10 +297,11 @@ class Tim2ToxFailedMessagePersistence {
     try {
       final conversationKey = groupID ?? userID ?? '';
       if (conversationKey.isEmpty) return;
+      final key = _accountKey(accountToxId);
+      if (key == null) return; // No owner: never write the shared key.
 
       final prefs = await SharedPreferences.getInstance();
       await _migrateLegacyPrefixKey(prefs, accountToxId);
-      final key = _storageKey(accountToxId);
       final failedMessagesMap =
           _decodeStore(prefs.getString(key)) ?? <String, dynamic>{};
       final rawRows = failedMessagesMap[conversationKey];
@@ -325,9 +340,10 @@ class Tim2ToxFailedMessagePersistence {
     String? accountToxId,
   }) async {
     try {
+      final key = _accountKey(accountToxId);
+      if (key == null) return;
       final prefs = await SharedPreferences.getInstance();
       await _migrateLegacyPrefixKey(prefs, accountToxId);
-      final key = _storageKey(accountToxId);
       final jsonString = prefs.getString(key);
       if (jsonString == null || jsonString.isEmpty) return;
 
@@ -377,10 +393,11 @@ class Tim2ToxFailedMessagePersistence {
     String? accountToxId,
   }) async {
     if (messageIDs.isEmpty) return 0;
+    final key = _accountKey(accountToxId);
+    if (key == null) return 0;
     try {
       final prefs = await SharedPreferences.getInstance();
       await _migrateLegacyPrefixKey(prefs, accountToxId);
-      final key = _storageKey(accountToxId);
       final failedMessagesMap = _decodeStore(prefs.getString(key));
       if (failedMessagesMap == null || failedMessagesMap.isEmpty) return 0;
 
@@ -414,33 +431,55 @@ class Tim2ToxFailedMessagePersistence {
     }
   }
 
+  /// Drop every failed row stored under [conversationKeys] (clear history /
+  /// delete conversation). Failed rows are merged back into the reloaded chat,
+  /// so a cleared conversation must lose them too or they would reappear.
+  /// Returns the number of rows removed.
+  static Future<int> removeFailedMessagesForConversation({
+    required Set<String> conversationKeys,
+    String? accountToxId,
+  }) async {
+    if (conversationKeys.isEmpty) return 0;
+    final key = _accountKey(accountToxId);
+    if (key == null) return 0;
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await _migrateLegacyPrefixKey(prefs, accountToxId);
+      final failedMessagesMap = _decodeStore(prefs.getString(key));
+      if (failedMessagesMap == null || failedMessagesMap.isEmpty) return 0;
+      var removed = 0;
+      for (final conversationKey in conversationKeys) {
+        final rows = failedMessagesMap.remove(conversationKey);
+        if (rows is List) removed += rows.length;
+      }
+      if (removed > 0) {
+        await prefs.setString(key, json.encode(failedMessagesMap));
+      }
+      return removed;
+    } catch (e) {
+      return 0;
+    }
+  }
+
   /// Find one failed row by either `id` or `msgID` within the scoped account.
   static Future<FailedMessageLookupResult?> findFailedMessageByID({
     required String messageID,
     String? accountToxId,
   }) async {
     if (messageID.isEmpty) return null;
+    final key = _accountKey(accountToxId);
+    if (key == null) return null;
     try {
       final prefs = await SharedPreferences.getInstance();
       await _migrateLegacyPrefixKey(prefs, accountToxId);
-      final scoped = _findInStore(
-        store: _decodeStore(prefs.getString(_storageKey(accountToxId))),
+      // The account's own key only. The pre-scoping base key used to be a
+      // fallback here, which let account B find — and resend as itself — a
+      // row account A had failed to send (see [_accountKey]).
+      return _findInStore(
+        store: _decodeStore(prefs.getString(key)),
         messageID: messageID,
         accountToxId: accountToxId,
       );
-      if (scoped != null) return scoped;
-
-      // Pre-account-scoping builds stored rows under the unscoped base key.
-      // Preserve that compatibility fallback without scanning another
-      // account's full-ID key.
-      if (accountToxId != null && accountToxId.isNotEmpty) {
-        return _findInStore(
-          store: _decodeStore(prefs.getString(_persistenceKey)),
-          messageID: messageID,
-          accountToxId: null,
-        );
-      }
-      return null;
     } catch (e) {
       return null;
     }
@@ -454,9 +493,10 @@ class Tim2ToxFailedMessagePersistence {
     String? accountToxId,
   }) async {
     try {
+      final key = _accountKey(accountToxId);
+      if (key == null) return [];
       final prefs = await SharedPreferences.getInstance();
       await _migrateLegacyPrefixKey(prefs, accountToxId);
-      final key = _storageKey(accountToxId);
       final jsonString = prefs.getString(key);
       if (jsonString == null || jsonString.isEmpty) return [];
 

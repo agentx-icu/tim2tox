@@ -11,6 +11,51 @@
 #include <stdexcept>
 #include <vector>
 
+// Legacy conferences and NGC groups are numbered by toxcore in two independent
+// spaces that both start at 0, so conference #0 and NGC group #0 routinely
+// coexist. Tim2Tox keeps one groupID <-> number map for both kinds; to keep the
+// keys disjoint, a conference is stored under its number with the high bit set.
+// A tagged key handed to a tox_group_* API fails its lookup (NGC numbers are
+// small indices), so a kind mix-up degrades to an error instead of acting on
+// the other group. Conference wrappers below strip the tag, and every direct
+// tox_conference_* / toxav_group* call must pass ConferenceNumberFromKey().
+constexpr uint32_t kConferenceMapKeyTag = 0x80000000u;
+inline uint32_t ConferenceMapKey(uint32_t conference_number) {
+    return conference_number == UINT32_MAX ? UINT32_MAX
+                                           : (conference_number | kConferenceMapKeyTag);
+}
+inline bool IsConferenceMapKey(uint32_t key) {
+    return key != UINT32_MAX && (key & kConferenceMapKeyTag) != 0;
+}
+inline uint32_t ConferenceNumberFromKey(uint32_t key) {
+    return key == UINT32_MAX ? UINT32_MAX : (key & ~kConferenceMapKeyTag);
+}
+
+// Marks "this thread is inside a tox_iterate()/toxav_iterate()" and carries a
+// per-thread queue of work that must not run from inside a callback. Tox and
+// ToxAV callbacks run synchronously on the iterating thread while it holds the
+// iterate's NON-recursive lock and while toxcore is still walking the objects
+// that fired them. A callback that tears down (UnInitSDK, ToxManager/
+// ToxAVManager::shutdown) would re-lock that mutex, join its own thread, or
+// free the Tox/ToxAV under the running iterate. Such calls Defer() themselves
+// instead; the queue runs on the same thread as soon as its OUTERMOST scope
+// exits. Every iterate()/shutdown() that sets an iterate owner declares a
+// scope as its FIRST local, so the deferred work runs after all of that
+// function's locks are released and after its last member access.
+class IterateReentryScope {
+public:
+    IterateReentryScope();
+    ~IterateReentryScope();
+    IterateReentryScope(const IterateReentryScope&) = delete;
+    IterateReentryScope& operator=(const IterateReentryScope&) = delete;
+
+    // True while the calling thread is inside any scope.
+    static bool Active();
+    // Queue fn to run on this thread once its outermost scope exits. Returns
+    // false (fn dropped) when no scope is active on this thread.
+    static bool Defer(std::function<void()> fn);
+};
+
 class ToxManager {
 public:
     // 删除拷贝构造函数和赋值运算符
@@ -42,6 +87,18 @@ public:
     // single-instance path is unchanged.
     void setTcpRelayServerAllowed(bool allowed) { tcp_relay_server_allowed_ = allowed; }
 
+    // Preferred UDP bind range for this instance's tox_new (start..end,
+    // inclusive; toxcore binds the first free port). 0/0 = toxcore default.
+    // Lives HERE, next to the other tox_new-time knobs, because both
+    // initialize() and loadFrom() reach tox_new and loadFrom builds its own
+    // Tox_Options — an option set only on the caller's Tox_Options would be
+    // dropped on every profile reload. Used by LAN bootstrap nodes to honour
+    // the user's chosen port.
+    void setUdpPortRange(uint16_t start_port, uint16_t end_port) {
+        udp_start_port_ = start_port;
+        udp_end_port_ = end_port;
+    }
+
     // 核心功能接口
     Tox* getTox() const;
     void iterate(uint32_t timeout = 0);
@@ -55,10 +112,15 @@ public:
     // thread (from inside a tox callback) it returns an unowned lock: the
     // caller is already serialized with the iterate by construction.
     std::unique_lock<std::mutex> lockIterate() {
-        if (iterate_owner_.load(std::memory_order_acquire) == std::this_thread::get_id()) {
+        if (isIterateOwner()) {
             return std::unique_lock<std::mutex>();
         }
         return std::unique_lock<std::mutex>(iterate_mutex_);
+    }
+    // True when the calling thread holds iterate_mutex_ inside iterate() or
+    // shutdown(), i.e. it is running a tox callback of this instance.
+    bool isIterateOwner() const {
+        return iterate_owner_.load(std::memory_order_acquire) == std::this_thread::get_id();
     }
 
     // 数据保存和加载
@@ -137,6 +199,8 @@ public:
     Tox_Group_Role getGroupMemberRole(Tox_Group_Number group_number, Tox_Group_Peer_Number peer_id,
                                      Tox_Err_Group_Peer_Query* error = nullptr);
     Tox_Group_Role getSelfRole(Tox_Group_Number group_number, Tox_Err_Group_Self_Query* error = nullptr);
+    Tox_Group_Topic_Lock getGroupTopicLock(Tox_Group_Number group_number,
+                                           Tox_Err_Group_State_Query* error = nullptr);
     bool getGroupPeerPublicKey(Tox_Group_Number group_number, Tox_Group_Peer_Number peer_id,
                               uint8_t public_key[TOX_PUBLIC_KEY_SIZE],
                               Tox_Err_Group_Peer_Query* error = nullptr);
@@ -189,7 +253,8 @@ public:
     using GroupConnectedCallback = std::function<void(uint32_t)>;
     
     // Tox group callbacks
-    using GroupInviteGroupCallback = std::function<void(Tox_Friend_Number, const uint8_t*, size_t)>;
+    // (friend_number, invite_data, invite_data_length, group_name)
+    using GroupInviteGroupCallback = std::function<void(Tox_Friend_Number, const uint8_t*, size_t, const std::string&)>;
     using GroupMessageGroupCallback = std::function<void(Tox_Group_Number, Tox_Group_Peer_Number, TOX_MESSAGE_TYPE, const uint8_t*, size_t, Tox_Group_Message_Id)>;
     using GroupCustomPacketCallback = std::function<void(Tox_Group_Number, Tox_Group_Peer_Number, const uint8_t*, size_t)>;
     using GroupPrivateMessageGroupCallback = std::function<void(Tox_Group_Number, Tox_Group_Peer_Number, TOX_MESSAGE_TYPE, const uint8_t*, size_t, Tox_Group_Message_Id)>;
@@ -233,6 +298,8 @@ public:
     void setGroupInviteGroupCallback(GroupInviteGroupCallback cb);
     void setGroupMessageGroupCallback(GroupMessageGroupCallback cb);
     void setGroupCustomPacketCallback(GroupCustomPacketCallback cb);
+    // Same shape as the broadcast custom packet, addressed to us alone.
+    void setGroupCustomPrivatePacketCallback(GroupCustomPacketCallback cb);
     void setGroupPrivateMessageGroupCallback(GroupPrivateMessageGroupCallback cb);
     void setGroupTopicCallback(GroupTopicCallback cb);
     void setGroupPeerNameGroupCallback(GroupPeerNameGroupCallback cb);
@@ -273,6 +340,7 @@ public:
     static void onGroupInviteGroup(Tox* tox, Tox_Friend_Number friend_number, const uint8_t* invite_data, size_t invite_data_length, const uint8_t* group_name, size_t group_name_length, void* user_data);
     static void onGroupMessageGroup(Tox* tox, Tox_Group_Number group_number, Tox_Group_Peer_Number peer_id, TOX_MESSAGE_TYPE type, const uint8_t* message, size_t length, Tox_Group_Message_Id message_id, void* user_data);
     static void onGroupCustomPacket(Tox* tox, Tox_Group_Number group_number, Tox_Group_Peer_Number peer_id, const uint8_t* data, size_t length, void* user_data);
+    static void onGroupCustomPrivatePacket(Tox* tox, Tox_Group_Number group_number, Tox_Group_Peer_Number peer_id, const uint8_t* data, size_t length, void* user_data);
     static void onGroupPrivateMessage(Tox* tox, Tox_Group_Number group_number, Tox_Group_Peer_Number peer_id, TOX_MESSAGE_TYPE type, const uint8_t* message, size_t message_length, Tox_Group_Message_Id message_id, void* user_data);
     static void onGroupTopic(Tox* tox, Tox_Group_Number group_number, Tox_Group_Peer_Number peer_id, const uint8_t* topic, size_t length, void* user_data);
     static void onGroupPeerNameGroup(Tox* tox, Tox_Group_Number group_number, Tox_Group_Peer_Number peer_id, const uint8_t* name, size_t length, void* user_data);
@@ -321,8 +389,11 @@ private:
     mutable std::mutex mutex_;
     std::mutex iterate_mutex_;  // Serialize tox_iterate - toxcore requires single-threaded access per instance
     std::atomic<std::thread::id> iterate_owner_{};  // thread holding iterate_mutex_ inside iterate()/shutdown() (see lockIterate)
+    std::shared_ptr<int> alive_token_ = std::make_shared<int>(0);  // lets a deferred shutdown() see that this object is gone
     std::atomic<bool> is_shutting_down_{false};  // Flag to prevent double cleanup; atomic for lock-free read in iterate()
     bool tcp_relay_server_allowed_{true};  // see setTcpRelayServerAllowed
+    uint16_t udp_start_port_{0};  // see setUdpPortRange
+    uint16_t udp_end_port_{0};
 
     // 回调存储
     SelfConnectionStatusCallback self_connection_status_cb_;
@@ -349,6 +420,7 @@ private:
     GroupInviteGroupCallback group_invite_group_cb_;
     GroupMessageGroupCallback group_message_group_cb_;
     GroupCustomPacketCallback group_custom_packet_cb_;
+    GroupCustomPacketCallback group_custom_private_packet_cb_;
     GroupPrivateMessageGroupCallback group_private_message_group_cb_;
     GroupTopicCallback group_topic_cb_;
     GroupPeerNameGroupCallback group_peer_name_group_cb_;

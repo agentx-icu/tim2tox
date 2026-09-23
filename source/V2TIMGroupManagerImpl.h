@@ -34,6 +34,10 @@ public:
     void UpdateGroupInfoFromTopic(const V2TIMString& groupID, const std::string& topic_value);
     /// Ensure group_info_ has an entry for groupID (e.g. when joining so GetGroupsInfo finds it before topic arrives).
     void EnsureGroupInfoExists(const V2TIMString& groupID);
+    /// Drop every per-session group cache. Called from UnInitSDK: the default
+    /// instance outlives a logout, so whatever stays here is inherited by the
+    /// next account that logs in within the same process.
+    void ClearAllState();
 
     // Best-known display name for a group: cached when real, live NGC name
     // otherwise. See the definition for why the cache alone is not enough.
@@ -82,6 +86,19 @@ public:
     void KickGroupMember(const V2TIMString& groupID, const V2TIMStringVector& memberList,
                          const V2TIMString& reason,
                          V2TIMValueCallback<V2TIMGroupMemberOperationResultVector>* callback) override;
+    // Shared by SetGroupMemberRole (V2TIM role) and MuteGroupMember (OBSERVER).
+    // mute_seconds is the MuteGroupMember duration (only read when mute_toggle
+    // and tox_role == OBSERVER); kMutePermanentSeconds means no expiry.
+    void SetGroupMemberToxRole(const V2TIMString& groupID, const V2TIMString& userID,
+                               Tox_Group_Role tox_role, V2TIMCallback* callback,
+                               bool mute_toggle = false, uint32_t mute_seconds = 0);
+    // UINT32_MAX seconds (~136 years) is the conventional "forever" mute.
+    static constexpr uint32_t kMutePermanentSeconds = UINT32_MAX;
+    /// Lift timed mutes whose deadline has passed (OBSERVER -> USER). Iterate-
+    /// driven like V2TIMSignalingManagerImpl::CheckTimeouts: called from the
+    /// event loop and from the test-mode iterate hook, so it runs on the tox
+    /// thread and follows the virtual clock in auto_tests.
+    void CheckMuteExpiries();
     void SetGroupMemberRole(const V2TIMString& groupID, const V2TIMString& userID, uint32_t role,
                             V2TIMCallback* callback) override;
     void MarkGroupMemberList(const V2TIMString& groupID, const V2TIMStringVector& memberList,
@@ -120,6 +137,25 @@ private:
     std::unordered_map<std::string, V2TIMGroupInfo> group_info_; // 本地存储群资料
     std::unordered_map<std::string, V2TIMGroupMemberInfoVector> group_members_; // 群成员列表
     std::unordered_map<std::string, std::unordered_set<std::string>> muted_members_; // 禁言列表
+    // Timed mutes this client imposed (MuteGroupMember with a finite duration).
+    // NGC has no timed mute: the OBSERVER sanction is keyed by the member's
+    // group key and survives leave/rejoin and restarts, so the moderator that
+    // muted must lift it when the deadline passes. Guarded by mute_mutex_.
+    struct TimedMute {
+        uint64_t deadline_mono_ms{0};   // NowMonoMs() basis (virtual clock in test mode)
+        int64_t deadline_unix_ms{0};    // wall-clock form, persisted across restarts
+        uint64_t next_attempt_mono_ms{0};  // retry pacing while the member is absent
+    };
+    // groupID -> member group key (64 upper-case hex) -> deadline
+    std::unordered_map<std::string, std::unordered_map<std::string, TimedMute>> timed_mutes_;
+    // Profile path the map was loaded from ("" = not loaded for this session).
+    std::string timed_mutes_loaded_for_;
+    uint64_t NowMonoMs() const;
+    std::string TimedMuteStorePath() const;
+    void EnsureTimedMutesLoadedLocked();  // mute_mutex_ held
+    void SaveTimedMutesLocked();          // mute_mutex_ held
+    void RecordTimedMute(const std::string& groupID, const std::string& member_key_upper, uint32_t seconds);
+    void ForgetTimedMute(const std::string& groupID, const std::string& member_key_upper);
     // nameCard overrides for other users (Tox only allows setting self name; we store others locally)
     std::unordered_map<std::string, std::unordered_map<std::string, std::string>> member_name_card_overrides_;
     V2TIMManagerImpl* manager_impl_; // Reference to V2TIMManagerImpl to access group mappings

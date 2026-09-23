@@ -1,0 +1,55 @@
+From 2c473174edc7bc3c3e38cdc3c7b3c9ab01c8f417 Mon Sep 17 00:00:00 2001
+From: agentx-icu <satina@cfeel.top>
+Date: Sun, 20 Sep 2026 01:19:20 +0800
+Subject: [PATCH] 0022-send-message-buffer-lifetime
+
+---
+ .../adapter/tim_message_manager.dart          | 22 ++++++++++++++++---
+ 1 file changed, 19 insertions(+), 3 deletions(-)
+
+diff --git a/lib/native_im/adapter/tim_message_manager.dart b/lib/native_im/adapter/tim_message_manager.dart
+index daf97f4..91f10b3 100644
+--- a/lib/native_im/adapter/tim_message_manager.dart
++++ b/lib/native_im/adapter/tim_message_manager.dart
+@@ -615,11 +615,27 @@ class TIMMessageManager {
+     if (receiver != null && receiver.isNotEmpty && groupID != null && groupID.isNotEmpty) {
+       msgJson['group_private_receiver'] = receiver;
+     }
++    // tim2tox: the conversation id and message JSON are read (copied) during
++    // the call, so they are freed as soon as it returns — the message JSON
++    // (a whole serialized message) used to stay allocated until the send
++    // callback, which for a file transfer is minutes. Only the user-data
++    // string must outlive the call: native echoes that pointer back in the
++    // callback, which frees it. A dispatch that THROWS never reaches native,
++    // so it releases the user data and the callback entry here instead of
++    // leaking both behind a future that could never complete.
+     Pointer<Char> pConvID = Tools.string2PointerChar(convID);
+     Pointer<Char> pMsgParam = Tools.string2PointerChar(json.encode(msgJson));
+     Pointer<Void> pUserData = Tools.string2PointerVoid(userData);
+-    Pointer<Char> pMessageID =
+-        NativeLibraryManager.bindings.DartSendMessage(pConvID, timConvType, pMsgParam, pUserData);
++    Pointer<Char> pMessageID;
++    try {
++      pMessageID = NativeLibraryManager.bindings.DartSendMessage(pConvID, timConvType, pMsgParam, pUserData);
++    } catch (_) {
++      NativeLibraryManager.removeTimCallbackFromMap(userData);
++      Tools.freePointers([pUserData]);
++      rethrow;
++    } finally {
++      Tools.freePointers([pConvID, pMsgParam]);
++    }
+     String messageIDDart = Tools.pointerChar2String(pMessageID);
+     if (onSyncMsgID != null) {
+       onSyncMsgID.call(messageIDDart);
+@@ -632,7 +648,7 @@ class TIMMessageManager {
+ 
+     return completer.future.then((value) {
+       NativeLibraryManager.removeTimCallbackFromMap(userData);
+-      Tools.freePointers([pConvID, pMsgParam, pUserData]);
++      Tools.freePointers([pUserData]);
+       return value;
+     });
+   }
+-- 
+2.50.1 (Apple Git-155)
+

@@ -216,19 +216,75 @@ void main() {
       'conference create join and re-enable retain the native PCM context',
       () {
         final managerSource = _readTim2ToxSource('source/V2TIMManagerImpl.cpp');
+        String squash(String text) => text.replaceAll(RegExp(r'\s+'), '');
+
+        // Create: CreateGroup's AV branch makes the conference with the PCM
+        // handler and this manager as its context, under the iterate lock
+        // (legacy group AV takes no toxcore lock), and registers the result
+        // under the tagged conference map key as an av_conference.
+        final createStart = managerSource.indexOf(
+          'void V2TIMManagerImpl::CreateGroup(',
+        );
+        final createEnd = managerSource.indexOf(
+          'void V2TIMManagerImpl::JoinGroupWithPassword(',
+          createStart,
+        );
+        expect(createStart, greaterThanOrEqualTo(0));
+        expect(createEnd, greaterThan(createStart));
+        final createBody = managerSource.substring(createStart, createEnd);
+        final avBranchStart = createBody.indexOf('} else if (is_av_conference) {');
+        final avBranchEnd = createBody.indexOf('#else', avBranchStart);
+        expect(avBranchStart, greaterThanOrEqualTo(0));
+        expect(avBranchEnd, greaterThan(avBranchStart));
+        final avBranch = createBody.substring(avBranchStart, avBranchEnd);
+        final createLock = avBranch.indexOf('tox_manager->lockIterate()');
+        final createCall = avBranch.indexOf('toxav_add_av_groupchat(');
+        final createFailure = avBranch.indexOf('if (created < 0)');
+        final createKey = avBranch.indexOf(
+          'group_number = ConferenceMapKey(static_cast<uint32_t>(created));',
+        );
+        final createSuccess = avBranch.indexOf('creation_success = true;');
+        expect(createLock, greaterThanOrEqualTo(0));
+        expect(createCall, greaterThan(createLock));
+        expect(
+          squash(avBranch),
+          contains(
+              'created=toxav_add_av_groupchat(av_tox,HandleAVConferenceAudio,this);'),
+          reason: 'the AV conference must be created with the PCM handler '
+              'and this manager as its callback context',
+        );
+        expect(createFailure, greaterThan(createCall));
+        expect(createKey, greaterThan(createFailure));
+        expect(createSuccess, greaterThan(createKey));
+        final registerMapping = createBody.indexOf(
+          'group_id_to_group_number_[finalGroupID] = group_number;',
+        );
+        expect(registerMapping, greaterThan(avBranchEnd));
+        expect(
+          createBody.indexOf(
+            'if (is_av_conference) type_for_map = "av_conference";',
+            registerMapping,
+          ),
+          greaterThan(registerMapping),
+        );
+
+        // Join: both the invite auto-accept path and the manual join of a
+        // pending AV invite pass the PCM handler and this manager.
         expect(
           managerSource,
           contains(
-            'toxav_add_av_groupchat(\n'
-            '            av_tox, HandleAVConferenceAudio, this)',
-          ),
+              'toxav_audio_data_cb* audio_callback = HandleAVConferenceAudio;'),
         );
         expect(
-          managerSource,
-          contains(
-            'audio_callback,\n'
-            '                    this  // userdata',
-          ),
+          squash(managerSource),
+          contains('toxav_join_av_groupchat(tox,friend_number,cookie,'
+              'static_cast<uint16_t>(length),audio_callback,this//userdata'),
+        );
+        expect(
+          squash(managerSource),
+          contains('toxav_join_av_groupchat(tox,inv.friend_number,'
+              'inv.cookie.data(),static_cast<uint16_t>(inv.cookie.size()),'
+              'HandleAVConferenceAudio,this);'),
         );
 
         final enableStart = managerSource.indexOf(
@@ -265,7 +321,28 @@ void main() {
         );
         expect(nativeEnableBody, contains('conference_audio_callback_'));
         expect(nativeEnableBody, contains('manager_impl_'));
-        expect(nativeEnableBody, isNot(contains('nullptr')));
+        // The callback is snapshotted under callbacks_mutex_ (so it starts
+        // out null); the contract is that a missing callback or context
+        // refuses the enable, and toxav is only ever handed the registered
+        // PCM callback with the manager as its context — never nullptr.
+        final nullGuard = nativeEnableBody.indexOf(
+          'if (!toxav_ || !manager_impl_ || !audio_callback) return false;',
+        );
+        final nativeCallStart = nativeEnableBody.indexOf(
+          'toxav_groupchat_enable_av(',
+        );
+        expect(nullGuard, greaterThanOrEqualTo(0));
+        expect(nativeCallStart, greaterThan(nullGuard));
+        final nativeCall = nativeEnableBody.substring(
+          nativeCallStart,
+          nativeEnableBody.indexOf(';', nativeCallStart),
+        );
+        expect(nativeCall, contains('audio_callback, manager_impl_'));
+        expect(nativeCall, isNot(contains('nullptr')));
+        expect(
+          nativeEnableBody,
+          contains('audio_callback = conference_audio_callback_;'),
+        );
       },
     );
 

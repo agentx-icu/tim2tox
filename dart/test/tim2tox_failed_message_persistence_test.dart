@@ -257,7 +257,11 @@ void main() {
       expect(prefs.getString(legacyKey), isNull);
     });
 
-    test('scoped lookup falls back to the legacy unscoped base key', () async {
+    // The unscoped base key predates account scoping and has no owner: a
+    // fallback to it let one account find, and resend as itself, a row another
+    // account had failed to send. Lookups stay inside the account's own key.
+    test('scoped lookup never falls back to the legacy unscoped base key',
+        () async {
       SharedPreferences.setMockInitialValues(<String, Object>{
         _baseKey: jsonEncode({
           'peer-a': [
@@ -276,10 +280,10 @@ void main() {
         accountToxId: _accountA,
       );
 
-      expect(found, isNotNull);
-      expect(found!.conversationKey, 'peer-a');
-      expect(found.messageData['text'], 'unscoped legacy failure');
-      expect(found.accountToxId, isNull);
+      expect(found, isNull);
+      final prefs = await SharedPreferences.getInstance();
+      expect(prefs.getString(_baseKey), isNotNull,
+          reason: 'the legacy rows are left for an explicit migration');
     });
 
     test('removeFailedMessagesByIDs only scans the current account failed keys',

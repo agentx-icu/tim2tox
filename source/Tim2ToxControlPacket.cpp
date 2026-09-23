@@ -20,6 +20,7 @@ bool IsKnownType(Type type) {
         case Type::kReceipt:
         case Type::kReaction:
         case Type::kGenericCustom:
+        case Type::kGroupIdentity:
             return true;
     }
     return false;

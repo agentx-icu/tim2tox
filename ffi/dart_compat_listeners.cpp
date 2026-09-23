@@ -360,7 +360,7 @@ static std::string ElemListToJsonArray(const V2TIMElemVector& elemList) {
 }
 
 // Helper: Convert single V2TIMMessage to JSON array (for OnRecvNewMessage and OnRecvMessageModified)
-static std::string MessageToJsonArray(const V2TIMMessage& msg) {
+static std::string MessageToJsonArray(const V2TIMMessage& msg, const std::string& local_custom_str = std::string()) {
     std::ostringstream json;
     json << "[";
     
@@ -428,9 +428,27 @@ static std::string MessageToJsonArray(const V2TIMMessage& msg) {
         json << "\"message_group_receipt_unread_count\":null,";
         json << "\"message_version\":null,";
         json << "\"ui_status\":null,";
-        json << "\"message_custom_str\":\"" << EscapeJsonString("") << "\",";
+        json << "\"message_custom_str\":\"" << EscapeJsonString(local_custom_str) << "\",";
         json << "\"message_cloud_custom_str\":\"" << EscapeJsonString("") << "\",";
-        json << "\"message_sender_profile\":null,";
+        // Sender profile, as the native SDK ships it (V2TimMessage.fromJson
+        // reads nickName / faceUrl / friendRemark from it). Without it the
+        // sender name native resolved (NGC peer name / conference peer name)
+        // never reached Dart. Still null when there is nothing to carry.
+        // Empty fields stay null: UIKit picks names with `??`, so an empty
+        // remark or face URL would shadow the real nickname / default avatar.
+        if (!nick_name.empty() || !face_url.empty()) {
+            auto json_or_null = [](const std::string& value) {
+                return value.empty() ? std::string("null")
+                                     : "\"" + EscapeJsonString(value) + "\"";
+            };
+            json << "\"message_sender_profile\":{"
+                 << "\"user_profile_identifier\":\"" << EscapeJsonString(sender) << "\","
+                 << "\"user_profile_nick_name\":" << json_or_null(nick_name) << ","
+                 << "\"user_profile_face_url\":" << json_or_null(face_url) << ","
+                 << "\"user_profile_friend_remark\":" << json_or_null(friend_remark) << "},";
+        } else {
+            json << "\"message_sender_profile\":null,";
+        }
         json << "\"message_excluded_from_content_moderation\":null,";
         json << "\"message_custom_moderation_configuration_id\":null,";
         json << "\"message_risk_type_identified\":" << (msg.hasRiskContent ? 1 : 0) << ",";
@@ -805,7 +823,18 @@ public:
             instance_id = GetInstanceIdForListener(this);
             if (instance_id == 0) instance_id = GetCurrentInstanceId();
         }
-        std::string msg_array_json = MessageToJsonArray(message);
+        // An inbound NGC group message carries toxcore's Tox_Group_Message_Id:
+        // the sender mints it and every member decodes the same value, so it
+        // is the one cross-path identity Dart can dedupe on exactly (the polled
+        // `gtext:` line carries the same id). V2TIMMessage has no local custom
+        // data storage, so it rides in `message_custom_str` for this delivery.
+        std::string local_custom_str;
+        const int64_t group_msg_id = GetReceiverGroupMessageIdOverride();
+        if (group_msg_id >= 0 && !message.groupID.Empty()) {
+            local_custom_str = "{\"toxGroupMsgId\":" +
+                std::to_string(static_cast<uint32_t>(group_msg_id)) + "}";
+        }
+        std::string msg_array_json = MessageToJsonArray(message, local_custom_str);
         std::map<std::string, std::string> fields;
         fields["json_msg_array"] = msg_array_json;
         std::string user_data = UserDataToString(GetCallbackUserData(instance_id, "ReceiveNewMessage"));
@@ -1810,12 +1839,15 @@ static std::string GroupMemberInfoVectorToJsonForDart(const V2TIMGroupMemberInfo
 static std::string GroupChangeInfoToJson(const V2TIMGroupChangeInfo& change) {
     std::ostringstream json;
     json << "{";
-    json << "\"type\":" << static_cast<int>(change.type) << ",";
-    json << "\"value\":\"" << EscapeJsonString(change.value.CString()) << "\",";
-    json << "\"key\":\"" << EscapeJsonString(change.key.CString()) << "\",";
-    json << "\"boolValue\":" << std::boolalpha << (change.boolValue ? true : false) << ",";
-    json << "\"intValue\":" << change.intValue << ",";
-    json << "\"uint64Value\":" << change.uint64Value;
+    // Field names are V2TimGroupChangeInfo.fromJson's (group_tips_group_change_info_*).
+    // The short names this used to emit parsed as type == null, so every
+    // group info change reached listeners as an unmatched, ignored change.
+    json << "\"group_tips_group_change_info_flag\":" << static_cast<int>(change.type) << ",";
+    json << "\"group_tips_group_change_info_value\":\"" << EscapeJsonString(change.value.CString()) << "\",";
+    json << "\"group_tips_group_change_info_key\":\"" << EscapeJsonString(change.key.CString()) << "\",";
+    json << "\"group_tips_group_change_info_bool_value\":" << std::boolalpha << (change.boolValue ? true : false) << ",";
+    json << "\"group_tips_group_change_info_int_value\":" << change.intValue << ",";
+    json << "\"group_tips_group_change_info_uint64_value\":" << change.uint64Value;
     json << "}";
     return json.str();
 }
@@ -2185,7 +2217,16 @@ public:
     
     // Other callbacks that are less commonly used - implement as needed
     void OnAllGroupMembersMuted(const V2TIMString& groupID, bool isMute) override {
-        // Not typically sent via GroupTipsEvent, handle separately if needed
+        // The SDK reports "all members muted" as a GROUP_INFO_CHANGE tip with a
+        // SHUT_UP_ALL change (NativeLibraryManager derives
+        // onAllGroupMembersMuted from it). Dropping it left members' composers
+        // enabled while every send failed with PERMISSIONS.
+        V2TIMGroupChangeInfo change;
+        change.type = V2TIM_GROUP_INFO_CHANGE_TYPE_SHUT_UP_ALL;
+        change.boolValue = isMute;
+        V2TIMGroupChangeInfoVector changes;
+        changes.PushBack(change);
+        OnGroupInfoChanged(groupID, changes);
     }
     
     void OnMemberMarkChanged(const V2TIMString& groupID, const V2TIMStringVector& memberIDList, 

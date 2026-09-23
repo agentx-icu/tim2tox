@@ -15,6 +15,15 @@ import 'control_message_envelope.dart';
 import 'message_history_persistence.dart';
 import 'message_converter.dart';
 
+/// Applies an inbound magic-prefix control signal; see
+/// [BinaryReplacementHistoryHook.applyInboundControlSignal].
+typedef InboundControlSignalApplier = Future<void> Function({
+  required String text,
+  required String fromUserId,
+  String? groupId,
+  bool isSelf,
+});
+
 /// Binary replacement history hook
 ///
 /// Provides hooks for binary replacement scheme to persist messages automatically
@@ -60,8 +69,18 @@ class BinaryReplacementHistoryHook {
   /// incorrect isSelf=false, which would also defeat the
   /// (text,fromUserId,isSelf,timestamp) dedup fallback and duplicate the
   /// FFI-path copy). Drained by [updateSelfId] once selfId resolves.
-  static final List<V2TimMessage> _pendingSelfIdBuffer = <V2TimMessage>[];
+  ///
+  /// #17: each entry is tagged with the [_generation] it arrived in, and a
+  /// drain replays only the current generation's entries. A message buffered
+  /// while account A's selfId was pending must never be persisted into
+  /// account B's history after a re-[initialize].
+  static final List<({int generation, V2TimMessage message})>
+      _pendingSelfIdBuffer = <({int generation, V2TimMessage message})>[];
   static const int _maxPendingSelfIdBuffer = 1000;
+
+  /// Visible-for-tests: how many messages wait for a selfId.
+  @visibleForTesting
+  static int get pendingSelfIdBufferLength => _pendingSelfIdBuffer.length;
 
   /// Whether this hook currently owns persistence for advanced-listener
   /// inbound messages. Read-only so the Platform poll path can avoid creating
@@ -80,12 +99,20 @@ class BinaryReplacementHistoryHook {
   /// `__revoke__:{…}` history row and the recalled message was never deleted on
   /// the receiver (real-UI `chat_recall_message` bGone=false, reproduced with
   /// the row found verbatim in the peer's chat_history JSON).
-  static Future<void> Function({
-    required String text,
-    required String fromUserId,
-    String? groupId,
-    bool isSelf,
-  })? applyInboundControlSignal;
+  ///
+  /// The platform installs this BEFORE the hook is (re)initialized for its
+  /// session, so the setter records the generation it was installed in:
+  /// [initialize] for a new session drops an applier left over from an
+  /// earlier session (#18) but keeps the one just installed for this one.
+  static InboundControlSignalApplier? get applyInboundControlSignal =>
+      _applyInboundControlSignal;
+  static set applyInboundControlSignal(InboundControlSignalApplier? value) {
+    _applyInboundControlSignal = value;
+    _applierInstalledAtGeneration = _generation;
+  }
+
+  static InboundControlSignalApplier? _applyInboundControlSignal;
+  static int _applierInstalledAtGeneration = 0;
 
   /// Fired after an INBOUND (non-self) message was persisted by this hook,
   /// with the raw conversation id (`groupID ?? userID`) and the persisted row.
@@ -100,13 +127,46 @@ class BinaryReplacementHistoryHook {
       onInboundMessagePersisted;
 
   /// Initialize the hook with persistence service and self ID
+  ///
+  /// Re-initializing for a DIFFERENT session (another persistence store, or
+  /// another known selfId) without [uninstallStandalone] in between resets
+  /// everything the previous session left behind (#17 / #18): its buffered
+  /// messages, and the callbacks that capture its services — the block
+  /// predicate and inbound notifier (the host sets them again right after
+  /// this call) and a control-signal applier not re-installed for this
+  /// session. Otherwise the old session stayed reachable and processed the
+  /// new session's messages.
   static void initialize(MessageHistoryPersistence persistence, String selfId,
       {LoggerService? logger}) {
+    final previous = _persistence;
+    final previousSelfId = _selfId ?? '';
+    final newSession = previous != null &&
+        (!identical(previous, persistence) ||
+            (previousSelfId.isNotEmpty &&
+                selfId.isNotEmpty &&
+                previousSelfId != selfId));
+    if (newSession) {
+      _pendingSelfIdBuffer.clear();
+      isBlockedPredicate = null;
+      onInboundMessagePersisted = null;
+      if (_applierInstalledAtGeneration < _generation) {
+        _applyInboundControlSignal = null;
+      }
+    }
     _persistence = persistence;
     _selfId = selfId;
     if (logger != null) _logger = logger;
     _warnedEmptySelfIdThisGeneration = false;
     _generation++;
+    if (!newSession && _pendingSelfIdBuffer.isNotEmpty) {
+      // Same session re-initialized: its buffered messages are still its own.
+      final carried = _pendingSelfIdBuffer
+          .map((e) => (generation: _generation, message: e.message))
+          .toList();
+      _pendingSelfIdBuffer
+        ..clear()
+        ..addAll(carried);
+    }
   }
 
   /// Update the captured selfId without bumping [_generation].
@@ -120,7 +180,13 @@ class BinaryReplacementHistoryHook {
   static void updateSelfId(String selfId) {
     _selfId = selfId;
     if (selfId.isNotEmpty && _pendingSelfIdBuffer.isNotEmpty) {
-      final buffered = List<V2TimMessage>.from(_pendingSelfIdBuffer);
+      final generation = _generation;
+      final buffered = _pendingSelfIdBuffer
+          .where((e) => e.generation == generation)
+          .map((e) => e.message)
+          .toList();
+      // Entries from an earlier generation belong to a session that is gone:
+      // dropped, never replayed into this one (#17).
       _pendingSelfIdBuffer.clear();
       for (final msg in buffered) {
         // Replay now that isSelf can be resolved correctly.
@@ -321,7 +387,10 @@ class BinaryReplacementHistoryHook {
             '($_maxPendingSelfIdBuffer) — dropping oldest buffered message');
         _pendingSelfIdBuffer.removeAt(0);
       }
-      _pendingSelfIdBuffer.add(v2Msg);
+      // A session change while this call was in flight: not this session's.
+      if (_generation != capturedGeneration) return;
+      _pendingSelfIdBuffer
+          .add((generation: capturedGeneration, message: v2Msg));
       return;
     }
 
@@ -356,22 +425,44 @@ class BinaryReplacementHistoryHook {
       //      would collapse into one. We also shorten the window from 5s
       //      to 2s — the original 5s window was wide enough to swallow
       //      a real user sending two distinct messages quickly.
+      //
+      // GH-4: identity beats content. An NGC group message carries the
+      // cross-path alias (MessageConverter stamps it from localCustomData's
+      // toxGroupMsgId; the poll path from its `gtext:` header), so the two
+      // copies match EXACTLY, and two rows that both carry an alias but
+      // different ones are two genuine messages however alike — the content
+      // window only applies when one side has no identity (legacy/conference).
       const dedupWindow = Duration(seconds: 2);
-      final chatMsgID = chatMsg.msgID;
-      final messageExists = existingHistory.any((msg) {
-        if (chatMsgID != null && msg.msgID == chatMsgID) return true;
+      final chatIds = <String>{
+        if (chatMsg.msgID != null) chatMsg.msgID!,
+        ...chatMsg.altMsgIds,
+      };
+      bool sameId(ChatMessage msg) =>
+          msg.isSelf == chatMsg.isSelf &&
+          chatIds.any((id) => msg.msgID == id || msg.altMsgIds.contains(id));
+      var matchIndex = existingHistory.indexWhere(sameId);
+      if (matchIndex < 0 && chatMsg.text.isNotEmpty) {
+        matchIndex = existingHistory.indexWhere((msg) {
+          if (chatMessagesShareGroupIdentity(msg, chatMsg) != null) {
+            return false;
+          }
+          if (msg.text != chatMsg.text) return false;
+          if (msg.fromUserId != chatMsg.fromUserId) return false;
+          if (msg.isSelf != chatMsg.isSelf) return false;
+          if (msg.contentKind != chatMsg.contentKind) return false;
+          final timeDiff = chatMsg.timestamp.difference(msg.timestamp).abs();
+          return timeDiff <= dedupWindow;
+        });
+      }
 
-        if (chatMsg.text.isEmpty) return false;
-        if (msg.text != chatMsg.text) return false;
-        if (msg.fromUserId != chatMsg.fromUserId) return false;
-        if (msg.isSelf != chatMsg.isSelf) return false;
-        if (msg.contentKind != chatMsg.contentKind) return false;
-        final timeDiff = chatMsg.timestamp.difference(msg.timestamp).abs();
-        return timeDiff <= dedupWindow;
-      });
-
-      if (messageExists) {
-        // Message already exists, skip saving to avoid duplicate
+      if (matchIndex >= 0) {
+        // Same logical message already persisted (typically by the poll path
+        // first). Don't add a second row, but keep THIS copy's ids resolvable
+        // on the existing one (GH-9): UIKit holds the native id, so a later
+        // delete / markRead / revoke by it must still find the row.
+        if (_generation != capturedGeneration) return;
+        await capturedPersistence.absorbDuplicateIds(
+            conversationId, existingHistory[matchIndex], chatMsg);
         return;
       }
 
@@ -408,8 +499,10 @@ class BinaryReplacementHistoryHook {
           }
         }
       }
-    } catch (_) {
-      _logFallback('BinaryReplacementHistoryHook.saveMessage failed');
+    } catch (e) {
+      // Now reachable for real disk failures too (saveHistory propagates
+      // them; the row stays in memory and the write is retried).
+      _logFallback('BinaryReplacementHistoryHook.saveMessage failed: $e');
     }
   }
 

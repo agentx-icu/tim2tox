@@ -55,9 +55,18 @@ void DartSetGroupTipsEventCallback(void* user_data);
 void DartSetGroupAttributeChangedCallback(void* user_data);
 void DartSetGroupCounterChangedCallback(void* user_data);
 
-// Group notification functions
-void DartNotifyGroupQuit(const char* group_id);
-void DartNotifyGroupJoin(const char* group_id);
+// Group notification functions (native → Dart only; not in the SDK bindings).
+// instance_id / session_epoch identify the emitting V2TIMManagerImpl session
+// (GetInstanceIdFromManager / GetSessionEpoch) and are written into the JSON so
+// the process-global Dart handler can drop other instances' and ended
+// sessions' notifications.
+void DartNotifyGroupQuit(const char* group_id, int64_t instance_id, int64_t session_epoch);
+void DartNotifyGroupJoin(const char* group_id, int64_t instance_id, int64_t session_epoch);
+void DartNotifyGroupInvite(const char* invite_id, int64_t instance_id, int64_t session_epoch);
+void DartNotifyGroupKicked(const char* group_id, int64_t instance_id, int64_t session_epoch);
+void DartNotifyGroupIdentityStored(const char* group_id, const char* chat_id_hex, int64_t instance_id, int64_t session_epoch);
+void DartNotifyGroupTypeStored(const char* group_id, const char* group_type, int64_t instance_id, int64_t session_epoch);
+void DartNotifyGroupJoinFailed(const char* group_id, const char* chat_id_hex, const char* reason, bool established, const char* invite_id, int64_t instance_id, int64_t session_epoch);
 
 // Friendship callbacks
 void DartSetOnAddFriendCallback(void* user_data);

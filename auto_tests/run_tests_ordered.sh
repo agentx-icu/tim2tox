@@ -619,6 +619,7 @@ PHASE10_GROUP_EXT=(
   "test/scenarios/scenario_group_info_modify_test.dart"
   "test/scenarios/scenario_group_tcp_test.dart"
   "test/scenarios/scenario_group_vs_conference_test.dart"
+  "test/scenarios/scenario_group_conference_number_collision_test.dart"
 )
 
 # Network / connectivity (reconnect, bootstrap, DHT, LAN, etc.)
