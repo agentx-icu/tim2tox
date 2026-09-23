@@ -3,6 +3,48 @@ import 'dart:io';
 void main() {
   final source = File('lib/sdk/tim2tox_sdk_platform.dart').readAsStringSync();
 
+  // The platform IS what the routed facade (manager/v2_tim_group_manager.dart,
+  // `V2TIMGroupManager`) dispatches to when `isPlatformRouted`, so every
+  // group-member operation here must reach the NATIVE adapter
+  // (native_im/adapter/tim_group_manager.dart, `TIMGroupManager` → Dart*
+  // bindings). Going through the facade would call back into this platform
+  // forever.
+  _assertContains(
+    source,
+    "import 'package:tencent_cloud_chat_sdk/native_im/adapter/tim_group_manager.dart';",
+    'the platform must use the native group adapter',
+  );
+  for (final forbidden in const [
+    'manager/v2_tim_group_manager.dart',
+    'V2TIMGroupManager(',
+    'V2TIMGroupManager.',
+    'v2TIMGroupManager',
+    'getGroupManager()',
+    'TencentImSDKPlugin',
+  ]) {
+    _assertNotContains(
+      source,
+      forbidden,
+      'the platform must never call the routed group facade ($forbidden)',
+    );
+  }
+  final serviceSource =
+      File('lib/service/ffi_chat_service.dart').readAsStringSync();
+  for (final forbidden in const [
+    'manager/v2_tim_group_manager.dart',
+    'V2TIMGroupManager(',
+    'V2TIMGroupManager.',
+    'v2TIMGroupManager',
+    'getGroupManager()',
+    'TencentImSDKPlugin',
+  ]) {
+    _assertNotContains(
+      serviceSource,
+      forbidden,
+      'FfiChatService must never call the routed group facade ($forbidden)',
+    );
+  }
+
   _assertContains(
     _methodBody(
       source,
@@ -27,47 +69,54 @@ void main() {
     'setGroupMemberRole should not keep the unconditional success stub',
   );
 
+  // MM-8: an NGC founder role cannot be handed over (toxcore's
+  // gc_set_peer_role rejects GR_FOUNDER as a target), and the native adapter's
+  // transferGroupOwner (DartSetGroupInfo with only `owner`) used to report a
+  // transfer that never happened. The platform refuses honestly instead:
+  // the unsupported-capability code with a message that says why.
+  final transferBody = _methodBody(
+    source,
+    'Future<V2TimCallback> transferGroupOwner({',
+    'Future<V2TimCallback> setGroupApplicationRead() async {',
+  );
   _assertContains(
-    _methodBody(
-      source,
-      'Future<V2TimCallback> transferGroupOwner({',
-      'Future<V2TimCallback> setGroupApplicationRead() async {',
-    ),
-    'TIMGroupManager.instance.transferGroupOwner(',
-    'transferGroupOwner should delegate to the native group manager',
+    transferBody,
+    'TIMErrCode.ERR_SDK_INTERFACE_NOT_SUPPORT.value',
+    'transferGroupOwner should refuse with the unsupported capability code',
+  );
+  _assertContains(
+    transferBody,
+    "desc: 'Group ownership cannot be transferred on Tox'",
+    'transferGroupOwner should explain why the transfer is refused',
   );
   _assertNotContains(
-    _methodBody(
-      source,
-      'Future<V2TimCallback> transferGroupOwner({',
-      'Future<V2TimCallback> setGroupApplicationRead() async {',
-    ),
-    "desc: 'success'",
-    'transferGroupOwner should not keep the unconditional success stub',
+    transferBody,
+    'TIMGroupManager.instance.transferGroupOwner(',
+    'transferGroupOwner must not delegate to the adapter that fakes success',
+  );
+  _assertNotContains(
+    transferBody,
+    'code: 0',
+    'transferGroupOwner should not report success',
   );
 
-  _assertContains(
-    _methodBody(
-      source,
-      'Future<V2TimCallback> muteGroupMember({',
-      'Future<V2TimValueCallback<List<V2TimGroupMemberOperationResult>>>\n      inviteUserToGroup({',
-    ),
-    'TIMErrCode.ERR_SDK_INTERFACE_NOT_SUPPORT.value',
-    'muteGroupMember should return the unsupported capability code',
+  // Mute is real now: native maps a mute to the NGC OBSERVER role
+  // (DartModifyGroupMemberInfo with shutup_time), so the platform delegates
+  // to the native group manager instead of refusing.
+  final muteBody = _methodBody(
+    source,
+    'Future<V2TimCallback> muteGroupMember({',
+    'Future<V2TimValueCallback<List<V2TimGroupMemberOperationResult>>>\n      inviteUserToGroup({',
   );
   _assertContains(
-    source,
-    "desc: 'Not supported'",
-    'muteGroupMember should keep the unsupported description',
+    muteBody,
+    'TIMGroupManager.instance.muteGroupMember(',
+    'muteGroupMember should delegate to the native group manager',
   );
   _assertNotContains(
-    _methodBody(
-      source,
-      'Future<V2TimCallback> muteGroupMember({',
-      'Future<V2TimValueCallback<List<V2TimGroupMemberOperationResult>>>\n      inviteUserToGroup({',
-    ),
+    muteBody,
     'code: 0',
-    'muteGroupMember should not report success',
+    'muteGroupMember should not report an unconditional success',
   );
 
   _assertContains(

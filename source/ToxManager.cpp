@@ -80,6 +80,48 @@ static ToxManager* getManagerFromTox(Tox* tox) {
     return nullptr;
 }
 
+// --- IterateReentryScope (see ToxManager.h) ---------------------------------
+namespace {
+thread_local int t_iterate_scope_depth = 0;
+thread_local std::vector<std::function<void()>>* t_iterate_deferred = nullptr;
+}  // namespace
+
+IterateReentryScope::IterateReentryScope() { ++t_iterate_scope_depth; }
+
+IterateReentryScope::~IterateReentryScope() {
+    if (--t_iterate_scope_depth != 0) return;
+    // Outermost scope on this thread: every iterate lock it covered is already
+    // released. Work queued by the deferred calls themselves runs in the same
+    // drain (they execute outside any scope, so they only queue again if they
+    // re-enter an iterate, which opens a nested scope of its own).
+    while (t_iterate_deferred != nullptr && !t_iterate_deferred->empty()) {
+        std::vector<std::function<void()>> batch;
+        batch.swap(*t_iterate_deferred);
+        for (auto& fn : batch) {
+            try {
+                fn();
+            } catch (const std::exception& e) {
+                V2TIM_LOG(kError, "[IterateReentryScope] deferred call threw: {}", e.what());
+            } catch (...) {
+                V2TIM_LOG(kError, "[IterateReentryScope] deferred call threw");
+            }
+        }
+    }
+    delete t_iterate_deferred;
+    t_iterate_deferred = nullptr;
+}
+
+bool IterateReentryScope::Active() { return t_iterate_scope_depth > 0; }
+
+bool IterateReentryScope::Defer(std::function<void()> fn) {
+    if (t_iterate_scope_depth <= 0 || !fn) return false;
+    if (t_iterate_deferred == nullptr) {
+        t_iterate_deferred = new std::vector<std::function<void()>>();
+    }
+    t_iterate_deferred->push_back(std::move(fn));
+    return true;
+}
+
 // 构造函数（现在是 public，支持多实例）
 ToxManager::ToxManager() : tox_(nullptr, &toxDeleter) {}
 
@@ -329,6 +371,9 @@ void ToxManager::initialize(const Tox_Options* options,
     if (group_custom_packet_cb_) {
         tox_callback_group_custom_packet(tox_.get(), onGroupCustomPacket);
     }
+    if (group_custom_private_packet_cb_) {
+        tox_callback_group_custom_private_packet(tox_.get(), onGroupCustomPrivatePacket);
+    }
     if (group_private_message_group_cb_) {
         tox_callback_group_private_message(tox_.get(), onGroupPrivateMessage);
     }
@@ -412,6 +457,22 @@ void ToxManager::initialize(const Tox_Options* options,
 
 // 关闭实现：与 iterate() 使用相同锁顺序 (iterate_mutex_ 再 mutex_) 避免 UAF 竞态
 void ToxManager::shutdown() {
+    // From inside a tox callback on the iterating thread (a listener that tears
+    // the SDK down): iterate_mutex_ is held by this very thread and is not
+    // recursive, and tox_kill() would free the Tox that tox_iterate() is still
+    // walking. Run it on this thread right after the iterate returns.
+    if (isIterateOwner()) {
+        std::weak_ptr<int> alive = alive_token_;
+        if (IterateReentryScope::Defer([this, alive] {
+                if (alive.lock()) shutdown();
+            })) {
+            V2TIM_LOG(kWarning, "[ToxManager] shutdown() called from inside a tox callback; deferred until the iterate returns");
+        } else {
+            V2TIM_LOG(kError, "[ToxManager] shutdown() called from inside a tox callback with no iterate scope; ignored");
+        }
+        return;
+    }
+    IterateReentryScope reentry_scope;  // first local: see IterateReentryScope
     std::scoped_lock lock(iterate_mutex_, mutex_);
     iterate_owner_.store(std::this_thread::get_id(), std::memory_order_release);
     struct OwnerReset {
@@ -467,6 +528,14 @@ bool ToxManager::isShuttingDown() const {
 
 // 迭代实现：先取 iterate_mutex_ 再 mutex_，与 shutdown() 一致；不在锁外使用裸 tox 指针
 void ToxManager::iterate(uint32_t /*timeout*/) {
+    // Re-entered from one of this instance's own callbacks (a pump loop inside
+    // a listener): the lock below is held by this thread already. The outer
+    // iterate is still running; a nested tox_iterate() would be reentrant.
+    if (isIterateOwner()) return;
+    // FIRST local: work deferred by callbacks (UnInitSDK, shutdown) runs when
+    // this scope ends — after owner_reset and iter_lock below are released and
+    // after the last access to members, so that work may even destroy *this.
+    IterateReentryScope reentry_scope;
     std::unique_lock<std::mutex> iter_lock(iterate_mutex_);
     iterate_owner_.store(std::this_thread::get_id(), std::memory_order_release);
     struct OwnerReset {
@@ -1301,7 +1370,7 @@ bool ToxManager::isGroupConnected(Tox_Group_Number group_number, Tox_Err_Group_I
 bool ToxManager::getConferenceId(uint32_t conference_number, uint8_t id[TOX_CONFERENCE_ID_SIZE]) {
     std::lock_guard<std::mutex> lock(mutex_);
     if (!tox_ || !id) return false;
-    return tox_conference_get_id(tox_.get(), conference_number, id);
+    return tox_conference_get_id(tox_.get(), ConferenceNumberFromKey(conference_number), id);
 }
 
 uint32_t ToxManager::getConferenceById(const uint8_t id[TOX_CONFERENCE_ID_SIZE], TOX_ERR_CONFERENCE_BY_ID* error) {
@@ -1319,7 +1388,7 @@ Tox_Conference_Type ToxManager::getConferenceType(uint32_t conference_number, TO
         if (error) *error = TOX_ERR_CONFERENCE_GET_TYPE_CONFERENCE_NOT_FOUND;
         return TOX_CONFERENCE_TYPE_TEXT; // Default
     }
-    return tox_conference_get_type(tox_.get(), conference_number, error);
+    return tox_conference_get_type(tox_.get(), ConferenceNumberFromKey(conference_number), error);
 }
 
 // Tox group API 实现
@@ -1496,6 +1565,16 @@ Tox_Group_Role ToxManager::getSelfRole(Tox_Group_Number group_number, Tox_Err_Gr
     return tox_group_self_get_role(tox_.get(), group_number, error);
 }
 
+Tox_Group_Topic_Lock ToxManager::getGroupTopicLock(Tox_Group_Number group_number,
+                                                   Tox_Err_Group_State_Query* error) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!tox_) {
+        if (error) *error = TOX_ERR_GROUP_STATE_QUERY_GROUP_NOT_FOUND;
+        return TOX_GROUP_TOPIC_LOCK_ENABLED;
+    }
+    return tox_group_get_topic_lock(tox_.get(), group_number, error);
+}
+
 bool ToxManager::getGroupPeerPublicKey(Tox_Group_Number group_number, Tox_Group_Peer_Number peer_id,
                                       uint8_t public_key[TOX_PUBLIC_KEY_SIZE],
                                       Tox_Err_Group_Peer_Query* error) {
@@ -1552,7 +1631,7 @@ bool ToxManager::inviteToConference(uint32_t friend_number, uint32_t conference_
         if (error) *error = TOX_ERR_CONFERENCE_INVITE_CONFERENCE_NOT_FOUND;
         return false;
     }
-    return tox_conference_invite(tox_.get(), friend_number, conference_number, error);
+    return tox_conference_invite(tox_.get(), friend_number, ConferenceNumberFromKey(conference_number), error);
 }
 
 size_t ToxManager::getConferenceListSize() const {
@@ -1573,7 +1652,7 @@ bool ToxManager::getConferencePeerPublicKey(uint32_t conference_number, uint32_t
         if (error) *error = TOX_ERR_CONFERENCE_PEER_QUERY_PEER_NOT_FOUND;
         return false;
     }
-    return tox_conference_peer_get_public_key(tox_.get(), conference_number, peer_number, public_key, error);
+    return tox_conference_peer_get_public_key(tox_.get(), ConferenceNumberFromKey(conference_number), peer_number, public_key, error);
 }
 
 bool ToxManager::isConferencePeerOurs(uint32_t conference_number, uint32_t peer_number, TOX_ERR_CONFERENCE_PEER_QUERY* error) const {
@@ -1582,7 +1661,7 @@ bool ToxManager::isConferencePeerOurs(uint32_t conference_number, uint32_t peer_
         if (error) *error = TOX_ERR_CONFERENCE_PEER_QUERY_NO_CONNECTION;
         return false;
     }
-    return tox_conference_peer_number_is_ours(tox_.get(), conference_number, peer_number, error);
+    return tox_conference_peer_number_is_ours(tox_.get(), ConferenceNumberFromKey(conference_number), peer_number, error);
 }
 
 bool ToxManager::getConferenceTitle(uint32_t conference_number, uint8_t* title, size_t max_length, TOX_ERR_CONFERENCE_TITLE* error) const {
@@ -1596,7 +1675,7 @@ bool ToxManager::getConferenceTitle(uint32_t conference_number, uint8_t* title, 
     TOX_ERR_CONFERENCE_TITLE* err = error ? error : &local_error;
 
     // Get title size first
-    size_t title_size = tox_conference_get_title_size(tox_.get(), conference_number, err);
+    size_t title_size = tox_conference_get_title_size(tox_.get(), ConferenceNumberFromKey(conference_number), err);
     if (title_size == 0 || *err != TOX_ERR_CONFERENCE_TITLE_OK) {
         return false;
     }
@@ -1608,7 +1687,7 @@ bool ToxManager::getConferenceTitle(uint32_t conference_number, uint8_t* title, 
     }
 
     // Get the actual title
-    return tox_conference_get_title(tox_.get(), conference_number, title, err);
+    return tox_conference_get_title(tox_.get(), ConferenceNumberFromKey(conference_number), title, err);
 }
 
 // 离线成员相关实现
@@ -1618,7 +1697,7 @@ uint32_t ToxManager::getConferenceOfflinePeerCount(uint32_t conference_number, T
         if (error) *error = TOX_ERR_CONFERENCE_PEER_QUERY_CONFERENCE_NOT_FOUND;
         return 0;
     }
-    return tox_conference_offline_peer_count(tox_.get(), conference_number, error);
+    return tox_conference_offline_peer_count(tox_.get(), ConferenceNumberFromKey(conference_number), error);
 }
 
 size_t ToxManager::getConferenceOfflinePeerNameSize(uint32_t conference_number, uint32_t offline_peer_number, TOX_ERR_CONFERENCE_PEER_QUERY* error) const {
@@ -1627,7 +1706,7 @@ size_t ToxManager::getConferenceOfflinePeerNameSize(uint32_t conference_number, 
         if (error) *error = TOX_ERR_CONFERENCE_PEER_QUERY_CONFERENCE_NOT_FOUND;
         return 0;
     }
-    return tox_conference_offline_peer_get_name_size(tox_.get(), conference_number, offline_peer_number, error);
+    return tox_conference_offline_peer_get_name_size(tox_.get(), ConferenceNumberFromKey(conference_number), offline_peer_number, error);
 }
 
 bool ToxManager::getConferenceOfflinePeerName(uint32_t conference_number, uint32_t offline_peer_number, uint8_t* name, size_t max_length, TOX_ERR_CONFERENCE_PEER_QUERY* error) const {
@@ -1641,7 +1720,7 @@ bool ToxManager::getConferenceOfflinePeerName(uint32_t conference_number, uint32
     TOX_ERR_CONFERENCE_PEER_QUERY* err = error ? error : &local_error;
 
     // Get name size first
-    size_t name_size = tox_conference_offline_peer_get_name_size(tox_.get(), conference_number, offline_peer_number, err);
+    size_t name_size = tox_conference_offline_peer_get_name_size(tox_.get(), ConferenceNumberFromKey(conference_number), offline_peer_number, err);
     if (name_size == 0 || *err != TOX_ERR_CONFERENCE_PEER_QUERY_OK) {
         return false;
     }
@@ -1653,7 +1732,7 @@ bool ToxManager::getConferenceOfflinePeerName(uint32_t conference_number, uint32
     }
 
     // Get the actual name
-    return tox_conference_offline_peer_get_name(tox_.get(), conference_number, offline_peer_number, name, err);
+    return tox_conference_offline_peer_get_name(tox_.get(), ConferenceNumberFromKey(conference_number), offline_peer_number, name, err);
 }
 
 bool ToxManager::getConferenceOfflinePeerPublicKey(uint32_t conference_number, uint32_t offline_peer_number, uint8_t public_key[TOX_PUBLIC_KEY_SIZE], TOX_ERR_CONFERENCE_PEER_QUERY* error) const {
@@ -1662,7 +1741,7 @@ bool ToxManager::getConferenceOfflinePeerPublicKey(uint32_t conference_number, u
         if (error) *error = TOX_ERR_CONFERENCE_PEER_QUERY_PEER_NOT_FOUND;
         return false;
     }
-    return tox_conference_offline_peer_get_public_key(tox_.get(), conference_number, offline_peer_number, public_key, error);
+    return tox_conference_offline_peer_get_public_key(tox_.get(), ConferenceNumberFromKey(conference_number), offline_peer_number, public_key, error);
 }
 
 uint64_t ToxManager::getConferenceOfflinePeerLastActive(uint32_t conference_number, uint32_t offline_peer_number, TOX_ERR_CONFERENCE_PEER_QUERY* error) const {
@@ -1671,7 +1750,7 @@ uint64_t ToxManager::getConferenceOfflinePeerLastActive(uint32_t conference_numb
         if (error) *error = TOX_ERR_CONFERENCE_PEER_QUERY_CONFERENCE_NOT_FOUND;
         return 0;
     }
-    return tox_conference_offline_peer_get_last_active(tox_.get(), conference_number, offline_peer_number, error);
+    return tox_conference_offline_peer_get_last_active(tox_.get(), ConferenceNumberFromKey(conference_number), offline_peer_number, error);
 }
 
 bool ToxManager::setConferenceMaxOffline(uint32_t conference_number, uint32_t max_offline, TOX_ERR_CONFERENCE_SET_MAX_OFFLINE* error) {
@@ -1680,7 +1759,7 @@ bool ToxManager::setConferenceMaxOffline(uint32_t conference_number, uint32_t ma
         if (error) *error = TOX_ERR_CONFERENCE_SET_MAX_OFFLINE_CONFERENCE_NOT_FOUND;
         return false;
     }
-    return tox_conference_set_max_offline(tox_.get(), conference_number, max_offline, error);
+    return tox_conference_set_max_offline(tox_.get(), ConferenceNumberFromKey(conference_number), max_offline, error);
 }
 
 // 数据保存和加载实现
@@ -1841,7 +1920,13 @@ void ToxManager::onGroupInviteGroup(Tox* tox, Tox_Friend_Number friend_number, c
     // Use global mapping since tox_callback_group_invite doesn't support user_data
     ToxManager* manager = getManagerFromTox(tox);
     if (manager && manager->group_invite_group_cb_) {
-        manager->group_invite_group_cb_(friend_number, invite_data, invite_data_length);
+        // The invite is the only place a not-yet-joined group's name is known;
+        // it is what a pending-invite prompt has to show.
+        const std::string invited_group_name =
+            (group_name && group_name_length > 0)
+                ? std::string(reinterpret_cast<const char*>(group_name), group_name_length)
+                : std::string();
+        manager->group_invite_group_cb_(friend_number, invite_data, invite_data_length, invited_group_name);
     }
 }
 
@@ -1874,6 +1959,19 @@ void ToxManager::onGroupCustomPacket(
     ToxManager* manager = getManagerFromTox(tox);
     if (manager && manager->group_custom_packet_cb_) {
         manager->group_custom_packet_cb_(group_number, peer_id, data, length);
+    }
+}
+
+void ToxManager::onGroupCustomPrivatePacket(
+    Tox* tox,
+    Tox_Group_Number group_number,
+    Tox_Group_Peer_Number peer_id,
+    const uint8_t* data,
+    size_t length,
+    void* user_data) {
+    ToxManager* manager = getManagerFromTox(tox);
+    if (manager && manager->group_custom_private_packet_cb_) {
+        manager->group_custom_private_packet_cb_(group_number, peer_id, data, length);
     }
 }
 
@@ -2024,6 +2122,15 @@ void ToxManager::setGroupCustomPacketCallback(GroupCustomPacketCallback cb) {
     group_custom_packet_cb_ = std::move(cb);
     if (tox_) {
         tox_callback_group_custom_packet(tox_.get(), onGroupCustomPacket);
+    }
+}
+
+void ToxManager::setGroupCustomPrivatePacketCallback(GroupCustomPacketCallback cb) {
+    auto iterate_lock = lockIterate();  // tox_callback_* bypasses toxcore's lock; keep it out of tox_iterate
+    std::lock_guard<std::mutex> lock(mutex_);
+    group_custom_private_packet_cb_ = std::move(cb);
+    if (tox_) {
+        tox_callback_group_custom_private_packet(tox_.get(), onGroupCustomPrivatePacket);
     }
 }
 

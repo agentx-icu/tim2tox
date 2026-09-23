@@ -1,0 +1,33 @@
+From a7df25da6a2a39e3f6e7835e8fbea8f7ea4041b0 Mon Sep 17 00:00:00 2001
+From: agentx-icu <satina@cfeel.top>
+Date: Fri, 18 Sep 2026 16:53:36 +0800
+Subject: [PATCH] 0021-group-private-message-receiver
+
+---
+ lib/native_im/adapter/tim_message_manager.dart | 9 ++++++++-
+ 1 file changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/lib/native_im/adapter/tim_message_manager.dart b/lib/native_im/adapter/tim_message_manager.dart
+index c44e807..daf97f4 100644
+--- a/lib/native_im/adapter/tim_message_manager.dart
++++ b/lib/native_im/adapter/tim_message_manager.dart
+@@ -608,8 +608,15 @@ class TIMMessageManager {
+ 
+     NativeLibraryManager.addTimApiValueCallback2Map(userData, handleApiCallback);
+ 
++    // tim2tox: receiver AND groupID = a private message to one group member.
++    // The native send reads `group_private_receiver`; without it the message
++    // went to the WHOLE group.
++    final Map<String, dynamic> msgJson = Map<String, dynamic>.from(message.toJson());
++    if (receiver != null && receiver.isNotEmpty && groupID != null && groupID.isNotEmpty) {
++      msgJson['group_private_receiver'] = receiver;
++    }
+     Pointer<Char> pConvID = Tools.string2PointerChar(convID);
+-    Pointer<Char> pMsgParam = Tools.string2PointerChar(json.encode(message.toJson()));
++    Pointer<Char> pMsgParam = Tools.string2PointerChar(json.encode(msgJson));
+     Pointer<Void> pUserData = Tools.string2PointerVoid(userData);
+     Pointer<Char> pMessageID =
+         NativeLibraryManager.bindings.DartSendMessage(pConvID, timConvType, pMsgParam, pUserData);
+-- 
+2.50.1 (Apple Git-155)
+

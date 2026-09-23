@@ -10,6 +10,8 @@ import 'package:tencent_cloud_chat_sdk/native_im/adapter/tim_manager.dart';
 import 'package:tencent_cloud_chat_sdk/native_im/adapter/tim_group_manager.dart';
 import 'package:tencent_cloud_chat_sdk/enum/V2TimGroupListener.dart';
 import 'package:tencent_cloud_chat_sdk/models/v2_tim_group_info.dart';
+import 'package:ffi/ffi.dart' as pkgffi;
+import 'package:tim2tox_dart/ffi/tim2tox_ffi.dart' as ffi_lib;
 import '../test_helper.dart';
 import '../test_fixtures.dart';
 
@@ -322,9 +324,11 @@ void main() {
       );
 
       var bobReceivedInfoChange = false;
+      final bobInfoChangeTypes = <int>[];
       final bobListener = V2TimGroupListener(
         onGroupInfoChanged: (groupID, changeInfos) {
           if (groupID == groupId) {
+            bobInfoChangeTypes.addAll(changeInfos.map((c) => c.type ?? -1));
             bobReceivedInfoChange = true;
             bob.markCallbackReceived('onGroupInfoChanged');
           }
@@ -334,10 +338,12 @@ void main() {
       bob.runWithInstance(
           () => TIMManager.instance.addGroupListener(listener: bobListener));
 
+      // The announcement is what travels (as the NGC topic). An NGC group's
+      // name is fixed at creation, so a rename is a local alias only.
       final groupInfo = V2TimGroupInfo(
         groupID: groupId,
         groupType: 'group',
-        groupName: 'Changed Name',
+        notification: 'Changed Announcement',
       );
 
       await alice.runWithInstanceAsync(
@@ -380,12 +386,15 @@ void main() {
           reason: 'Bob should be able to query group info');
       final bobObservedChangedName = bobGroupInfoResult.data != null &&
           bobGroupInfoResult.data!.isNotEmpty &&
-          bobGroupInfoResult.data!.first.groupInfo?.groupName == 'Changed Name';
+          bobGroupInfoResult.data!.first.groupInfo?.notification ==
+              'Changed Announcement';
       expect(
         bobObservedChangedName,
         isTrue,
-        reason: 'Bob should observe updated group name via getGroupsInfo',
+        reason: 'Bob should observe the new announcement via getGroupsInfo',
       );
+      expect(bobInfoChangeTypes, isNot(contains(1)),
+          reason: 'a topic must never arrive as a NAME change');
       expect(
         bobReceivedInfoChange || bobObservedChangedName,
         isTrue,
@@ -395,6 +404,36 @@ void main() {
 
       bob.runWithInstance(
           () => TIMManager.instance.removeGroupListener(listener: bobListener));
+
+      // A new NGC group has the topic lock ON, so only the founder and
+      // moderators may change the announcement. The native permission query
+      // (what toxee gates the "edit announcement" button on) must say so up
+      // front, and the refusal itself must read as NO PERMISSION (10007) —
+      // it used to come back as 7013 "not supported", which the UI explains
+      // as "this type of group can't do that".
+      int canSetTopic(TestNode node) {
+        final idPtr = groupId.toNativeUtf8();
+        try {
+          return ffi_lib.Tim2ToxFfi.open()
+              .canSetGroupTopicNative(node.testInstanceHandle!, idPtr);
+        } finally {
+          pkgffi.malloc.free(idPtr);
+        }
+      }
+
+      expect(canSetTopic(alice), equals(1),
+          reason: 'the founder may set the topic');
+      expect(canSetTopic(bob), equals(0),
+          reason: 'a plain member may not, under the default topic lock');
+      final bobSetResult = await bob.runWithInstanceAsync(() async =>
+          TIMGroupManager.instance.setGroupInfo(
+              info: V2TimGroupInfo(
+                  groupID: groupId,
+                  groupType: 'group',
+                  notification: 'Member Announcement')));
+      expect(bobSetResult.code, equals(10007), // ERR_SVR_GROUP_PERMISSION_DENY
+          reason: 'topic-lock refusal must be a permission error, got '
+              '${bobSetResult.code} ${bobSetResult.desc}');
     }, timeout: const Timeout(Duration(seconds: 120)));
   });
 }

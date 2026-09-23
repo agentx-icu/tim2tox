@@ -853,6 +853,14 @@ void V2TIMFriendshipManagerImpl::DeleteFromFriendList(const V2TIMStringVector& u
                 bool success = tox_friend_delete(tox, friend_num, &err_del);
                 V2TIM_LOG(kInfo, "DeleteFromFriendList: tox_friend_delete returned success=%d, err_del=%d", success, err_del);
                 if (success && err_del == TOX_ERR_FRIEND_DELETE_OK) {
+                    // toxcore reports no disconnect for a deleted friend, and a
+                    // later friend may reuse the number: forget it was sent our
+                    // group identity hints, and drop every hint, challenge and
+                    // proven NGC member mapping it left behind (MM-6).
+                    if (manager_impl_) {
+                        manager_impl_->PurgeFriendIdentityState(
+                            friend_num, ToxUtil::tox_bytes_to_hex(pubkey, TOX_PUBLIC_KEY_SIZE));
+                    }
                     result.resultCode = 0;
                     result.resultInfo = "Friend deleted successfully";
                     V2TIM_LOG(kInfo, "DeleteFromFriendList: Successfully deleted friend %s", user_id_str.c_str());

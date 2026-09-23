@@ -124,7 +124,7 @@ Signatures and the method inventory are authoritative in [API_REFERENCE_V2TIM.md
 
 | Domain | API | Status | Notes |
 | --- | --- | --- | --- |
-| Group | `MuteGroupMember` (:2535) | no-op-success | Returns success, but Tox has no timed-mute mechanism, so it has no effect. |
+| Group | `MuteGroupMember` | native (emulated expiry) | Mute = NGC `OBSERVER` role (toxcore drops the member's sends); `seconds == 0` unmutes (only lifts an observer); moderators/founder cannot be muted. NGC has no timed mute, so the muting client records the deadline (persisted to `<profile>.timed_mutes`) and lifts the role when it passes, from the event loop; re-muting resets the deadline, `UINT32_MAX` means forever. Only that client can lift it, and only while it is still a moderator; if the member is absent at the deadline it is lifted when they return (given up 7 days after the deadline). |
 | Group | `MuteAllGroupMembers` (:2546) | unsupported | |
 
 ### Search

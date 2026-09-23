@@ -40,6 +40,7 @@ import '../test_fixtures.dart';
 
 // Bit flags from toxav.h (Toxav_Friend_Call_State).
 const int _kCallStateSendingA = 4; // TOXAV_FRIEND_CALL_STATE_SENDING_A
+const int _kCallStateFinished = 2; // TOXAV_FRIEND_CALL_STATE_FINISHED
 
 /// Drives one harness tick in a mode-agnostic way, guaranteeing ToxAV's
 /// iterate loop runs on BOTH instances in BOTH clock modes.
@@ -450,11 +451,61 @@ void main() {
       expect(lastVLen, greaterThan(0),
           reason: 'Received video frame must have a non-empty V plane');
 
-      // Hang up + drain so tearDown never races an active call.
-      print('[Test] Hanging up...');
-      final hangupResult = await bob
-          .runWithInstanceAsync(() async => bobAV.endCall(aliceFriendNumber));
-      expect(hangupResult, isTrue, reason: 'Failed to end call');
+      // ============ RE-ENTRANCY: call back into ToxAV from a frame ==========
+      // The receive callbacks run synchronously inside toxav_iterate (see the
+      // header). ToxAVManager used to hold its non-recursive mutex across
+      // toxav_iterate, and every ToxAV API takes it, so calling back in from
+      // a callback deadlocked this thread for good. Change the bit rate and
+      // hang up from INSIDE bob's audio callback. The hang-up is scheduled to
+      // run as soon as that iterate returns (CANCEL frees the call the
+      // decoder is still using), and reports 1 = scheduled.
+      print('[Test] Re-entrancy: bit rate + hang-up from inside bob\'s audio '
+          'callback...');
+      final bobHandle = bob.testInstanceHandle!;
+      var reentrantBitRate = -1;
+      var reentrantEndCall = -1;
+      bobAV.setAudioReceiveCallback(
+          (friendNumber, pcm, sampleCount, channels, samplingRate) {
+        if (friendNumber != aliceFriendNumber || reentrantEndCall != -1) {
+          return;
+        }
+        final ffi = ffi_lib.Tim2ToxFfi.open();
+        reentrantBitRate =
+            ffi.avSetAudioBitRateNative(bobHandle, aliceFriendNumber, 32);
+        reentrantEndCall = ffi.avEndCallNative(bobHandle, aliceFriendNumber);
+      });
+      var reentrantAttempts = 0;
+      while (reentrantEndCall == -1 && reentrantAttempts < maxAudioAttempts) {
+        reentrantAttempts++;
+        await alice.runWithInstanceAsync(() async =>
+            aliceAV.sendAudioFrame(bobFriendNumber, pcm, 960, 1, 48000));
+        await _pumpAv(scenario,
+            advanceMs: 20,
+            iterationsPerInstance: 1,
+            wallSleep: const Duration(milliseconds: 20));
+      }
+      print('[Test] Re-entrancy: attempts=$reentrantAttempts '
+          'setBitRate=$reentrantBitRate endCall=$reentrantEndCall');
+      expect(reentrantEndCall, equals(1),
+          reason: 'end_call from inside the audio receive callback must be '
+              'accepted (scheduled), not deadlock or fail');
+      expect(reentrantBitRate, equals(1),
+          reason: 'set_audio_bit_rate from inside the audio receive callback '
+              'must succeed');
+      // The scheduled hang-up really ran: alice's side sees the call end.
+      await waitUntilWithAvVirtualPump(
+        scenario,
+        () => aliceCallState == _kCallStateFinished,
+        timeout: const Duration(seconds: 30),
+        description: 'Alice sees the call FINISHED after bob hung up from '
+            'inside his audio callback',
+        advanceMs: 50,
+        iterationsPerInstance: 1,
+        wallSleep: const Duration(milliseconds: 30),
+      );
+      bobAV.setAudioReceiveCallback(null);
+
+      // Drain so tearDown never races call teardown.
       for (int i = 0; i < 10; i++) {
         await _pumpAv(scenario,
             advanceMs: 50,

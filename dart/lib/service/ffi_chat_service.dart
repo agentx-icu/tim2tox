@@ -12,6 +12,7 @@ import '../models/chat_message.dart';
 import '../interfaces/preferences_service.dart';
 import '../interfaces/extended_preferences_service.dart';
 import '../interfaces/draft_preferences_service.dart';
+import '../interfaces/group_identity_preferences_service.dart';
 import '../interfaces/logger_service.dart';
 import '../interfaces/bootstrap_service.dart';
 import '../interfaces/scratch_file_service.dart';
@@ -25,6 +26,7 @@ import 'file_receive_cleanup.dart';
 import 'scratch_file_manager.dart';
 import 'package:tencent_cloud_chat_sdk/native_im/bindings/native_library_manager.dart';
 import 'package:tencent_cloud_chat_sdk/native_im/adapter/tim_message_manager.dart';
+import 'package:tencent_cloud_chat_sdk/native_im/adapter/tim_group_manager.dart';
 import 'package:tencent_cloud_chat_sdk/native_im/tools.dart';
 import 'package:tencent_cloud_chat_sdk/models/v2_tim_callback.dart';
 
@@ -607,7 +609,10 @@ class FfiChatService {
   final ScratchFileManager _scratchFiles;
 
   /// Per-account file receive directory (when set, used instead of app support file_recv).
-  final String? _fileRecvPath;
+  ///
+  /// Not `final`: [installAccountStorage] re-points it for services that had
+  /// to be constructed before the account identity was known.
+  String? _fileRecvPath;
 
   /// P1-2: Resolved file_recv directory once init has run (whatever path the
   /// constructor arg, resolver, or fallback ended up with). Used to anchor the
@@ -616,7 +621,25 @@ class FfiChatService {
   String? _fileRecvDir;
 
   /// Per-account avatars directory (when set, used instead of app support avatars).
-  final String? _avatarsPath;
+  ///
+  /// Not `final`: see [_fileRecvPath] / [installAccountStorage].
+  String? _avatarsPath;
+
+  /// The per-account storage [installAccountStorage] bound this service to, or
+  /// null when it was never called. Guards a second call for a DIFFERENT
+  /// account (see that method). Claimed SYNCHRONOUSLY, before the rebinds
+  /// start, so two concurrent installs cannot both see "not installed".
+  ({String historyDirectory, String queueFilePath})? _installedAccountStorage;
+
+  /// The install currently rebinding and reloading, so a concurrent caller for
+  /// the SAME account waits for it instead of returning "already installed"
+  /// while the stores are still mid-rebind.
+  Future<void>? _accountStorageInstall;
+
+  /// Whether the last install for [_installedAccountStorage] failed part-way.
+  /// The claim survives (no other account may take it), but a retry with the
+  /// same paths re-runs the work instead of reporting success.
+  bool _accountStorageInstallFailed = false;
 
   /// Optional path resolver injected by the integrating client. When set,
   /// overrides the `getApplicationSupportDirectory()` defaults used for
@@ -637,6 +660,19 @@ class FfiChatService {
         eventInstanceId: eventInstanceId,
         isKnownEventInstance: synchronized(_instanceServicesLock,
             () => _knownInstanceIds.contains(eventInstanceId)),
+      );
+
+  /// Whether a native group notification (stamped `instance_id` /
+  /// `session_epoch`, see [acceptsNativeSessionNotification]) belongs to this
+  /// service's live session. Tim2ToxSdkPlatform's process-global custom
+  /// callback handler drops every one this returns false for, so a delayed
+  /// notification from another node or from the previous account cannot
+  /// mutate this service's state or the current account's preferences.
+  bool ownsNativeSessionNotification(Map<String, dynamic> data) =>
+      acceptsNativeSessionNotification(
+        data: data,
+        ownsInstance: _ownsEventInstance,
+        liveSessionEpoch: (instanceId) => _ffi.getSessionEpoch(instanceId),
       );
 
   /// R-08: Async login: completer completed when native login callback fires.
@@ -681,6 +717,171 @@ class FfiChatService {
   /// paths were available. Must be called before the first scratch operation.
   void installScratchFileService(ScratchFileService service) {
     _scratchFiles.installScratchFileService(service);
+  }
+
+  /// Re-point this service's per-account storage after construction.
+  ///
+  /// WHY THIS EXISTS: the account's storage paths are keyed by the Tox ID, and
+  /// a host with a legacy account row that carries no Tox ID cannot know it
+  /// until `init()` has opened the profile and `login()` has published the
+  /// address. Such a service therefore has to be constructed WITHOUT
+  /// `historyDirectory` / `queueFilePath` / `fileRecvPath` / `avatarsPath`,
+  /// which lands it on the shared `<AppSupport>` defaults that every account
+  /// on the device would share. This is the late-binding counterpart of
+  /// [installScratchFileService] and of the host injecting its per-account
+  /// preferences prefix once `getSelfToxId()` answers.
+  ///
+  /// THE WINDOW: pre-boot only — after `init()` + `login()`, before
+  /// [startPolling] and before the app has read or written any history of its
+  /// own. Called later it throws [StateError] rather than quietly leaving the
+  /// service on the shared defaults; a silent no-op here is indistinguishable
+  /// from the bug it fixes.
+  ///
+  /// WHAT IT DOES: flushes everything still owed to the previous location,
+  /// drops all in-memory history/queue state so nothing read from the shared
+  /// default can leak into the account directory, re-points the four stores,
+  /// and reloads history, unread counts and the offline queue from the new
+  /// location. `init()` has already loaded from the old location by the time
+  /// this runs, which is exactly why the reload is not optional.
+  ///
+  /// The caller is responsible for creating the directories and for adopting
+  /// any legacy data that belongs to this account (toxee:
+  /// `AppPaths.migrateAccountDataFromLegacy`) BEFORE calling this — the
+  /// reload below is what makes the adopted data visible.
+  ///
+  /// Calling it twice with the same paths is a no-op; twice with different
+  /// paths throws [StateError] (two accounts cannot share one service).
+  Future<void> installAccountStorage({
+    required String historyDirectory,
+    required String queueFilePath,
+    String? fileRecvPath,
+    String? avatarsPath,
+  }) async {
+    _assertAccountStoragePath(historyDirectory, 'historyDirectory');
+    _assertAccountStoragePath(queueFilePath, 'queueFilePath');
+    if (fileRecvPath != null) {
+      _assertAccountStoragePath(fileRecvPath, 'fileRecvPath');
+    }
+    if (avatarsPath != null) {
+      _assertAccountStoragePath(avatarsPath, 'avatarsPath');
+    }
+
+    // The binding is claimed SYNCHRONOUSLY below, before the first await, and
+    // an install already in flight is awaited rather than reported as done.
+    // Both matter: the claim used to be recorded only after the rebinds and
+    // the reload, so two concurrent calls with DIFFERENT paths both passed
+    // this check, interleaved their rebinds, and the loser returned success
+    // on a service pointing at the other account's files — while an
+    // equal-paths caller returned success while the stores were still mid
+    // rebind.
+    final installed = _installedAccountStorage;
+    if (installed != null) {
+      if (installed.historyDirectory != historyDirectory ||
+          installed.queueFilePath != queueFilePath) {
+        throw StateError(
+          'FfiChatService.installAccountStorage: this service is already bound '
+          'to ${installed.historyDirectory}; re-binding it to '
+          '$historyDirectory would mix two accounts in one session. Create a '
+          'new service for the other account.',
+        );
+      }
+      final inFlight = _accountStorageInstall;
+      if (inFlight != null) {
+        await inFlight;
+        return;
+      }
+      // A previous attempt for THESE paths failed part-way; retry it below
+      // (every step is idempotent) instead of reporting a success that never
+      // happened.
+      if (!_accountStorageInstallFailed) return;
+    }
+    if (_pollingStarted) {
+      throw StateError(
+        'FfiChatService.installAccountStorage: refused — polling has already '
+        'started, so history and the offline queue are live and may already '
+        'have been written to the previous location. Account storage must be '
+        'installed in the pre-boot window (after login(), before '
+        'startPolling()).',
+      );
+    }
+    if (_disposing || _sessionClosed) {
+      throw StateError(
+        'FfiChatService.installAccountStorage: refused — the session is '
+        'closed or being disposed.',
+      );
+    }
+
+    _installedAccountStorage = (
+      historyDirectory: historyDirectory,
+      queueFilePath: queueFilePath,
+    );
+    _accountStorageInstallFailed = false;
+    final install = _runAccountStorageInstall(
+      historyDirectory: historyDirectory,
+      queueFilePath: queueFilePath,
+      fileRecvPath: fileRecvPath,
+      avatarsPath: avatarsPath,
+    );
+    _accountStorageInstall = install;
+    try {
+      await install;
+    } catch (_) {
+      // Keep the claim: a partially applied rebind must not let a DIFFERENT
+      // account install over it. A retry with the same paths re-runs the work.
+      _accountStorageInstallFailed = true;
+      rethrow;
+    } finally {
+      if (identical(_accountStorageInstall, install)) {
+        _accountStorageInstall = null;
+      }
+    }
+  }
+
+  /// The body of [installAccountStorage], run as a single in-flight future so
+  /// concurrent callers can await the one install instead of racing it.
+  Future<void> _runAccountStorageInstall({
+    required String historyDirectory,
+    required String queueFilePath,
+    String? fileRecvPath,
+    String? avatarsPath,
+  }) async {
+    await _messageHistoryPersistence.rebindHistoryDirectory(historyDirectory);
+    await _offlineQueuePersistence.rebindQueueFile(queueFilePath);
+    if (fileRecvPath != null) _fileRecvPath = fileRecvPath;
+    if (avatarsPath != null) _avatarsPath = avatarsPath;
+
+    // Conversation previews were derived from the OLD location's rows; drop
+    // them with the rest of the state the rebind discarded.
+    _lastByPeer.clear();
+    if (fileRecvPath != null) {
+      await _applyFileRecvDirectory();
+    }
+    await _loadAllHistories();
+    await _restoreUnreadCounts();
+    await _loadOfflineQueue();
+  }
+
+  /// Test seam: flips the flag [installAccountStorage] refuses after, without
+  /// running the real poll loop (which needs a live native instance). Tests
+  /// only — production code reaches this state through [startPolling].
+  void debugMarkPollingStartedForTest() => _pollingStarted = true;
+
+  static void _assertAccountStoragePath(String path, String which) {
+    if (path.isEmpty) {
+      throw ArgumentError.value(
+        path,
+        which,
+        'must be a non-empty absolute path',
+      );
+    }
+    if (!p.isAbsolute(path)) {
+      throw ArgumentError.value(
+        path,
+        which,
+        'must be absolute; a relative path resolves against the process '
+            'working directory, which is not the app sandbox',
+      );
+    }
   }
 
   /// Writes short-lived helper bytes through the host's scratch owner, or an
@@ -912,7 +1113,13 @@ class FfiChatService {
     required String senderPk,
     required int pseudoMsgId,
   }) =>
-      'gmid:$groupId|${senderPk.toUpperCase()}|$pseudoMsgId';
+      // Single definition shared with MessageConverter (binary-replacement
+      // path), so both inbound copies of one message derive the same alias.
+      toxGroupMessageAlias(
+        groupId: groupId,
+        senderPk: senderPk,
+        pseudoMsgId: pseudoMsgId,
+      );
 
   /// Parses an event emitted as either
   /// `progress_recv:<uid>:<received>:<total>:<path>` or
@@ -1325,6 +1532,10 @@ class FfiChatService {
   bool _isConnected = false;
   bool get isConnected => _isConnected;
 
+  /// TEST-ONLY stand-in for the native "can a send to this group reach anyone"
+  /// query ([_groupWireReady]); same contract as [debugSetConnected].
+  bool Function(String groupId)? debugGroupWireReadyOverride;
+
   /// TEST-ONLY: inject the exact `isConnected` transition that a real toxcore
   /// link-loss / restore produces (see the poller at the `conn:failed` /
   /// `conn:ok` paths). Every offline-UI widget subscribes to
@@ -1386,6 +1597,17 @@ class FfiChatService {
   Set<String> _quitGroups =
       {}; // Cache of quit groups to avoid async calls in timer
   Set<String> get quitGroups => Set.unmodifiable(_quitGroups);
+
+  /// Groups we are no longer in but whose local history must NOT be deleted:
+  /// we were removed (kicked) rather than choosing to leave. History exists
+  /// only on this device, so someone else's moderation action must never
+  /// destroy it. Account-scoped through the injected preferences.
+  static const String _kHistoryRetainedGroups = 'groups_history_retained_v1';
+  final Set<String> _historyRetainedGroups = <String>{};
+
+  /// What the history loader may delete on sight: groups the USER left.
+  Set<String> get historyPurgeGroups =>
+      _quitGroups.difference(_historyRetainedGroups);
 
   /// S29 block/unblock: in-memory cache of blocked peer Tox IDs (normalized to
   /// 64-char) so the SYNCHRONOUS inbound paths can drop a blocked sender's
@@ -1616,6 +1838,16 @@ class FfiChatService {
   /// use-after-free the teardown flags exist to prevent.
   bool _disposing = false;
 
+  /// True from the start of [dispose] until the next [init]. Unlike
+  /// [_disposing] (cleared again once a clean teardown finishes, because the
+  /// object is re-initable) this stays latched across the inter-session gap.
+  /// Native group join/quit notifications are routed through a process-global
+  /// handler that can still point at THIS service while the next account's
+  /// native instance is already coming up. Honoring one then would persist
+  /// that account's group into this account's (account-scoped) known-groups
+  /// list and replace the real list, because [_knownGroups] is already empty.
+  bool _sessionClosed = false;
+
   /// Whether the most recent completed [dispose] actually stopped the native
   /// instance, i.e. reached `_ffi.uninit()`.
   ///
@@ -1794,12 +2026,23 @@ class FfiChatService {
   void setActivePeer(String? conversationId) {
     if (conversationId == null || conversationId.isEmpty) {
       _activePeerId = null;
+      _openChatMentions = null;
       return;
     }
     final normalizedId = ConversationIdUtils.normalize(conversationId);
     if (normalizedId.isEmpty) {
       _activePeerId = null;
+      _openChatMentions = null;
       return;
+    }
+    // Snapshot the unread mentions BEFORE this open reads them (below): the
+    // chat page asks for its "@me" jump targets only after the tap made the
+    // group active. Re-activating the same group keeps the snapshot.
+    final mentions = unreadMentionRows(normalizedId);
+    if (mentions.isNotEmpty) {
+      _openChatMentions = (groupKey: normalizedId, rows: mentions);
+    } else if (_openChatMentions?.groupKey != normalizedId) {
+      _openChatMentions = null;
     }
     _activePeerId = normalizedId;
     // CR-07: anchor the read barrier to the conversation's highest message
@@ -1883,9 +2126,10 @@ class FfiChatService {
       final msg = history[i];
       if (!msg.isSelf && !msg.isRead) candidates.add(i);
     }
-    candidates.sort(
-      (a, b) => history[b].timestamp.compareTo(history[a].timestamp),
-    );
+    candidates.sort((a, b) {
+      final byTime = history[b].timestamp.compareTo(history[a].timestamp);
+      return byTime != 0 ? byTime : b.compareTo(a); // GH-6 stable tiebreak
+    });
     var sent = 0;
     final deferred = <String>[];
     for (final i in candidates.take(50)) {
@@ -2073,8 +2317,8 @@ class FfiChatService {
     final history = getHistory(normalizedId);
     if (history.isEmpty) return;
 
-    final sortedHistory = List<ChatMessage>.from(history)
-      ..sort((a, b) => b.timestamp.compareTo(a.timestamp));
+    final sortedHistory = List<ChatMessage>.from(history);
+    sortChatMessagesChronologically(sortedHistory, newestFirst: true);
     _lastByPeer[normalizedId] = sortedHistory.first;
   }
 
@@ -2164,46 +2408,83 @@ class FfiChatService {
       final count = _ffi.getRestoredConferenceCountNative(instanceId);
       if (count <= 0) return;
 
-      // Count existing tox_conf_* entries already tracked in _knownGroups
       final confPattern = RegExp(r'^tox_conf_(\d+)$');
-      final existingConfIds =
-          _knownGroups.where((id) => confPattern.hasMatch(id)).toList();
+      // A known group is a conference when its persisted kind says so — for
+      // every id shape: tox_<n> (created here), tox_conf_<friend>_<ms>
+      // (invited), tox_conf_<n> (discovered). Only profiles from before kinds
+      // were persisted fall back to the discovered-id shape. Counting the
+      // shape alone missed the first two and minted a phantom tox_conf_<k>
+      // for each of them on every start.
+      bool isTrackedConference(String id) {
+        final kind = _nativeGroupType(instanceId, id);
+        if (kind != null) {
+          return kind == 'conference' || kind == 'av_conference';
+        }
+        return confPattern.hasMatch(id);
+      }
+
+      Future<void> markConferenceIfUntyped(String id) async {
+        if (_nativeGroupType(instanceId, id) != null) return;
+        final groupIdPtr = id.toNativeUtf8();
+        final typePtr = 'conference'.toNativeUtf8();
+        try {
+          _ffi.setGroupTypeNative(instanceId, groupIdPtr, typePtr);
+        } finally {
+          pkgffi.malloc.free(groupIdPtr);
+          pkgffi.malloc.free(typePtr);
+        }
+        // Native treats this as a value FROM Dart and does not echo it back,
+        // so persist the discovery here — awaited, so a failed write is seen
+        // (and retried once) instead of escaping as an unhandled async error.
+        // Still failing: the next start finds the id untyped and marks it
+        // again (and the discovered-id shape keeps it a conference meanwhile).
+        final identityPrefs = _groupIdentityPrefs;
+        if (identityPrefs == null) return;
+        for (var attempt = 1;; attempt++) {
+          try {
+            await identityPrefs.setGroupType(id, 'conference');
+            return;
+          } catch (e, st) {
+            if (attempt >= 2) {
+              _logger?.logError(
+                  '[FfiChatService] persisting conference kind of $id failed',
+                  e,
+                  st);
+              return;
+            }
+          }
+        }
+      }
+
+      final existingConfIds = _knownGroups.where(isTrackedConference).toList();
       final existingCount = existingConfIds.length;
 
-      // Cleanup: if we have MORE tracked conferences than actual restored ones,
-      // remove the excess phantom entries (keep lowest-numbered ones which were the originals).
+      // Cleanup: more tracked conferences than restored ones means phantom
+      // entries from older builds; drop the highest-numbered discovered ids.
       if (existingCount > count) {
-        existingConfIds.sort((a, b) {
-          final numA =
-              int.tryParse(confPattern.firstMatch(a)?.group(1) ?? '999') ?? 999;
-          final numB =
-              int.tryParse(confPattern.firstMatch(b)?.group(1) ?? '999') ?? 999;
-          return numA.compareTo(numB);
-        });
-        final toRemove = existingConfIds.sublist(count);
+        final phantoms = existingConfIds.where(confPattern.hasMatch).toList()
+          ..sort((a, b) {
+            final numA = int.tryParse(confPattern.firstMatch(a)?.group(1) ?? '') ??
+                1 << 30;
+            final numB = int.tryParse(confPattern.firstMatch(b)?.group(1) ?? '') ??
+                1 << 30;
+            return numA.compareTo(numB);
+          });
+        final excess = (existingCount - count).clamp(0, phantoms.length);
+        final toRemove = phantoms.sublist(phantoms.length - excess);
         _knownGroups.removeAll(toRemove);
-        if (_prefs != null) {
+        if (_prefs != null && toRemove.isNotEmpty) {
           await _prefs!.setGroups(_knownGroups);
         }
         print(
             '[FfiChatService] _discoverRestoredConferences: Cleaned up ${toRemove.length} phantom conference entries: $toRemove');
       }
 
-      // Only create new IDs for conferences not yet tracked
-      final trackedCount =
-          _knownGroups.where((id) => confPattern.hasMatch(id)).length;
+      final trackedCount = _knownGroups.where(isTrackedConference).length;
       final needed = count - trackedCount;
       if (needed <= 0) {
-        // All conferences already tracked, just ensure C++ types are set
-        for (final id in _knownGroups.where((id) => confPattern.hasMatch(id))) {
-          final groupIdPtr = id.toNativeUtf8();
-          final typePtr = 'conference'.toNativeUtf8();
-          try {
-            _ffi.setGroupTypeNative(instanceId, groupIdPtr, typePtr);
-          } finally {
-            pkgffi.malloc.free(groupIdPtr);
-            pkgffi.malloc.free(typePtr);
-          }
+        for (final id in _knownGroups.where(confPattern.hasMatch).toList()) {
+          await markConferenceIfUntyped(id);
         }
         return;
       }
@@ -2213,9 +2494,10 @@ class FfiChatService {
         final written =
             _ffi.getRestoredConferenceListNative(instanceId, ptr, count);
         if (written <= 0) return;
-        // Generate unique group_ids only for the NEW (untracked) conferences
+        // Generate unique group_ids only for the NEW (untracked) conferences,
+        // above every discovered id ever used (left ones included).
         int startIndex = 0;
-        for (final id in _knownGroups) {
+        for (final id in {..._knownGroups, ..._quitGroups}) {
           final m = confPattern.firstMatch(id);
           if (m != null) {
             final k = int.tryParse(m.group(1) ?? '') ?? -1;
@@ -2226,25 +2508,10 @@ class FfiChatService {
         for (int i = 0; i < actualNeeded; i++) {
           final groupId = 'tox_conf_${startIndex + i}';
           _knownGroups.add(groupId);
-          final groupIdPtr = groupId.toNativeUtf8();
-          final typePtr = 'conference'.toNativeUtf8();
-          try {
-            _ffi.setGroupTypeNative(instanceId, groupIdPtr, typePtr);
-          } finally {
-            pkgffi.malloc.free(groupIdPtr);
-            pkgffi.malloc.free(typePtr);
-          }
+          await markConferenceIfUntyped(groupId);
         }
-        // Also set type for existing conference entries
-        for (final id in _knownGroups.where((id) => confPattern.hasMatch(id))) {
-          final groupIdPtr = id.toNativeUtf8();
-          final typePtr = 'conference'.toNativeUtf8();
-          try {
-            _ffi.setGroupTypeNative(instanceId, groupIdPtr, typePtr);
-          } finally {
-            pkgffi.malloc.free(groupIdPtr);
-            pkgffi.malloc.free(typePtr);
-          }
+        for (final id in _knownGroups.where(confPattern.hasMatch).toList()) {
+          await markConferenceIfUntyped(id);
         }
         if (actualNeeded > 0 && _prefs != null) {
           await _prefs!.setGroups(_knownGroups);
@@ -2257,23 +2524,111 @@ class FfiChatService {
     }
   }
 
+  /// The kind native holds for [groupId] (replayed from preferences at
+  /// start, or learned this session), or null when it has none.
+  String? _nativeGroupType(int instanceId, String groupId) {
+    final idPtr = groupId.toNativeUtf8();
+    final buf = pkgffi.calloc<ffi.Int8>(32);
+    try {
+      if (_ffi.getGroupTypeFromStorageNative(instanceId, idPtr, buf, 32) != 1) {
+        return null;
+      }
+      final kind = buf.cast<pkgffi.Utf8>().toDartString();
+      return kind.isEmpty ? null : kind;
+    } catch (_) {
+      return null;
+    } finally {
+      pkgffi.malloc.free(idPtr);
+      pkgffi.calloc.free(buf);
+    }
+  }
+
+  /// [key] in the current account's namespace (see
+  /// [AccountScopedPreferencesService]); verbatim for preference services
+  /// that do their own scoping or have only one account.
+  String _scopedKey(String key) {
+    final prefs = _prefs;
+    return prefs is AccountScopedPreferencesService
+        ? (prefs as AccountScopedPreferencesService).accountScopedKey(key)
+        : key;
+  }
+
+  GroupIdentityPreferencesService? get _groupIdentityPrefs {
+    final prefs = _prefs;
+    // Not a subtype of ExtendedPreferencesService, so no type promotion.
+    return prefs is GroupIdentityPreferencesService
+        ? prefs as GroupIdentityPreferencesService
+        : null;
+  }
+
+  static final RegExp _mintedGroupIdPattern = RegExp(r'^tox_(\d+)$');
+
+  /// Tell native the highest `tox_<n>` this account has ever used — known,
+  /// left, kicked-from (history kept) and dismissed groups alike — so a new
+  /// group never gets a retired id. A reused id inherited the old group's
+  /// persisted chat id (silently rejoining the group the user left on the
+  /// next start), its settings and its retained history.
+  void _syncRetiredGroupIdMaxToNative([int? instanceId]) {
+    var maxId = 0;
+    for (final id in {
+      ..._knownGroups,
+      ..._quitGroups,
+      ..._historyRetainedGroups,
+    }) {
+      final n =
+          int.tryParse(_mintedGroupIdPattern.firstMatch(id)?.group(1) ?? '');
+      if (n != null && n > maxId) maxId = n;
+    }
+    try {
+      _ffi.setRetiredGroupIdMaxNative(instanceId ?? _serviceInstanceId, maxId);
+    } catch (_) {
+      // Older native library / test double without the export: ids fall back
+      // to the known-groups floor.
+    }
+  }
+
   /// Sync group conference IDs from persistence to C++ layer
   /// This is called on startup to rebuild the mapping after restart
   Future<void> _syncGroupChatIdsToNative() async {
-    if (_prefs == null) return;
+    final prefs = _prefs;
+    if (prefs == null) return;
+    // The instance this session's identities belong to, captured BEFORE the
+    // first await: re-reading the process-wide "current" instance after a
+    // preference read could hand account A's identities to account B's
+    // instance if a switch ran in between.
+    final instanceId = _ffi.getCurrentInstanceId();
 
     try {
-      for (final groupId in _knownGroups) {
+      final identityPrefs = _groupIdentityPrefs;
+      for (final groupId in _knownGroups.toList()) {
+        if (_sessionClosed) return; // the session these ids belong to ended
         try {
-          final chatId = await _prefs!.getGroupChatId(groupId);
+          // Kind first: native restore decides NGC vs conference by it.
+          final groupType = await identityPrefs?.getGroupType(groupId);
+          if (_sessionClosed) return;
+          if (groupType != null && groupType.isNotEmpty) {
+            final groupIdNative = groupId.toNativeUtf8();
+            final typeNative = groupType.toNativeUtf8();
+            try {
+              _ffi.setGroupTypeNative(instanceId, groupIdNative, typeNative);
+            } finally {
+              pkgffi.malloc.free(groupIdNative);
+              pkgffi.malloc.free(typeNative);
+            }
+          }
+          final chatId = await prefs.getGroupChatId(groupId);
+          if (_sessionClosed) return;
           if (chatId != null && chatId.isNotEmpty) {
             // Sync to C++ layer
             final groupIdNative = groupId.toNativeUtf8();
             final chatIdNative = chatId.toNativeUtf8();
-            _ffi.setGroupChatIdNative(
-                _ffi.getCurrentInstanceId(), groupIdNative, chatIdNative);
-            pkgffi.malloc.free(groupIdNative);
-            pkgffi.malloc.free(chatIdNative);
+            try {
+              _ffi.setGroupChatIdNative(
+                  instanceId, groupIdNative, chatIdNative);
+            } finally {
+              pkgffi.malloc.free(groupIdNative);
+              pkgffi.malloc.free(chatIdNative);
+            }
           }
         } catch (e) {
           // Ignore errors for individual groups
@@ -2284,25 +2639,106 @@ class FfiChatService {
     }
   }
 
+  /// Persist every group identity (chat / conference id) and kind the native
+  /// layer knows right now — the pull counterpart of the groupChatIdStored /
+  /// groupTypeStored pushes. Native learns most of them while restoring and
+  /// rejoining during login, before this client has a SendPort or a handler
+  /// for those callbacks (Tim2ToxSdkPlatform installs it later), so the pushes
+  /// were dropped and the next start could not rebind those groups.
+  /// Idempotent: writes only values that differ from what is persisted. Call
+  /// whenever persisting becomes possible (polling start, platform install).
+  Future<void> syncGroupIdentitiesFromNative() async {
+    final prefs = _prefs;
+    if (prefs == null) return;
+    final identityPrefs = _groupIdentityPrefs;
+    String? snapshot;
+    try {
+      final instanceId = _ffi.getCurrentInstanceId();
+      var capacity = 4096;
+      for (var attempt = 0; attempt < 3 && snapshot == null; attempt++) {
+        final buffer = pkgffi.malloc.allocate<ffi.Int8>(capacity);
+        try {
+          final n =
+              _ffi.getGroupIdentitySnapshotNative(instanceId, buffer, capacity);
+          if (n < 0) {
+            capacity = -n; // grew since the last call: retry with its size
+            continue;
+          }
+          snapshot = n == 0
+              ? ''
+              : buffer.cast<pkgffi.Utf8>().toDartString(length: n);
+        } finally {
+          pkgffi.malloc.free(buffer);
+        }
+      }
+    } catch (e) {
+      // Older native library without the export (lookup ArgumentError).
+      _logger?.log(
+          '[FfiChatService] syncGroupIdentitiesFromNative: snapshot unavailable: $e');
+      return;
+    }
+    if (snapshot == null || snapshot.isEmpty) return;
+    var written = 0;
+    for (final line in snapshot.split('\n')) {
+      final fields = line.split('\t');
+      if (fields.length != 3 || fields[0].isEmpty) continue;
+      final groupId = fields[0];
+      final chatId = fields[1];
+      final groupType = fields[2];
+      // Left groups keep their cleared identity (see quitGroup).
+      if (_quitGroups.contains(groupId)) continue;
+      try {
+        if (chatId.isNotEmpty &&
+            (await prefs.getGroupChatId(groupId))?.toLowerCase() != chatId) {
+          await prefs.setGroupChatId(groupId, chatId);
+          written++;
+        }
+        if (groupType.isNotEmpty &&
+            identityPrefs != null &&
+            await identityPrefs.getGroupType(groupId) != groupType) {
+          await identityPrefs.setGroupType(groupId, groupType);
+          written++;
+        }
+      } catch (e, st) {
+        _logger?.logError(
+            '[FfiChatService] syncGroupIdentitiesFromNative failed for groupId=$groupId',
+            e,
+            st);
+      }
+    }
+    if (written > 0) {
+      _logger?.log(
+          '[FfiChatService] syncGroupIdentitiesFromNative: persisted $written value(s) native announced before they could be stored');
+    }
+  }
+
   // Save message history for a conversation (delegate to persistence service)
   Future<void> _saveHistory(String id) async {
     final list = _messageHistoryPersistence.getCachedList(id);
     if (list != null && list.isNotEmpty) {
-      await _messageHistoryPersistence.saveHistory(id, list);
+      try {
+        await _messageHistoryPersistence.saveHistory(id, list);
+      } catch (_) {
+        // saveHistory now propagates write failures (GH-7) after logging them
+        // and arming a retry of the cached list. Most of this helper's callers
+        // fire and forget, and none can do better than that retry, so the
+        // error stops here instead of reaching the zone.
+      }
     }
   }
 
   // Load message history for a conversation (delegate to persistence service)
   Future<void> _loadHistory(String id) async {
     if (_draftDisposing) return;
-    final quitGroups = _quitGroups.toSet();
+    final quitGroups = historyPurgeGroups;
     final messages = await _messageHistoryPersistence.loadHistory(id,
         quitGroups: quitGroups);
     if (_draftDisposing) return;
     if (messages.isNotEmpty) {
       // Persistence already owns the in-memory list; we only need to refresh
-      // conversation-preview state here.
-      messages.sort((a, b) => b.timestamp.compareTo(a.timestamp));
+      // conversation-preview state here. `messages` is a copy (sorting the
+      // cache in place used to reverse its arrival order); stable (GH-6).
+      sortChatMessagesChronologically(messages, newestFirst: true);
       final lastMsg = messages.first;
       _lastByPeer[id] = lastMsg;
     }
@@ -2310,8 +2746,24 @@ class FfiChatService {
 
   // Load all message histories (called on init) - delegate to persistence service
   Future<void> _loadAllHistories() async {
+    // Start this session on the persistence store: undoes a previous
+    // dispose() (a re-init of this service object after logout).
+    //
+    // The owner key binds the DEFAULT directory to a Tox identity, but on the
+    // path that needs it most it is not known yet: init() runs before
+    // login(), so `getSelfToxId()` is null here and this load still reads
+    // whatever sits in the shared `<AppSupport>/chat_history`. Per-account
+    // isolation therefore comes from the host injecting a historyDirectory,
+    // or calling [installAccountStorage] once the id arrives (toxee does the
+    // latter on its legacy login paths); the owner binding only helps a host
+    // that already knew the identity at construction time.
+    String? ownerKey;
     try {
-      final quitGroups = _quitGroups.toSet();
+      ownerKey = getSelfToxId();
+    } catch (_) {}
+    _messageHistoryPersistence.openSession(ownerKey: ownerKey);
+    try {
+      final quitGroups = historyPurgeGroups;
       final allHistories = await _messageHistoryPersistence.loadAllHistories(
           quitGroups: quitGroups);
 
@@ -2324,8 +2776,9 @@ class FfiChatService {
         final conversationId = entry.key;
         final messages = entry.value;
         if (messages.isNotEmpty) {
-          // Sort messages by timestamp to get the latest one
-          messages.sort((a, b) => b.timestamp.compareTo(a.timestamp));
+          // Sort messages by timestamp to get the latest one (a copy of the
+          // cache list, see _loadHistory; stable for equal timestamps).
+          sortChatMessagesChronologically(messages, newestFirst: true);
           final lastMsg = messages.first;
           _lastByPeer[conversationId] = lastMsg;
         }
@@ -2368,7 +2821,60 @@ class FfiChatService {
   /// quarantine is authorized ONLY for this epoch.
   int _sessionEpoch = 0;
 
+  /// The Dart-side session state [init] opens before any native work.
+  void _beginSession() {
+    _sessionClosed = false;
+    // A re-init after dispose: the session-scoped streams closed with the
+    // previous session; a native callback of this one must find them open.
+    _reopenSessionStreams();
+    // Accepted-invite bookkeeping belongs to the session that accepted them
+    // (a restart restores them as pending invites, see
+    // [_restorePendingGroupInvites]).
+    _joiningInvites.clear();
+    _groupInvitePersistClosed = false;
+  }
+
+  /// Test seam: what [init] does to the Dart session state before any native
+  /// work (a re-login on a disposed service object). Tests only.
+  void debugBeginSessionForTest() => _beginSession();
+
+  /// Resolve the file-receive directory and hand it to native.
+  ///
+  /// Per-account when [_fileRecvPath] is set, else the injected resolver (X6),
+  /// else the app-support fallback. Runs from [init] and again from
+  /// [installAccountStorage] when the account path arrives late.
+  Future<void> _applyFileRecvDirectory() async {
+    try {
+      final String recvPath;
+      if (_fileRecvPath != null && _fileRecvPath!.isNotEmpty) {
+        recvPath = _fileRecvPath!;
+      } else if (_pathResolver != null) {
+        recvPath = _assertResolverPath(
+          await _pathResolver!.resolveFileRecvDirectory(),
+          'resolveFileRecvDirectory',
+        );
+      } else {
+        final appDir = await getApplicationSupportDirectory();
+        recvPath = '${appDir.path}/file_recv';
+      }
+      final recvDir = Directory(recvPath);
+      if (!await recvDir.exists()) {
+        await recvDir.create(recursive: true);
+      }
+      // P1-2: remember the resolved dir so the pending "receiving_*" temp
+      // path lives in the same per-account location as the actual file_recv
+      // output, instead of being hard-coded to `/tmp`.
+      _fileRecvDir = recvDir.path;
+      final dirPath = recvDir.path.toNativeUtf8();
+      final result = _ffi.setFileRecvDir(dirPath);
+      pkgffi.malloc.free(dirPath);
+      if (result == 1) {
+      } else {}
+    } catch (e) {}
+  }
+
   Future<void> init({String? profileDirectory}) async {
+    _beginSession();
     // A different profile may be about to be opened on this object; anything
     // latched from a previous one is now wrong. See [_selfToxIdCacheByInstance].
     _selfToxIdCacheByInstance.clear();
@@ -2421,35 +2927,7 @@ class FfiChatService {
     } on Object catch (_) {
       _sessionEpoch = 0; // older native lib
     }
-    // Set file receive directory: per-account when _fileRecvPath is set, else
-    // ask the injected resolver (X6), else fall back to app support file_recv.
-    try {
-      final String recvPath;
-      if (_fileRecvPath != null && _fileRecvPath!.isNotEmpty) {
-        recvPath = _fileRecvPath!;
-      } else if (_pathResolver != null) {
-        recvPath = _assertResolverPath(
-          await _pathResolver!.resolveFileRecvDirectory(),
-          'resolveFileRecvDirectory',
-        );
-      } else {
-        final appDir = await getApplicationSupportDirectory();
-        recvPath = '${appDir.path}/file_recv';
-      }
-      final recvDir = Directory(recvPath);
-      if (!await recvDir.exists()) {
-        await recvDir.create(recursive: true);
-      }
-      // P1-2: remember the resolved dir so the pending "receiving_*" temp
-      // path lives in the same per-account location as the actual file_recv
-      // output, instead of being hard-coded to `/tmp`.
-      _fileRecvDir = recvDir.path;
-      final dirPath = recvDir.path.toNativeUtf8();
-      final result = _ffi.setFileRecvDir(dirPath);
-      pkgffi.malloc.free(dirPath);
-      if (result == 1) {
-      } else {}
-    } catch (e) {}
+    await _applyFileRecvDirectory();
     // register callback mode (preferred)
     _globalService = this;
     _ffi.setCallback(_nativeCbPtr, ffi.Pointer.fromAddress(0));
@@ -2460,10 +2938,19 @@ class FfiChatService {
     }
     final savedGroups = await _prefs?.getGroups() ?? <String>{};
     final quitGroups = await _prefs?.getQuitGroups() ?? <String>{};
+    _historyRetainedGroups
+      ..clear()
+      ..addAll(await _prefs?.getStringSet(_scopedKey(_kHistoryRetainedGroups)) ??
+          const <String>{});
     // Only load groups that are not in quit list
     _knownGroups
       ..clear()
       ..addAll(savedGroups.where((g) => !quitGroups.contains(g)));
+
+    // Load and sync group identities (chat / conference ids) and kinds from
+    // persistence to the C++ layer. This rebuilds the mapping after restart,
+    // and conference discovery below relies on the replayed kinds.
+    await _syncGroupChatIdsToNative();
 
     // Always discover conferences restored from Tox savedata (e.g. after load/restart).
     // This ensures conference-only accounts see their groups in the session list even when
@@ -2472,10 +2959,11 @@ class FfiChatService {
 
     // Synchronize to C++ layer after loading from persistence
     _syncKnownGroupsToNative();
+    _syncRetiredGroupIdMaxToNative();
 
-    // Load and sync group conference IDs from persistence to C++ layer
-    // This is critical for rebuilding the mapping after restart
-    await _syncGroupChatIdsToNative();
+    // Hand back the group invites the user had not answered when the previous
+    // session ended (native holds them in memory only).
+    await _restorePendingGroupInvites();
 
     // CRITICAL: Rejoin all known groups using stored chat_id (c-toxcore recommended approach)
     // This ensures groups are properly restored after client restart, even if they're not in savedata
@@ -2825,6 +3313,27 @@ class FfiChatService {
     }
   }
 
+  /// Everything that must reach disk before the app may be suspended: the
+  /// tox profile and any debounced history. One entry point so a host's
+  /// lifecycle observer cannot persist one and forget the other.
+  void persistForBackground() {
+    saveToxProfileNow();
+    unawaited(flushPendingHistory());
+  }
+
+  /// Write any debounced history saves now. For app pause/hide: a mobile OS
+  /// may suspend or kill the process before a pending debounce timer fires,
+  /// and `detached` (where [dispose] flushes) is not guaranteed to be
+  /// delivered. History exists only on this device.
+  Future<void> flushPendingHistory() async {
+    if (_sessionClosed) return;
+    try {
+      await _messageHistoryPersistence.flushPendingSaves();
+    } catch (e, st) {
+      _logger?.logError('[FfiChatService] flushPendingHistory failed', e, st);
+    }
+  }
+
   Future<void> startPolling() async {
     if (_pollingStarted) {
       _logger?.log(
@@ -2843,6 +3352,9 @@ class FfiChatService {
     // too, or the re-used service is permanently deaf — the first tick hits
     // the disposed guard and the loop never re-arms, with no error anywhere.
     _pollDisposed = false;
+    // Identities native learned during login restore/rejoin were announced
+    // before anything could persist them; store them now.
+    unawaited(syncGroupIdentitiesFromNative());
     _logger?.log('[FfiChatService] ========== startPolling called ==========');
     _logger?.log(
         '[FfiChatService] startPolling: Service instance type: ${runtimeType}');
@@ -5455,8 +5967,88 @@ class FfiChatService {
     return msg;
   }
 
+  /// The name this account shows in groups (and is mentioned by).
+  String _selfNickname = '';
+
+  /// Groups with an unread message that mentions us. Read through
+  /// [hasUnreadMention], which also drops a group once its unread is gone.
+  final Set<String> _unreadMentionGroups = <String>{};
+
+  /// True while [groupId] has unread messages and one of them mentions us.
+  /// Mentions travel as the "@name " text UIKit's picker inserts (the wire
+  /// has no mention list, and this is what every Tox client shows and
+  /// highlights by), so they are recognised on the receiving side.
+  bool hasUnreadMention(String groupId) {
+    final key = _unreadKey(groupId);
+    if (!_unreadMentionGroups.contains(key)) return false;
+    if (getUnreadOf(groupId) <= 0) {
+      _unreadMentionGroups.remove(key);
+      return false;
+    }
+    return true;
+  }
+
+  /// The unread rows of [groupId] that mention us, newest first: the newest
+  /// `getUnreadOf(groupId)` inbound rows filtered by [textMentionsSelf] (the
+  /// matcher that raised the flag at ingest). Empty without an unread mention.
+  List<ChatMessage> unreadMentionRows(String groupId) {
+    if (!hasUnreadMention(groupId)) return <ChatMessage>[];
+    final unread = getUnreadOf(groupId);
+    final rows = List<ChatMessage>.from(getHistory(groupId));
+    sortChatMessagesChronologically(rows, newestFirst: true);
+    final hits = <ChatMessage>[];
+    var inbound = 0;
+    for (final row in rows) {
+      if (row.isSelf) continue;
+      if (inbound++ >= unread) break;
+      if (textMentionsSelf(row.text)) hits.add(row);
+    }
+    return hits;
+  }
+
+  /// The unread mentions [setActivePeer] captured when the open chat's group
+  /// became active — opening reads them, yet the chat page asks for its
+  /// "@me" jump targets only afterwards. Dropped when another conversation
+  /// (or none) becomes active.
+  ({String groupKey, List<ChatMessage> rows})? _openChatMentions;
+
+  /// The "@me" jump targets of the OPEN chat of [groupId] (newest first), or
+  /// empty when [groupId] is not the active conversation. Only the open
+  /// chat's getConversation reads this: the conversation-LIST marker follows
+  /// [hasUnreadMention] and clears once the group is read.
+  List<ChatMessage> openChatMentionRows(String groupId) {
+    final snapshot = _openChatMentions;
+    final key = _unreadKey(groupId);
+    if (snapshot == null ||
+        snapshot.groupKey != key ||
+        _activePeerId != key) {
+      return <ChatMessage>[];
+    }
+    return List<ChatMessage>.unmodifiable(snapshot.rows);
+  }
+
+  /// Whether [text] mentions this account ("@<our name>" followed by a word
+  /// boundary).
+  bool textMentionsSelf(String text) {
+    final name = _selfNickname.trim();
+    if (name.isEmpty) return false;
+    final needle = '@$name';
+    for (var i = text.indexOf(needle); i >= 0; i = text.indexOf(needle, i + 1)) {
+      final end = i + needle.length;
+      // "@Ann" must not match "@Anna".
+      if (end == text.length || _mentionBoundary.hasMatch(text[end])) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  static final RegExp _mentionBoundary =
+      RegExp(r'[\s,.;:!?)\]}，。；：！？、）」』]');
+
   Future<void> updateSelfProfile(
       {required String nickname, required String statusMessage}) async {
+    _selfNickname = nickname;
     final pnick = nickname.toNativeUtf8();
     final pstat = statusMessage.toNativeUtf8();
     _ffi.setSelfInfo(pnick, pstat);
@@ -5519,6 +6111,15 @@ class FfiChatService {
             unawaited(_sendAvatarToFriendIfNeeded(uid));
             // Send pending offline messages - use normalized ID
             unawaited(retryPendingC2cMessages(normalizedUid));
+            // Group invites that waited for this friend to come online.
+            // Fire-and-forget, but never as an unhandled zone error: the
+            // queue lock only swallows failures on its tail.
+            unawaited(_flushPendingGroupInvites(uid).catchError((Object e,
+                StackTrace st) {
+              _logger?.logError(
+                  '[FfiChatService] flushing queued group invites failed', e,
+                  st);
+            }));
             // Flush READ receipts that were queued while this peer was
             // offline (chat opened -> rows flipped isRead locally -> the wire
             // receipt had nowhere to go and would otherwise be lost forever).
@@ -6153,9 +6754,15 @@ class FfiChatService {
   }) {
     // Check if this group was quit - if so, don't add it back
     if (_quitGroups.contains(gid)) return false;
+    if (from != _selfId &&
+        _activePeerId != _unreadKey(gid) &&
+        textMentionsSelf(text)) {
+      _unreadMentionGroups.add(_unreadKey(gid));
+    }
     // Deduplicate: same message can be delivered twice (conference + group callback in C++)
-    final duplicate =
-        _findRecentGroupHistoryMessage(gid, from, text, contentKind);
+    final duplicate = _findRecentGroupHistoryMessage(
+        gid, from, text, contentKind,
+        pseudoMsgId: pseudoMsgId);
     if (duplicate != null) {
       // THE PRODUCT'S NORMAL PATH LANDS HERE. In hybrid mode the native
       // advanced listener persists the row first (MessageConverter has no
@@ -6167,17 +6774,34 @@ class FfiChatService {
       // nothing in the app. Merge the alias, and receipt the row exactly once.
       final mergedAlias = _mergeGroupAliasIntoRow(gid, duplicate, from,
           pseudoMsgId: pseudoMsgId);
-      if (mergedAlias != null &&
+      // The advanced listener now stamps the alias itself (GH-4), so "newly
+      // merged" no longer means "not yet receipted": claim it explicitly.
+      final receiptAlias = mergedAlias ??
+          (pseudoMsgId == null
+              ? null
+              : groupMessageAlias(
+                  groupId: gid, senderPk: from, pseudoMsgId: pseudoMsgId));
+      if (receiptAlias != null &&
           !duplicate.isSelf &&
-          !_isReactionMessage(text)) {
-        unawaited(_sendReceipt(from, mergedAlias, 'received', groupID: gid));
+          !_isReactionMessage(text) &&
+          _claimGroupReceipt(receiptAlias)) {
+        unawaited(_sendReceipt(from, receiptAlias, 'received', groupID: gid));
       }
       final last = _lastByPeer[gid];
+      // By identity when both rows have ids: two genuine identical messages
+      // ("ok", "ok") are two rows, and the second must still be reflected and
+      // counted. Content equality only for id-less legacy rows.
+      final lastId = last?.msgID;
+      final duplicateId = duplicate.msgID;
       final alreadyReflected = last != null &&
-          last.fromUserId == duplicate.fromUserId &&
-          last.text == duplicate.text &&
-          last.contentKind == duplicate.contentKind &&
-          last.groupId == gid;
+          last.groupId == gid &&
+          (lastId != null && duplicateId != null
+              ? (lastId == duplicateId ||
+                  last.altMsgIds.contains(duplicateId) ||
+                  duplicate.altMsgIds.contains(lastId))
+              : (last.fromUserId == duplicate.fromUserId &&
+                  last.text == duplicate.text &&
+                  last.contentKind == duplicate.contentKind));
       if (!alreadyReflected) {
         final emittedDuplicate = sourceInstanceId == null
             ? duplicate
@@ -6274,7 +6898,9 @@ class FfiChatService {
     }
     // Auto-send received receipt for received group messages (not self-sent)
     // Note: reaction messages are sent via custom messages and should not trigger receipts
-    if (!msg.isSelf && !_isReactionMessage(text)) {
+    if (!msg.isSelf &&
+        !_isReactionMessage(text) &&
+        (alias == null || _claimGroupReceipt(alias))) {
       // Echo the alias, not our local id: the author has never seen the id we
       // just minted, so a local-id receipt can neither tally nor even be
       // recognised as a control on the author's side.
@@ -6423,6 +7049,11 @@ class FfiChatService {
       return false;
     }
     if (decoded == null) return false;
+    // Every group receipt that reached Dart, applied or not: evidence for the
+    // native replay filter (a replayed receipt must arrive once).
+    if (eventGroupId != null && decoded['type'] == 'receipt') {
+      _bumpDiag('groupReceiptsIn');
+    }
 
     // A body that carries tim2tox's OWN control signature is never content,
     // even when we end up refusing to apply it. Every "not authorized" exit
@@ -6757,14 +7388,33 @@ class FfiChatService {
     String gid,
     String from,
     String text,
-    ChatMessageContentKind contentKind,
-  ) {
+    ChatMessageContentKind contentKind, {
+    int? pseudoMsgId,
+  }) {
     final nowMs = DateTime.now().millisecondsSinceEpoch;
     const windowMs = 5000;
     final list = _messageHistoryPersistence.getCachedList(gid);
     if (list == null || list.isEmpty) return null;
+    // GH-4: exact identity first. The advanced listener's copy carries the
+    // same `gmid:` alias (MessageConverter), whatever its timing.
+    final alias = pseudoMsgId == null
+        ? null
+        : groupMessageAlias(
+            groupId: gid, senderPk: from, pseudoMsgId: pseudoMsgId);
+    if (alias != null) {
+      for (var i = list.length - 1; i >= 0; i--) {
+        final m = list[i];
+        // Inbound only: our own row carries the same alias as its echo.
+        if (!m.isSelf && (m.msgID == alias || m.altMsgIds.contains(alias))) {
+          return m;
+        }
+      }
+    }
     for (var i = list.length - 1; i >= 0 && i >= list.length - 20; i--) {
       final m = list[i];
+      // A row with a DIFFERENT alias is a different message (a member sending
+      // the same "ok" twice); content+time only when identity is unknown.
+      if (alias != null && toxGroupMessageAliasOf(m) != null) continue;
       if (m.fromUserId == from &&
           m.text == text &&
           m.contentKind == contentKind &&
@@ -6844,32 +7494,33 @@ class FfiChatService {
   Set<String> getConversationIds() =>
       _messageHistoryPersistence.getConversationIds();
 
+  /// Rows older than the in-memory history window (see
+  /// [MessageHistoryPersistence.loadArchivedHistory]), oldest first. Same id
+  /// normalization as [getHistory].
+  Future<List<ChatMessage>> getArchivedHistory(String id) async {
+    return _messageHistoryPersistence
+        .loadArchivedHistory(ConversationIdUtils.normalize(id));
+  }
+
+  Future<bool> hasArchivedHistory(String id) async {
+    return _messageHistoryPersistence
+        .hasArchivedHistory(ConversationIdUtils.normalize(id));
+  }
+
   List<ChatMessage> getHistory(String id) {
-    // Normalize friend ID to 64 characters if it's a C2C conversation (not a group)
-    // Group IDs don't need normalization, but friend IDs should be normalized
-    // We can't easily distinguish here, so we normalize all IDs (groups are typically shorter)
-    final normalizedId = id.length > 64 ? _normalizeFriendId(id) : id;
-
-    // Get from persistence service (which maintains in-memory cache)
-    var list = _messageHistoryPersistence.getHistory(normalizedId);
-    if (list.isEmpty && id != normalizedId) {
-      // Try original ID if normalized ID doesn't exist
-      list = _messageHistoryPersistence.getHistory(id);
-      if (list.isNotEmpty) {
-        // Migrate to normalized ID for consistency (async, don't await)
-        unawaited(_messageHistoryPersistence.saveHistory(normalizedId, list));
-        unawaited(_messageHistoryPersistence.clearHistory(id));
-      }
-    }
-
+    // The persistence layer keys every conversation by
+    // ConversationIdUtils.normalize (prefix stripped, then cut to 64), so
+    // there is exactly one key per conversation and nothing to migrate here.
+    // Cutting the raw id to 64 first mangled a prefixed one: `c2c_<pk>`
+    // became `c2c_` + 60 hex chars, which normalizes to a different key, so the
+    // old migration branch moved the real history to that key and cleared the
+    // conversation.
+    final normalizedId = ConversationIdUtils.normalize(id);
+    final list = _messageHistoryPersistence.getHistory(normalizedId);
     if (list.isEmpty) {
-      // Try to load from disk if not in memory (async, but we return empty list for now)
-      // The history will be loaded on next access after async load completes
-      // Try both normalized and original ID
-      _scheduleHistoryLoad(normalizedId);
-      if (id != normalizedId) {
-        _scheduleHistoryLoad(id);
-      }
+      // Not in memory yet: load it in the background; the next read sees it.
+      // The load normalizes (and dedupes) by the same key itself.
+      _scheduleHistoryLoad(id);
     }
 
     return list;
@@ -7191,10 +7842,25 @@ class FfiChatService {
     int deletedCount = 0;
     final modifiedConversations = <String>{};
 
+    // Every identity of every row removed from memory. A crash between an
+    // archive append and the main-file rewrite leaves one row in BOTH files,
+    // so the archive has to be swept for the rows we just deleted in memory
+    // too — not only for the ids that matched nothing (pre-fix: once the
+    // tombstone cleared, the archived copy came back as a message the user
+    // had deleted). It doubles as the "already counted" set below.
+    final removedIdentities = <String>{};
     bool matches(ChatMessage msg) {
       final id = msg.msgID;
       if (id != null && id.isNotEmpty) {
-        return msgIDSet.contains(id);
+        // Primary id OR an absorbed cross-path alias: in hybrid mode UIKit can
+        // hold the native `msg_...` id while the row is stored under the
+        // poll-minted one (or vice versa). A primary-only match reported
+        // success, removed nothing, and the bubble came back on reopen.
+        if (msgIDSet.contains(id)) return true;
+        for (final alias in msg.altMsgIds) {
+          if (msgIDSet.contains(alias)) return true;
+        }
+        return false;
       }
       // Legacy fallback: pre-msgID records used (timestamp, fromUserId).
       final legacy =
@@ -7207,23 +7873,30 @@ class FfiChatService {
       final conversationId = entry.key;
       final messages = entry.value;
       final originalLength = messages.length;
+      final removedRows = <ChatMessage>[];
       messages.removeWhere((msg) {
         if (matches(msg)) {
           deletedCount++;
+          removedRows.add(msg);
+          removedIdentities.addAll(MessageHistoryPersistence.identitiesOf(msg));
           return true;
         }
         return false;
       });
       if (messages.length < originalLength) {
+        _messageHistoryPersistence.noteRemovedFromCache(
+            conversationId, removedRows);
         modifiedConversations.add(conversationId);
 
         final remaining = _historyById[conversationId];
         if (remaining == null || remaining.isEmpty) {
-          // CR-05: the conversation is now empty. `_saveHistory` would no-op
-          // (saveHistory returns early on an empty list), leaving the stale
-          // on-disk JSON to resurrect the deleted message on the next launch.
-          // Delete the history file (and backup) and drop preview state.
-          await _messageHistoryPersistence.clearHistory(conversationId);
+          // CR-05: the conversation is now empty. The stale on-disk JSON must
+          // not resurrect the deleted message on the next launch: delete the
+          // history file (and backup) and drop preview state. Rows older
+          // than the memory window are NOT part of this delete (queued ones
+          // are drained to the archive by the clear).
+          await _messageHistoryPersistence.clearHistory(conversationId,
+              keepArchive: true);
           _lastByPeer.remove(conversationId);
           _unreadByPeer.remove(conversationId);
         } else {
@@ -7250,6 +7923,31 @@ class FfiChatService {
             _unreadByPeer.remove(conversationId);
           }
         }
+      }
+    }
+
+    // The archive is swept for EVERY requested id — including the ones that
+    // matched in memory, whose archived copy would otherwise survive the
+    // delete — plus every alias the removed rows carried (the archived copy
+    // may predate an absorbed id). Ids that matched nothing in memory may
+    // belong to rows that already moved to a conversation's archive (older
+    // than the in-memory window), including conversations with NO in-memory
+    // rows left, which the in-memory conversation list does not name. A failed
+    // archive rewrite propagates: the platform then reports the delete as not
+    // performed.
+    final archiveTargets = <String>{...msgIDSet, ...removedIdentities};
+    if (archiveTargets.isNotEmpty) {
+      final archivedRows = await _messageHistoryPersistence
+          .removeArchivedRowsEverywhere(archiveTargets);
+      for (final row in archivedRows) {
+        // Only a row that was NOT already counted from memory is a further
+        // deletion; an archived duplicate of one we just removed is the same
+        // logical message.
+        if (MessageHistoryPersistence.identitiesOf(row)
+            .any(removedIdentities.contains)) {
+          continue;
+        }
+        deletedCount++;
       }
     }
 
@@ -7577,6 +8275,23 @@ class FfiChatService {
     );
   }
 
+  /// Whether a text sent to [groupId] right now can reach anyone (see
+  /// `tim2tox_ffi_group_wire_ready`). Unknown groups and anything that cannot
+  /// be asked (older native lib, a test double) count as ready, so the send
+  /// proceeds and fails — or succeeds — exactly as it did before.
+  bool _groupWireReady(String groupId) {
+    final override = debugGroupWireReadyOverride;
+    if (override != null) return override(groupId);
+    final p = groupId.toNativeUtf8();
+    try {
+      return _ffi.groupWireReady(p) != 0;
+    } on Object {
+      return true;
+    } finally {
+      pkgffi.malloc.free(p);
+    }
+  }
+
   void _sendGroupTextByKindChecked(
     String groupId,
     String text,
@@ -7632,17 +8347,23 @@ class FfiChatService {
 
   Future<String?> createGroup(String name, {String groupType = 'group'}) async {
     final trimmed = name.trim();
+    // Every native buffer is released in the `finally`, whatever throws (the
+    // retired-id sync, the create call, the id decode); the awaited
+    // prefs/history work below runs only after they are all freed.
+    final String? gid;
     final pname = trimmed.toNativeUtf8();
     final ptype = groupType.toNativeUtf8();
     final buf = pkgffi.malloc.allocate<ffi.Int8>(256);
-    final n = _ffi.createGroup(pname, ptype, buf, 256);
-    pkgffi.malloc.free(pname);
-    pkgffi.malloc.free(ptype);
-    if (n > 0) {
-      // Extract the id and free the native buffer BEFORE the awaited
-      // prefs/history work below — a throw from those writes must not leak it.
-      final gid = buf.cast<pkgffi.Utf8>().toDartString();
+    try {
+      _syncRetiredGroupIdMaxToNative();
+      final n = _ffi.createGroup(pname, ptype, buf, 256);
+      gid = n > 0 ? buf.cast<pkgffi.Utf8>().toDartString() : null;
+    } finally {
+      pkgffi.malloc.free(pname);
+      pkgffi.malloc.free(ptype);
       pkgffi.malloc.free(buf);
+    }
+    if (gid != null) {
       _knownGroups.add(gid);
       // Remove from quit groups if it was previously quit (in case of group ID reuse)
       _quitGroups.remove(gid);
@@ -7653,26 +8374,498 @@ class FfiChatService {
       await _persistKnownGroups(); // This will call _syncKnownGroupsToNative()
       return gid;
     }
-    pkgffi.malloc.free(buf);
     return null;
   }
 
-  Future<void> joinGroup(String groupId, {String? requestMessage}) async {
+  // --- Group invites awaiting an answer (auto-accept off) -------------------
+
+  // SESSION-scoped, unlike the service's other (object-lifetime) streams:
+  // [dispose] closes them — completing every listener of the ending session —
+  // and [init] reopens them via [_reopenSessionStreams], so a service object
+  // that is re-inited (init -> login -> startPolling after a dispose) delivers
+  // invites and join refusals again instead of dropping them on a closed
+  // controller. Listeners subscribe through the getters AFTER init, which
+  // hand out the current session's stream.
+  StreamController<void> _pendingGroupInvitesChangedCtrl =
+      StreamController<void>.broadcast();
+
+  StreamController<GroupJoinFailure> _groupJoinFailuresCtrl =
+      StreamController<GroupJoinFailure>.broadcast();
+
+  void _reopenSessionStreams() {
+    if (_pendingGroupInvitesChangedCtrl.isClosed) {
+      _pendingGroupInvitesChangedCtrl = StreamController<void>.broadcast();
+    }
+    if (_groupJoinFailuresCtrl.isClosed) {
+      _groupJoinFailuresCtrl = StreamController<GroupJoinFailure>.broadcast();
+    }
+  }
+
+  /// Joins the group refused (wrong/missing password, full, ...). A join
+  /// started this session has already been dropped when this fires; an
+  /// [GroupJoinFailure.established] group is kept, history and all.
+  Stream<GroupJoinFailure> get groupJoinFailures =>
+      _groupJoinFailuresCtrl.stream;
+
+  /// Called by the platform's native-callback handler: the group refused our
+  /// join. A join started this session never became membership, so it is
+  /// dropped like a leave. An [established] group — one we already held,
+  /// refused on reconnect (password set since, group full) — is kept with
+  /// its history: dropping it on the peer's say-so would destroy the user's
+  /// only copy. Either way the UI is told why.
+  Future<void> handleGroupJoinFailed(String groupId, String chatId,
+      String reason, {bool established = false, String inviteId = ''}) async {
+    if (_sessionClosed) return;
+    // Only a group we actually recorded is dropped: a refused invite-join is
+    // still under its temporary invite alias, which Dart never knew.
+    if (!established && _knownGroups.contains(groupId)) {
+      await cleanupGroupState(groupId);
+    }
+    // An invite accepted but never confirmed is the way to retry the join.
+    await _returnJoiningInviteAfterRefusal(chatId);
+    if (_groupJoinFailuresCtrl.isClosed) return;
+    _groupJoinFailuresCtrl.add(GroupJoinFailure(
+      groupId: groupId,
+      chatId: chatId,
+      reason: GroupJoinFailure.reasonFromWire(reason),
+      established: established,
+      inviteId: inviteId,
+    ));
+  }
+
+  /// Fires whenever [getPendingGroupInvites] may have changed (a new invite
+  /// arrived, or one was accepted / declined here).
+  Stream<void> get pendingGroupInvitesChanged =>
+      _pendingGroupInvitesChangedCtrl.stream;
+
+  /// Called by the platform's native-callback handler when an invite lands.
+  void notifyPendingGroupInvitesChanged() {
+    if (_sessionClosed || _pendingGroupInvitesChangedCtrl.isClosed) return;
+    unawaited(_persistPendingGroupInvites());
+    _pendingGroupInvitesChangedCtrl.add(null);
+  }
+
+  /// Account-scoped (the injected preferences are), survives restarts.
+  static const String _kPendingGroupInvites = 'pending_group_invites_v1';
+
+  /// Invites the user ACCEPTED whose join toxcore has not confirmed yet
+  /// (invite id -> invite). Native drops an accepted invite from its pending
+  /// list at accept time, but an NGC join is asynchronous: until the group's
+  /// self-join is confirmed the invite is the only way back in (a private
+  /// group cannot be entered by chat id). Persisted next to the unanswered
+  /// ones with `joining: true`, so a process death before the confirmation —
+  /// or before a refusal is reported — does not lose it. Dropped on the
+  /// confirmed self-join ([_confirmJoiningInvites]), or when native hands the
+  /// invite back as unanswered (refused join).
+  final Map<String, PendingGroupInvite> _joiningInvites = {};
+
+  /// Serializes [_persistPendingGroupInvites]: each run snapshots native +
+  /// [_joiningInvites] and writes the whole list, so two overlapping runs
+  /// could otherwise land an OLDER snapshot last.
+  Future<void> _pendingInvitesPersistTail = Future<void>.value();
+
+  /// Latched by [dispose] once the queued invite writes have drained, BEFORE
+  /// native goes away: a later run would read native's (then empty) invite
+  /// list and erase the persisted copy.
+  bool _groupInvitePersistClosed = false;
+
+  /// The chat id (64 hex, lower case) an NGC invite leads to — its cookie is
+  /// the invite data, which starts with the chat id (gc_accept_invite). Null
+  /// for a conference invite: a conference join completes synchronously in
+  /// native (no later confirmation or refusal), so it never waits here.
+  static String? _inviteChatId(PendingGroupInvite invite) {
+    if (invite.kind != 'group' || invite.cookieHex.length < 64) return null;
+    return invite.cookieHex.substring(0, 64).toLowerCase();
+  }
+
+  /// A group we hold whose stored chat id is the one [invite] leads to.
+  Future<String?> _heldGroupForInvite(PendingGroupInvite invite) async {
+    final chatId = _inviteChatId(invite);
+    final prefs = _prefs;
+    if (chatId == null || prefs == null) return null;
+    for (final groupId in _knownGroups.toList()) {
+      final stored = await prefs.getGroupChatId(groupId);
+      if (stored != null && stored.toLowerCase() == chatId) return groupId;
+    }
+    return null;
+  }
+
+  /// Native keeps unanswered invites in memory only, and a mobile OS kills
+  /// the app routinely. An NGC/conference invite cookie does not expire — it
+  /// only needs the inviter online at accept time — so keep a copy and hand
+  /// it back to native on the next start ([_restorePendingGroupInvites]).
+  Future<void> _persistPendingGroupInvites() {
+    if (_sessionClosed) return Future<void>.value();
+    final run = _pendingInvitesPersistTail
+        .then((_) => _persistPendingGroupInvitesNow());
+    _pendingInvitesPersistTail = run.catchError((Object _) {});
+    return run;
+  }
+
+  Future<void> _persistPendingGroupInvitesNow() async {
+    final prefs = _prefs;
+    if (prefs == null || _groupInvitePersistClosed) return;
+    try {
+      // Native's own list, not the session-gated getter: see
+      // [_readPendingGroupInvitesFromNative]. Null means "could not read" —
+      // leave the persisted copy alone rather than erasing it.
+      final native = _readPendingGroupInvitesFromNative();
+      if (native == null) return;
+      final entries = _pendingInviteEntries(native);
+      if (entries.isEmpty) {
+        await prefs.remove(_scopedKey(_kPendingGroupInvites));
+      } else {
+        await prefs.setString(
+            _scopedKey(_kPendingGroupInvites), jsonEncode(entries));
+      }
+    } catch (e, st) {
+      _logger?.logError(
+          '[FfiChatService] persisting pending group invites failed', e, st);
+    }
+  }
+
+  /// What [_persistPendingGroupInvites] writes: native's unanswered invites
+  /// plus the accepted-but-unconfirmed ones. An accepted invite native lists
+  /// again was handed back (the join was refused): it is unanswered again.
+  List<Map<String, dynamic>> _pendingInviteEntries(
+      List<PendingGroupInvite> native) {
+    for (final invite in native) {
+      _joiningInvites.remove(invite.id);
+    }
+    return [
+      for (final i in native) i.toJson(),
+      for (final i in _joiningInvites.values) {...i.toJson(), 'joining': true},
+    ];
+  }
+
+  /// Test seam for [_pendingInviteEntries].
+  List<Map<String, dynamic>> debugPendingInviteEntriesForTest(
+          List<PendingGroupInvite> native) =>
+      _pendingInviteEntries(native);
+
+  /// Test seam: record [invite] as accepted and awaiting confirmation.
+  void debugMarkInviteJoiningForTest(PendingGroupInvite invite) =>
+      _joiningInvites[invite.id] = invite;
+
+  /// Test seam: run one persist pass, the way a write queued before dispose
+  /// resumes after it.
+  Future<void> debugPersistPendingGroupInvitesNowForTest() =>
+      _persistPendingGroupInvitesNow();
+
+  /// Test seam: stand in for native's invite list (no Tox session in a unit
+  /// test). Returning null means "could not read".
+  List<PendingGroupInvite>? Function()? debugNativePendingInvitesOverride;
+
+  /// Test seam: close the session WITHOUT the rest of dispose, reproducing the
+  /// window in which `_sessionClosed` is already set while the invite writes
+  /// queued before it are still draining.
+  void debugCloseSessionForTest() => _sessionClosed = true;
+
+  /// A self-join for [groupId]: once toxcore has CONFIRMED it (the group is
+  /// connected — native also posts a provisional self-join right after the
+  /// accept, before any peer answered), the accepted invite that led here is
+  /// done. [chatId] overrides the native lookup (tests).
+  Future<void> _confirmJoiningInvites(String groupId, {String? chatId}) async {
+    if (_joiningInvites.isEmpty) return;
+    final resolved = (chatId ?? _liveGroupChatId(groupId))?.toLowerCase();
+    if (resolved == null || resolved.isEmpty) return;
+    if (chatId == null && !_groupJoinConfirmed(groupId)) return;
+    final before = _joiningInvites.length;
+    _joiningInvites
+        .removeWhere((_, invite) => _inviteChatId(invite) == resolved);
+    if (_joiningInvites.length != before) {
+      await _persistPendingGroupInvites();
+    }
+  }
+
+  /// Strictly "toxcore reports the group connected" (tox_group_is_connected:
+  /// the sync handshake is done, which is also when toxcore fires its own
+  /// self-join). Unlike [_groupWireReady], an unknown group or an older
+  /// library is NOT confirmation.
+  bool _groupJoinConfirmed(String groupId) {
+    final p = groupId.toNativeUtf8();
+    try {
+      return _ffi.groupWireReady(p) == 1;
+    } on Object {
+      return false;
+    } finally {
+      pkgffi.malloc.free(p);
+    }
+  }
+
+  /// Test seam for [_confirmJoiningInvites] without a native group.
+  Future<void> debugConfirmJoiningInvitesForTest(String chatId) =>
+      _confirmJoiningInvites('', chatId: chatId);
+
+  /// Accepted invites still awaiting confirmation (tests / diagnostics).
+  List<String> get debugJoiningInviteIds => _joiningInvites.keys.toList();
+
+  /// The live chat id native resolves for [groupId]; unlike [getGroupChatId]
+  /// it persists nothing (an invite alias must never be stored as a group).
+  String? _liveGroupChatId(String groupId) {
+    if (groupId.isEmpty) return null;
+    final idPtr = groupId.toNativeUtf8();
+    final buf = pkgffi.malloc<ffi.Int8>(65);
+    try {
+      final rc = _ffi.getGroupChatIdNative(_serviceInstanceId, idPtr, buf, 65);
+      return rc == 1 ? buf.cast<pkgffi.Utf8>().toDartString() : null;
+    } catch (_) {
+      return null;
+    } finally {
+      pkgffi.malloc.free(idPtr);
+      pkgffi.malloc.free(buf);
+    }
+  }
+
+  /// A refused join whose invite native did NOT hand back — the accept
+  /// happened in an earlier session (native's accepted-invite record died
+  /// with it), so only [_joiningInvites] still has the invite. Give it back to
+  /// native as unanswered so the user can retry (with a password).
+  Future<void> _returnJoiningInviteAfterRefusal(String chatId) async {
+    final target = chatId.toLowerCase();
+    if (target.isEmpty || _joiningInvites.isEmpty) return;
+    final nativeIds = {for (final i in getPendingGroupInvites()) i.id};
+    final refused = _joiningInvites.values
+        .where((i) => _inviteChatId(i) == target)
+        .toList();
+    var returned = false;
+    for (final invite in refused) {
+      if (nativeIds.contains(invite.id)) {
+        _joiningInvites.remove(invite.id); // native re-announced it
+      } else if (_restoreInviteToNative(invite)) {
+        _joiningInvites.remove(invite.id);
+        returned = true;
+      }
+      // else: kept (persisted as joining); the next start, no longer holding
+      // the group, hands it back as unanswered.
+    }
+    if (refused.isNotEmpty) {
+      await _persistPendingGroupInvites();
+      if (returned && !_pendingGroupInvitesChangedCtrl.isClosed) {
+        _pendingGroupInvitesChangedCtrl.add(null);
+      }
+    }
+  }
+
+  /// Hands [invite] to native as an unanswered invite. False when native
+  /// refused it (inviter no longer a friend) or predates the export.
+  bool _restoreInviteToNative(PendingGroupInvite invite) {
+    final pId = invite.id.toNativeUtf8();
+    final pInviter = invite.inviterUserId.toNativeUtf8();
+    final pKind = invite.kind.toNativeUtf8();
+    final pName = invite.groupName.toNativeUtf8();
+    final pCookie = invite.cookieHex.toNativeUtf8();
+    try {
+      return _ffi.restoreGroupInvite(pId, pInviter, pKind, pName,
+              invite.receivedAt.millisecondsSinceEpoch, pCookie) ==
+          1;
+    } on ArgumentError {
+      return false; // native lib predates the export
+    } finally {
+      pkgffi.malloc.free(pId);
+      pkgffi.malloc.free(pInviter);
+      pkgffi.malloc.free(pKind);
+      pkgffi.malloc.free(pName);
+      pkgffi.malloc.free(pCookie);
+    }
+  }
+
+  Future<void> _restorePendingGroupInvites() async {
+    final prefs = _prefs;
+    if (prefs == null) return;
+    try {
+      final raw = await prefs.getString(_scopedKey(_kPendingGroupInvites));
+      if (raw == null || raw.isEmpty) return;
+      for (final entry in jsonDecode(raw) as List<dynamic>) {
+        final map = entry as Map<String, dynamic>;
+        final invite = PendingGroupInvite.fromJson(map);
+        if (invite.cookieHex.isEmpty) continue;
+        // Accepted last session, never confirmed. If we hold the group (its
+        // provisional join persisted; it rejoins now), it waits for that
+        // rejoin's confirmation — handing it back as unanswered would invite
+        // a second accept of a group we are in. A refusal of the rejoin gives
+        // it back ([_returnJoiningInviteAfterRefusal]). Not held: the join
+        // never took, so it is an unanswered invite again (below).
+        if (map['joining'] == true &&
+            await _heldGroupForInvite(invite) != null) {
+          _joiningInvites[invite.id] = invite;
+          continue;
+        }
+        final pId = invite.id.toNativeUtf8();
+        final pInviter = invite.inviterUserId.toNativeUtf8();
+        final pKind = invite.kind.toNativeUtf8();
+        final pName = invite.groupName.toNativeUtf8();
+        final pCookie = invite.cookieHex.toNativeUtf8();
+        try {
+          _ffi.restoreGroupInvite(pId, pInviter, pKind, pName,
+              invite.receivedAt.millisecondsSinceEpoch, pCookie);
+        } on ArgumentError {
+          return; // native lib predates the export
+        } finally {
+          pkgffi.malloc.free(pId);
+          pkgffi.malloc.free(pInviter);
+          pkgffi.malloc.free(pKind);
+          pkgffi.malloc.free(pName);
+          pkgffi.malloc.free(pCookie);
+        }
+      }
+      // Native dropped the ones whose inviter is no longer a friend.
+      await _persistPendingGroupInvites();
+      if (getPendingGroupInvites().isNotEmpty &&
+          !_pendingGroupInvitesChangedCtrl.isClosed) {
+        _pendingGroupInvitesChangedCtrl.add(null);
+      }
+    } catch (e, st) {
+      _logger?.logError(
+          '[FfiChatService] restoring pending group invites failed', e, st);
+    }
+  }
+
+  /// Invites the user has not answered yet, oldest first.
+  List<PendingGroupInvite> getPendingGroupInvites() {
+    if (_sessionClosed) return const [];
+    return _readPendingGroupInvitesFromNative() ?? const [];
+  }
+
+  /// Native's own list, WITHOUT the [_sessionClosed] gate — null when there is
+  /// no answer to give (export missing, instance torn down, or two capacity
+  /// attempts failed). An empty list means native really holds no invites.
+  ///
+  /// The persist path must use this, not [getPendingGroupInvites]: dispose
+  /// sets [_sessionClosed] first and only then awaits the writes already
+  /// queued, so a straggler asking the public getter would see "no invites"
+  /// and erase the account's persisted copy — which native holds in memory
+  /// only, so the next login would restore nothing. Native is still alive
+  /// here; [_groupInvitePersistClosed] is what closes this path, and it is
+  /// latched after that await and before `uninit()`.
+  List<PendingGroupInvite>? _readPendingGroupInvitesFromNative() {
+    final override = debugNativePendingInvitesOverride;
+    if (override != null) return override();
+    var capacity = 16 * 1024;
+    for (var attempt = 0; attempt < 2; attempt++) {
+      final buf = pkgffi.malloc.allocate<ffi.Int8>(capacity);
+      try {
+        final int n;
+        try {
+          n = _ffi.getPendingGroupInvites(buf, capacity);
+        } on ArgumentError {
+          return null; // native lib predates the export: unknown, not empty
+        }
+        // TIM2TOX_FFI_PENDING_INVITES_UNAVAILABLE: no answer to give (the
+        // instance is torn down / bad arguments). Checked before the
+        // negative-is-a-capacity-hint branch, whose negation would overflow.
+        if (n == -2147483648) return null;
+        if (n < 0) {
+          capacity = -n;
+          continue;
+        }
+        if (n == 0) return const [];
+        final out = <PendingGroupInvite>[];
+        for (final line in buf.cast<pkgffi.Utf8>().toDartString().split('\n')) {
+          if (line.isEmpty) continue;
+          final parts = line.split('\t');
+          if (parts.length < 5 || parts[0].isEmpty) continue;
+          out.add(PendingGroupInvite(
+            id: parts[0],
+            inviterUserId: parts[1],
+            kind: parts[2],
+            groupName: parts[3],
+            receivedAt: DateTime.fromMillisecondsSinceEpoch(
+                int.tryParse(parts[4]) ?? 0),
+            cookieHex: parts.length > 5 ? parts[5] : '',
+          ));
+        }
+        return out;
+      } finally {
+        pkgffi.malloc.free(buf);
+      }
+    }
+    return null; // two capacity attempts and still no answer: unknown
+  }
+
+  /// Accept a pending invite. Deliberately NOT [joinGroup]: that records the
+  /// id it was given in [_knownGroups], and an invite id (`tox_inv_*` /
+  /// `tox_conf_*`) is a throw-away alias. The group's real id reaches
+  /// [registerJoinedGroupState] through the native self-join notification.
+  /// [password]: for a password-protected group — typically the retry after
+  /// the group refused the first accept (see [groupJoinFailures]).
+  Future<void> acceptGroupInvite(String inviteId, {String? password}) async {
+    // Native forgets the invite the moment the accept is issued; keep our
+    // own copy until the join is confirmed (see [_joiningInvites]).
+    PendingGroupInvite? accepted;
+    for (final invite in getPendingGroupInvites()) {
+      if (invite.id == inviteId) {
+        accepted = invite;
+        break;
+      }
+    }
+    final p = inviteId.toNativeUtf8();
+    final withPassword = password != null && password.isNotEmpty;
+    final pmsg = (withPassword ? password : '').toNativeUtf8();
+    final int rc;
+    try {
+      rc = withPassword
+          ? _ffi.joinGroupWithPassword(p, pmsg)
+          : _ffi.joinGroup(p, pmsg);
+    } finally {
+      pkgffi.malloc.free(p);
+      pkgffi.malloc.free(pmsg);
+    }
+    // Recorded before anything can await, so the confirming self-join (a
+    // later native callback) always finds it.
+    if (rc == 1 && accepted != null && _inviteChatId(accepted) != null) {
+      _joiningInvites[inviteId] = accepted;
+    }
+    notifyPendingGroupInvitesChanged();
+    if (rc != 1) {
+      // Typical cause: the inviter went offline, so the cookie cannot be
+      // redeemed right now. The invite stays listed for another try.
+      throw StateError('acceptGroupInvite failed (rc=$rc) for $inviteId');
+    }
+  }
+
+  /// Decline a pending invite. Tox has no reject packet; this forgets it.
+  void rejectGroupInvite(String inviteId) {
+    final p = inviteId.toNativeUtf8();
+    try {
+      _ffi.rejectGroupInvite(p);
+    } on ArgumentError {
+      // native lib predates the export
+    } finally {
+      pkgffi.malloc.free(p);
+    }
+    notifyPendingGroupInvitesChanged();
+  }
+
+  /// [password] is for password-protected groups (join by chat id, or an
+  /// invite to one). A wrong or missing password is reported later through
+  /// [groupJoinFailures], when the group refuses the join.
+  Future<void> joinGroup(String groupId,
+      {String? requestMessage, String? password}) async {
     final p = groupId.toNativeUtf8();
     final wording = (requestMessage != null && requestMessage.trim().isNotEmpty)
         ? requestMessage.trim()
         : '';
-    final pmsg = wording.toNativeUtf8();
+    final withPassword = password != null && password.isNotEmpty;
+    final pmsg = (withPassword ? password : wording).toNativeUtf8();
     final int rc;
     try {
       // P0-B5: previously fire-and-forget. The FFI returns 1 on success,
       // 0 on failure (per the int convention). Surface a failure rather
       // than silently marking the group joined and persisting it to
       // _knownGroups — that left ghost entries on the user's group list.
-      rc = _ffi.joinGroup(p, pmsg);
+      rc = withPassword
+          ? _ffi.joinGroupWithPassword(p, pmsg)
+          : _ffi.joinGroup(p, pmsg);
     } finally {
       pkgffi.malloc.free(p);
       pkgffi.malloc.free(pmsg);
+    }
+    if (rc == 2) {
+      // Already in that group under another id (e.g. joined through an invite
+      // as tox_N, now pasting its 64-hex chat id). Native changed nothing;
+      // recording [groupId] would create a second conversation for one group.
+      throw GroupAlreadyJoinedException(groupId);
     }
     if (rc != 1) {
       _logger?.log(
@@ -7781,6 +8974,8 @@ class FfiChatService {
       _quitGroups.add(groupId);
       await _prefs?.addQuitGroup(groupId);
       print('[FfiChatService] quitGroup: Added to _quitGroups and persisted');
+      _syncRetiredGroupIdMaxToNative();
+      await _forgetGroupIdentity(groupId);
 
       // Clear history for this group (memory cache and persistence)
       print(
@@ -7815,6 +9010,16 @@ class FfiChatService {
   /// _knownGroups. Mirrors joinGroup's LOCAL bookkeeping without the C++ call;
   /// idempotent (no-op if already known).
   Future<void> registerJoinedGroupState(String groupId) async {
+    if (_sessionClosed) return; // see [_sessionClosed]
+    // Native reports EVERY self-join here, including a restored group's
+    // reconnect — the moment queued texts become deliverable.
+    unawaited(_sendPendingGroupMessages(groupId).catchError((Object e,
+        StackTrace st) {
+      _logger?.logError(
+          '[FfiChatService] sending queued group messages failed', e, st);
+    }));
+    // The confirmed self-join ends the wait of the invite that led here.
+    await _confirmJoiningInvites(groupId);
     if (_knownGroups.contains(groupId)) return;
     print(
         '[FfiChatService] registerJoinedGroupState: adding $groupId to _knownGroups');
@@ -7824,12 +9029,24 @@ class FfiChatService {
     // A (re)join clears any prior quit so it is not filtered back out.
     _quitGroups.remove(groupId);
     await _prefs?.removeQuitGroup(groupId);
+    // Back in the group: its history is ordinary live history again.
+    if (_historyRetainedGroups.remove(groupId)) {
+      await _prefs?.setStringSet(
+          _scopedKey(_kHistoryRetainedGroups), _historyRetainedGroups);
+    }
   }
 
   /// Cleanup group state after quit (called from C++ layer via FFI notification)
   /// This method performs the same cleanup as quitGroup but without calling C++ layer
   /// It's used when quitGroup is called directly from C++ layer (bypassing Dart layer)
-  Future<void> cleanupGroupState(String groupId) async {
+  ///
+  /// [keepHistory]: the removal was NOT the user's decision (we were kicked).
+  /// Membership state is cleaned up the same way, but the conversation's
+  /// history stays on disk (see [_historyRetainedGroups]) — it used to be
+  /// wiped, so any moderator could erase a member's local copy of the group.
+  Future<void> cleanupGroupState(String groupId,
+      {bool keepHistory = false}) async {
+    if (_sessionClosed) return; // see [_sessionClosed]
     print('[FfiChatService] cleanupGroupState: ENTRY - groupId=$groupId');
 
     try {
@@ -7847,12 +9064,23 @@ class FfiChatService {
       await _prefs?.addQuitGroup(groupId);
       print(
           '[FfiChatService] cleanupGroupState: Added to _quitGroups and persisted');
+      _syncRetiredGroupIdMaxToNative();
+      // A voluntary leave forgets the group's identity; a kick keeps it with
+      // the retained history.
+      if (!keepHistory) await _forgetGroupIdentity(groupId);
 
       // Clear history for this group (memory cache and persistence)
-      print(
-          '[FfiChatService] cleanupGroupState: Clearing group history (memory and persistence)');
-      await clearGroupHistory(groupId);
-      print('[FfiChatService] cleanupGroupState: Group history cleared');
+      if (keepHistory) {
+        if (_historyRetainedGroups.add(groupId)) {
+          await _prefs?.setStringSet(
+              _scopedKey(_kHistoryRetainedGroups), _historyRetainedGroups);
+        }
+      } else {
+        print(
+            '[FfiChatService] cleanupGroupState: Clearing group history (memory and persistence)');
+        await clearGroupHistory(groupId);
+        print('[FfiChatService] cleanupGroupState: Group history cleared');
+      }
 
       // Clear offline message queue for this group
       print(
@@ -7891,9 +9119,239 @@ class FfiChatService {
     // Add to quit groups list to prevent re-adding
     _quitGroups.add(groupId);
     await _prefs?.addQuitGroup(groupId);
+    _syncRetiredGroupIdMaxToNative(_serviceInstanceId);
+    await _forgetGroupIdentity(groupId);
     // Clear history for this group to prevent old messages from appearing if group ID is reused
     await clearGroupHistory(groupId);
+    // Same local cleanup as quitGroup: queued offline texts for a dismissed
+    // group must not survive to be flushed later.
+    await _clearGroupOfflineQueue(groupId);
     // Note: In Tox, we can't actually dismiss a group, but we can remove it from local state
+  }
+
+  /// Publish a group edit to the Tox network. [field] is the
+  /// GroupChangeInfoType value: 1 = name (a conference's title; an NGC
+  /// group's name is fixed, so only the local alias changes), 3 = notification
+  /// (the NGC topic; conferences keep it local). Returns 1 ok, -2 when the
+  /// group does not let us change it, 0 on failure.
+  int publishGroupInfoField(String groupId, int field, String value) {
+    final idPtr = groupId.toNativeUtf8();
+    final valuePtr = value.toNativeUtf8();
+    try {
+      return _ffi.setGroupInfoFieldNative(
+          _serviceInstanceId, idPtr, field, valuePtr);
+    } catch (_) {
+      return 0;
+    } finally {
+      pkgffi.malloc.free(idPtr);
+      pkgffi.malloc.free(valuePtr);
+    }
+  }
+
+  /// Whether toxcore would let us set [groupId]'s NGC topic (its
+  /// announcement) right now: true / false, or null when unknown (a legacy
+  /// conference, whose announcement is local; an unmapped group; a failed
+  /// query). Follows the topic lock and our role, which the V2TIM role alone
+  /// cannot express.
+  bool? canSetGroupTopic(String groupId) {
+    if (groupId.isEmpty) return null;
+    final idPtr = groupId.toNativeUtf8();
+    try {
+      final rc = _ffi.canSetGroupTopicNative(_serviceInstanceId, idPtr);
+      return rc == 1 ? true : (rc == 0 ? false : null);
+    } catch (_) {
+      return null;
+    } finally {
+      pkgffi.malloc.free(idPtr);
+    }
+  }
+
+  /// The friend (long-term public key) behind an NGC per-group member key,
+  /// when that friend proved it to us over the friend channel; else null.
+  String? friendForGroupMemberKey(String memberKey) {
+    if (memberKey.length < 64) return null;
+    final keyPtr = memberKey.toNativeUtf8();
+    final buf = pkgffi.calloc<ffi.Int8>(80);
+    try {
+      final n = _ffi.getGroupMemberFriendNative(keyPtr, buf, 80);
+      if (n <= 0) return null;
+      return buf.cast<pkgffi.Utf8>().toDartString(length: n);
+    } catch (_) {
+      return null;
+    } finally {
+      pkgffi.malloc.free(keyPtr);
+      pkgffi.calloc.free(buf);
+    }
+  }
+
+  // --- Group invites for friends who are offline (GI-6) ---------------------
+  //
+  // Tox can only deliver a group invite to a friend who is online right now.
+  // An invite to an offline friend used to fail and be lost; it is queued
+  // (persisted, so a restart does not lose it either) and sent when the
+  // friend comes online.
+  static const String _kQueuedOfflineGroupInvites =
+      'queued_offline_group_invites_v1';
+
+  bool isFriendKnownOffline(String friendId) =>
+      _friendOnlineStatus[_normalizeFriendId(friendId)] == 'offline';
+
+  /// Whether a failed group invite to [friendId] failed because the friend is
+  /// not connected right now: the one failure that waiting fixes. Asked of
+  /// native (the friend's live transport status), not of
+  /// [_friendOnlineStatus]: that cache is filled lazily by friend-list
+  /// refreshes and is empty right after login, when an invite to an offline
+  /// friend would otherwise be reported failed and lost. False for a user
+  /// who is not our friend (an invite to them can never be delivered).
+  bool isFriendNotConnected(String friendId) {
+    final override = debugFriendConnectionOverride;
+    if (override != null) return override(friendId) == 0;
+    final userIdPtr = friendId.toNativeUtf8();
+    try {
+      final instanceId = _serviceInstanceId;
+      final friendNumber = instanceId == 0
+          ? _ffi.getFriendNumberByUserIdNative(userIdPtr)
+          : _ffi.getFriendNumberByUserIdForInstanceNative(
+              instanceId, userIdPtr);
+      if (friendNumber == 0xFFFFFFFF || friendNumber < 0) return false;
+      final status =
+          _ffi.getFriendConnectionStatusNative(instanceId, friendNumber);
+      if (status >= 0) return status == 0;
+    } on ArgumentError {
+      // Older native library without one of the exports: use the cache.
+    } finally {
+      pkgffi.malloc.free(userIdPtr);
+    }
+    return isFriendKnownOffline(friendId);
+  }
+
+  /// Test seam: stands in for native's friend transport status (0 = not
+  /// connected, 1/2 = connected); null uses native.
+  int Function(String friendId)? debugFriendConnectionOverride;
+
+  /// Test seam: record [groupId] as a group we are in, without native or
+  /// preference side effects.
+  void debugAddKnownGroupForTest(String groupId) => _knownGroups.add(groupId);
+
+  /// Serializes every read-modify-write of the queued-invite set. Each
+  /// mutation re-reads the persisted set INSIDE the lock, so an enqueue can
+  /// no longer be overwritten by a concurrent enqueue or flush, and a flush
+  /// can no longer write back a delivered entry another run already removed.
+  Future<void> _offlineInviteQueueTail = Future<void>.value();
+
+  Future<T> _withOfflineInviteQueueLock<T>(Future<T> Function() body) {
+    final run = _offlineInviteQueueTail.then((_) => body());
+    _offlineInviteQueueTail = run.then<void>((_) {}, onError: (Object _) {});
+    return run;
+  }
+
+  static String _offlineInviteEntry(String groupId, String normalizedFriend) =>
+      '$groupId\t$normalizedFriend';
+
+  Future<void> queueGroupInviteForOfflineFriend(
+      String groupId, String friendId) {
+    final entry = _offlineInviteEntry(groupId, _normalizeFriendId(friendId));
+    return _withOfflineInviteQueueLock(() async {
+      final prefs = _prefs;
+      if (prefs == null) return;
+      final key = _scopedKey(_kQueuedOfflineGroupInvites);
+      final entries = <String>{...await prefs.getStringSet(key)};
+      if (entries.add(entry)) await prefs.setStringSet(key, entries);
+    });
+  }
+
+  /// The queued invites ("groupId<TAB>normalizedFriendId"), for tests and
+  /// diagnostics.
+  Future<Set<String>> debugQueuedOfflineGroupInvites() async {
+    final prefs = _prefs;
+    if (prefs == null) return const <String>{};
+    return <String>{
+      ...await prefs.getStringSet(_scopedKey(_kQueuedOfflineGroupInvites))
+    };
+  }
+
+  /// Test seam for [_flushPendingGroupInvites] with a stand-in for the
+  /// native invite: [invite] returns true when the invite was delivered.
+  Future<void> debugFlushPendingGroupInvitesForTest(String friendId,
+          Future<bool> Function(String groupId) invite) =>
+      _flushPendingGroupInvites(friendId, inviteOverride: invite);
+
+  /// A queued invite whose native answer never came stays queued; the queue
+  /// lock is not held forever.
+  static const Duration _kQueuedInviteTimeout = Duration(seconds: 30);
+
+  Future<void> _flushPendingGroupInvites(String friendId,
+      {Future<bool> Function(String groupId)? inviteOverride}) {
+    if (_sessionClosed) return Future<void>.value();
+    final normalized = _normalizeFriendId(friendId);
+    return _withOfflineInviteQueueLock(() async {
+      final prefs = _prefs;
+      if (prefs == null || _sessionClosed) return;
+      final key = _scopedKey(_kQueuedOfflineGroupInvites);
+      final entries = <String>{...await prefs.getStringSet(key)};
+      if (entries.isEmpty) return;
+      final remaining = <String>{...entries};
+      for (final entry in entries) {
+        final tab = entry.indexOf('\t');
+        if (tab <= 0 || entry.substring(tab + 1) != normalized) continue;
+        if (_sessionClosed) break;
+        final groupId = entry.substring(0, tab);
+        if (!_knownGroups.contains(groupId)) {
+          remaining.remove(entry); // left the group meanwhile
+          continue;
+        }
+        try {
+          final bool delivered;
+          if (inviteOverride != null) {
+            delivered = await inviteOverride(groupId);
+          } else {
+            // The native adapter (Dart* bindings), never the routed facade:
+            // the facade dispatches to the platform, which queues here.
+            final result = await TIMGroupManager.instance
+                .inviteUserToGroup(groupID: groupId, userList: [friendId])
+                .timeout(_kQueuedInviteTimeout);
+            delivered = result.code == 0 &&
+                (result.data ?? const []).any((op) => op.result == 1);
+          }
+          if (delivered) remaining.remove(entry);
+        } catch (e, st) {
+          _logger?.logError('queued group invite to $friendId failed', e, st);
+        }
+      }
+      if (remaining.length != entries.length) {
+        await prefs.setStringSet(key, remaining);
+      }
+    });
+  }
+
+  /// The name the group carries on the network (NGC name / conference
+  /// title), or null. Used when nothing local names the group — an invitee
+  /// otherwise saw the internal id forever.
+  String? sharedGroupName(String groupId) {
+    final idPtr = groupId.toNativeUtf8();
+    final buf = pkgffi.calloc<ffi.Int8>(512);
+    try {
+      final n =
+          _ffi.getGroupNameNative(_serviceInstanceId, idPtr, buf, 512);
+      if (n <= 0) return null;
+      return buf.cast<pkgffi.Utf8>().toDartString(length: n);
+    } catch (_) {
+      return null;
+    } finally {
+      pkgffi.malloc.free(idPtr);
+      pkgffi.calloc.free(buf);
+    }
+  }
+
+  /// Drop the persisted chat id / conference id / kind of a group the user
+  /// left, so nothing can rebind or rejoin it on a later start.
+  Future<void> _forgetGroupIdentity(String groupId) async {
+    try {
+      await _prefs?.setGroupChatId(groupId, '');
+      await _groupIdentityPrefs?.removeGroupIdentity(groupId);
+    } catch (e, st) {
+      _logger?.logError('forgetGroupIdentity failed for $groupId', e, st);
+    }
   }
 
   /// Connect to an IRC channel
@@ -8064,10 +9522,33 @@ class FfiChatService {
       return;
     }
     if (groupID != null) {
-      // Group receipts ride the group ACTION control line: the body is the
-      // EXACT legacy receipt schema (type/msgID/receiptType/sender — no
-      // groupID key, the gaction envelope already carries it), so every
-      // peer's ingestActionEvent consumes it via
+      // Group receipts go to the message's AUTHOR only ([peerId] is their
+      // per-group key), as a tim2tox custom private packet that carries our
+      // per-group key. Broadcasting them to the group as ACTION lines sent
+      // every member (and every qTox/Toxic user) O(N) JSON lines per message
+      // and published each reader's long-term Tox key to strangers.
+      final gidPtr = groupID.toNativeUtf8();
+      final authorPtr = peerId.toNativeUtf8();
+      final msgIdPtr = msgID.toNativeUtf8();
+      final typePtr = receiptType.toNativeUtf8();
+      int rc = 0;
+      try {
+        // Instance 0 = the calling instance, like the group text sends.
+        rc = _ffi.sendGroupReceiptNative(
+            0, gidPtr, authorPtr, msgIdPtr, typePtr);
+      } catch (_) {
+        rc = 0;
+      } finally {
+        pkgffi.malloc.free(gidPtr);
+        pkgffi.malloc.free(authorPtr);
+        pkgffi.malloc.free(msgIdPtr);
+        pkgffi.malloc.free(typePtr);
+      }
+      if (rc != -2) return;
+      // Legacy conferences have no private channel; their peers are named by
+      // long-term keys anyway. Keep the ACTION control line there: the body
+      // is the EXACT legacy receipt schema (type/msgID/receiptType/sender), so
+      // every peer's ingestActionEvent consumes it via
       // _tryConsumeLegacyActionControl instead of rendering an ACTION row.
       // Wire-only: _sendGroupTextByKindChecked never appends history.
       try {
@@ -8131,6 +9612,22 @@ class FfiChatService {
     }
   }
 
+  /// Group aliases this session already sent the automatic 'received' receipt
+  /// for. Insertion-ordered and bounded: a re-delivery arrives within seconds.
+  final Set<String> _receiptedGroupAliases = <String>{};
+  static const int _maxReceiptedGroupAliases = 4096;
+
+  /// True exactly once per [alias]: the automatic group receipt must go out
+  /// once per message whichever inbound copy (poll or advanced listener, in
+  /// either order, possibly twice) reaches ingestion first.
+  bool _claimGroupReceipt(String alias) {
+    if (!_receiptedGroupAliases.add(alias)) return false;
+    if (_receiptedGroupAliases.length > _maxReceiptedGroupAliases) {
+      _receiptedGroupAliases.remove(_receiptedGroupAliases.first);
+    }
+    return true;
+  }
+
   /// Stamps the cross-peer alias onto an already-persisted group row.
   ///
   /// Returns the alias only when it was NEWLY added, so the caller can send
@@ -8188,22 +9685,49 @@ class FfiChatService {
   }
 
   // Handle received receipt (async helper)
+  /// Receipt tallies are only interesting for recent messages; keep the
+  /// newest [_kMaxReceiptTallies] (maps iterate in insertion order).
+  static const int _kMaxReceiptTallies = 2000;
+  static void _capReceiptTally(Map<String, Set<String>> tally) {
+    while (tally.length > _kMaxReceiptTallies) {
+      tally.remove(tally.keys.first);
+    }
+  }
+
   Future<void> _handleReceipt(
       String msgID, String receiptType, String sender, String? groupID) async {
     // For group messages, track receivers and readers. Guard against the
     // sender's own NGC echo: a self-receipt must not inflate either tally.
     if (groupID != null && sender != _wireSelfSender()) {
       final tallyKey = _localGroupRowId(msgID, groupID);
+      // Only our OWN rows have receivers worth counting: receipts from older
+      // toxee members still arrive broadcast for everyone's messages, and
+      // tallying those grew these maps without bound on every device.
+      final ownRow = (_historyById[groupID] ?? const <ChatMessage>[]).any(
+          (m) =>
+              m.isSelf &&
+              (m.msgID == tallyKey ||
+                  m.msgID == msgID ||
+                  m.altMsgIds.contains(msgID)));
+      if (!ownRow) return;
       if (receiptType == 'received' || receiptType == 'read') {
         _messageReceivers.putIfAbsent(tallyKey, () => <String>{}).add(sender);
+        _capReceiptTally(_messageReceivers);
       }
       if (receiptType == 'read') {
-        _messageReaders.putIfAbsent(tallyKey, () => <String>{}).add(sender);
-        _receiptEventsCtrl.add((
-          msgID: tallyKey,
-          groupID: groupID,
-          readCount: _messageReaders[tallyKey]!.length,
-        ));
+        // Idempotent: a replayed READ from a reader already counted changes
+        // nothing, so it must not re-fire the live read-receipt event.
+        final newReader = _messageReaders
+            .putIfAbsent(tallyKey, () => <String>{})
+            .add(sender);
+        _capReceiptTally(_messageReaders);
+        if (newReader) {
+          _receiptEventsCtrl.add((
+            msgID: tallyKey,
+            groupID: groupID,
+            readCount: _messageReaders[tallyKey]!.length,
+          ));
+        }
       }
     }
 
@@ -8220,9 +9744,10 @@ class FfiChatService {
       // 1:1 in true send order.
       var order = List<int>.generate(history.length, (i) => i);
       if (hashWanted != null) {
-        order.sort(
-          (a, b) => history[a].timestamp.compareTo(history[b].timestamp),
-        );
+        order.sort((a, b) {
+          final byTime = history[a].timestamp.compareTo(history[b].timestamp);
+          return byTime != 0 ? byTime : a.compareTo(b); // GH-6 stable tiebreak
+        });
       }
       for (final i in order) {
         final msg = history[i];
@@ -8256,8 +9781,12 @@ class FfiChatService {
           // Update self-sent message receipt status
           ChatMessage updatedMsg;
           if (receiptType == 'received') {
+            // Idempotent: a replayed (or second member's) receipt that
+            // changes no flag must not rewrite history or re-emit the row.
+            if (msg.isReceived) break;
             updatedMsg = msg.copyWith(isReceived: true);
           } else if (receiptType == 'read') {
+            if (msg.isReceived && msg.isRead) break;
             updatedMsg = msg.copyWith(isReceived: true, isRead: true);
           } else {
             return; // Unknown receipt type
@@ -8298,7 +9827,11 @@ class FfiChatService {
     if (history != null) {
       for (int i = 0; i < history.length; i++) {
         final msg = history[i];
-        if (msg.msgID == msgID && !msg.isSelf) {
+        // Alias-aware (GH-9): UIKit may hold the id of the cross-path copy
+        // that was absorbed into this row (the native advanced-listener id
+        // when the poll copy was persisted first).
+        if ((msg.msgID == msgID || msg.altMsgIds.contains(msgID)) &&
+            !msg.isSelf) {
           // Update received message to read status
           final updatedMsg = msg.copyWith(isRead: true);
           history[i] = updatedMsg;
@@ -8312,7 +9845,11 @@ class FfiChatService {
                   (id) => id.startsWith('gmid:'),
                   orElse: () => msgID,
                 );
-          await _sendReceipt(peerId, wireMsgID, 'read', groupID: groupID);
+          // A group receipt goes to the row's AUTHOR (their per-group key),
+          // not to the conversation id.
+          await _sendReceipt(groupID == null ? peerId : msg.fromUserId,
+              wireMsgID, 'read',
+              groupID: groupID);
           break;
         }
       }
@@ -8384,7 +9921,15 @@ class FfiChatService {
     // user only learned about it when peers asked why their replies went
     // nowhere. Now: if we're not connected, queue the message and surface
     // it as pending; drain on the next conn:success.
-    if (!_isConnected) {
+    //
+    // "Connected" has to mean the GROUP, not just our DHT link. A group
+    // restored from the savefile stays CONNECTING until a peer handshake
+    // completes — seconds to minutes after conn:success — and in that state
+    // tox_group_send_message SUCCEEDS while delivering to nobody
+    // (gc_send_message: `sent > 0 || confirmed_peers == 0`). NGC has no
+    // history sync, so a message "sent" then was lost for good while showing
+    // as delivered. Queue it; it drains when the group connects.
+    if (!_isConnected || !_groupWireReady(groupId)) {
       // Offline: consume (drop) the armed read-receipt intent so it cannot
       // leak onto an unrelated NEXT send; queued items do not carry it yet.
       _consumeArmedNeedReadReceipt();
@@ -8482,7 +10027,30 @@ class FfiChatService {
     return _sendPendingGroupMessages(groupId);
   }
 
+  final Set<String> _groupDrainInFlight = <String>{};
+  final Set<String> _groupDrainRerun = <String>{};
+
+  /// Single-flight per group. The drain is triggered from more than one place
+  /// (conn:success, a group's self-join, the manual retry) and suspends on
+  /// persistence between items: two overlapping runs each held their own
+  /// queue snapshot and could put the same message on the wire twice.
   Future<void> _sendPendingGroupMessages(String groupId) async {
+    if (!_groupDrainInFlight.add(groupId)) {
+      _groupDrainRerun.add(groupId); // pick up whatever the trigger was about
+      return;
+    }
+    try {
+      do {
+        _groupDrainRerun.remove(groupId);
+        await _sendPendingGroupMessagesOnce(groupId);
+      } while (_groupDrainRerun.contains(groupId) && !_pollDisposed);
+    } finally {
+      _groupDrainInFlight.remove(groupId);
+      _groupDrainRerun.remove(groupId);
+    }
+  }
+
+  Future<void> _sendPendingGroupMessagesOnce(String groupId) async {
     final storageKey = _groupOfflineQueueKey(groupId);
     final pending = List<OfflineMessageItem>.from(_getOfflineQueue(storageKey));
     if (pending.isEmpty) return;
@@ -8496,9 +10064,11 @@ class FfiChatService {
         await _offlineQueuePersistence.removeItem(storageKey, item);
         continue;
       }
-      if (!_isConnected) {
+      if (!_isConnected || !_groupWireReady(groupId)) {
+        // Not (yet) deliverable: keep the rest queued. The drain runs again on
+        // the next conn:success and when this group reports its self-join.
         _logger?.log(
-            '[FfiChatService] _sendPendingGroupMessages: lost connection mid-drain for $groupId; ${pending.length - pending.indexOf(item)} item(s) kept in queue');
+            '[FfiChatService] _sendPendingGroupMessages: $groupId not deliverable yet; ${pending.length - pending.indexOf(item)} item(s) kept in queue');
         break;
       }
       // dispose() may have freed the native instance while the previous
@@ -10264,8 +11834,11 @@ class FfiChatService {
         await _saveHistory(conversationId);
         // Update last message if needed
         if (messages.isNotEmpty) {
-          messages.sort((a, b) => b.timestamp.compareTo(a.timestamp));
-          _lastByPeer[conversationId] = messages.first;
+          // `messages` IS the persistence cache list: pick from a copy, never
+          // re-sort the cache in place (it holds arrival order, GH-6).
+          final newestFirst = List<ChatMessage>.from(messages);
+          sortChatMessagesChronologically(newestFirst, newestFirst: true);
+          _lastByPeer[conversationId] = newestFirst.first;
         } else {
           _lastByPeer.remove(conversationId);
         }
@@ -10343,6 +11916,7 @@ class FfiChatService {
 
   Future<void> _disposeImpl() async {
     _disposing = true;
+    _sessionClosed = true;
     // Order matters here — the previous arrangement had a race where a poll
     // tick or in-flight callback could `appendHistory` between
     // `flushPendingSaves()` and `clearAllCached()`, resurrecting the
@@ -10447,13 +12021,27 @@ class FfiChatService {
       // Best-effort: don't block dispose if a queue mutation fails.
     }
     await _draftOperationTail;
+    // Group-invite writes already queued (unanswered/joining invites, the
+    // offline-invite queue) finish while native is still alive; nothing new
+    // is queued (_sessionClosed). The invite-list latch then keeps a straggler
+    // from snapshotting native's list after uninit and erasing the copy.
+    try {
+      await Future.wait<void>(
+              [_pendingInvitesPersistTail, _offlineInviteQueueTail])
+          .timeout(const Duration(seconds: 10));
+    } on TimeoutException {
+      _logger?.log('[FfiChatService] dispose: group-invite writes did not '
+          'finish in 10s');
+    }
+    _groupInvitePersistClosed = true;
+    _joiningInvites.clear();
 
-    // 3. Switch persistence into disposed mode. After this, any late call
-    // into _scheduleDebouncedSave (defensive — should not happen given step 1)
-    // falls through to a synchronous saveHistory using the still-present
-    // in-memory list, instead of scheduling a timer that gets cancelled in
-    // step 4. `dispose()` itself awaits an internal `flushPendingSaves` —
-    // idempotent against the explicit flush in step 2.
+    // 3. End the persistence session. `dispose()` awaits an internal
+    // `flushPendingSaves` (idempotent against the explicit flush in step 2),
+    // then drops all session state and invalidates in-flight loads. A late
+    // append / save after this (defensive — should not happen given step 1)
+    // is refused rather than writing a partial list over a file; the next
+    // init() reopens the store via `_loadAllHistories`.
     await _messageHistoryPersistence.dispose();
 
     // 4. Clear caches and tear down.
@@ -10469,6 +12057,8 @@ class FfiChatService {
     _seededApplications.clear();
     _seededApplicationNicknames.clear();
     _activePeerId = null;
+    _openChatMentions = null;
+    _unreadMentionGroups.clear();
 
     // P1-18: previously-leaked maps. Empty them so a re-init of the service
     // (e.g. account switch) doesn't carry state over from the dead account.
@@ -10536,6 +12126,8 @@ class FfiChatService {
     await _avatarUpdatedCtrl.close();
     await _nicknameUpdatedCtrl.close();
     await _conversationDraftChanges.close();
+    await _pendingGroupInvitesChangedCtrl.close();
+    await _groupJoinFailuresCtrl.close();
     // Object is now fully torn down and safe to re-init (init -> login ->
     // startPolling). Two deliberate exceptions keep the latch set forever:
     // a dispose that THREW above, and a zombie in-flight poll that outlived
@@ -10558,4 +12150,97 @@ class FfiChatService {
       _disposeFuture = null;
     }
   }
+}
+
+/// [FfiChatService.joinGroup] was asked to join a group we are already in.
+class GroupAlreadyJoinedException implements Exception {
+  const GroupAlreadyJoinedException(this.requestedId);
+  final String requestedId;
+  @override
+  String toString() => 'GroupAlreadyJoinedException($requestedId)';
+}
+
+/// A group invite the user has not answered yet (auto-accept off).
+/// Why a group refused our join (see [FfiChatService.groupJoinFailures]).
+enum GroupJoinFailureReason { invalidPassword, groupFull, unknown }
+
+class GroupJoinFailure {
+  const GroupJoinFailure({
+    required this.groupId,
+    required this.chatId,
+    required this.reason,
+    this.established = false,
+    this.inviteId = '',
+  });
+
+  /// The invite the refused join came from, handed back (unanswered) by
+  /// native: accepting it again — with a password — is how a PRIVATE group
+  /// is retried (it cannot be joined by chat id).
+  final String inviteId;
+
+  /// A group we already held, refused on reconnect: still in the list.
+  final bool established;
+
+  final String groupId;
+
+  /// The group's public chat id (64 hex), empty when native could not read
+  /// it. Joining it again (with a password) is how the user retries.
+  final String chatId;
+  final GroupJoinFailureReason reason;
+
+  static GroupJoinFailureReason reasonFromWire(String reason) =>
+      switch (reason) {
+        'invalid_password' => GroupJoinFailureReason.invalidPassword,
+        'peer_limit' => GroupJoinFailureReason.groupFull,
+        _ => GroupJoinFailureReason.unknown,
+      };
+}
+
+class PendingGroupInvite {
+  const PendingGroupInvite({
+    required this.id,
+    required this.inviterUserId,
+    required this.kind,
+    required this.groupName,
+    required this.receivedAt,
+    this.cookieHex = '',
+  });
+
+  factory PendingGroupInvite.fromJson(Map<String, dynamic> json) =>
+      PendingGroupInvite(
+        id: json['id'] as String? ?? '',
+        inviterUserId: json['inviter'] as String? ?? '',
+        kind: json['kind'] as String? ?? 'group',
+        groupName: json['name'] as String? ?? '',
+        receivedAt: DateTime.fromMillisecondsSinceEpoch(
+            (json['receivedMs'] as num?)?.toInt() ?? 0),
+        cookieHex: json['cookie'] as String? ?? '',
+      );
+
+  Map<String, dynamic> toJson() => {
+        'id': id,
+        'inviter': inviterUserId,
+        'kind': kind,
+        'name': groupName,
+        'receivedMs': receivedAt.millisecondsSinceEpoch,
+        'cookie': cookieHex,
+      };
+
+  /// Pass to [FfiChatService.acceptGroupInvite] / `rejectGroupInvite`.
+  final String id;
+
+  /// The inviting FRIEND's long-term public key (64 hex).
+  final String inviterUserId;
+
+  /// `group` (NGC), `conference` or `av_conference`.
+  final String kind;
+
+  /// From the invite packet; empty for conferences (they carry no name).
+  final String groupName;
+
+  final DateTime receivedAt;
+
+  /// The invite cookie (hex). Only needed to re-create the invite in native
+  /// after a restart; not a secret beyond what the inviter already sent us.
+  final String cookieHex;
 }

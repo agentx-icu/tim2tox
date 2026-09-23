@@ -124,7 +124,7 @@
 
 | 域 | API | 状态 | 说明 |
 | --- | --- | --- | --- |
-| Group | `MuteGroupMember` (:2535) | no-op-success | 返回成功，但 Tox 没有定时禁言机制，实际不生效。 |
+| Group | `MuteGroupMember` | native（模拟到期） | 禁言 = NGC `OBSERVER` 角色（toxcore 丢弃该成员的发言）；`seconds == 0` 解除禁言（只解除 observer）；不能禁言管理员/群主。NGC 没有定时禁言，由执行禁言的客户端记录截止时间（持久化到 `<profile>.timed_mutes`），在事件循环中到期后恢复角色；再次禁言会重置截止时间，`UINT32_MAX` 表示永久。只有该客户端、且仍为管理员时才能解除；到期时成员不在群内则在其回来时解除（截止后 7 天放弃）。 |
 | Group | `MuteAllGroupMembers` (:2546) | unsupported | |
 
 ### 搜索

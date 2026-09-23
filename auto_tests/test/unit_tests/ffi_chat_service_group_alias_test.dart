@@ -262,4 +262,80 @@ void main() {
     // underneath the in-flight save.
     await waitForHistoryFile((contents) => contents.contains('"isRead":true'));
   });
+
+  // A group member can replay one valid receipt as often as it likes (and a
+  // receipt that slips past the native replay filter can arrive twice).
+  // Only a CHANGE may cost anything: a new reader re-fires the tally event,
+  // a flag flip rewrites and re-emits the row; a replay does neither.
+  test('a replayed group read receipt is tallied, emitted and saved once',
+      () async {
+    final alias = FfiChatService.groupMessageAlias(
+      groupId: _groupId,
+      senderPk: _authorKey,
+      pseudoMsgId: 78,
+    );
+    const localId = 'local-replay-id';
+    await persistence.appendHistory(
+      _groupId,
+      ChatMessage(
+        text: 'replayed line',
+        fromUserId: _authorKey,
+        isSelf: true,
+        timestamp: DateTime.now(),
+        groupId: _groupId,
+        msgID: localId,
+        altMsgIds: [alias],
+      ),
+    );
+
+    final readCounts = <int>[];
+    final rowEmits = <ChatMessage>[];
+    final receiptSub =
+        service.receiptEvents.listen((e) => readCounts.add(e.readCount));
+    final rowSub = service.messages.listen((m) {
+      if (m.msgID == localId) rowEmits.add(m);
+    });
+    String readReceiptFrom(String reader) =>
+        'gaction:$_groupId|$reader:${jsonEncode({
+              'type': 'receipt',
+              'msgID': alias,
+              'receiptType': 'read',
+              'sender': reader,
+            })}';
+    Future<void> settle() async {
+      for (var i = 0; i < 10; i++) {
+        await Future<void>.delayed(const Duration(milliseconds: 10));
+      }
+    }
+
+    for (var i = 0; i < 5; i++) {
+      expect(service.ingestActionEvent(readReceiptFrom(_readerKey)), isTrue,
+          reason: 'every copy is consumed as a control, never rendered');
+    }
+    await waitForHistoryFile((contents) => contents.contains('"isRead":true'));
+    await settle();
+    expect(readCounts, [1], reason: 'one reader, one tally event');
+    expect(rowEmits, hasLength(1),
+        reason: 'the row flips (and is saved and emitted) exactly once');
+    // A received after the read changes no flag either.
+    service.ingestActionEvent(readReceiptFrom(_readerKey)
+        .replaceFirst('"receiptType":"read"', '"receiptType":"received"'));
+
+    const secondReader =
+        'DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD';
+    service.ingestActionEvent(readReceiptFrom(secondReader));
+    service.ingestActionEvent(readReceiptFrom(secondReader));
+    await settle();
+    expect(readCounts, [1, 2],
+        reason: 'a new reader changes the tally once; its replay does not');
+    expect(rowEmits, hasLength(1),
+        reason: 'an already-read row is not rewritten for another reader');
+    expect(service.getMessageReaders(localId),
+        unorderedEquals([_readerKey, secondReader]));
+    expect(service.getHistory(_groupId).where((m) => !m.isSelf), isEmpty,
+        reason: 'no receipt may materialise as a row');
+
+    await receiptSub.cancel();
+    await rowSub.cancel();
+  });
 }

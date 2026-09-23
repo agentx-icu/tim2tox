@@ -8,6 +8,9 @@
 #include <V2TIMMessageManager.h>
 #include <mutex>
 #include <queue>
+#include <deque>
+#include <cstring>
+#include <unordered_map>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -26,6 +29,10 @@
 #include "irc_client_api.h"
 #include "V2TIMSignalingManager.h"
 #include "V2TIMSignalingManagerImpl.h"  // For CheckTimeouts() in iterate hook
+// For CheckMuteExpiries() in iterate hook. Explicit path: include/ still holds
+// a stale legacy V2TIMGroupManagerImpl.h that shadows the real one on the
+// include path.
+#include "../source/V2TIMGroupManagerImpl.h"
 #ifdef BUILD_TOXAV
 #include "ToxAVManager.h"
 #endif
@@ -114,6 +121,12 @@ static inline int tim2tox_mkdir(const char* path, int mode) {
 V2TIMManagerImpl* GetCurrentInstance();
 int64_t GetCurrentInstanceId();
 int64_t GetInstanceIdFromManager(V2TIMManagerImpl* manager);
+// Session epoch (V2TIMManagerImpl::GetSessionEpoch) of `instance_id` RIGHT
+// NOW: a value that changes on every InitSDK and is 0 while no session is
+// live. Queued poll records are stamped with it so a record left behind by
+// one account cannot be handed to the next account that reuses the same
+// instance id. Never blocks: see the definition.
+int64_t CurrentSessionEpochForInstance(int64_t instance_id);
 int64_t GetReceiverInstanceOverride(void);
 void SetReceiverInstanceOverride(int64_t id);
 void ClearReceiverInstanceOverride(void);
@@ -385,11 +398,131 @@ static int CopyPayloadOrReturnRequiredCapacity(const std::string& payload, char*
     return bytes_written;
 }
 
+// --- Bounded text-event queue ------------------------------------------------
+// Every Platform-path event (messages, file / connection / profile events)
+// waits here until FfiChatService polls it: at most 200 events per poll tick,
+// ticks 16 ms..1 s apart depending on activity, and none at all while a mobile
+// app is suspended. Remote peers drive most producers, so a flood that outruns
+// the drain used to grow native memory without bound.
+//
+// Events are classed by line prefix; when a SOFT cap is reached the oldest
+// events are evicted class by class:
+//   kLossy  typing:, and progress_send:/progress_recv: before the final 100%
+//           update — each is superseded by the next one anyway.
+//   kChat   c2c:/c2caction:/c2cbin:/gtext:/gaction:/gcustombin: (ordinary
+//           message content), oldest first.
+//   kState  everything else (conn:, file_request:, file_done:, final
+//           progress, file control, avatar / nickname / status changes, ...):
+//           never evicted to make room. They are admitted beyond the soft caps
+//           up to the HARD caps; only a new state event arriving past those is
+//           refused.
+// No drop is silent: each is counted per class
+// (tim2tox_ffi_get_text_queue_drop_count) and logged, rate-limited, without
+// its content.
+namespace text_queue {
+enum EventClass : uint8_t { kLossy = 0, kChat = 1, kState = 2, kClassCount = 3 };
+// Normal backlog is a few hundred events; 64K / 32 MiB holds hours of a busy
+// suspended session (a chat event is ~0.1-3 KiB) before anything is evicted.
+constexpr size_t kSoftMaxEvents = 64 * 1024;
+constexpr size_t kSoftMaxBytes = 32u * 1024u * 1024u;
+constexpr size_t kHardMaxEvents = 2 * kSoftMaxEvents;
+constexpr size_t kHardMaxBytes = 2 * kSoftMaxBytes;
+// Consumed/evicted slots are tombstoned in place (keeps FIFO order and O(1)
+// eviction); rebuild once they outnumber the live events by this margin.
+constexpr size_t kCompactMinTombstones = 4096;
+// Stamp for a record whose session could not be determined at enqueue time.
+// Never rejected at poll time (see CurrentSessionEpochForInstance).
+constexpr int64_t kSessionEpochUnknown = -1;
+// "Drop every record for this instance", whatever it is stamped with.
+constexpr int64_t kSessionEpochNone = 0;
+
+static std::atomic<int64_t> g_drops[kClassCount];
+
+inline bool HasPrefix(const std::string& line, const char* prefix) {
+    return line.compare(0, std::strlen(prefix), prefix) == 0;
+}
+
+// progress_send:<uid>:<done>:<total>
+// progress_recv:<instance>:<uid>:<done>:<total>:<path>
+// `done_field` is the 0-based ':' field holding <done>.
+inline bool IsFinalProgress(const std::string& line, int done_field) {
+    std::string_view view(line);
+    std::string_view done;
+    std::string_view total;
+    size_t pos = 0;
+    for (int field = 0; field <= done_field + 1; ++field) {
+        const size_t colon = view.find(':', pos);
+        const std::string_view part =
+            view.substr(pos, colon == std::string_view::npos ? std::string_view::npos : colon - pos);
+        if (field == done_field) done = part;
+        if (field == done_field + 1) total = part;
+        if (colon == std::string_view::npos) break;
+        pos = colon + 1;
+    }
+    return !done.empty() && done == total;
+}
+
+inline EventClass Classify(const std::string& line) {
+    if (HasPrefix(line, "typing:")) return kLossy;
+    if (HasPrefix(line, "progress_send:")) return IsFinalProgress(line, 2) ? kState : kLossy;
+    if (HasPrefix(line, "progress_recv:")) return IsFinalProgress(line, 3) ? kState : kLossy;
+    if (HasPrefix(line, "c2c:") || HasPrefix(line, "c2caction:") ||
+        HasPrefix(line, "c2cbin:") || HasPrefix(line, "gtext:") ||
+        HasPrefix(line, "gaction:") || HasPrefix(line, "gcustombin:")) {
+        return kChat;
+    }
+    return kState;
+}
+
+static void RecordDrop(EventClass cls, int64_t instance_id, const std::string& line, const char* why) {
+    const int64_t n = g_drops[cls].fetch_add(1, std::memory_order_relaxed) + 1;
+    // First drop, then every 1000th per class: a flood must not flood the log.
+    if (n == 1 || n % 1000 == 0) {
+        const size_t colon = line.find(':');
+        const std::string kind = line.substr(0, colon == std::string::npos ? 0 : colon);
+        V2TIM_LOG(kWarning,
+                  "[ffi] text queue {}: dropped class={} kind={} instance={} bytes={} (class drops so far={})",
+                  why, static_cast<int>(cls), kind, (long long)instance_id, line.size(), (long long)n);
+    }
+}
+}  // namespace text_queue
+
 class SimpleMsgListenerImpl : public V2TIMSimpleMsgListener {
 public:
     void enqueue_text_line_for_instance(int64_t instance_id, const std::string& s) {
+        using namespace text_queue;
+        const EventClass cls = Classify(s);
+        // Which SESSION produced this record. Resolved before the queue lock
+        // (it may take the instance registry's) and stored with the record:
+        // an unpolled record of account A must never be handed to account B
+        // after B's login reused the same instance id.
+        const int64_t session_epoch = CurrentSessionEpochForInstance(instance_id);
         std::lock_guard<std::mutex> lock(m_);
-        text_q_.emplace(instance_id, s);
+        // Make room under the soft caps: oldest lossy events first, then (not
+        // for a lossy newcomer — a typing update never displaces a message)
+        // the oldest chat events. State events are never evicted for room.
+        while (over_caps_locked(s.size(), kSoftMaxEvents, kSoftMaxBytes) &&
+               (evict_oldest_locked(kLossy) ||
+                (cls != kLossy && evict_oldest_locked(kChat)))) {
+        }
+        if (over_caps_locked(s.size(), kSoftMaxEvents, kSoftMaxBytes)) {
+            // Nothing it may displace is left. A lossy/chat newcomer is
+            // dropped itself; a state event is admitted up to the hard caps.
+            if (cls != kState) {
+                RecordDrop(cls, instance_id, s, "full (state backlog)");
+                return;
+            }
+            if (over_caps_locked(s.size(), kHardMaxEvents, kHardMaxBytes)) {
+                RecordDrop(cls, instance_id, s, "hard cap reached");
+                return;
+            }
+        }
+        const uint64_t seq = text_q_front_seq_ + text_q_.size();
+        text_q_.push_back(TextEvent{instance_id, s, cls, true, session_epoch});
+        if (cls != kState) text_evictable_[cls].push_back(seq);
+        ++text_live_events_;
+        text_live_bytes_ += s.size();
+        ++text_live_per_instance_[instance_id];
     }
 
     void enqueue_text_line(const std::string& s) {
@@ -442,16 +575,40 @@ public:
         std::string line = std::string("gcustombin:") + groupID.CString() + "|" + sender.userID.CString() + ":" + payload;
         enqueue_text_line_for_instance(instance_id, line);
     }
-    // instance_id: only return events for this instance (or broadcast events with id 0).
-    int poll_text(int64_t instance_id, char* buf, int len) {
+    // instance_id: only return events for this instance (or broadcast events
+    // with id 0). session_epoch is that instance's LIVE session epoch; records
+    // stamped with a different one belong to a previous account on the same
+    // instance id and are dropped here rather than delivered.
+    int poll_text(int64_t instance_id, int64_t session_epoch, char* buf, int len) {
         std::lock_guard<std::mutex> lock(m_);
-        const size_t qsize = text_q_.size();
-        for (size_t i = 0; i < qsize; ++i) {
-            // Peek the front before consuming it, so a too-small buffer leaves
-            // the event queued for a retry instead of truncating it.
-            auto& front = text_q_.front();
-            if (front.first == 0 || front.first == instance_id) {
-                const std::string& s = front.second;
+        // Once per session, not per poll: the stamp only changes at InitSDK.
+        if (session_epoch > 0) {
+            const auto seen = text_polled_epoch_.find(instance_id);
+            if (seen == text_polled_epoch_.end() || seen->second != session_epoch) {
+                const size_t dropped =
+                    purge_locked(instance_id, session_epoch);
+                text_polled_epoch_[instance_id] = session_epoch;
+                if (dropped > 0) {
+                    V2TIM_LOG(kWarning,
+                              "[ffi] text queue: dropped {} record(s) left by a "
+                              "previous session of instance {}",
+                              (unsigned long long)dropped,
+                              (long long)instance_id);
+                }
+            }
+        }
+        // Nothing queued for this instance or for broadcast: skip the scan.
+        if (live_count_for_locked(0) == 0 &&
+            (instance_id == 0 || live_count_for_locked(instance_id) == 0)) {
+            return 0;
+        }
+        // Oldest matching event, in arrival order. Events for other instances
+        // stay where they are (they used to be rotated to the back, reordering
+        // them behind newer events).
+        for (size_t i = 0; i < text_q_.size(); ++i) {
+            TextEvent& event = text_q_[i];
+            if (!event.live) continue;
+            if (event.instance_id == 0 || event.instance_id == instance_id) {
                 // Each dequeue returns exactly one opaque queued record. The
                 // payload may legally contain newlines, so callers must treat
                 // the returned bytes as a single event and never split on '\n'.
@@ -460,17 +617,32 @@ public:
                 // leave the event queued — the caller grows its buffer and
                 // retries. (Previously the event was copied truncated and
                 // popped, silently losing the tail of a long file path.)
-                const int n = CopyPayloadOrReturnRequiredCapacity(s, buf, len);
+                const int n = CopyPayloadOrReturnRequiredCapacity(event.line, buf, len);
                 if (n < 0) return n;
-                text_q_.pop();
+                remove_locked(i);
                 return n;
             }
-            // Not for this instance: rotate to the back and keep scanning.
-            auto p = std::move(front);
-            text_q_.pop();
-            text_q_.push(std::move(p));
         }
         return 0;
+    }
+    // Drop everything still queued for `instance_id` (text and custom) —
+    // called when its session ends. Without it a record nobody polled stayed
+    // in the process-wide queue, and the next account to init on that same
+    // instance id could receive it. The epoch stamp is the belt (poll rejects
+    // stale records even if a teardown path forgot to call this); this is the
+    // braces, and it also releases the memory immediately.
+    void purge_instance(int64_t instance_id) {
+        std::lock_guard<std::mutex> lock(m_);
+        purge_locked(instance_id, text_queue::kSessionEpochNone);
+        text_polled_epoch_.erase(instance_id);
+        std::queue<std::pair<int64_t, std::vector<unsigned char>>> kept;
+        while (!custom_q_.empty()) {
+            auto entry = std::move(custom_q_.front());
+            custom_q_.pop();
+            if (entry.first == instance_id) continue;
+            kept.push(std::move(entry));
+        }
+        custom_q_.swap(kept);
     }
     int poll_custom(int64_t instance_id, unsigned char* buf, int len) {
         std::lock_guard<std::mutex> lock(m_);
@@ -492,8 +664,133 @@ public:
         return 0;
     }
 private:
+    // One queued text event. `live` is false once it has been polled or
+    // evicted (a tombstone: line freed, slot kept so sequence numbers stay
+    // stable and arrival order is preserved).
+    struct TextEvent {
+        int64_t instance_id;
+        std::string line;
+        text_queue::EventClass cls;
+        bool live;
+        // Session that produced it (see CurrentSessionEpochForInstance).
+        // text_queue::kSessionEpochUnknown when it could not be determined.
+        int64_t session_epoch;
+    };
+
+    bool over_caps_locked(size_t incoming_bytes, size_t max_events, size_t max_bytes) const {
+        return text_live_events_ + 1 > max_events ||
+               text_live_bytes_ + incoming_bytes > max_bytes;
+    }
+
+    size_t live_count_for_locked(int64_t instance_id) const {
+        const auto it = text_live_per_instance_.find(instance_id);
+        return it == text_live_per_instance_.end() ? 0 : it->second;
+    }
+
+    // Evict the oldest live event of `cls`. False when there is none.
+    bool evict_oldest_locked(text_queue::EventClass cls) {
+        auto& index = text_evictable_[cls];
+        while (!index.empty()) {
+            const uint64_t seq = index.front();
+            index.pop_front();
+            if (seq < text_q_front_seq_) continue;  // already gone
+            const size_t pos = static_cast<size_t>(seq - text_q_front_seq_);
+            if (pos >= text_q_.size() || !text_q_[pos].live) continue;  // polled
+            text_queue::RecordDrop(cls, text_q_[pos].instance_id, text_q_[pos].line,
+                                   "over soft cap");
+            remove_locked(pos);
+            return true;
+        }
+        return false;
+    }
+
+    // Tombstone the live event at `pos`, then trim / compact. Invalidates
+    // references into text_q_.
+    void remove_locked(size_t pos) {
+        TextEvent& event = text_q_[pos];
+        text_live_bytes_ -= event.line.size();
+        --text_live_events_;
+        auto count = text_live_per_instance_.find(event.instance_id);
+        if (count != text_live_per_instance_.end() && --count->second == 0) {
+            text_live_per_instance_.erase(count);
+        }
+        std::string().swap(event.line);
+        event.live = false;
+        ++text_tombstones_;
+        while (!text_q_.empty() && !text_q_.front().live) {
+            text_q_.pop_front();
+            ++text_q_front_seq_;
+            --text_tombstones_;
+        }
+        for (auto& index : text_evictable_) {
+            while (!index.empty() && index.front() < text_q_front_seq_) index.pop_front();
+        }
+        // Tombstones pinned behind an old live event (e.g. one for an
+        // instance nobody polls any more) would otherwise accumulate.
+        if (text_tombstones_ >= text_queue::kCompactMinTombstones &&
+            text_tombstones_ > text_live_events_) {
+            compact_locked();
+        }
+    }
+
+    void compact_locked() {
+        purge_locked(text_queue::kSessionEpochUnknown, 0);
+    }
+
+    // One rebuild pass: keeps live records, drops tombstones, and drops the
+    // live records of `instance_id` that do not belong to `keep_epoch`
+    // (kSessionEpochNone keeps none of them). instance_id ==
+    // kSessionEpochUnknown (-1, never a real id) means "purge nothing", which
+    // is exactly compaction. Returns how many live records were dropped.
+    size_t purge_locked(int64_t instance_id, int64_t keep_epoch) {
+        std::deque<TextEvent> live;
+        for (auto& index : text_evictable_) index.clear();
+        size_t dropped = 0;
+        for (auto& event : text_q_) {
+            if (!event.live) continue;
+            const bool mine = instance_id != text_queue::kSessionEpochUnknown &&
+                              event.instance_id == instance_id;
+            // A record with no provenance (kSessionEpochUnknown) is never
+            // rejected by epoch; an explicit purge still drops it.
+            const bool stale =
+                keep_epoch == text_queue::kSessionEpochNone ||
+                (event.session_epoch > 0 && event.session_epoch != keep_epoch);
+            if (mine && stale) {
+                text_live_bytes_ -= event.line.size();
+                --text_live_events_;
+                auto count = text_live_per_instance_.find(event.instance_id);
+                if (count != text_live_per_instance_.end() &&
+                    --count->second == 0) {
+                    text_live_per_instance_.erase(count);
+                }
+                ++dropped;
+                continue;
+            }
+            const uint64_t seq = text_q_front_seq_ + live.size();
+            if (event.cls != text_queue::kState) text_evictable_[event.cls].push_back(seq);
+            live.push_back(std::move(event));
+        }
+        text_q_.swap(live);
+        text_tombstones_ = 0;
+        return dropped;
+    }
+
     std::mutex m_;
-    std::queue<std::pair<int64_t, std::string>> text_q_;
+    // Bounded text-event queue (see text_queue above). Sequence number of
+    // text_q_[i] is text_q_front_seq_ + i.
+    std::deque<TextEvent> text_q_;
+    uint64_t text_q_front_seq_ = 0;
+    // Sequence numbers of queued kLossy / kChat events, oldest first. May hold
+    // stale entries (already polled); those are skipped when evicting.
+    std::deque<uint64_t> text_evictable_[2];
+    size_t text_live_events_ = 0;
+    size_t text_live_bytes_ = 0;
+    size_t text_tombstones_ = 0;
+    std::unordered_map<int64_t, size_t> text_live_per_instance_;
+    // Session epoch each instance was last polled with. A change means a new
+    // session took over that instance id, which is when the records the
+    // previous one left behind are purged (see poll_text).
+    std::unordered_map<int64_t, int64_t> text_polled_epoch_;
     std::queue<std::pair<int64_t, std::vector<unsigned char>>> custom_q_;
 };
 
@@ -1271,6 +1568,38 @@ int tim2tox_ffi_is_instance_event_loop_running(int64_t instance_id) {
     return it != g_test_instances.end() && it->second->IsEventThreadRunning() ? 1 : 0;
 }
 
+int64_t tim2tox_ffi_get_session_epoch(int64_t instance_id) {
+    if (instance_id == 0) {
+        auto* manager = V2TIMManagerImpl::GetInstance();
+        return manager ? manager->GetSessionEpoch() : 0;
+    }
+    std::lock_guard<std::mutex> lock(g_test_instances_mutex);
+    auto it = g_test_instances.find(instance_id);
+    return it != g_test_instances.end() && it->second ? it->second->GetSessionEpoch() : 0;
+}
+
+// Same value as tim2tox_ffi_get_session_epoch, but callable from the ENQUEUE
+// side, which runs on toxcore's event thread inside listener callbacks and may
+// already hold locks of its own. The default instance (the only one a
+// production account switch reuses) is resolved lock-free; for an auxiliary
+// test instance the registry lock is only TRIED, and a miss stamps
+// kSessionEpochUnknown, which poll treats as "provenance unknown" and never
+// rejects. Blocking here could deadlock a callback chain, and a stale record
+// on an auxiliary instance is not the cross-account hazard this guards
+// (auxiliary handles are not reused across accounts).
+int64_t CurrentSessionEpochForInstance(int64_t instance_id) {
+    if (instance_id == 0) {
+        auto* manager = V2TIMManagerImpl::GetInstance();
+        return manager ? manager->GetSessionEpoch() : 0;
+    }
+    std::unique_lock<std::mutex> lock(g_test_instances_mutex, std::try_to_lock);
+    if (!lock.owns_lock()) return text_queue::kSessionEpochUnknown;
+    auto it = g_test_instances.find(instance_id);
+    return it != g_test_instances.end() && it->second
+               ? it->second->GetSessionEpoch()
+               : text_queue::kSessionEpochUnknown;
+}
+
 // Get instance ID from V2TIMManagerImpl pointer
 // Returns 0 for default instance, positive for test instances, kInstanceIdDestroyed if not in map (teardown).
 int64_t GetInstanceIdFromManager(V2TIMManagerImpl* manager) {
@@ -1359,7 +1688,8 @@ int tim2tox_ffi_destroy_test_instance(int64_t instance_handle) {
     }
     EraseRecvContextsForInstance(instance_handle);
     EraseSendContextsForInstance(instance_handle);
-    
+    G.simple_listener.purge_instance(instance_handle);
+
     // Remove from maps only AFTER UnInitSDK so no code path (including
     // UnInitSDK and any callbacks it joins) sees the manager as "not found".
     MarkInstanceUninited(instance_handle);
@@ -1498,6 +1828,9 @@ int tim2tox_ffi_detach_default_instance(void) {
     }
     EraseRecvContextsForInstance(0);
     EraseSendContextsForInstance(0);
+    // Same reason as in tim2tox_ffi_uninit: instance 0 is the singleton every
+    // account switch reuses, so its unpolled backlog must not outlive it.
+    G.simple_listener.purge_instance(0);
     g_default_quarantined_epoch.store(0);
     g_default_epoch.fetch_add(1);
     V2TIM_LOG(kWarning,
@@ -1890,7 +2223,21 @@ int tim2tox_ffi_send_c2c_control(
 int tim2tox_ffi_poll_text(int64_t instance_id, char* buffer, int buffer_len) {
     int64_t id = (instance_id == 0) ? GetCurrentInstanceId() : instance_id;
     if (!IsInstanceInited(id) || !buffer || buffer_len <= 0) return 0;
-    return G.simple_listener.poll_text(id, buffer, buffer_len);
+    // Resolved outside the queue lock; identifies THIS session, so records
+    // queued by a previous account on the same instance id are not delivered.
+    const int64_t session_epoch = tim2tox_ffi_get_session_epoch(id);
+    return G.simple_listener.poll_text(id, session_epoch, buffer, buffer_len);
+}
+
+int64_t tim2tox_ffi_get_text_queue_drop_count(int32_t event_class) {
+    using namespace text_queue;
+    if (event_class >= 0 && event_class < kClassCount) {
+        return g_drops[event_class].load(std::memory_order_relaxed);
+    }
+    if (event_class != -1) return 0;
+    int64_t total = 0;
+    for (const auto& drops : g_drops) total += drops.load(std::memory_order_relaxed);
+    return total;
 }
 
 int tim2tox_ffi_poll_custom(unsigned char* buffer, int buffer_len) {
@@ -1935,6 +2282,9 @@ void tim2tox_ffi_uninit(void) {
     manager_impl->UnInitSDK();
     EraseRecvContextsForInstance(instance_id);
     EraseSendContextsForInstance(instance_id);
+    // Whatever this session queued and Dart never polled dies with it; the
+    // next account to init on this instance id must not receive it.
+    G.simple_listener.purge_instance(instance_id);
     MarkInstanceUninited(instance_id);
 }
 
@@ -2213,15 +2563,115 @@ int tim2tox_ffi_create_group(const char* group_name, const char* group_type, cha
 
 int tim2tox_ffi_join_group(const char* group_id, const char* request_msg) {
     if (!IsCurrentInstanceInited() || !group_id) return 0;
+    // JoinGroup reports its outcome synchronously (every OnSuccess/OnError site
+    // runs before it returns), so the result can be handed straight back. This
+    // used to return 1 unconditionally, which made the Dart side persist a
+    // failed join as a joined group.
     struct Cb : public V2TIMCallback {
-        void OnSuccess() override {}
+        bool ok = false;
+        int error_code = 0;
+        void OnSuccess() override { ok = true; }
         void OnError(int code, const V2TIMString& msg) override {
-            // Error logged via V2TIM_LOG
+            ok = false;
+            error_code = code;
+            V2TIM_LOG(kError, "[ffi] JoinGroup failed: code={}, msg={}", code, msg.CString());
         }
     } cb;
     const char* wording = request_msg ? request_msg : "";
-    GetCurrentInstance()->JoinGroup(group_id, wording, &cb);
-    return 1;
+    try {
+        GetCurrentInstance()->JoinGroup(group_id, wording, &cb);
+    } catch (...) {
+        V2TIM_LOG(kError, "[ffi] JoinGroup: exception caught");
+        return 0;
+    }
+    if (cb.ok) return 1;
+    // 2 = already a member under another group ID (ERR_SVR_GROUP_ALLREADY_MEMBER):
+    // nothing changed, and the caller should say so rather than "join failed".
+    return cb.error_code == 10013 ? 2 : 0;
+}
+
+int tim2tox_ffi_join_group_with_password(const char* group_id, const char* password) {
+    if (!IsCurrentInstanceInited() || !group_id) return 0;
+    struct Cb : public V2TIMCallback {
+        bool ok = false;
+        int error_code = 0;
+        void OnSuccess() override { ok = true; }
+        void OnError(int code, const V2TIMString& msg) override {
+            error_code = code;
+            V2TIM_LOG(kError, "[ffi] JoinGroupWithPassword failed: code={}, msg={}", code, msg.CString());
+        }
+    } cb;
+    try {
+        GetCurrentInstance()->JoinGroupWithPassword(group_id, password ? password : "", &cb);
+    } catch (...) {
+        return 0;
+    }
+    if (cb.ok) return 1;
+    return cb.error_code == 10013 ? 2 : 0;
+}
+
+int tim2tox_ffi_get_pending_group_invites(char* buffer, int buffer_len) {
+    // Distinct from "no invites": the Dart side persists this list, and an
+    // empty answer from a torn-down instance would erase the stored copy.
+    if (!IsCurrentInstanceInited() || !buffer || buffer_len <= 0) {
+        return TIM2TOX_FFI_PENDING_INVITES_UNAVAILABLE;
+    }
+    std::string out;
+    for (const auto& invite : GetCurrentInstance()->GetPendingGroupInvites()) {
+        std::string name = invite.group_name;
+        for (char& c : name) {
+            if (c == '\t' || c == '\n' || c == '\r') c = ' ';
+        }
+        const char* kind = invite.kind == PendingInviteKind::kConferenceAv
+            ? "av_conference"
+            : (invite.kind == PendingInviteKind::kConferenceText ? "conference" : "group");
+        out.append(invite.id).push_back('\t');
+        out.append(invite.inviter_userID).push_back('\t');
+        out.append(kind).push_back('\t');
+        out.append(name).push_back('\t');
+        out.append(std::to_string(invite.received_ms)).push_back('\t');
+        out.append(ToxUtil::tox_bytes_to_hex(invite.cookie.data(), invite.cookie.size())).push_back('\n');
+    }
+    if (out.empty()) {
+        buffer[0] = 0;
+        return 0;
+    }
+    if (out.size() + 1 > static_cast<size_t>(buffer_len)) {
+        buffer[0] = 0;
+        return -static_cast<int>(out.size() + 1);
+    }
+    memcpy(buffer, out.data(), out.size());
+    buffer[out.size()] = 0;
+    return static_cast<int>(out.size());
+}
+
+int tim2tox_ffi_restore_group_invite(const char* invite_id, const char* inviter_pubkey_hex,
+                                     const char* kind, const char* group_name,
+                                     int64_t received_ms, const char* cookie_hex) {
+    if (!IsCurrentInstanceInited() || !invite_id || !inviter_pubkey_hex || !kind || !cookie_hex) return 0;
+    V2TIMManagerImpl::PendingGroupInviteInfo invite;
+    invite.id = invite_id;
+    invite.inviter_userID = inviter_pubkey_hex;
+    const std::string kind_str(kind);
+    invite.kind = kind_str == "av_conference"
+        ? PendingInviteKind::kConferenceAv
+        : (kind_str == "conference" ? PendingInviteKind::kConferenceText
+                                    : PendingInviteKind::kGroupInvite);
+    invite.group_name = group_name ? group_name : "";
+    invite.received_ms = received_ms;
+    const std::string cookie_str(cookie_hex);
+    if (cookie_str.empty() || cookie_str.size() % 2 != 0) return 0;
+    invite.cookie.resize(cookie_str.size() / 2);
+    if (!ToxUtil::tox_hex_to_bytes(cookie_str.c_str(), cookie_str.size(),
+                                   invite.cookie.data(), invite.cookie.size())) {
+        return 0;
+    }
+    return GetCurrentInstance()->RestorePendingGroupInvite(invite) ? 1 : 0;
+}
+
+int tim2tox_ffi_reject_group_invite(const char* invite_id) {
+    if (!IsCurrentInstanceInited() || !invite_id) return 0;
+    return GetCurrentInstance()->RejectPendingGroupInvite(invite_id) ? 1 : 0;
 }
 
 // Cross-peer id of the group message most recently sent from THIS thread.
@@ -2256,6 +2706,21 @@ int tim2tox_ffi_send_group_text(const char* group_id, const char* text) {
     if (!manager_impl) return 0;
     V2TIMString msg_id = manager_impl->SendGroupTextMessage(text, group_id, V2TIMMessagePriority::V2TIM_PRIORITY_NORMAL, &sendcb);
     return msg_id.Empty() ? 0 : 1;
+}
+
+int tim2tox_ffi_group_wire_ready(const char* group_id) {
+    if (!IsCurrentInstanceInited() || !group_id) return -1;
+    V2TIMManagerImpl* manager_impl = GetCurrentInstance();
+    if (!manager_impl || !manager_impl->GetToxManager()) return -1;
+    Tox_Group_Number group_number = UINT32_MAX;
+    if (!manager_impl->GetGroupNumberFromID(group_id, group_number)) return -1;
+    // Conferences have no per-peer delivery confirmation: always "ready". The
+    // map key decides the kind, not a (possibly stale) type label.
+    if (IsConferenceMapKey(group_number)) return 1;
+    Tox_Err_Group_Is_Connected err_conn;
+    const bool connected = manager_impl->GetToxManager()->isGroupConnected(group_number, &err_conn);
+    if (err_conn != TOX_ERR_GROUP_IS_CONNECTED_OK) return -1;
+    return connected ? 1 : 0;
 }
 
 int tim2tox_ffi_send_group_action(const char* group_id, const char* text) {
@@ -2361,92 +2826,19 @@ int tim2tox_ffi_get_group_chat_id(int64_t instance_id, const char* group_id, cha
     V2TIMString groupIDStr(group_id);
     Tox_Group_Number group_number = UINT32_MAX;
     if (!manager_impl->GetGroupNumberFromID(groupIDStr, group_number)) {
-        // R-07: Try Core metadata for stored chat_id
-        char stored_chat_id[65];
-        bool has_stored_chat_id = manager_impl->GetGroupChatIdFromStorage(std::string(group_id), stored_chat_id, sizeof(stored_chat_id));
-        
-        if (has_stored_chat_id) {
-            // Convert hex string to binary chat_id
-            uint8_t target_chat_id[TOX_GROUP_CHAT_ID_SIZE];
-            std::string chat_id_hex(stored_chat_id);
-            std::istringstream iss(chat_id_hex);
-            bool valid = true;
-            for (size_t i = 0; i < TOX_GROUP_CHAT_ID_SIZE; ++i) {
-                std::string byte_str = chat_id_hex.substr(i * 2, 2);
-                char* endptr;
-                unsigned long byte_val = strtoul(byte_str.c_str(), &endptr, 16);
-                if (*endptr != '\0' || byte_val > 255) {
-                    valid = false;
-                    break;
-                }
-                target_chat_id[i] = static_cast<uint8_t>(byte_val);
-            }
-            
-            if (valid) {
-                // Try to find group by chat_id
-                ToxManager* tox_manager = manager_impl->GetToxManager();
-                if (tox_manager) {
-                    group_number = tox_manager->getGroupByChatId(target_chat_id);
-                    if (group_number != UINT32_MAX) {
-                        // Rebuild the mapping for future use
-                        std::lock_guard<std::mutex> lock(manager_impl->mutex_);
-                        manager_impl->group_id_to_group_number_[V2TIMString(group_id)] = group_number;
-                        manager_impl->group_number_to_group_id_[group_number] = V2TIMString(group_id);
-                    }
-                }
-            }
-        }
-        
-        // If still not found, try to find matching group by checking group_number_to_group_id_ mapping
-        if (group_number == UINT32_MAX) {
-            ToxManager* tox_manager = manager_impl->GetToxManager();
-            if (tox_manager) {
-                size_t group_count = tox_manager->getGroupListSize();
-                if (group_count > 0) {
-                    std::vector<Tox_Group_Number> group_list(group_count);
-                    tox_manager->getGroupList(group_list.data(), group_count);
-                
-                    std::lock_guard<std::mutex> lock(manager_impl->mutex_);
-                    for (Tox_Group_Number group_num : group_list) {
-                        auto it = manager_impl->group_number_to_group_id_.find(group_num);
-                        if (it != manager_impl->group_number_to_group_id_.end() && 
-                            it->second.CString() == std::string(group_id)) {
-                            group_number = group_num;
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-        
-        // If still not found, the mapping is truly empty and we can't match
-        if (group_number == UINT32_MAX) {
-            // R-07: Return stored chat_id from Core metadata even if group not found
-            char stored_chat_id[65];
-            bool has_stored_chat_id = manager_impl->GetGroupChatIdFromStorage(std::string(group_id), stored_chat_id, sizeof(stored_chat_id));
-            if (has_stored_chat_id) {
-                // Copy stored chat_id to output buffer
-                int copy_len = (int)std::min((size_t)(out_len - 1), strlen(stored_chat_id));
-                memcpy(out_chat_id, stored_chat_id, copy_len);
-                out_chat_id[copy_len] = '\0';
-                return 1;
-            }
-            return 0;
-        }
+        // R-07: rebuild the mapping from the stored identity, resolved by the
+        // stored KIND (a conference identity only via tox_conference_by_id).
+        // A read never binds an unrelated unmapped group.
+        group_number = manager_impl->RecoverGroupMapping(std::string(group_id),
+                                                         /*allow_unmapped_ngc_bind=*/false);
     }
-    
-    if (group_number == UINT32_MAX) {
-        return 0;
-    }
-    
-    // Get chat_id from ToxManager
-    // manager_impl is already defined at the beginning of the function
-    ToxManager* tox_manager = manager_impl->GetToxManager();
+
+    // Live identity with the API matching the key's kind: the conference id for
+    // a conference map key (a tagged key handed to the NGC query only failed),
+    // the NGC chat id otherwise.
     uint8_t chat_id[TOX_GROUP_CHAT_ID_SIZE];
-    Tox_Err_Group_State_Query err_chat_id;
-    if (tox_manager &&
-        tox_manager->getGroupChatId(group_number, chat_id, &err_chat_id) &&
-        err_chat_id == TOX_ERR_GROUP_STATE_QUERY_OK) {
+    if (group_number != UINT32_MAX &&
+        manager_impl->GetLiveGroupIdentity(group_number, chat_id)) {
         // Convert to hex string (64 characters: 32 bytes * 2)
         std::ostringstream oss;
         for (size_t i = 0; i < TOX_GROUP_CHAT_ID_SIZE; ++i) {
@@ -2461,7 +2853,8 @@ int tim2tox_ffi_get_group_chat_id(int64_t instance_id, const char* group_id, cha
         return 1;
     }
 
-    // Live query unavailable even though the group IS mapped (the group's state
+    // Unmapped (R-07: the stored identity is still the answer), or the live
+    // query is unavailable even though the group IS mapped (the group's state
     // isn't queryable this tick — e.g. right after create, before the group is
     // fully self-connected). The public NGC chat_id is IMMUTABLE, so the value
     // stored at create time (tim2tox_ffi_set_group_chat_id) is authoritative — a
@@ -2485,22 +2878,8 @@ int tim2tox_ffi_set_group_chat_id(int64_t instance_id, const char* group_id, con
     if (instance_id == 0) instance_id = GetCurrentInstanceId();
     V2TIMManagerImpl* manager = GetInstanceFromId(instance_id);
     if (!manager) return 0;
-    manager->SetGroupChatIdInStorage(std::string(group_id), std::string(chat_id));
-    std::ostringstream json;
-    json << "{";
-    json << "\"callback\":\"groupChatIdStored\",";
-    std::string escaped_group_id = EscapeJsonString(std::string(group_id));
-    json << "\"group_id\":\"" << escaped_group_id << "\",";
-    std::string escaped_chat_id = EscapeJsonString(std::string(chat_id));
-    json << "\"chat_id\":\"" << escaped_chat_id << "\"";
-    json << "}";
-    std::string json_str = json.str();
-    try {
-        SendCallbackToDart("groupChatIdStored", json_str, nullptr);
-    } catch (...) {
-        V2TIM_LOG(kError, "[tim2tox_ffi] tim2tox_ffi_set_group_chat_id: EXCEPTION in SendCallbackToDart");
-    }
-
+    // Replayed FROM Dart: recorded as already known there, not echoed back.
+    manager->SetGroupChatIdInStorage(std::string(group_id), std::string(chat_id), /*from_dart=*/true);
     return 1;
 }
 
@@ -2519,22 +2898,8 @@ int tim2tox_ffi_set_group_type(int64_t instance_id, const char* group_id, const 
     if (instance_id == 0) instance_id = GetCurrentInstanceId();
     V2TIMManagerImpl* manager = GetInstanceFromId(instance_id);
     if (!manager) return 0;
-    manager->SetGroupTypeInStorage(std::string(group_id), std::string(group_type));
-    // Notify Dart layer to persist to SharedPreferences
-    std::ostringstream json;
-    json << "{";
-    json << "\"callback\":\"groupTypeStored\",";
-    json << "\"group_id\":\"" << EscapeJsonString(std::string(group_id)) << "\",";
-    json << "\"group_type\":\"" << EscapeJsonString(std::string(group_type)) << "\"";
-    json << "}";
-    
-    std::string json_str = json.str();
-    try {
-        SendCallbackToDart("groupTypeStored", json_str, nullptr);
-    } catch (...) {
-        // Continue execution even if SendCallbackToDart fails
-    }
-    
+    // Replayed FROM Dart: recorded as already known there, not echoed back.
+    manager->SetGroupTypeInStorage(std::string(group_id), std::string(group_type), /*from_dart=*/true);
     return 1;
 }
 
@@ -2547,12 +2912,90 @@ int tim2tox_ffi_get_group_type_from_storage(int64_t instance_id, const char* gro
     return manager->GetGroupTypeFromStorage(std::string(group_id), out_group_type, out_len) ? 1 : 0;
 }
 
+// Pull side of groupChatIdStored / groupTypeStored (see the header).
+int tim2tox_ffi_get_group_identity_snapshot(int64_t instance_id, char* buffer, int buffer_len) {
+    if (instance_id == 0) instance_id = GetCurrentInstanceId();
+    V2TIMManagerImpl* manager = GetInstanceFromId(instance_id);
+    if (!manager) return 0;
+    const std::string snapshot = manager->SnapshotGroupIdentitiesForClient();
+    if (snapshot.empty()) return 0;
+    return CopyPayloadOrReturnRequiredCapacity(snapshot, buffer, buffer_len);
+}
+
 // R-07: Auto-accept setting in Core (FFI forwards to manager)
 int tim2tox_ffi_set_auto_accept_group_invites(int64_t instance_id, int enabled) {
     if (instance_id == 0) instance_id = GetCurrentInstanceId();
     V2TIMManagerImpl* manager = GetInstanceFromId(instance_id);
     if (!manager) return 0;
     manager->SetAutoAcceptGroupInvites(enabled != 0);
+    return 1;
+}
+
+// field: 1 = name, 3 = notification (the GroupChangeInfoType values).
+// Returns 1 on success, -2 when the group does not allow us to change it
+// (NGC topic lock), 0 on any other failure. See V2TIMGroupManagerImpl::
+// SetGroupInfo for how each field maps onto the Tox wire.
+int tim2tox_ffi_set_group_info_field(int64_t instance_id, const char* group_id,
+                                     int field, const char* value) {
+    if (!group_id || !value) return 0;
+    if (instance_id == 0) instance_id = GetCurrentInstanceId();
+    V2TIMManagerImpl* manager = GetInstanceFromId(instance_id);
+    if (!manager || !manager->GetToxManager()) return 0;
+    return manager->PublishGroupInfoField(group_id, field, value);
+}
+
+// 1 = we may set the NGC topic (announcement) now, 0 = toxcore would refuse
+// (topic lock / observer), -1 = unknown. See V2TIMManagerImpl::CanSetGroupTopic.
+int tim2tox_ffi_can_set_group_topic(int64_t instance_id, const char* group_id) {
+    if (!group_id) return -1;
+    if (instance_id == 0) instance_id = GetCurrentInstanceId();
+    V2TIMManagerImpl* manager = GetInstanceFromId(instance_id);
+    if (!manager || !manager->GetToxManager()) return -1;
+    return manager->CanSetGroupTopic(group_id);
+}
+
+// The group's shared name: NGC name / conference title, or the cached
+// name when it is a real one. Writes a NUL-terminated UTF-8 string.
+// Returns bytes written (without NUL), 0 when unknown.
+int tim2tox_ffi_get_group_name(int64_t instance_id, const char* group_id,
+                               char* out, int out_len) {
+    if (!group_id || !out || out_len <= 1) return 0;
+    if (instance_id == 0) instance_id = GetCurrentInstanceId();
+    V2TIMManagerImpl* manager = GetInstanceFromId(instance_id);
+    if (!manager || !manager->GetToxManager()) return 0;
+    const std::string name = manager->ResolveSharedGroupName(group_id);
+    if (name.empty()) return 0;
+    const int n = static_cast<int>(std::min(name.size(), static_cast<size_t>(out_len - 1)));
+    memcpy(out, name.data(), n);
+    out[n] = '\0';
+    return n;
+}
+
+int tim2tox_ffi_send_group_receipt(int64_t instance_id, const char* group_id,
+                                   const char* author_key_hex, const char* msg_id,
+                                   const char* receipt_type) {
+    if (!group_id || !author_key_hex || !msg_id || !receipt_type) return 0;
+    if (instance_id == 0) instance_id = GetCurrentInstanceId();
+    V2TIMManagerImpl* manager = GetInstanceFromId(instance_id);
+    if (!manager || !manager->GetToxManager()) return 0;
+    return manager->SendGroupReceipt(group_id, author_key_hex, msg_id, receipt_type);
+}
+
+int tim2tox_ffi_get_group_member_friend(const char* member_key, char* out, int out_len) {
+    if (!IsCurrentInstanceInited() || !member_key || !out || out_len <= 1) return 0;
+    const std::string friend_key = GetCurrentInstance()->FriendForGroupMemberKey(member_key);
+    if (friend_key.empty()) return 0;
+    const int n = static_cast<int>(std::min(friend_key.size(), static_cast<size_t>(out_len - 1)));
+    memcpy(out, friend_key.data(), n);
+    out[n] = '\0';
+    return n;
+}
+
+int tim2tox_ffi_set_retired_group_id_max(int64_t instance_id, uint64_t max_id) {
+    if (instance_id == 0) instance_id = GetCurrentInstanceId();
+    V2TIMManagerImpl* manager = GetInstanceFromId(instance_id);
+    if (!manager) return 0;
+    manager->SetRetiredGroupIdMax(max_id);
     return 1;
 }
 
@@ -2867,9 +3310,11 @@ int tim2tox_ffi_iterate_current_instance(int count) {
     if (!IsCurrentInstanceInited() || count <= 0) return 0;
     V2TIMManagerImpl* manager_impl = GetCurrentInstance();
     if (!manager_impl) return 0;
-    ToxManager* tox_manager = manager_impl->GetToxManager();
-    if (!tox_manager) return 0;
     for (int i = 0; i < count; ++i) {
+        // Re-fetched every round: a callback may UnInitSDK, which runs (and
+        // destroys the ToxManager) when that iterate returns.
+        ToxManager* tox_manager = manager_impl->GetToxManager();
+        if (!tox_manager) return i > 0 ? 1 : 0;
         tox_manager->iterate(0);
     }
     return 1;
@@ -2939,6 +3384,10 @@ int tim2tox_ffi_iterate_instance(int64_t instance_id) {
         if (sig) {
             static_cast<V2TIMSignalingManagerImpl*>(sig)->CheckTimeouts();
         }
+    }
+    // Timed group mutes expire against the same (virtual) clock.
+    if (V2TIMGroupManager* grp = impl->GetGroupManager()) {
+        static_cast<V2TIMGroupManagerImpl*>(grp)->CheckMuteExpiries();
     }
     return 1;
 }
@@ -4544,6 +4993,14 @@ int tim2tox_ffi_av_conference_disable(int64_t instance_id, const char* group_id)
                : 0;
 }
 
+int tim2tox_ffi_av_conference_is_enabled(int64_t instance_id, const char* group_id) {
+    if (instance_id == 0) instance_id = GetCurrentInstanceId();
+    if (!group_id) return -1;
+    V2TIMManagerImpl* manager = GetInstanceFromId(instance_id);
+    if (manager == nullptr) return -1;
+    return manager->QueryAVConferenceAudioEnabled(V2TIMString(group_id));
+}
+
 int tim2tox_ffi_av_conference_mute(int64_t instance_id, const char* group_id,
                                    int mute) {
     if (instance_id == 0) instance_id = GetCurrentInstanceId();
@@ -4794,6 +5251,7 @@ int tim2tox_ffi_av_conference_send_audio_frame(
     int64_t, const char*, const int16_t*, size_t, uint8_t, uint32_t) { return 0; }
 int tim2tox_ffi_av_conference_enable(int64_t, const char*) { return 0; }
 int tim2tox_ffi_av_conference_disable(int64_t, const char*) { return 0; }
+int tim2tox_ffi_av_conference_is_enabled(int64_t, const char*) { return -1; }
 int tim2tox_ffi_av_conference_mute(int64_t, const char*, int) { return 0; }
 
 #endif // BUILD_TOXAV

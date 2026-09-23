@@ -3,6 +3,7 @@
 // Bridges signaling events to ToxAV connections
 
 import 'dart:async';
+import 'dart:convert';
 import 'package:tencent_cloud_chat_sdk/enum/V2TimSignalingListener.dart';
 import 'package:tencent_cloud_chat_sdk/tencent_cloud_chat_sdk_platform_interface.dart';
 import '../interfaces/logger_service.dart';
@@ -99,6 +100,33 @@ class CallBridgeService {
 
   final Map<_TeardownKey, _PendingTeardown> _pendingTeardowns = {};
 
+  /// Invitations auto-rejected as busy (inviteID -> when). A busy invite never
+  /// enters [_activeCalls], so without this a redelivered INVITE would pass
+  /// the duplicate guard and send another reject + busy callback. Kept for
+  /// [_busyTombstoneTtl] after the reject, past any realistic redelivery.
+  final Map<String, DateTime> _busyTombstones = {};
+  static const Duration _busyTombstoneTtl = Duration(minutes: 2);
+
+  /// Set by [dispose]: no callback may reach the embedder afterwards and no
+  /// teardown is retried (the session and its Tox instance are going away).
+  bool _disposed = false;
+  Future<void>? _disposing;
+
+  /// Tox's "no such friend" (`UINT32_MAX`), returned by friend lookups.
+  static const int noFriendNumber = 0xFFFFFFFF;
+
+  /// Whether [friendNumber] names a real friend (not null / the sentinel).
+  static bool isValidFriendNumber(int? friendNumber) =>
+      friendNumber != null &&
+      friendNumber >= 0 &&
+      friendNumber != noFriendNumber;
+
+  int? _lookupFriendNumber(String userId) {
+    if (userId.isEmpty) return null;
+    final friendNumber = _avService.getFriendNumberByUserId(userId);
+    return isValidFriendNumber(friendNumber) ? friendNumber : null;
+  }
+
   // Signaling listener
   V2TimSignalingListener? _signalingListener;
 
@@ -111,11 +139,40 @@ class CallBridgeService {
   //   - 'cancel'  — caller cancelled before the call was up, or the local
   //     side aborted an outgoing/ringing call without ever entering inCall
   //   - 'hangup'  — either party hung up an established (inCall) session
+  //   - 'line_busy' — the invitee auto-rejected because it was already in a
+  //     call (TUICallKit's `line_busy` reject payload, see
+  //     [lineBusyRejectData])
   //
   // Consumers are expected to surface these in call-history rows so users can
   // tell "missed (timeout)" from "declined (reject)" from "cancelled (cancel)".
   void Function(String inviteID, CallState state, {String? endReason})?
       onCallStateChanged;
+
+  /// Embedder predicate: true when the local user cannot take a new call
+  /// right now (already ringing / in a call, or in an AV conference). A busy
+  /// invitation is rejected with [lineBusyRejectData] and never surfaces as
+  /// [CallState.ringing], so the active call's state is left untouched.
+  bool Function(CallInfo invitation)? isBusyForInvitation;
+
+  /// Fired once per invitation auto-rejected as busy (missed-call record /
+  /// notification). Never paired with an [onCallStateChanged] event.
+  void Function(CallInfo invitation)? onInvitationRejectedBusy;
+
+  /// Reject payload understood by TUICallKit / the UIKit calling-message
+  /// parser (`line_busy` key → "line busy") and by [isLineBusyData].
+  static const String lineBusyRejectData =
+      '{"businessID":"av_call","line_busy":"line_busy"}';
+
+  /// Whether a reject payload carries TUICallKit's `line_busy` marker.
+  static bool isLineBusyData(String data) {
+    if (data.isEmpty) return false;
+    try {
+      final decoded = jsonDecode(data);
+      return decoded is Map && decoded.containsKey('line_busy');
+    } catch (_) {
+      return false;
+    }
+  }
 
   CallBridgeService(this._sdkPlatform, this._avService, {LoggerService? logger})
       : _logger = logger {
@@ -126,6 +183,17 @@ class CallBridgeService {
   void _setupSignalingListener() {
     _signalingListener = V2TimSignalingListener(
       onReceiveNewInvitation: (inviteID, inviter, groupID, inviteeList, data) {
+        if (_disposed) return;
+        // A re-delivered invite for a call we already track must not reset
+        // it to "ringing" (that also marked its media leg as not started, so
+        // a later hang-up would leave the leg running). Same for one already
+        // (being) rejected as busy.
+        _pruneBusyTombstones();
+        if (_activeCalls.containsKey(inviteID) ||
+            _busyTombstones.containsKey(inviteID)) {
+          _logger?.log('[CallBridge] duplicate invitation ignored');
+          return;
+        }
         _logger?.log(
             '[CallBridge] onReceiveNewInvitation groupPresent=${groupID.isNotEmpty} inviteeCount=${inviteeList.length} dataLength=${data.length}');
         // New invitation received
@@ -138,22 +206,30 @@ class CallBridgeService {
           state: CallState.ringing,
         );
 
-        // Get friend number from inviter user ID
-        callInfo.friendNumber = _avService.getFriendNumberByUserId(inviter);
-        if (callInfo.friendNumber == 0xFFFFFFFF) {
-          // Friend not found, try to get from invitee list if 1-on-1
-          if (inviteeList.isNotEmpty) {
-            callInfo.friendNumber =
-                _avService.getFriendNumberByUserId(inviteeList.first);
-          }
+        // Friend number of the inviter; the Tox "not found" sentinel is never
+        // stored (it used to leak out as a real friend number and made the
+        // call-state filter discard the caller's actual ToxAV events). Left
+        // null here, it is re-resolved on accept / by the embedder.
+        callInfo.friendNumber = _lookupFriendNumber(inviter) ??
+            (inviteeList.isNotEmpty
+                ? _lookupFriendNumber(inviteeList.first)
+                : null);
+
+        if (isBusyForInvitation?.call(callInfo) ?? false) {
+          _logger?.log('[CallBridge] invitation auto-rejected: line busy');
+          unawaited(_rejectAsBusy(callInfo));
+          return;
         }
+        // The predicate may run embedder code (glare yield) — re-check.
+        if (_disposed) return;
 
         _activeCalls[inviteID] = callInfo;
         _logger?.log(
-            '[CallBridge] invitation mapped friendResolved=${callInfo.friendNumber != null && callInfo.friendNumber != 0xFFFFFFFF} state=${callInfo.state}');
+            '[CallBridge] invitation mapped friendResolved=${callInfo.friendNumber != null} state=${callInfo.state}');
         onCallStateChanged?.call(inviteID, CallState.ringing);
       },
       onInvitationCancelled: (inviteID, inviter, data) {
+        if (_disposed) return;
         _logger?.log(
             '[CallBridge] onInvitationCancelled dataLength=${data.length}');
         final callInfo = _activeCalls[inviteID];
@@ -168,6 +244,7 @@ class CallBridgeService {
         }
       },
       onInviteeAccepted: (inviteID, invitee, data) {
+        if (_disposed) return;
         _logger
             ?.log('[CallBridge] onInviteeAccepted dataLength=${data.length}');
         // Invitee accepted - this callback is for the inviter (caller)
@@ -186,6 +263,7 @@ class CallBridgeService {
         }
       },
       onInviteeRejected: (inviteID, invitee, data) {
+        if (_disposed) return;
         _logger
             ?.log('[CallBridge] onInviteeRejected dataLength=${data.length}');
         // Invitee rejected the invitation.
@@ -195,10 +273,14 @@ class CallBridgeService {
           _endAvLegIfStarted(callInfo);
           _activeCalls.remove(inviteID);
           onCallStateChanged?.call(inviteID, CallState.ended,
-              endReason: 'reject');
+              endReason: isLineBusyData(data) ? 'line_busy' : 'reject');
         }
       },
       onInvitationTimeout: (inviteID, inviteeList) {
+        if (_disposed) return;
+        // Fired on BOTH sides: the caller's own deadline, and on the callee
+        // either the caller's timeout packet or the callee-side deadline
+        // (native signaling), so an unanswered ring always ends.
         _logger?.log(
             '[CallBridge] onInvitationTimeout inviteeCount=${inviteeList.length}');
         // Invitation rang out without an answer.
@@ -248,9 +330,9 @@ class CallBridgeService {
     );
   }
 
-  Future<bool> _tryRejectInvite(String inviteID) async {
+  Future<bool> _tryRejectInvite(String inviteID, {String? data}) async {
     try {
-      final result = await _sdkPlatform.reject(inviteID: inviteID);
+      final result = await _sdkPlatform.reject(inviteID: inviteID, data: data);
       return result.code == 0;
     } catch (_) {
       return false;
@@ -314,7 +396,8 @@ class CallBridgeService {
       if (!pending.terminal.isCompleted) pending.terminal.complete(false);
       return success;
     }
-    if (success || pending.attempts >= _maxTeardownAttempts) {
+    // After dispose there is no session left to retry against.
+    if (success || pending.attempts >= _maxTeardownAttempts || _disposed) {
       _pendingTeardowns.remove(key);
       if (!pending.terminal.isCompleted) pending.terminal.complete(success);
       return success;
@@ -339,6 +422,7 @@ class CallBridgeService {
   }) {
     _logger?.log(
         '[CallBridge] registerOutgoingCall groupPresent=${groupID != null && groupID.isNotEmpty} hasFriendNumber=${friendNumber != null} dataLength=${data.length}');
+    if (_disposed) return;
     _activeCalls[inviteID] = CallInfo(
       inviteID: inviteID,
       inviter: inviter,
@@ -365,8 +449,10 @@ class CallBridgeService {
   }) {
     _logger?.log(
         '[CallBridge] markAvLegStarted hasFriendNumber=${friendNumber != null}');
-    final callInfo = _activeCalls[inviteID];
+    final callInfo = _disposed ? null : _activeCalls[inviteID];
     if (callInfo == null) {
+      // Missing / disposed: the leg must not outlive its invite (single
+      // attempt after dispose, see _runTeardownAttempt).
       if (friendNumber != null && teardownIfMissing) {
         unawaited(_startAvLegTeardown(inviteID, friendNumber));
       }
@@ -419,10 +505,15 @@ class CallBridgeService {
   Future<bool> acceptInvitation(String inviteID,
       {int audioBitRate = 48, int videoBitRate = 2000}) async {
     final callInfo = _activeCalls[inviteID];
-    if (callInfo == null) return false;
+    if (callInfo == null || _disposed) return false;
 
+    // Not resolvable when the invite arrived (e.g. before the friend entry
+    // was known): try again now rather than failing a valid call.
+    if (!isValidFriendNumber(callInfo.friendNumber)) {
+      callInfo.friendNumber = _lookupFriendNumber(callInfo.inviter);
+    }
     final friendNumber = callInfo.friendNumber;
-    if (friendNumber == null || friendNumber == 0xFFFFFFFF) {
+    if (friendNumber == null) {
       await _failAccept(inviteID, postAccept: false);
       return false;
     }
@@ -519,6 +610,47 @@ class CallBridgeService {
     return false;
   }
 
+  /// Reject a ringing invitation because the local user is busy (a second
+  /// invite that raced past [isBusyForInvitation]). Unlike
+  /// [rejectInvitation] this does NOT emit [CallState.ended] — the caller
+  /// has another call on screen that must not be torn down — and it sends
+  /// [lineBusyRejectData] so the inviter shows "line busy".
+  ///
+  /// Only a still-RINGING incoming invite qualifies: once accepted, native
+  /// signaling has consumed it (a reject cannot reach the peer) and it may
+  /// own a live ToxAV leg — end such a call with [endCall] instead. Should a
+  /// leg nevertheless be marked started, it is torn down here rather than
+  /// orphaned when ownership is dropped.
+  Future<bool> rejectInvitationAsBusy(String inviteID) async {
+    final callInfo = _activeCalls[inviteID];
+    if (callInfo == null || callInfo.state != CallState.ringing) return false;
+    _activeCalls.remove(inviteID);
+    final friendNumber = callInfo.friendNumber;
+    if (callInfo.avLegStarted && isValidFriendNumber(friendNumber)) {
+      unawaited(_startAvLegTeardown(inviteID, friendNumber!));
+    }
+    return _rejectAsBusy(callInfo);
+  }
+
+  Future<bool> _rejectAsBusy(CallInfo callInfo) {
+    callInfo.state = CallState.ended;
+    _busyTombstones[callInfo.inviteID] = DateTime.now();
+    onInvitationRejectedBusy?.call(callInfo);
+    return _startBoundedTeardown(
+      _TeardownKey(_TeardownOperation.reject, callInfo.inviteID),
+      () => _tryRejectInvite(callInfo.inviteID, data: lineBusyRejectData),
+    );
+  }
+
+  void _pruneBusyTombstones() {
+    if (_busyTombstones.isEmpty) return;
+    final now = DateTime.now();
+    _busyTombstones.removeWhere((inviteID, at) =>
+        now.difference(at) > _busyTombstoneTtl &&
+        !_pendingTeardowns.containsKey(
+            _TeardownKey(_TeardownOperation.reject, inviteID)));
+  }
+
   /// End a call. The emitted `endReason` reflects which side of the lifecycle
   /// we were in: `'cancel'` for an outgoing call that never connected, and
   /// `'hangup'` for an established (or just-accepted) session.
@@ -590,16 +722,51 @@ class CallBridgeService {
     return _activeCalls.values.toList();
   }
 
-  /// Cleanup
-  void dispose() {
+  /// Session teardown (logout). Marks the bridge disposed FIRST, so no late
+  /// signaling / AV callback can repopulate state or reach the embedder,
+  /// detaches the listener, then gives every owned call one teardown attempt
+  /// — dispatched synchronously, before the embedder shuts ToxAV down:
+  /// started ToxAV legs are ended, an unanswered outgoing invite is
+  /// cancelled and a ringing incoming one rejected (the peer would otherwise
+  /// keep ringing). No retries: the session is going away. The returned
+  /// future completes once those attempts have.
+  Future<void> dispose() {
+    final existing = _disposing;
+    if (existing != null) return existing;
+    _disposed = true;
     for (final pending in _pendingTeardowns.values) {
       pending.timer?.cancel();
       if (!pending.terminal.isCompleted) pending.terminal.complete(false);
     }
     _pendingTeardowns.clear();
-    if (_signalingListener != null) {
-      _sdkPlatform.removeSignalingListener(listener: _signalingListener);
+    final listener = _signalingListener;
+    _signalingListener = null;
+    if (listener != null) {
+      unawaited(_sdkPlatform
+          .removeSignalingListener(listener: listener)
+          .catchError((Object e) {
+        _logger?.logWarning('[CallBridge] removeSignalingListener failed: $e');
+      }));
     }
+    final calls = _activeCalls.values.toList();
     _activeCalls.clear();
+    _busyTombstones.clear();
+    final attempts = <Future<bool>>[];
+    for (final call in calls) {
+      final friendNumber = call.friendNumber;
+      if (call.avLegStarted && isValidFriendNumber(friendNumber)) {
+        attempts.add(_disposeAttempt(() => _avService.endCall(friendNumber!)));
+      }
+      if (call.state == CallState.calling) {
+        attempts.add(_disposeAttempt(() => _tryCancelInvite(call.inviteID)));
+      } else if (call.state == CallState.ringing) {
+        attempts.add(_disposeAttempt(() => _tryRejectInvite(call.inviteID)));
+      }
+    }
+    return _disposing = Future.wait(attempts).then<void>((_) {});
   }
+
+  /// Starts [attempt] now (its FFI call runs synchronously) and never throws.
+  Future<bool> _disposeAttempt(Future<bool> Function() attempt) =>
+      Future<bool>.sync(attempt).catchError((Object _) => false);
 }

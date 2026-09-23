@@ -57,12 +57,45 @@ class OfflineMessageQueuePersistence {
   OfflineMessageQueuePersistence({String? queueFilePath})
       : _queueFilePath = queueFilePath;
 
-  final String? _queueFilePath;
+  /// Per-account queue file, when one was injected.
+  ///
+  /// Not `final`: a host that cannot know the account until the Tox profile is
+  /// open re-points it through [rebindQueueFile] during the pre-boot window.
+  String? _queueFilePath;
 
   // In-memory cache: peerId -> List<OfflineMessageItem>.
   final Map<String, List<OfflineMessageItem>> _offlineQueue = {};
 
   Future<void> _mutationFence = Future<void>.value();
+
+  /// Re-point this queue at a per-account [queueFilePath] after construction.
+  ///
+  /// Counterpart of [MessageHistoryPersistence.rebindHistoryDirectory], for
+  /// hosts that only learn the account identity after the Tox profile is open.
+  /// PRE-BOOT ONLY — [FfiChatService.installAccountStorage] owns the window.
+  ///
+  /// Serialized against the mutation fence, so every write already submitted
+  /// lands in the OLD file before the swap; the in-memory cache is then
+  /// dropped so nothing loaded from the shared default can be re-persisted
+  /// under the account. Callers reload from the new path afterwards.
+  ///
+  /// Idempotent: rebinding to the path already in use is a no-op.
+  Future<void> rebindQueueFile(String queueFilePath) {
+    if (queueFilePath.isEmpty) {
+      throw ArgumentError.value(
+        queueFilePath,
+        'queueFilePath',
+        'must be a non-empty absolute file path',
+      );
+    }
+    if (_queueFilePath == queueFilePath) {
+      return Future<void>.value();
+    }
+    return _runSerialized(() async {
+      _offlineQueue.clear();
+      _queueFilePath = queueFilePath;
+    });
+  }
 
   /// Get the file path for offline message queue.
   Future<File> _getQueueFile() async {

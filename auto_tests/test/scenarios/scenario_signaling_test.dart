@@ -535,6 +535,31 @@ void main() {
             .addSignalingListener(aliceSignalingListener);
       });
 
+      // The callee must stop ringing too, by EITHER of the two paths: the
+      // caller's expiry packet (SIGNALING_CANCEL — the type every build
+      // understands, see CheckTimeouts) or its own receive-side deadline,
+      // which fires at the same moment. Asserting on one of them would be
+      // asserting on which of the two won a race.
+      final bobRingEnded = <String>{};
+      final bobReceived = <String>{};
+      final bobSignalingListener = V2TimSignalingListener(
+        onReceiveNewInvitation:
+            (inviteID, inviter, groupID, inviteeList, data) =>
+                bobReceived.add(inviteID),
+        onInviteeAccepted: (inviteID, invitee, data) {},
+        onInviteeRejected: (inviteID, invitee, data) {},
+        onInvitationCancelled: (inviteID, inviter, data) =>
+            bobRingEnded.add(inviteID),
+        onInvitationTimeout: (inviteID, inviteeList) =>
+            bobRingEnded.add(inviteID),
+      );
+      await bob.runWithInstanceAsync(() async {
+        ffi_lib.Tim2ToxFfi.open().setCurrentInstance(bob.testInstanceHandle!);
+        await TencentCloudChatSdkPlatform.instance
+            .addSignalingListener(listener: bobSignalingListener);
+        TIMSignalingManager.instance.addSignalingListener(bobSignalingListener);
+      });
+
       // Alice sends invite with short timeout (use Tox ID for invitee)
       final inviteResult = await alice
           .runWithInstanceAsync(() async => TIMSignalingManager.instance.invite(
@@ -558,12 +583,29 @@ void main() {
 
       expect(timeoutInviteID, equals(inviteID));
 
+      // Callee side: the invite reached Bob, and its ring ended.
+      await waitUntilWithVirtualPump(
+        scenario,
+        () => bobRingEnded.contains(inviteID),
+        timeout: const Duration(seconds: 15),
+        description: 'bob (callee) ring ended for $inviteID',
+        advanceMs: 50,
+        iterationsPerInstance: 1,
+      );
+      expect(bobReceived, contains(inviteID));
+
       // Clean up
       await alice.runWithInstanceAsync(() async {
         await TencentCloudChatSdkPlatform.instance
             .removeSignalingListener(listener: aliceSignalingListener);
         TIMSignalingManager.instance
             .removeSignalingListener(listener: aliceSignalingListener);
+      });
+      await bob.runWithInstanceAsync(() async {
+        await TencentCloudChatSdkPlatform.instance
+            .removeSignalingListener(listener: bobSignalingListener);
+        TIMSignalingManager.instance
+            .removeSignalingListener(listener: bobSignalingListener);
       });
     }, timeout: const Timeout(Duration(seconds: 90)));
 

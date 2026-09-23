@@ -83,6 +83,11 @@ int64_t GetReceiverInstanceOverride(void);
 void SetReceiverInstanceOverride(int64_t id);
 void ClearReceiverInstanceOverride(void);
 
+// Toxcore Tox_Group_Message_Id of the NGC group message currently being
+// delivered on this thread, or -1 outside a group delivery. Published by
+// V2TIMManagerImpl::HandleGroupMessageGroup (scope-bound guard).
+int64_t GetReceiverGroupMessageIdOverride(void);
+
 // Global callback user_data storage (extern declarations)
 // Key: (instance_id, callback_name) for per-instance storage
 extern std::map<std::pair<int64_t, std::string>, void*> g_callback_user_data;

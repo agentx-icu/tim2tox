@@ -581,7 +581,11 @@ V2TIMString V2TIMMessageManagerImpl::SendMessage(
             
             V2TIMString textToSend(messageText.c_str());
             // 发送时不传递cloudCustomData，因为合并消息信息已经编码到文本中了
-            if (isC2C) {
+            // receiver + groupID is a group-private chat: the receiver is a
+            // per-group key, never a friend, so it must not take the C2C path.
+            if (isGroupPrivate) {
+                sentMsgID = manager->SendGroupPrivateTextMessage(groupID, receiver, textToSend, callback);
+            } else if (isC2C) {
                 sentMsgID = manager->SendC2CTextMessage(textToSend, receiver, V2TIMBuffer(), callback);
             } else {
                 sentMsgID = manager->SendGroupTextMessage(textToSend, groupID, priority, V2TIMBuffer(), callback);
@@ -596,6 +600,13 @@ V2TIMString V2TIMMessageManagerImpl::SendMessage(
                 sentMsgID = "";
                 break;
             }
+            if (isGroupPrivate) {
+                // No group-private custom transport exists. The receiver is a
+                // per-group key, so the C2C path would address a non-friend.
+                if (callback) callback->OnError(ERR_SDK_INTERFACE_NOT_SUPPORT, "Group private custom messages are not supported");
+                sentMsgID = "";
+                break;
+            }
             if (isC2C) {
                 sentMsgID = manager->SendC2CCustomMessage(customElem->data, receiver, callback);
             } else {
@@ -605,20 +616,29 @@ V2TIMString V2TIMMessageManagerImpl::SendMessage(
         }
         case V2TIM_ELEM_TYPE_IMAGE: {
             // 图片消息转发：转换为文本消息说明
-            V2TIMImageElem* imageElem = static_cast<V2TIMImageElem*>(elem);
+            // (Never the local path: it is the sender's private filesystem
+            // layout, and meaningless to the receiver.)
+            if (isGroup) {
+                // There is no group file transport. Refuse honestly instead of
+                // broadcasting a text stand-in that reports "sent". This keys on
+                // groupID, not on an empty receiver: a group-private message has
+                // a receiver too (the per-group key), and the C2C stand-in below
+                // would address that key as if it were a friend.
+                if (callback) callback->OnError(ERR_SDK_INTERFACE_NOT_SUPPORT, "Group media messages are not supported");
+                sentMsgID = "";
+                break;
+            }
             std::string forwardText = "[转发图片]";
-            if (imageElem && !imageElem->path.Empty()) {
-                forwardText += " " + std::string(imageElem->path.CString());
-            }
             V2TIMString textToSend(forwardText.c_str());
-            if (isC2C) {
-                sentMsgID = manager->SendC2CTextMessage(textToSend, receiver, message.cloudCustomData, callback);
-            } else {
-                sentMsgID = manager->SendGroupTextMessage(textToSend, groupID, priority, message.cloudCustomData, callback);
-            }
+            sentMsgID = manager->SendC2CTextMessage(textToSend, receiver, message.cloudCustomData, callback);
             break;
         }
         case V2TIM_ELEM_TYPE_SOUND: {
+            if (isGroup) {  // group or group-private: see the IMAGE case
+                if (callback) callback->OnError(ERR_SDK_INTERFACE_NOT_SUPPORT, "Group media messages are not supported");
+                sentMsgID = "";
+                break;
+            }
             // 语音消息转发：转换为文本消息说明
             V2TIMSoundElem* soundElem = static_cast<V2TIMSoundElem*>(elem);
             std::string forwardText = "[转发语音]";
@@ -626,14 +646,15 @@ V2TIMString V2TIMMessageManagerImpl::SendMessage(
                 forwardText += " (" + std::to_string(soundElem->duration) + "秒)";
             }
             V2TIMString textToSend(forwardText.c_str());
-            if (isC2C) {
-                sentMsgID = manager->SendC2CTextMessage(textToSend, receiver, message.cloudCustomData, callback);
-            } else {
-                sentMsgID = manager->SendGroupTextMessage(textToSend, groupID, priority, message.cloudCustomData, callback);
-            }
+            sentMsgID = manager->SendC2CTextMessage(textToSend, receiver, message.cloudCustomData, callback);
             break;
         }
         case V2TIM_ELEM_TYPE_VIDEO: {
+            if (isGroup) {  // group or group-private: see the IMAGE case
+                if (callback) callback->OnError(ERR_SDK_INTERFACE_NOT_SUPPORT, "Group media messages are not supported");
+                sentMsgID = "";
+                break;
+            }
             // 视频消息转发：转换为文本消息说明
             V2TIMVideoElem* videoElem = static_cast<V2TIMVideoElem*>(elem);
             std::string forwardText = "[转发视频]";
@@ -641,14 +662,15 @@ V2TIMString V2TIMMessageManagerImpl::SendMessage(
                 forwardText += " (" + std::to_string(videoElem->duration) + "秒)";
             }
             V2TIMString textToSend(forwardText.c_str());
-            if (isC2C) {
-                sentMsgID = manager->SendC2CTextMessage(textToSend, receiver, message.cloudCustomData, callback);
-            } else {
-                sentMsgID = manager->SendGroupTextMessage(textToSend, groupID, priority, message.cloudCustomData, callback);
-            }
+            sentMsgID = manager->SendC2CTextMessage(textToSend, receiver, message.cloudCustomData, callback);
             break;
         }
         case V2TIM_ELEM_TYPE_FILE: {
+            if (isGroup) {  // group or group-private: see the IMAGE case
+                if (callback) callback->OnError(ERR_SDK_INTERFACE_NOT_SUPPORT, "Group media messages are not supported");
+                sentMsgID = "";
+                break;
+            }
             // 文件消息转发：转换为文本消息说明
             V2TIMFileElem* fileElem = static_cast<V2TIMFileElem*>(elem);
             std::string forwardText = "[转发文件]";
@@ -659,11 +681,7 @@ V2TIMString V2TIMMessageManagerImpl::SendMessage(
                 forwardText += " (" + std::to_string(fileElem->fileSize) + " 字节)";
             }
             V2TIMString textToSend(forwardText.c_str());
-            if (isC2C) {
-                sentMsgID = manager->SendC2CTextMessage(textToSend, receiver, message.cloudCustomData, callback);
-            } else {
-                sentMsgID = manager->SendGroupTextMessage(textToSend, groupID, priority, message.cloudCustomData, callback);
-            }
+            sentMsgID = manager->SendC2CTextMessage(textToSend, receiver, message.cloudCustomData, callback);
             break;
         }
         case V2TIM_ELEM_TYPE_LOCATION: {
@@ -674,7 +692,9 @@ V2TIMString V2TIMMessageManagerImpl::SendMessage(
                 forwardText += " " + std::string(locationElem->desc.CString());
             }
             V2TIMString textToSend(forwardText.c_str());
-            if (isC2C) {
+            if (isGroupPrivate) {
+                sentMsgID = manager->SendGroupPrivateTextMessage(groupID, receiver, textToSend, callback);
+            } else if (isC2C) {
                 sentMsgID = manager->SendC2CTextMessage(textToSend, receiver, message.cloudCustomData, callback);
             } else {
                 sentMsgID = manager->SendGroupTextMessage(textToSend, groupID, priority, message.cloudCustomData, callback);
@@ -685,7 +705,9 @@ V2TIMString V2TIMMessageManagerImpl::SendMessage(
             // 表情消息转发：转换为文本消息说明
             std::string forwardText = "[转发表情]";
             V2TIMString textToSend(forwardText.c_str());
-            if (isC2C) {
+            if (isGroupPrivate) {
+                sentMsgID = manager->SendGroupPrivateTextMessage(groupID, receiver, textToSend, callback);
+            } else if (isC2C) {
                 sentMsgID = manager->SendC2CTextMessage(textToSend, receiver, message.cloudCustomData, callback);
             } else {
                 sentMsgID = manager->SendGroupTextMessage(textToSend, groupID, priority, message.cloudCustomData, callback);

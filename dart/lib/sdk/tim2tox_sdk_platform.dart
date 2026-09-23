@@ -58,6 +58,8 @@ import 'package:tencent_cloud_chat_sdk/models/v2_tim_group_member_info.dart';
 import 'package:tencent_cloud_chat_sdk/models/v2_tim_group_member_operation_result.dart';
 import 'package:tencent_cloud_chat_sdk/models/v2_tim_group_tips_elem.dart';
 import 'package:tencent_cloud_chat_sdk/models/v2_tim_group_member_change_info.dart';
+import 'package:tencent_cloud_chat_sdk/enum/group_change_info_type.dart';
+import 'package:tencent_cloud_chat_sdk/enum/group_member_role.dart';
 import 'package:tencent_cloud_chat_sdk/enum/group_tips_elem_type.dart';
 import 'package:tencent_cloud_chat_sdk/models/v2_tim_message_receipt.dart';
 import 'package:tencent_cloud_chat_sdk/models/v2_tim_message_reaction_change_info.dart';
@@ -92,6 +94,8 @@ import '../utils/binary_replacement_history_hook.dart';
 import '../utils/control_message_envelope.dart';
 import '../utils/message_converter.dart';
 import '../utils/tim2tox_failed_message_persistence.dart';
+import '../utils/tim2tox_failed_message_rebuild.dart';
+import '../utils/v2tim_control_envelope.dart';
 import '../utils/conversation_id_utils.dart';
 import 'message_search.dart';
 import 'sound_file_name.dart';
@@ -104,6 +108,7 @@ import 'package:ffi/ffi.dart' as pkgffi;
 import '../interfaces/event_bus_provider.dart';
 import '../interfaces/conversation_manager_provider.dart';
 import '../interfaces/draft_preferences_service.dart';
+import '../interfaces/group_identity_preferences_service.dart';
 import '../interfaces/extended_preferences_service.dart';
 import '../interfaces/event_bus.dart';
 import '../models/fake_models.dart';
@@ -499,6 +504,9 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
     _currentInstance = this;
     // Register custom callback handler for tim2tox-specific native callbacks
     NativeLibraryManager.customCallbackHandler = _handleCustomCallback;
+    // groupChatIdStored / groupTypeStored that fired before this handler
+    // existed were dropped by NativeLibraryManager; pull and persist them.
+    _pullNativeGroupIdentities();
     // Setup connection status listener
     _setupConnectionStatusListener();
     // Setup message listener
@@ -533,6 +541,56 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
     // UIKit's initSDK call will properly set _isInitialized = true.
   }
 
+  void _pullNativeGroupIdentities() {
+    try {
+      unawaited(ffiService.syncGroupIdentitiesFromNative().catchError(
+          (Object e, StackTrace st) => ffiService.logger?.logError(
+              '[Tim2ToxSdkPlatform] group identity pull failed', e, st)));
+    } catch (e) {
+      // A partial FfiChatService (test double) without the method: nothing
+      // native to pull from.
+      ffiService.logger?.log(
+          '[Tim2ToxSdkPlatform] group identity pull unavailable: $e');
+    }
+  }
+
+  /// Native group notifications posted without user_data (the DartNotifyGroup*
+  /// family). The handler below is process-global, so each is stamped with
+  /// the emitting native session and applied only by the service that owns it.
+  static const Set<String> _sessionScopedNativeNotifications = {
+    'groupQuitNotification',
+    'groupJoinNotification',
+    'groupJoinFailedNotification',
+    'groupInviteNotification',
+    'groupChatIdStored',
+    'groupTypeStored',
+  };
+
+  /// False for a notification another instance (test node) emitted, one from
+  /// an ended native session (the previous account, after an account switch
+  /// on the same instance id), and one that cannot be attributed at all:
+  /// applying it would mutate the wrong service's state or write the wrong
+  /// account's preferences.
+  bool _ownsNativeSessionNotification(
+      String callbackName, Map<String, dynamic> data) {
+    bool owned;
+    try {
+      owned = ffiService.ownsNativeSessionNotification(data);
+    } catch (e, st) {
+      ffiService.logger?.logError(
+          '[Tim2ToxSdkPlatform] $callbackName: session ownership check failed; dropped',
+          e,
+          st);
+      return false;
+    }
+    if (!owned) {
+      ffiService.logger?.log(
+          '[Tim2ToxSdkPlatform] $callbackName dropped: not this session '
+          '(instance_id=${data['instance_id']}, session_epoch=${data['session_epoch']})');
+    }
+    return owned;
+  }
+
   /// Handle custom callbacks from native layer that are tim2tox-specific.
   /// These are callbacks not handled by the generic SDK (e.g., clearHistoryMessage,
   /// groupQuitNotification, groupChatIdStored).
@@ -541,6 +599,10 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
     Map<String, dynamic> data,
     Map<String, void Function(Map)> apiCallbackMap,
   ) async {
+    if (_sessionScopedNativeNotifications.contains(callbackName) &&
+        !_ownsNativeSessionNotification(callbackName, data)) {
+      return;
+    }
     switch (callbackName) {
       case "clearHistoryMessage":
         final String? userData = data["user_data"];
@@ -580,7 +642,8 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
         final String? groupId = data["group_id"];
         if (groupId != null) {
           try {
-            await ffiService.cleanupGroupState(groupId);
+            await ffiService.cleanupGroupState(groupId,
+                keepHistory: data["reason"] == "kicked");
           } catch (e, st) {
             // Binary-replacement-only callback: if cleanupGroupState fails,
             // toxee's group state stays out of sync with C++ until next
@@ -609,6 +672,23 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
           }
         }
         break;
+      case "groupJoinFailedNotification":
+        final String? failedGroupId = data["group_id"];
+        if (failedGroupId != null && failedGroupId.isNotEmpty) {
+          await ffiService.handleGroupJoinFailed(
+            failedGroupId,
+            (data["chat_id"] as String?) ?? '',
+            (data["reason"] as String?) ?? 'unknown',
+            established: data["established"] == true,
+            inviteId: (data["invite_id"] as String?) ?? '',
+          );
+        }
+        break;
+      case "groupInviteNotification":
+        // A group invite is waiting for the user's answer (auto-accept off).
+        // The details are read on demand via getPendingGroupInvites().
+        ffiService.notifyPendingGroupInvitesChanged();
+        break;
       case "groupChatIdStored":
         final String? groupId = data["group_id"];
         final String? chatId = data["chat_id"];
@@ -626,6 +706,27 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
             // Same reasoning as above: log loudly, do not rethrow.
             ffiService.logger?.logError(
                 '[Tim2ToxSdkPlatform] _handleCustomCallback groupChatIdStored failed for groupId=$groupId',
+                e,
+                st);
+          }
+        }
+        break;
+      case "groupTypeStored":
+        // Native learned a group's kind (group / conference / av_conference).
+        // Persisted so a restart rebinds conferences as conferences.
+        final String? typedGroupId = data["group_id"];
+        final String? groupType = data["group_type"];
+        final prefs = _prefs;
+        if (typedGroupId != null &&
+            groupType != null &&
+            groupType.isNotEmpty &&
+            prefs is GroupIdentityPreferencesService) {
+          try {
+            await (prefs as GroupIdentityPreferencesService)
+                .setGroupType(typedGroupId, groupType);
+          } catch (e, st) {
+            ffiService.logger?.logError(
+                '[Tim2ToxSdkPlatform] _handleCustomCallback groupTypeStored failed for groupId=$typedGroupId',
                 e,
                 st);
           }
@@ -878,6 +979,16 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
         timestamp: DateTime.now(),
         groupId: (groupId != null && groupId.isNotEmpty) ? groupId : null,
       ));
+      // The binary path is the live receive path in the product, so the
+      // recall must also re-render the sidebar preview here (the stream path
+      // below does the same) — otherwise the recalled text stays the
+      // conversation's last message until something else refreshes it.
+      if (!isSelf) {
+        await _refreshConversationPreviewFor(
+          groupId: groupId,
+          userId: fromUserId,
+        );
+      }
     };
     _messagesSubscription?.cancel();
     _messagesSubscription = ffiService.messages.listen((chatMsg) async {
@@ -924,11 +1035,12 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
           // message on the receive side. The signal (and, for revoke, the
           // referenced message) were deleted above; re-notify so UIKit re-reads
           // the corrected preview. Sender-side is handled in revokeMessage; this
-          // covers the receive path. C2C only (no group notify helper yet).
-          if (!chatMsg.isSelf &&
-              (chatMsg.groupId == null || chatMsg.groupId!.isEmpty) &&
-              chatMsg.fromUserId.isNotEmpty) {
-            await _refreshConversationPreviewC2C(chatMsg.fromUserId);
+          // covers the receive path, C2C and group alike.
+          if (!chatMsg.isSelf) {
+            await _refreshConversationPreviewFor(
+              groupId: chatMsg.groupId,
+              userId: chatMsg.fromUserId,
+            );
           }
           if (_debugLog) {
             print(
@@ -2467,6 +2579,10 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
     }
   }
 
+  /// One Tox message after the qTox fragmenter's safety margin
+  /// (TOX_MAX_MESSAGE_LENGTH - 50, see QToxMessageFragmenter.h).
+  static const int _kMaxSingleFragmentBytes = 1322;
+
   Future<void> _persistFinalizedFailedMessage({
     required V2TimMessage message,
     required String receiver,
@@ -2480,28 +2596,140 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
     );
   }
 
-  /// Returns the number of failed rows removed across both keys, so callers can
-  /// tell a real removal from a no-op.
+  /// Persisted failed rows of one conversation, from the current account's key
+  /// only, under the raw and the 64-char normalized C2C id.
+  Future<List<({String conversationKey, Map<String, dynamic> entry})>>
+      _loadFailedRowsForConversation({String? userID, String? groupID}) async {
+    final keys = _failedRowKeys(userID: userID, groupID: groupID);
+    final rows = <({String conversationKey, Map<String, dynamic> entry})>[];
+    for (final account in _failedRowAccounts()) {
+      for (final key in keys) {
+        final loaded = await Tim2ToxFailedMessagePersistence.loadFailedMessages(
+          userID: groupID == null ? key : null,
+          groupID: groupID == null ? null : key,
+          accountToxId: account,
+        );
+        for (final entry in loaded) {
+          rows.add((conversationKey: key, entry: entry));
+        }
+      }
+    }
+    return rows;
+  }
+
+  Set<String> _failedRowKeys({String? userID, String? groupID}) => <String>{
+        if (groupID != null && groupID.isNotEmpty) groupID,
+        if ((groupID == null || groupID.isEmpty) &&
+            userID != null &&
+            userID.isNotEmpty) ...{
+          userID,
+          if (userID.length > 64) userID.substring(0, 64),
+        },
+      };
+
+  /// The current account, and nothing else. The pre-account-scoping base key
+  /// (`null` here) used to be included: its rows carry no owner, so account B
+  /// imported, showed and could resend account A's failed messages. No
+  /// account known -> no failed rows at all.
+  Set<String> _failedRowAccounts() {
+    final accountToxId = ffiService.getSelfToxId();
+    return <String>{
+      if (accountToxId != null && accountToxId.isNotEmpty) accountToxId,
+    };
+  }
+
+  /// Clearing a conversation's history must clear its failed rows too: they
+  /// are merged back into the reloaded chat and feed the conversation
+  /// preview, so they would otherwise resurrect a cleared conversation.
+  Future<void> _clearFailedRowsForConversation({
+    String? userID,
+    String? groupID,
+  }) async {
+    final keys = _failedRowKeys(userID: userID, groupID: groupID);
+    for (final account in _failedRowAccounts()) {
+      await Tim2ToxFailedMessagePersistence.removeFailedMessagesForConversation(
+        conversationKeys: keys,
+        accountToxId: account,
+      );
+    }
+  }
+
+  Future<void> _clearFailedRowsForConversationID(String conversationID) {
+    if (conversationID.startsWith('group_')) {
+      return _clearFailedRowsForConversation(
+          groupID: conversationID.substring(6));
+    }
+    if (conversationID.startsWith('c2c_')) {
+      return _clearFailedRowsForConversation(
+          userID: conversationID.substring(4));
+    }
+    return Future<void>.value();
+  }
+
+  Future<List<V2TimMessage>> _mergePersistedFailedRows({
+    required List<V2TimMessage> page,
+    required List<ChatMessage> source,
+    required bool isFinished,
+    required String? lastMsgID,
+    required String? userID,
+    required String? groupID,
+  }) async {
+    try {
+      final rows = await _loadFailedRowsForConversation(
+        userID: userID,
+        groupID: groupID,
+      );
+      if (rows.isEmpty) return page;
+      int? anchorTimestamp;
+      if (lastMsgID != null) {
+        final anchor = source.where((m) =>
+            m.msgID == lastMsgID || m.altMsgIds.contains(lastMsgID));
+        // An anchor history does not know (stale / revoked) gets an empty,
+        // unfinished page; do not attach failed rows to it.
+        if (anchor.isEmpty) return page;
+        anchorTimestamp = anchor.first.timestamp.millisecondsSinceEpoch ~/ 1000;
+      }
+      final historyIds = <String>{
+        for (final m in source) ...{
+          if (m.msgID != null && m.msgID!.isNotEmpty) m.msgID!,
+          ...m.altMsgIds,
+        },
+      };
+      final merged = mergeFailedRowsIntoHistoryPage(
+        page: page,
+        failedRows: rows,
+        historyIds: historyIds,
+        isFinished: isFinished,
+        anchorTimestamp: anchorTimestamp,
+      );
+      final fromHistory = Set<V2TimMessage>.identity()..addAll(page);
+      for (final msg in merged) {
+        if (!fromHistory.contains(msg)) await _setFaceUrlForMsg(msg);
+      }
+      return merged;
+    } catch (e) {
+      _log('[Tim2ToxSdkPlatform] failed-row history merge skipped: $e');
+      return page;
+    }
+  }
+
+  /// Returns the number of failed rows removed from the current account's
+  /// key, so callers can tell a real removal from a no-op. The unowned
+  /// pre-scoping base key is neither read nor mutated (see
+  /// [_failedRowAccounts]).
   Future<int> _removeFailedMessagesByIDsForCurrentAccount(
     Iterable<String> msgIDs,
   ) async {
     final ids = msgIDs.where((msgID) => msgID.isNotEmpty).toSet();
     if (ids.isEmpty) return 0;
     var removed = 0;
-    final accountToxId = ffiService.getSelfToxId();
-    if (accountToxId != null && accountToxId.isNotEmpty) {
+    for (final account in _failedRowAccounts()) {
       removed +=
           await Tim2ToxFailedMessagePersistence.removeFailedMessagesByIDs(
         messageIDs: ids,
-        accountToxId: accountToxId,
+        accountToxId: account,
       );
     }
-    // Pre-account-scoping rows have no account suffix. Clean only that legacy
-    // base key in addition to the current full-ID key; never scan other keys.
-    removed += await Tim2ToxFailedMessagePersistence.removeFailedMessagesByIDs(
-      messageIDs: ids,
-      accountToxId: null,
-    );
     return removed;
   }
 
@@ -2951,6 +3179,12 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
     _friendNicknameCache.clear();
     _friendRemarkCache.clear();
     _previousFriendOnlineStatus.clear();
+    // The handler is a process-global static. Left pointing at this disposed
+    // platform it kept routing native group join/quit notifications to the
+    // previous account's service until the next platform was constructed.
+    if (NativeLibraryManager.customCallbackHandler == _handleCustomCallback) {
+      NativeLibraryManager.customCallbackHandler = null;
+    }
     if (_currentInstance == this) {
       _currentInstance = null;
     }
@@ -3260,6 +3494,18 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
                   v2Msg.elemType == kNativeFileElemType ||
                   v2Msg.fileElem != null) {
                 ffiService.triggerPollOnce();
+              }
+              // GT-4: the same text-control-envelope contract as the
+              // ffiService.messages stream path and the history converter.
+              // In the product this IS the live path (native stamps
+              // instance_id=0 on every globalCallback, so
+              // NativeLibraryManager routes here first). A `__revoke__:`
+              // command reaches no listener — BinaryReplacementHistoryHook
+              // applies it on the SDK singleton path — instead of rendering
+              // as a raw bubble that leaks the recalled text prefix; stickers,
+              // locations and custom payloads arrive as their element types.
+              if (!applyInboundControlEnvelope(v2Msg)) {
+                break;
               }
               // Populate faceUrl from local avatar cache so message list shows correct avatar (same as event path).
               // Per-listener isolation around the fan-out.
@@ -3716,6 +3962,8 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
             case GroupTipsElemType.V2TIM_GROUP_TIPS_TYPE_GROUP_INFO_CHANGE:
               groupChangeInfoList
                   .removeWhere((changeInfo) => changeInfo.type == 7);
+              unawaited(
+                  _persistRemoteGroupInfoChanges(groupID, groupChangeInfoList));
               if (groupChangeInfoList.isNotEmpty) {
                 for (final l in grpList) {
                   try {
@@ -4213,8 +4461,30 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
   Future<void> _refreshConversationPreviewC2C(String receiver) async {
     if (receiver.isEmpty) return;
     final c2cKey = receiver.length >= 64 ? receiver.substring(0, 64) : receiver;
+    await _refreshConversationPreviewByID('c2c_$c2cKey');
+  }
+
+  /// Group twin of [_refreshConversationPreviewC2C].
+  Future<void> _refreshConversationPreviewGroup(String groupID) async {
+    if (groupID.isEmpty) return;
+    await _refreshConversationPreviewByID('group_$groupID');
+  }
+
+  /// Refresh whichever conversation a control signal / recall touched.
+  Future<void> _refreshConversationPreviewFor({
+    String? groupId,
+    String? userId,
+  }) async {
+    if (groupId != null && groupId.isNotEmpty) {
+      await _refreshConversationPreviewGroup(groupId);
+    } else if (userId != null && userId.isNotEmpty) {
+      await _refreshConversationPreviewC2C(userId);
+    }
+  }
+
+  Future<void> _refreshConversationPreviewByID(String conversationID) async {
     try {
-      final res = await getConversation(conversationID: 'c2c_$c2cKey');
+      final res = await _getConversation(conversationID, openChat: false);
       final conv = res.data;
       if (conv != null) {
         _notifyConversationListeners((listener) {
@@ -4223,7 +4493,7 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
       }
     } catch (e) {
       if (_debugLog) {
-        print('[Tim2ToxSdkPlatform] _refreshConversationPreviewC2C: $e');
+        print('[Tim2ToxSdkPlatform] conversation preview refresh: $e');
       }
     }
   }
@@ -4347,9 +4617,20 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
     }
   }
 
+  /// The V2TIM getConversation — in UIKit, the OPEN chat page loading its
+  /// own conversation, so a group's "@me" jump targets survive the open that
+  /// read them (`openChat`). Conversation-list pushes built inside this class
+  /// go through [_getConversation] with `openChat: false` instead, so the
+  /// list row's marker clears once read.
   @override
   Future<V2TimValueCallback<V2TimConversation>> getConversation({
     required String conversationID,
+  }) =>
+      _getConversation(conversationID, openChat: true);
+
+  Future<V2TimValueCallback<V2TimConversation>> _getConversation(
+    String conversationID, {
+    required bool openChat,
   }) async {
     if (_debugLog) print('[Tim2ToxSdkPlatform] getConversation: START');
     debugPrint('[Tim2ToxSdkPlatform] getConversation: START');
@@ -4414,7 +4695,8 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
             '[Tim2ToxSdkPlatform] getConversation: Calling fakeConversationToV2TimConversation()...');
       debugPrint(
           '[Tim2ToxSdkPlatform] getConversation: Calling fakeConversationToV2TimConversation()...');
-      final v2Conv = await fakeConversationToV2TimConversation(fakeConv);
+      final v2Conv = await fakeConversationToV2TimConversation(fakeConv,
+          openChat: openChat);
       if (_debugLog)
         print('[Tim2ToxSdkPlatform] getConversation: conversion returned');
       debugPrint('[Tim2ToxSdkPlatform] getConversation: conversion returned');
@@ -4473,6 +4755,7 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
       if (conversationManager != null) {
         await conversationManager.deleteConversation(conversationID);
       }
+      await _clearFailedRowsForConversationID(conversationID);
 
       return V2TimCallback(
         code: 0,
@@ -4523,6 +4806,7 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
                 // Silently handle errors
               }
             }
+            await _clearFailedRowsForConversationID(conversationID);
           }
 
           results.add(V2TimConversationOperationResult(
@@ -5527,6 +5811,26 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
         messageToSend.needReadReceipt = true;
       }
 
+      // GF-5: Tox has no group file transfer (`tox_file_send` is friend-only),
+      // so a pure media message into a group can never succeed. Refuse it here,
+      // BEFORE the provider dispatch, and do NOT persist it as a retryable
+      // failed row: that row could never be resent, never reloaded into the
+      // chat, and used to strand as the group's conversation-list preview.
+      // The returned message (SEND_FAIL) lets the UIKit flip its optimistic
+      // row; the desc is what integrators localize.
+      if (groupID.isNotEmpty && isUnsupportedGroupMedia(messageToSend)) {
+        messageToSend.status = MessageStatus.V2TIM_MSG_STATUS_SEND_FAIL;
+        await _setFaceUrlForMsg(messageToSend);
+        _notifyAdvancedMsgListeners((listener) {
+          listener.onRecvMessageModified?.call(messageToSend);
+        });
+        return V2TimValueCallback<V2TimMessage>(
+          code: -1,
+          desc: kGroupMediaUnsupportedDesc,
+          data: messageToSend,
+        );
+      }
+
       // Set faceUrl immediately so the list shows correct avatar from the first frame (avoids default→correct flicker)
       await _setFaceUrlForMsg(messageToSend);
       _notifyAdvancedMsgListeners((listener) {
@@ -5840,6 +6144,16 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
             'data': messageToSend.faceElem!.data,
           });
           final payload = '__face__:$faceJson';
+          // Same single-message limit as the custom/location envelopes: a
+          // long sticker `data` would arrive split — a truncated `__face__:`
+          // head plus loose text the receiver cannot parse.
+          if (utf8.encode(payload).length > _kMaxSingleFragmentBytes) {
+            // Not persisted as a failed row: a resend could never succeed.
+            return V2TimValueCallback<V2TimMessage>(
+              code: 8001, // ERR_SDK_MSG_BODY_SIZE_LIMIT
+              desc: 'Face message too large for one Tox message',
+            );
+          }
           if (_debugLog)
             print(
                 '[Tim2ToxSdkPlatform] Sending face message: payloadLength=${payload.length}');
@@ -5862,6 +6176,14 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
             'latitude': messageToSend.locationElem!.latitude,
           });
           final payload = '__location__:$locJson';
+          // Same single-message limit as custom envelopes (a long place
+          // description would otherwise arrive split and unparseable).
+          if (utf8.encode(payload).length > _kMaxSingleFragmentBytes) {
+            return V2TimValueCallback<V2TimMessage>(
+              code: 8001, // ERR_SDK_MSG_BODY_SIZE_LIMIT
+              desc: 'Location message too large for one Tox message',
+            );
+          }
           if (_debugLog)
             print(
                 '[Tim2ToxSdkPlatform] Sending location message: payloadLength=${payload.length}');
@@ -5882,6 +6204,17 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
           // into a customElem instead of rendering as plain text.
           // Receiver-side parsing is deferred (TODO(P0-1)).
           final payload = '__custom__:${messageToSend.customElem!.data}';
+          // Tox splits text above one message (1322 bytes after the qTox
+          // fragmenter's margin) into several messages. A split envelope
+          // arrives as a truncated `__custom__:` head plus loose text, so an
+          // oversized one is refused instead of delivered broken.
+          if (utf8.encode(payload).length > _kMaxSingleFragmentBytes) {
+            // Not persisted as a failed row: a resend could never succeed.
+            return V2TimValueCallback<V2TimMessage>(
+              code: 8001, // ERR_SDK_MSG_BODY_SIZE_LIMIT
+              desc: 'Custom message too large for one Tox message',
+            );
+          }
           if (_debugLog) print('[Tim2ToxSdkPlatform] Sending custom message');
           textSendResult = await _sendProviderText(
             provider,
@@ -6164,22 +6497,18 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
     int? timePeriod,
   }) async {
     try {
-      // M7: `lastMsgSeq` and `messageSeqList` are intentionally unsupported
-      // here. Tox has no server-assigned sequence numbers — all ordering is
-      // local-timestamp based. The Tencent V2TIM SDK uses these for
-      // cloud-side anchored pagination; in Tim2Tox the equivalent anchor is
-      // `lastMsgID`. If a caller passes a non-default value we log a warning
-      // so they can fix the call site rather than silently mis-paginating.
+      // M7: `lastMsgSeq` is intentionally unsupported here. Tox has no
+      // server-assigned sequence numbers — all ordering is local-timestamp
+      // based. The Tencent V2TIM SDK uses it for cloud-side anchored
+      // pagination; in Tim2Tox the equivalent anchor is `lastMsgID`. If a
+      // caller passes a non-default value we log a warning so they can fix
+      // the call site rather than silently mis-paginating.
+      // `messageSeqList` IS honoured (below): its only caller is UIKit's "@me"
+      // jump, and the seqs are the locally minted groupAtInfo seqs.
       if (lastMsgSeq != -1) {
         if (_debugLog) {
           print(
               '[Tim2ToxSdkPlatform] getHistoryMessageListV2: lastMsgSeq=$lastMsgSeq ignored (Tox has no server sequence numbers; use lastMsgID instead)');
-        }
-      }
-      if (messageSeqList != null && messageSeqList.isNotEmpty) {
-        if (_debugLog) {
-          print(
-              '[Tim2ToxSdkPlatform] getHistoryMessageListV2: messageSeqList (${messageSeqList.length} entries) ignored (Tox has no server sequence numbers)');
         }
       }
       final targetID = groupID ?? userID ?? '';
@@ -6209,7 +6538,7 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
         // If the history file was deleted by clearHistory(), loadHistory will return empty list
         try {
           final persistence = ffiService.messageHistoryPersistence;
-          final quitGroups = ffiService.quitGroups;
+          final quitGroups = ffiService.historyPurgeGroups;
           final loadedMessages = await persistence.loadHistory(normalizedId,
               quitGroups: quitGroups);
 
@@ -6263,6 +6592,48 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
         } catch (e) {}
       }
 
+      // V2TIM ordering contract (V2TIMMessageListGetOption, tencent_cloud_chat_sdk):
+      // an OLDER page (getType 1/3) is in reverse time order (newest first),
+      // a NEWER page (getType 2/4) in time order (oldest first). UIKit relies
+      // on it: loadToSpecificMessage `.reversed`s the NEWER page around the
+      // jump target and anchors the following OLDER call on its `.last`, and
+      // the media viewer appends the NEWER page after the current item.
+      final bool isGetOlderMessages = (getType == 1 || getType == 3);
+
+      // "@me" jump: return exactly the rows the groupAtInfo seqs point at
+      // (in getType order; empty when none resolves). Falling through to the
+      // newest page here is what landed the jump on the wrong message.
+      if (messageSeqList != null && messageSeqList.isNotEmpty) {
+        final mentioned = <V2TimMessage>[];
+        final rows = chatMessagesForGroupAtSeqs(history, messageSeqList);
+        for (final row in isGetOlderMessages ? rows : rows.reversed) {
+          final msg = chatMessageToV2TimMessage(row, ffiService.selfId,
+              forwardTargetUserID: userID, forwardTargetGroupID: groupID);
+          if (userID != null) msg.userID = userID;
+          if (groupID != null) msg.groupID = groupID;
+          await _setFaceUrlForMsg(msg);
+          mentioned.add(msg);
+        }
+        return V2TimValueCallback<V2TimMessageListResult>(
+          code: 0,
+          desc: 'success',
+          data: V2TimMessageListResult(
+              isFinished: true, messageList: mentioned),
+        );
+      }
+
+      // Time range (V2TIM getTimeBegin/getTimePeriod, seconds): a closed
+      // interval whose direction follows getType — OLDER covers
+      // [timeBegin - timePeriod, timeBegin], NEWER [timeBegin, timeBegin +
+      // timePeriod]. timeBegin 0 means "now", timePeriod 0 "no limit", so a
+      // lone timeBegin (UIKit's jump to a timestamp) is open-ended. Without a
+      // start message the range's timeBegin is also the paging start point.
+      final timeRange = historyTimeRange(
+        newer: !isGetOlderMessages,
+        timeBegin: timeBegin,
+        timePeriod: timePeriod,
+      );
+
       // Filter + sort history.
       //
       // Performance (P4 in `local-storage-review-2026-05-18.md`): the previous
@@ -6271,7 +6642,13 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
       // so a single sort after both filters have run is correct and O(n log n)
       // instead of O(3·n log n). For 1k-message conversations on a cold open
       // this used to dominate `getHistoryMessageListV2`'s wall time.
-      List<ChatMessage> filteredHistory = List.from(history);
+      //
+      // Wrapped in a local function because it runs twice when the page
+      // reaches past the in-memory window: once over memory alone (the common
+      // case, no disk I/O), then again with the archived rows included.
+      ({List<ChatMessage> sublist, bool isFinished, bool ranOffOldEnd}) paginate(
+          List<ChatMessage> source) {
+      List<ChatMessage> filteredHistory = List.from(source);
 
       // Filter by message type if specified
       if (messageTypeList != null && messageTypeList.isNotEmpty) {
@@ -6291,33 +6668,40 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
       }
 
       // Filter by time range if specified
-      if (timeBegin != null && timePeriod != null) {
-        final timeEnd = timeBegin + timePeriod;
+      if (timeRange != null) {
         filteredHistory = filteredHistory.where((msg) {
           final msgTime = msg.timestamp.millisecondsSinceEpoch ~/ 1000;
-          return msgTime >= timeBegin && msgTime <= timeEnd;
+          return (timeRange.from == null || msgTime >= timeRange.from!) &&
+              (timeRange.to == null || msgTime <= timeRange.to!);
         }).toList();
       }
 
       // Sort once, descending (newest first, oldest last) — matches the
       // internal storage format in TencentCloudChatMessageData and is required
       // for the pagination logic below.
-      filteredHistory.sort((a, b) => b.timestamp.compareTo(a.timestamp));
+      // Stable (GH-6): equal timestamps keep arrival order (reversed here),
+      // instead of an arbitrary order past 32 rows that also differed between
+      // two page requests.
+      sortChatMessagesChronologically(filteredHistory, newestFirst: true);
 
       // CRITICAL: Keep descending order (newest first, oldest last)
-      // This is required for correct pagination logic below
+      // This is required for correct pagination logic below; a NEWER page is
+      // flipped to ascending once its window is chosen (see the end).
       // getType: 1 = V2TIM_GET_CLOUD_OLDER_MSG (get older messages from cloud)
       //          2 = V2TIM_GET_CLOUD_NEWER_MSG (get newer messages from cloud)
       //          3 = V2TIM_GET_LOCAL_OLDER_MSG (get older messages from local)
       //          4 = V2TIM_GET_LOCAL_NEWER_MSG (get newer messages from local)
       // Both 1 and 3 mean "get older messages"; both 2 and 4 mean "get newer messages"
-      final bool isGetOlderMessages = (getType == 1 || getType == 3);
       List<ChatMessage> sublist;
       bool isFinished = false;
+      // True when older rows than `source` holds could complete this page.
+      bool ranOffOldEnd = false;
 
       if (lastMsgID != null) {
-        final lastMsgIndex =
-            filteredHistory.indexWhere((msg) => msg.msgID == lastMsgID);
+        // Alias-aware: UIKit may anchor on the native id of a row stored under
+        // its poll-minted id (hybrid double delivery merges them).
+        final lastMsgIndex = filteredHistory.indexWhere((msg) =>
+            msg.msgID == lastMsgID || msg.altMsgIds.contains(lastMsgID));
         if (lastMsgIndex != -1) {
           if (isGetOlderMessages) {
             // Get older messages (after lastMsgID in descending list, going backwards in time)
@@ -6336,6 +6720,7 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
                   filteredHistory
                       .length; // Finished if we reached the end (oldest)
             }
+            ranOffOldEnd = isFinished;
           } else {
             // Get newer messages (before lastMsgID in descending list, going forwards in time)
             // Since list is newest-first, newer messages are at lower indices
@@ -6366,7 +6751,17 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
           }
           sublist = [];
           isFinished = false;
+          ranOffOldEnd = true; // the anchor may be an archived row
         }
+      } else if (!isGetOlderMessages && timeRange?.from != null) {
+        // NEWER from timeBegin: the page nearest to timeBegin, i.e. the
+        // OLDEST `count` rows of the (already range-filtered) list.
+        final startIndex = (filteredHistory.length - count)
+            .clamp(0, filteredHistory.length);
+        sublist = filteredHistory.sublist(startIndex);
+        isFinished = startIndex == 0; // reached the newest message
+        // Rows older than the in-memory window may still be in range.
+        ranOffOldEnd = true;
       } else {
         // No lastMsgID provided - return the most recent messages
         // CRITICAL: When opening a chat, UIKit expects the most recent messages first
@@ -6374,9 +6769,36 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
         // Both older and newer initial loads start from the most recent messages
         final endIndex = count.clamp(0, filteredHistory.length);
         sublist = filteredHistory.sublist(0, endIndex);
-        isFinished = endIndex >=
-            filteredHistory.length; // Finished if we got all messages
+        // OLDER: finished once every row is returned. NEWER: this page ends
+        // at the newest message, so nothing newer remains.
+        isFinished = !isGetOlderMessages ||
+            endIndex >= filteredHistory.length;
+        ranOffOldEnd = endIndex >= filteredHistory.length;
       }
+        // NEWER pages go out in time order (oldest first) per the V2TIM
+        // contract; the window above was cut from the newest-first list.
+        if (!isGetOlderMessages) sublist = sublist.reversed.toList();
+        return (
+          sublist: sublist,
+          isFinished: isFinished,
+          ranOffOldEnd: ranOffOldEnd,
+        );
+      }
+
+      var pageSource = history;
+      var page = paginate(pageSource);
+      // Rows pushed out of the in-memory window live in the conversation's
+      // archive. Without this, "load older" stopped at the newest 1000 rows
+      // and reported isFinished — the rest of the history was unreachable.
+      if (page.ranOffOldEnd && await ffiService.hasArchivedHistory(targetID)) {
+        final archived = await ffiService.getArchivedHistory(targetID);
+        if (archived.isNotEmpty) {
+          pageSource = <ChatMessage>[...archived, ...history];
+          page = paginate(pageSource);
+        }
+      }
+      final sublist = page.sublist;
+      final isFinished = page.isFinished;
 
       // Convert ChatMessage to V2TimMessage with conversation context so sent messages get correct userID/groupID
       final v2Messages = sublist.map((chatMsg) {
@@ -6418,15 +6840,34 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
       // - getMessageListForRender handles the display order
       // - onReceiveNewMessage inserts new messages at index 0 (newest first)
       // - loadMessageList with direction=latest inserts reversed messages at index 0
-      // OPTIMIZED: sublist is already in descending order (newest first) from filteredHistory
-      // (which was sorted at line 3054), so no need to sort again here
+      // OPTIMIZED: sublist is already in getType order from paginate()
+      // (OLDER newest-first, NEWER oldest-first), so no need to sort again here
+
+      // GF-5: failed sends that never reached the history store (the send
+      // threw before FfiChatService recorded it) live only in the failed-
+      // message persistence. Merge them back so a failed bubble survives a
+      // reload instead of vanishing from the chat while the conversation list
+      // still previews it. Plain browsing only: a type/time-filtered query
+      // (media gallery, date search) is answered from history alone.
+      final messageList = isGetOlderMessages &&
+              (messageTypeList == null || messageTypeList.isEmpty) &&
+              timeRange == null
+          ? await _mergePersistedFailedRows(
+              page: deduped,
+              source: pageSource,
+              isFinished: isFinished,
+              lastMsgID: lastMsgID,
+              userID: userID,
+              groupID: groupID,
+            )
+          : deduped;
 
       return V2TimValueCallback<V2TimMessageListResult>(
         code: 0,
         desc: 'success',
         data: V2TimMessageListResult(
           isFinished: isFinished,
-          messageList: deduped,
+          messageList: messageList,
         ),
       );
     } catch (e) {
@@ -6619,151 +7060,45 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
       final matchedConvKey = stored.conversationKey;
       final entry = stored.messageData;
 
-      // Decide userID/groupID. The persisted `userID`/`groupID` fields
-      // are authoritative when present; the conversation key is a useful
-      // fallback for legacy entries.
-      String? userID = entry['userID'] as String?;
-      String? groupID = entry['groupID'] as String?;
-      // Conversation key contains the destination when persisted entries
-      // were keyed only by conversation.
-      if ((userID == null || userID.isEmpty) &&
-          (groupID == null || groupID.isEmpty)) {
-        // matchedConvKey is groupID for groups, userID for c2c (see
-        // saveFailedMessage's conversationKey construction).
-        // H-C: previously we always assumed userID, which silently routed
-        // group-message resends into a C2C target named `tox_conf_…`. In
-        // toxee, every group ID begins with `tox_` (`tox_conf_` for
-        // conferences, `tox_group_` for ng-groups), and C2C peer IDs are
-        // raw 64-char Tox public keys that never start with `tox_`. Use
-        // that as the discriminator so legacy entries route correctly.
-        if (matchedConvKey.startsWith('tox_')) {
-          groupID = matchedConvKey;
-        } else {
-          userID = matchedConvKey;
-        }
-      }
-
-      // Rebuild a V2TimMessage from the entry.
+      // Decide userID/groupID and rebuild the V2TimMessage (media element
+      // included) through the shared helper that also restores failed rows
+      // into getHistoryMessageListV2 — one rebuild, not two drifting copies.
+      final target = failedRowTarget(entry, matchedConvKey);
+      final userID = target.userID;
+      final groupID = target.groupID;
       final storedID = entry['id'] as String?;
       final storedMsgID = entry['msgID'] as String?;
       final rebuiltID = storedID == null || storedID.isEmpty ? msgID : storedID;
       final realMsgID =
           storedMsgID == null || storedMsgID.isEmpty ? msgID : storedMsgID;
-      final mediaKind = entry['mediaKind'] as String?;
-      final text = entry['text'] as String? ?? '';
-      final filePath = entry['filePath'] as String?;
-      final fileName = entry['fileName'] as String?;
-      final fileSize = entry['fileSize'] as int?;
-      final localUrl = entry['localUrl'] as String?;
-      final customData = entry['customData'] as String?;
-      final soundDuration = entry['soundDuration'] as int?;
-      final videoDuration = entry['videoDuration'] as int?;
-
-      int elemType =
-          entry['elemType'] as int? ?? MessageElemType.V2TIM_ELEM_TYPE_TEXT;
-      // mediaKind takes precedence when present (v2 entries).
-      switch (mediaKind) {
-        case 'image':
-          elemType = MessageElemType.V2TIM_ELEM_TYPE_IMAGE;
-          break;
-        case 'file':
-          elemType = MessageElemType.V2TIM_ELEM_TYPE_FILE;
-          break;
-        case 'audio':
-          elemType = MessageElemType.V2TIM_ELEM_TYPE_SOUND;
-          break;
-        case 'video':
-          elemType = MessageElemType.V2TIM_ELEM_TYPE_VIDEO;
-          break;
-        case 'custom':
-          elemType = MessageElemType.V2TIM_ELEM_TYPE_CUSTOM;
-          break;
+      final rebuiltResult = rebuildFailedMessage(
+        entry,
+        conversationKey: matchedConvKey,
+        fallbackID: msgID,
+      );
+      final rebuilt = rebuiltResult.message;
+      if (rebuilt == null) {
+        return V2TimValueCallback<V2TimMessage>(
+          code: -1,
+          desc: 'reSendMessage: ${rebuiltResult.error}',
+        );
       }
-
-      final rebuilt = V2TimMessage(elemType: elemType);
       rebuilt.msgID = realMsgID;
       rebuilt.id = rebuiltID;
-      rebuilt.isSelf = entry['isSelf'] as bool? ?? true;
+
+      // GF-5: a legacy failed row for group media (persisted before sends of
+      // it were refused up front) can never succeed. Refuse BEFORE the
+      // pre-resend history cleanup below so the row stays put, failed and
+      // deletable, instead of flickering through SENDING into a new failure.
+      if (groupID != null && isUnsupportedGroupMedia(rebuilt)) {
+        return V2TimValueCallback<V2TimMessage>(
+          code: -1,
+          desc: kGroupMediaUnsupportedDesc,
+          data: rebuilt,
+        );
+      }
       rebuilt.timestamp = DateTime.now().millisecondsSinceEpoch ~/ 1000;
       rebuilt.status = MessageStatus.V2TIM_MSG_STATUS_SENDING;
-      if (userID != null && userID.isNotEmpty) rebuilt.userID = userID;
-      if (groupID != null && groupID.isNotEmpty) rebuilt.groupID = groupID;
-
-      // Always include a textElem when the entry had text (e.g. text
-      // messages, file-with-caption). For pure media this stays null.
-      if (text.isNotEmpty) {
-        rebuilt.textElem = V2TimTextElem(text: text);
-      }
-
-      switch (elemType) {
-        case MessageElemType.V2TIM_ELEM_TYPE_IMAGE:
-          final p = filePath ?? localUrl;
-          if (p == null || p.isEmpty) {
-            return V2TimValueCallback<V2TimMessage>(
-              code: -1,
-              desc:
-                  'reSendMessage: image entry missing filePath/localUrl for msgID=$msgID',
-            );
-          }
-          rebuilt.imageElem = V2TimImageElem(path: p);
-          break;
-        case MessageElemType.V2TIM_ELEM_TYPE_FILE:
-          final p = filePath ?? localUrl;
-          if (p == null || p.isEmpty) {
-            return V2TimValueCallback<V2TimMessage>(
-              code: -1,
-              desc:
-                  'reSendMessage: file entry missing filePath/localUrl for msgID=$msgID',
-            );
-          }
-          rebuilt.fileElem = V2TimFileElem(
-            path: p,
-            fileName: fileName ?? p.split('/').last,
-            fileSize: fileSize,
-            localUrl: localUrl,
-          );
-          break;
-        case MessageElemType.V2TIM_ELEM_TYPE_SOUND:
-          final p = filePath ?? localUrl;
-          if (p == null || p.isEmpty) {
-            return V2TimValueCallback<V2TimMessage>(
-              code: -1,
-              desc:
-                  'reSendMessage: sound entry missing filePath/localUrl for msgID=$msgID',
-            );
-          }
-          rebuilt.soundElem = V2TimSoundElem(
-            path: p,
-            dataSize: fileSize,
-            duration: soundDuration,
-          );
-          break;
-        case MessageElemType.V2TIM_ELEM_TYPE_VIDEO:
-          final p = filePath ?? localUrl;
-          if (p == null || p.isEmpty) {
-            return V2TimValueCallback<V2TimMessage>(
-              code: -1,
-              desc:
-                  'reSendMessage: video entry missing filePath/localUrl for msgID=$msgID',
-            );
-          }
-          rebuilt.videoElem = V2TimVideoElem(
-            videoPath: p,
-            videoSize: fileSize,
-            duration: videoDuration,
-          );
-          break;
-        case MessageElemType.V2TIM_ELEM_TYPE_CUSTOM:
-          rebuilt.customElem = V2TimCustomElem(data: customData ?? '');
-          break;
-        case MessageElemType.V2TIM_ELEM_TYPE_TEXT:
-        default:
-          // text-only or unknown elemType — treat as text. textElem already set above when non-empty.
-          if (rebuilt.textElem == null) {
-            rebuilt.textElem = V2TimTextElem(text: text);
-          }
-          break;
-      }
 
       // Cache the rebuilt message in the same way createXxxMessage does
       // so the sendMessage path can find it via id lookup.
@@ -6812,12 +7147,6 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
             groupID: groupID,
             accountToxId: stored.accountToxId,
           );
-          if (stored.accountToxId != null) {
-            await Tim2ToxFailedMessagePersistence.removeFailedMessagesByIDs(
-              messageIDs: {realMsgID},
-              accountToxId: null,
-            );
-          }
         } catch (_) {
           // Non-fatal: the message is sent; failure to clean up is just
           // a stale entry.
@@ -7572,12 +7901,11 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
       // Refresh the sender's conversation preview. The local delete above
       // dropped the recalled message, so the sidebar must re-render off the
       // newest remaining message rather than stranding the recalled text.
-      // (Group conversations have no dedicated notify helper yet; the group
-      // recall preview refresh is a documented residual.)
-      final String? notifyC2C = message.userID;
-      if (notifyC2C != null && notifyC2C.isNotEmpty) {
-        await _refreshConversationPreviewC2C(notifyC2C);
-      }
+      // Group recalls refresh the group conversation the same way.
+      await _refreshConversationPreviewFor(
+        groupId: message.groupID,
+        userId: message.userID,
+      );
 
       return V2TimCallback(
         code: 0,
@@ -7786,6 +8114,23 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
               // (non-matching) msgID either — clear the target so we swallow
               // the signal without deleting a wrong/uncertain row.
               targetMsgID = null;
+            } else {
+              // Legacy signal carrying only a msgID. `deleteMessages` matches
+              // that id across EVERY conversation with no author check, so a
+              // peer-supplied id used to be able to remove someone else's
+              // row (receiver-local ids leak in legacy-conference receipts).
+              // Honor it only when it names a row in THIS conversation that
+              // the signal's sender wrote.
+              final legacy = revokedID == null || revokedID.isEmpty
+                  ? const <ChatMessage>[]
+                  : history
+                      .where((m) =>
+                          (m.msgID == revokedID ||
+                              m.altMsgIds.contains(revokedID)) &&
+                          ConversationIdUtils.normalize(m.fromUserId) ==
+                              senderUid)
+                      .toList();
+              targetMsgID = legacy.length == 1 ? legacy.single.msgID : null;
             }
           }
 
@@ -7932,7 +8277,8 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
       // persisted group recvOpt. Mirrors _refreshConversationPreviewC2C; closes
       // the "a group message arrives in the window right after muting" race.
       try {
-        final convRes = await getConversation(conversationID: 'group_$groupID');
+        final convRes =
+            await _getConversation('group_$groupID', openChat: false);
         final conv = convRes.data;
         if (conv != null) {
           _notifyConversationListeners((listener) {
@@ -7959,6 +8305,7 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
     try {
       // Clear C2C history via FfiChatService
       await ffiService.clearC2CHistory(userID);
+      await _clearFailedRowsForConversation(userID: userID);
 
       // Trigger message list refresh in UIKit
       // This ensures the chat window updates after clearing history
@@ -8029,6 +8376,7 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
     try {
       // Clear group history via FfiChatService
       await ffiService.clearGroupHistory(groupID);
+      await _clearFailedRowsForConversation(groupID: groupID);
 
       // Trigger message list refresh in UIKit
       // This ensures the chat window updates after clearing history
@@ -8042,7 +8390,7 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
       try {
         final conversationID = 'group_$groupID';
         final convResult =
-            await getConversation(conversationID: conversationID);
+            await _getConversation(conversationID, openChat: false);
         if (convResult.code == 0 && convResult.data != null) {
           // Notify conversation listeners that the conversation has changed
           // This will update the conversation list to show no last message
@@ -9148,8 +9496,19 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
   Future<void> addGroupListener({
     required V2TimGroupListener listener,
   }) async {
+    // The per-instance list routes callbacks between auto_test nodes; like the
+    // other listener kinds it is for test instances only. It used to be filled
+    // for instance 0 (the product) too, without dedupe and with no removal:
+    // dispatch prefers a non-empty instance list, so UIKit's remove-then-add
+    // re-registration multiplied every group callback and a removed listener
+    // kept firing.
     final id = ffi_lib.Tim2ToxFfi.open().getCurrentInstanceId();
-    (_instanceGroupListeners[id] ??= []).add(listener);
+    if (id != 0) {
+      final instanceListeners = _instanceGroupListeners[id] ??= [];
+      if (!instanceListeners.contains(listener)) {
+        instanceListeners.add(listener);
+      }
+    }
     if (!_groupListeners.contains(listener)) {
       _groupListeners.add(listener);
     }
@@ -9170,6 +9529,9 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
   }) async {
     if (listener != null) {
       _groupListeners.remove(listener);
+      for (final instanceListeners in _instanceGroupListeners.values) {
+        instanceListeners.remove(listener);
+      }
     }
   }
 
@@ -9228,7 +9590,9 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
         listener.onGroupCreated?.call(gid);
         listener.onGroupInfoChanged?.call(gid, [
           V2TimGroupChangeInfo(
-            type: 0, // V2TIM_GROUP_INFO_CHANGE_TYPE_NAME
+            // Was the literal 0 (= INVALID): consumers switch on these
+            // constants, so the change was dropped.
+            type: GroupChangeInfoType.V2TIM_GROUP_INFO_CHANGE_TYPE_NAME,
             value: groupName,
           )
         ]);
@@ -9395,6 +9759,43 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
     }
   }
 
+  /// Member count from the live Tox peer list, plus OUR role in the group
+  /// read from the same rows.
+  ///
+  /// `V2TimGroupInfo.role` used to be left null. UIKit's group-announcement
+  /// page evaluates `groupInfo.role!` in build(), so opening it threw on every
+  /// platform, and every role-gated group-management row was blind.
+  Future<({int? memberCount, int selfRole})> _memberCountAndSelfRole(
+      String groupID, String? groupOwner) async {
+    final selfKey = ffiService
+        .normalizeToxId(ffiService.getSelfToxId() ?? ffiService.selfId)
+        .toUpperCase();
+    int? memberCount;
+    int? selfRole;
+    try {
+      final memberResult = await getGroupMemberList(
+          groupID: groupID, nextSeq: '0', count: 1000, filter: 0);
+      final members = memberResult.data?.memberInfoList;
+      if (memberResult.code == 0 && members != null) {
+        memberCount = members.length;
+        for (final member in members) {
+          if (member.userID.toUpperCase() == selfKey) {
+            selfRole = member.role;
+            break;
+          }
+        }
+      }
+    } catch (_) {}
+    // No self row yet (not connected to the group): the locally recorded
+    // owner is the only role evidence there is.
+    selfRole ??= (groupOwner != null &&
+            groupOwner.isNotEmpty &&
+            ffiService.normalizeToxId(groupOwner).toUpperCase() == selfKey)
+        ? GroupMemberRoleType.V2TIM_GROUP_MEMBER_ROLE_OWNER
+        : GroupMemberRoleType.V2TIM_GROUP_MEMBER_ROLE_MEMBER;
+    return (memberCount: memberCount, selfRole: selfRole);
+  }
+
   @override
   Future<V2TimValueCallback<List<V2TimGroupInfoResult>>> getGroupsInfo({
     required List<String> groupIDList,
@@ -9410,16 +9811,8 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
         final groupIntroduction = await _prefs?.getGroupIntroduction(groupID);
         final groupOwner = await _prefs?.getGroupOwner(groupID);
 
-        // Get member count from actual Tox peer list
-        int? memberCount;
-        try {
-          final memberResult = await getGroupMemberList(
-              groupID: groupID, nextSeq: '0', count: 1000, filter: 0);
-          if (memberResult.code == 0 &&
-              memberResult.data?.memberInfoList != null) {
-            memberCount = memberResult.data!.memberInfoList!.length;
-          }
-        } catch (_) {}
+        final membership = await _memberCountAndSelfRole(groupID, groupOwner);
+        final memberCount = membership.memberCount;
 
         // Project the locally-persisted group DND so the group-profile
         // do-not-disturb switch reflects the saved state on reopen (Tox has no
@@ -9437,13 +9830,15 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
         final groupInfo = V2TimGroupInfo(
           groupID: groupID,
           groupType: _groupTypeForGroupInfo(groupID),
-          groupName: groupName ?? groupID,
+          groupName:
+              groupName ?? ffiService.sharedGroupName(groupID) ?? groupID,
           faceUrl: groupAvatar,
           memberCount: memberCount,
           notification: groupNotification,
           introduction: groupIntroduction,
           owner: groupOwner,
           recvOpt: groupRecvOpt,
+          role: membership.selfRole,
         );
 
         results.add(V2TimGroupInfoResult(
@@ -9466,11 +9861,66 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
     }
   }
 
+  /// A member changed the group on the network (NGC topic -> notification,
+  /// conference title -> name). Store it like a local edit so the change
+  /// survives a reload; the UI reads names and announcements from Prefs.
+  Future<void> _persistRemoteGroupInfoChanges(
+      String groupID, List<V2TimGroupChangeInfo> changes) async {
+    try {
+      for (final change in changes) {
+        if (change.type ==
+                GroupChangeInfoType.V2TIM_GROUP_INFO_CHANGE_TYPE_NAME &&
+            (change.value ?? '').isNotEmpty) {
+          await _prefs?.setGroupName(groupID, change.value!);
+        } else if (change.type ==
+            GroupChangeInfoType.V2TIM_GROUP_INFO_CHANGE_TYPE_NOTIFICATION) {
+          await _prefs?.setGroupNotification(groupID, change.value);
+        }
+      }
+    } catch (e, st) {
+      ffiService.logger?.logError(
+          '[Tim2ToxSdkPlatform] persisting remote group change failed for $groupID',
+          e,
+          st);
+    }
+  }
+
   @override
   Future<V2TimCallback> setGroupInfo({
     required V2TimGroupInfo info,
   }) async {
     try {
+      // Publish first: an edit that did not reach the group must not be
+      // reported (and stored) as done. The announcement travels as the NGC
+      // topic; a conference's name as its title. An NGC group's name is fixed
+      // by the network, so renaming it only sets the local alias.
+      if (info.notification != null) {
+        final rc = ffiService.publishGroupInfoField(
+            info.groupID,
+            GroupChangeInfoType.V2TIM_GROUP_INFO_CHANGE_TYPE_NOTIFICATION,
+            info.notification!);
+        if (rc != 1) {
+          return V2TimCallback(
+            code: rc == -2 ? 10007 : -1,
+            desc: rc == -2
+                ? 'No permission to change the group announcement'
+                : 'Failed to publish the group announcement',
+          );
+        }
+      }
+      if (info.groupName != null) {
+        // Best effort: only a conference title travels; for every other group
+        // the local alias below is the whole rename.
+        final rc = ffiService.publishGroupInfoField(
+            info.groupID,
+            GroupChangeInfoType.V2TIM_GROUP_INFO_CHANGE_TYPE_NAME,
+            info.groupName!);
+        if (rc != 1) {
+          ffiService.logger?.log(
+              '[Tim2ToxSdkPlatform] setGroupInfo: name not published for ${info.groupID} (rc=$rc); local alias only');
+        }
+      }
+
       // Save group info to Prefs
       if (info.groupName != null) {
         await _prefs?.setGroupName(info.groupID, info.groupName!);
@@ -9492,25 +9942,30 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
       final changeInfos = <V2TimGroupChangeInfo>[];
       if (info.groupName != null) {
         changeInfos.add(V2TimGroupChangeInfo(
-          type: 0, // V2TIM_GROUP_INFO_CHANGE_TYPE_NAME
+          // These four were hand-written literals that did not match the SDK
+          // (0/3/1/2 for NAME/FACE_URL/NOTIFICATION/INTRODUCTION; the real
+          // values are 1/4/3/2). UIKit's updateGroupInfo switches on the
+          // constants: a rename matched nothing, and an announcement (sent
+          // as 1 = NAME) overwrote the group's NAME in the contacts list.
+          type: GroupChangeInfoType.V2TIM_GROUP_INFO_CHANGE_TYPE_NAME,
           value: info.groupName!,
         ));
       }
       if (info.faceUrl != null) {
         changeInfos.add(V2TimGroupChangeInfo(
-          type: 3, // V2TIM_GROUP_INFO_CHANGE_TYPE_FACE_URL
+          type: GroupChangeInfoType.V2TIM_GROUP_INFO_CHANGE_TYPE_FACE_URL,
           value: info.faceUrl!,
         ));
       }
       if (info.notification != null) {
         changeInfos.add(V2TimGroupChangeInfo(
-          type: 1, // V2TIM_GROUP_INFO_CHANGE_TYPE_NOTIFICATION
+          type: GroupChangeInfoType.V2TIM_GROUP_INFO_CHANGE_TYPE_NOTIFICATION,
           value: info.notification!,
         ));
       }
       if (info.introduction != null) {
         changeInfos.add(V2TimGroupChangeInfo(
-          type: 2, // V2TIM_GROUP_INFO_CHANGE_TYPE_INTRODUCTION
+          type: GroupChangeInfoType.V2TIM_GROUP_INFO_CHANGE_TYPE_INTRODUCTION,
           value: info.introduction!,
         ));
       }
@@ -9575,26 +10030,20 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
         final groupIntroduction = await _prefs?.getGroupIntroduction(groupID);
         final groupOwner = await _prefs?.getGroupOwner(groupID);
 
-        // Get member count from actual Tox peer list
-        int? memberCount;
-        try {
-          final memberResult = await getGroupMemberList(
-              groupID: groupID, nextSeq: '0', count: 1000, filter: 0);
-          if (memberResult.code == 0 &&
-              memberResult.data?.memberInfoList != null) {
-            memberCount = memberResult.data!.memberInfoList!.length;
-          }
-        } catch (_) {}
+        final membership = await _memberCountAndSelfRole(groupID, groupOwner);
+        final memberCount = membership.memberCount;
 
         final groupInfo = V2TimGroupInfo(
           groupID: groupID,
           groupType: _groupTypeForGroupInfo(groupID),
-          groupName: groupName ?? groupID,
+          groupName:
+              groupName ?? ffiService.sharedGroupName(groupID) ?? groupID,
           faceUrl: groupAvatar,
           memberCount: memberCount,
           notification: groupNotification,
           introduction: groupIntroduction,
           owner: groupOwner,
+          role: membership.selfRole,
         );
         groupInfoList.add(groupInfo);
       }
@@ -9975,11 +10424,16 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
     String? nameCard,
     Map<String, String>? customInfo,
   }) async {
-    // Group member info is stored locally, not in FfiChatService
-    // For now, just return success
-    return V2TimCallback(
-      code: 0,
-      desc: 'success',
+    // This used to return success WITHOUT doing anything: "My group nickname"
+    // confirmed the edit, showed nothing on reopen, and no peer ever saw it.
+    // Native does the right thing already — our own name card becomes the NGC
+    // self name (tox_group_self_set_name, broadcast to the group and kept in
+    // the savefile); another member's is a local override.
+    return TIMGroupManager.instance.setGroupMemberInfo(
+      groupID: groupID,
+      userID: userID,
+      nameCard: nameCard,
+      customInfo: customInfo,
     );
   }
 
@@ -9989,9 +10443,12 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
     required String userID,
     required int seconds,
   }) async {
-    return V2TimCallback(
-      code: TIMErrCode.ERR_SDK_INTERFACE_NOT_SUPPORT.value,
-      desc: 'Not supported',
+    // Real now: native maps it to the NGC OBSERVER role (toxcore refuses an
+    // observer's sends group-wide); seconds == 0 restores USER. Not timed.
+    return TIMGroupManager.instance.muteGroupMember(
+      groupID: groupID,
+      userID: userID,
+      seconds: seconds,
     );
   }
 
@@ -10006,8 +10463,33 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
     // tox_group_invite_friend). The block below was a no-op stub that returned
     // success WITHOUT actually inviting (the invite never reached C++), so a
     // peer never received it. TIMGroupManager goes straight to the FFI bindings.
-    return TIMGroupManager.instance
+    final result = await TIMGroupManager.instance
         .inviteUserToGroup(groupID: groupID, userList: userList);
+    // GI-6: a friend who is offline cannot receive the invite now. Keep it
+    // and deliver it when they come online; report it as PENDING (3), which
+    // UIKit presents as "waiting", instead of a FAIL that lost it. Native
+    // reports an undeliverable invite as FAIL (0) whatever the reason (the
+    // offline case is toxcore's INVITE_FAIL / NO_CONNECTION), so the reason is
+    // read from the friend's LIVE transport status, not from the lazily
+    // filled online cache (empty right after login).
+    if (result.code == 0 && result.data != null) {
+      for (final op in result.data!) {
+        final id = op.memberID;
+        if (op.result != 0 || id == null || id.isEmpty) continue;
+        if (!ffiService.isFriendNotConnected(id)) continue;
+        try {
+          await ffiService.queueGroupInviteForOfflineFriend(groupID, id);
+          op.result = 3;
+        } catch (e, st) {
+          // Not queued: stays FAIL, which is the truth.
+          ffiService.logger?.logError(
+              '[Tim2ToxSdkPlatform] queueing offline group invite failed',
+              e,
+              st);
+        }
+      }
+    }
+    return result;
     // ignore: dead_code
     try {
       // Call C++ implementation via FFI
@@ -10202,9 +10684,13 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
     required String groupID,
     required String userID,
   }) async {
-    return TIMGroupManager.instance.transferGroupOwner(
-      groupID: groupID,
-      userID: userID,
+    // The native adapter sends the new owner through DartSetGroupInfo, which
+    // ignores the owner field and reports success — so the UI showed a
+    // completed transfer that never happened. An NGC founder role cannot be
+    // handed over at all (tox_group_set_role rejects FOUNDER as a target).
+    return V2TimCallback(
+      code: TIMErrCode.ERR_SDK_INTERFACE_NOT_SUPPORT.value,
+      desc: 'Group ownership cannot be transferred on Tox',
     );
   }
 
@@ -10964,4 +11450,28 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
       }
     }
   }
+}
+
+/// The V2TIM history time range (`getTimeBegin` / `getTimePeriod`, UTC
+/// seconds) as inclusive bounds, `null` bound = unbounded; `null` when the
+/// query carries no range. Per V2TIMMessageListGetOption: the interval is
+/// closed and its direction follows getType — OLDER is
+/// `[timeBegin - timePeriod, timeBegin]`, NEWER `[timeBegin, timeBegin +
+/// timePeriod]`; timeBegin 0 means "now" and timePeriod 0 "no limit".
+@visibleForTesting
+({int? from, int? to})? historyTimeRange({
+  required bool newer,
+  int? timeBegin,
+  int? timePeriod,
+  int? nowSeconds,
+}) {
+  final begin = (timeBegin ?? 0) > 0 ? timeBegin! : null;
+  final period = (timePeriod ?? 0) > 0 ? timePeriod! : null;
+  if (begin == null && period == null) return null;
+  final start =
+      begin ?? nowSeconds ?? DateTime.now().millisecondsSinceEpoch ~/ 1000;
+  if (newer) {
+    return (from: start, to: period == null ? null : start + period);
+  }
+  return (from: period == null ? null : start - period, to: begin);
 }

@@ -155,7 +155,8 @@ TEST(GroupCanonicalIdentitySourceRegressionTest,
         self_join.find(
             "HandleGroupSelfJoin: refusing to publish temporary group alias"),
         std::string::npos);
-    EXPECT_NE(self_join.find("DartNotifyGroupJoin(groupID.CString())"),
+    EXPECT_NE(self_join.find("DartNotifyGroupJoin(groupID.CString(), "
+                             "GetInstanceIdFromManager(this), GetSessionEpoch())"),
               std::string::npos);
     EXPECT_EQ(self_join.find("DartNotifyGroupJoin(tempGroupID"),
               std::string::npos);

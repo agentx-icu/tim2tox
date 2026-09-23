@@ -753,6 +753,14 @@ class ToxAVService implements CallAvBackend {
   }
 
   /// Disable conference audio
+  ///
+  /// A native refusal is ambiguous: `DisableAVConferenceAudio` returns false
+  /// both for a real failure AND when the group is unknown / no longer a
+  /// conference — i.e. exactly when nothing is enabled. Keeping the cache
+  /// entry in the second case made a later re-join short-circuit
+  /// [enableConferenceAudio] and report a joined session with no audio in
+  /// either direction. So a refusal is only kept (for the caller's retry)
+  /// while native still says the audio is ON.
   Future<bool> disableConferenceAudio(String groupId) async {
     if (groupId.isEmpty || !_initialized) return false;
     final wasTracked = _enabledConferenceAudioGroups.contains(groupId) ||
@@ -761,7 +769,23 @@ class ToxAVService implements CallAvBackend {
 
     try {
       final result = _ffi.avConferenceDisable(_boundInstanceId, groupId);
-      if (result != 1) return false;
+      if (result != 1) {
+        // 1 = still on, 0 = a known conference with it off, -1 = nothing to
+        // answer about (the group is gone / not a conference), -2 = the
+        // export is missing so the question could not be put.
+        //
+        // Only -2 keeps a failed disable pending: reporting success there
+        // would leave audio running. A definite 0 or native's -1 means there
+        // is nothing left to disable, so the entry must go — leaving it is
+        // what made a later re-join short-circuit into a silent session.
+        final state = _ffi.avConferenceIsEnabled(_boundInstanceId, groupId);
+        if (state == 1 || state == Tim2ToxFfi.conferenceAudioStateUnavailable) {
+          return false; // still on, or unknowable: keep it for the retry
+        }
+        _enabledConferenceAudioGroups.remove(groupId);
+        _mutedConferenceAudioGroups.remove(groupId);
+        return true;
+      }
       _enabledConferenceAudioGroups.remove(groupId);
       _mutedConferenceAudioGroups.remove(groupId);
       return true;

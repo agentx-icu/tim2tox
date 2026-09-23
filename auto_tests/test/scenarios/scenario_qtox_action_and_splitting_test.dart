@@ -18,6 +18,7 @@ import 'package:tencent_cloud_chat_sdk/models/v2_tim_group_member_info.dart';
 import 'package:tencent_cloud_chat_sdk/models/v2_tim_message.dart';
 import 'package:tencent_cloud_chat_sdk/models/v2_tim_value_callback.dart';
 import 'package:tencent_cloud_chat_sdk/native_im/adapter/tim_group_manager.dart';
+import 'package:tencent_cloud_chat_sdk/native_im/adapter/tim_manager.dart';
 import 'package:tencent_cloud_chat_sdk/native_im/adapter/tim_message_manager.dart';
 import 'package:tencent_cloud_chat_sdk/native_im/bindings/native_library_manager.dart';
 import 'package:tencent_cloud_chat_sdk/native_im/tools.dart';
@@ -482,6 +483,17 @@ void main() {
           }
           expect(inviteArrived, isTrue);
           expect(invitedGroupId, isNotNull);
+
+          // "Auto-accept group invites" is off by default and a legacy
+          // conference invite honors it like an NGC invite does: it waits for
+          // an answer instead of joining unasked. Accept it explicitly.
+          final accepted = await bob.runWithInstanceAsync(
+            () async => TIMManager.instance.joinGroup(
+              groupID: invitedGroupId!,
+              message: '',
+            ),
+          );
+          expect(accepted.code, 0, reason: accepted.desc);
 
           await pumpTestTick(
             scenario,

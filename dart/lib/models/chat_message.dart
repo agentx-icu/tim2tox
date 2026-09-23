@@ -51,6 +51,104 @@ String mergeChatMessageContentKindLocalCustomData(
   return jsonEncode(merged);
 }
 
+/// `localCustomData` key under which the native advanced listener delivers an
+/// inbound NGC group message's `Tox_Group_Message_Id` (a uint32 the sender
+/// mints and every member decodes identically). The polled `gtext:` /
+/// `gaction:` line carries the same value as its `|m<id>` header segment.
+const String toxGroupMsgIdLocalCustomDataKey = 'toxGroupMsgId';
+
+/// Prefix of the cross-path / cross-peer group message identity
+/// ([toxGroupMessageAlias]) stored in [ChatMessage.altMsgIds].
+const String toxGroupMessageAliasPrefix = 'gmid:';
+
+/// The `Tox_Group_Message_Id` carried in a V2TIM message's `localCustomData`,
+/// or null when absent. Tolerant: empty, non-JSON, non-object, a missing key,
+/// or a value that is not an integral uint32 all mean "no id" — a garbled id
+/// must never cost the message itself, it only loses exact dedupe.
+int? toxGroupMsgIdFromLocalCustomData(String? data) {
+  if (data == null || data.isEmpty) return null;
+  final trimmed = data.trimLeft();
+  if (!trimmed.startsWith('{')) return null;
+  try {
+    final decoded = jsonDecode(trimmed);
+    if (decoded is! Map<String, dynamic>) return null;
+    final value = decoded[toxGroupMsgIdLocalCustomDataKey];
+    final int? id = value is int
+        ? value
+        : (value is double && value == value.truncateToDouble()
+            ? value.toInt()
+            : null);
+    if (id == null || id < 0 || id > 0xFFFFFFFF) return null;
+    return id;
+  } on FormatException {
+    return null;
+  }
+}
+
+/// The cross-path identity of one NGC group message, scoped so that a 32-bit
+/// random pseudo id cannot collide across groups or authors. Both inbound
+/// paths stamp it into [ChatMessage.altMsgIds]: the poll path from the
+/// `gtext:` header, the binary-replacement path from [MessageConverter] via
+/// [toxGroupMsgIdFromLocalCustomData]. Both see the same per-group sender key.
+String toxGroupMessageAlias({
+  required String groupId,
+  required String senderPk,
+  required int pseudoMsgId,
+}) =>
+    '$toxGroupMessageAliasPrefix$groupId|${senderPk.toUpperCase()}|$pseudoMsgId';
+
+/// The group identity alias a row carries, or null (C2C, legacy conference,
+/// custom packets, or a native library that predates the id).
+String? toxGroupMessageAliasOf(ChatMessage message) {
+  for (final id in message.altMsgIds) {
+    if (id.startsWith(toxGroupMessageAliasPrefix)) return id;
+  }
+  final primary = message.msgID;
+  if (primary != null && primary.startsWith(toxGroupMessageAliasPrefix)) {
+    return primary;
+  }
+  return null;
+}
+
+/// Whether two rows are the same logical group message by IDENTITY:
+/// true when both carry the same [toxGroupMessageAlias], false when both carry
+/// one and they differ (two genuine messages, however identical their text),
+/// null when at least one side has no identity — only then may a caller fall
+/// back to its content+time heuristic.
+bool? chatMessagesShareGroupIdentity(ChatMessage a, ChatMessage b) {
+  final aliasA = toxGroupMessageAliasOf(a);
+  if (aliasA == null) return null;
+  final aliasB = toxGroupMessageAliasOf(b);
+  if (aliasB == null) return null;
+  return aliasA == aliasB;
+}
+
+/// Sorts [messages] in place by timestamp, STABLY: rows with equal timestamps
+/// keep their relative input order (history lists are kept in arrival order,
+/// and that order is what is persisted). `List.sort` is not stable past 32
+/// elements, so equal timestamps — whole-second native rows, same-ms bursts —
+/// used to come back in arbitrary order after a reload. With [newestFirst],
+/// ties come out latest-arrival first (the exact reverse of oldest-first).
+void sortChatMessagesChronologically(
+  List<ChatMessage> messages, {
+  bool newestFirst = false,
+}) {
+  if (messages.length < 2) return;
+  final indexed = List<(int, ChatMessage)>.generate(
+    messages.length,
+    (i) => (i, messages[i]),
+    growable: false,
+  );
+  indexed.sort((a, b) {
+    final byTime = a.$2.timestamp.compareTo(b.$2.timestamp);
+    final order = byTime != 0 ? byTime : a.$1.compareTo(b.$1);
+    return newestFirst ? -order : order;
+  });
+  for (var i = 0; i < indexed.length; i++) {
+    messages[i] = indexed[i].$2;
+  }
+}
+
 ({String text, ChatMessageContentKind contentKind}) parseOutgoingChatText(
   String text,
 ) {

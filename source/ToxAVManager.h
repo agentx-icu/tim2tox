@@ -1,9 +1,12 @@
 #ifndef TOXAV_MANAGER_H
 #define TOXAV_MANAGER_H
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
+#include <thread>
 #include <functional>
 #include "toxav/toxav.h"
 
@@ -40,6 +43,9 @@ public:
     bool startCall(uint32_t friend_number, uint32_t audio_bit_rate, uint32_t video_bit_rate);
     
     // 结束通话
+    // From inside a ToxAV/tox callback the hang-up is scheduled to run right
+    // after that iterate returns (it frees the call the iterate is still
+    // using) and true means "scheduled".
     bool endCall(uint32_t friend_number);
     
     // 接听通话
@@ -60,6 +66,13 @@ public:
     bool enableConferenceAudio(uint32_t conference_number);
     bool disableConferenceAudio(uint32_t conference_number);
     bool isConferenceAudioEnabled(uint32_t conference_number) const;
+    // Iterate lock for the legacy group AV entry points; see the definition.
+    std::unique_lock<std::mutex> lockToxIterate() const;
+    // True while the calling thread is inside this manager's iterate(), i.e.
+    // it is running a toxav_iterate() callback (audio/video frames, timeouts).
+    bool isIterateOwner() const {
+        return av_iterate_owner_.load(std::memory_order_acquire) == std::this_thread::get_id();
+    }
     
     // 发送视频帧
     bool sendVideoFrame(uint32_t friend_number, uint16_t width, uint16_t height,
@@ -110,9 +123,36 @@ private:
     V2TIMManagerImpl* manager_impl_ = nullptr;
     toxav_audio_data_cb* conference_audio_callback_ = nullptr;
     
-    // 互斥锁
-    mutable std::mutex mutex_;
-    
+    // Locking model (details at the top of ToxAVManager.cpp). Order, never
+    // reversed: av_iterate_mutex_ -> ToxManager iterate lock -> mutex_ ->
+    // callbacks_mutex_.
+    //  - av_iterate_mutex_: serializes toxav_iterate() with toxav_kill().
+    //    Held across toxav_iterate(), so callbacks run under it; nothing a
+    //    callback may call takes it (shutdown() defers, iterate() no-ops).
+    //  - mutex_: guards toxav_/tox_/manager_impl_. SHARED for every API call
+    //    (held across the toxav_* call, which is internally locked), EXCLUSIVE
+    //    only in initialize() while toxav_ is null (no ToxAV callback exists)
+    //    and in shutdown() while holding both iterate locks — so an exclusive
+    //    waiter never blocks a callback that a shared holder is waiting on.
+    //    Never held while a callback runs.
+    //  - callbacks_mutex_: leaf; guards the std::function slots and the
+    //    conference audio context. Held only to copy/assign them.
+    mutable std::mutex av_iterate_mutex_;
+    std::atomic<std::thread::id> av_iterate_owner_{};
+    mutable std::shared_mutex mutex_;
+    mutable std::mutex callbacks_mutex_;
+    std::shared_ptr<int> alive_token_ = std::make_shared<int>(0);  // see shutdown() deferral
+
+    // True when the calling thread is running a callback of this manager's
+    // toxav_iterate() or of its Tox instance's tox_iterate().
+    bool insideIterateCallback() const;
+
+    template <typename Callback>
+    Callback snapshotCallback(const Callback& slot) const {
+        std::lock_guard<std::mutex> lock(callbacks_mutex_);
+        return slot;
+    }
+
     // 回调函数
     CallCallback call_cb_;
     CallStateCallback call_state_cb_;

@@ -6,6 +6,7 @@
 import 'dart:convert';
 import 'package:tencent_cloud_chat_sdk/models/v2_tim_message.dart';
 import 'package:tencent_cloud_chat_sdk/models/v2_tim_conversation.dart';
+import 'package:tencent_cloud_chat_sdk/models/v2_tim_group_at_info.dart';
 import 'package:tencent_cloud_chat_sdk/models/v2_tim_friend_info.dart';
 import 'package:tencent_cloud_chat_sdk/models/v2_tim_friend_application.dart';
 import 'package:tencent_cloud_chat_sdk/models/v2_tim_user_full_info.dart';
@@ -20,8 +21,6 @@ import 'package:tencent_cloud_chat_sdk/models/v2_tim_file_elem.dart';
 import 'package:tencent_cloud_chat_sdk/models/v2_tim_sound_elem.dart';
 import 'package:tencent_cloud_chat_sdk/models/v2_tim_video_elem.dart';
 import 'package:tencent_cloud_chat_sdk/models/v2_tim_custom_elem.dart';
-import 'package:tencent_cloud_chat_sdk/models/v2_tim_face_elem.dart';
-import 'package:tencent_cloud_chat_sdk/models/v2_tim_location_elem.dart';
 import 'package:tencent_cloud_chat_sdk/models/v2_tim_merger_elem.dart';
 import 'package:tencent_cloud_chat_sdk/enum/image_types.dart';
 import 'dart:io';
@@ -30,7 +29,88 @@ import '../models/fake_models.dart';
 import '../service/ffi_chat_service.dart';
 import '../interfaces/extended_preferences_service.dart';
 import '../utils/control_message_envelope.dart';
+import '../utils/v2tim_control_envelope.dart';
 import 'tim2tox_sdk_platform.dart';
+
+// ---------------------------------------------------------------------------
+// Group "@me" markers (V2TimConversation.groupAtInfoList).
+//
+// The Tox wire carries neither a mention list nor server sequence numbers, so
+// a marker's `seq` is minted locally from the identity of the row that
+// mentions us ([groupAtSeqOf]), and UIKit's "@me" jump — which asks
+// getHistoryMessageListV2 for `messageSeqList: [seq, ...]` — is resolved back
+// to exactly those rows by [chatMessagesForGroupAtSeqs].
+// ---------------------------------------------------------------------------
+
+/// The seq of a marker whose mentioning row is not in memory (history not
+/// loaded yet). It resolves to no row, so the jump is a no-op instead of
+/// landing on some other message; [groupAtSeqOf] never returns it.
+const int unresolvedGroupAtSeq = 0;
+
+/// Stable, positive seq for [message]: FNV-1a (64-bit) of its msgID — or of
+/// `timestamp|sender` for a legacy id-less row — cut to 53 bits so it survives
+/// a double / JSON round trip.
+int groupAtSeqOf(ChatMessage message) {
+  final id = message.msgID;
+  return _groupAtSeqOfKey(id != null && id.isNotEmpty
+      ? id
+      : '${message.timestamp.millisecondsSinceEpoch}|${message.fromUserId}');
+}
+
+int _groupAtSeqOfKey(String key) {
+  var hash = -3750763034362895579; // 0xcbf29ce484222325 (FNV offset basis)
+  for (final unit in key.codeUnits) {
+    hash = (hash ^ unit) * 1099511628211; // FNV prime; wraps mod 2^64
+  }
+  final seq = hash & 0x1FFFFFFFFFFFFF;
+  return seq == unresolvedGroupAtSeq ? 1 : seq;
+}
+
+/// Rows of [rows] a groupAtInfo seq in [seqs] points at, newest first. A row
+/// also answers to the seq of any of its alias ids, so a hybrid-path alias
+/// merge between building the marker and the jump still resolves.
+List<ChatMessage> chatMessagesForGroupAtSeqs(
+    Iterable<ChatMessage> rows, Iterable<int> seqs) {
+  final wanted = seqs.where((s) => s != unresolvedGroupAtSeq).toSet();
+  if (wanted.isEmpty) return <ChatMessage>[];
+  final hits = rows
+      .where((m) =>
+          wanted.contains(groupAtSeqOf(m)) ||
+          m.altMsgIds.any((alias) => wanted.contains(_groupAtSeqOfKey(alias))))
+      .toList();
+  sortChatMessagesChronologically(hits, newestFirst: true);
+  return hits;
+}
+
+/// The groupAtInfoList for a group conversation — ALWAYS a list, empty once
+/// nothing unread mentions us. UIKit merges conversation updates as
+/// `incoming.groupAtInfoList ?? existing.groupAtInfoList`, so leaving it null
+/// (the constructor default) never cleared a marker already shown. One entry
+/// per unread mention (atType 1 = AT_ME) whose seq resolves back to that row.
+///
+/// [openChat]: the conversation is being loaded BY its open chat page (the
+/// public getConversation), which reads its "@me" jump targets from this
+/// list. Opening the group already read the mentions, so for the active group
+/// this reports [FfiChatService.openChatMentionRows] — the snapshot taken
+/// at activation. Conversation-LIST producers never pass it, so the row's
+/// marker still clears once read.
+List<V2TimGroupAtInfo> groupAtInfoListFor(
+    FfiChatService service, String groupId,
+    {bool openChat = false}) {
+  final opened =
+      openChat ? service.openChatMentionRows(groupId) : const <ChatMessage>[];
+  if (opened.isEmpty && !service.hasUnreadMention(groupId)) {
+    return <V2TimGroupAtInfo>[];
+  }
+  final rows = opened.isNotEmpty ? opened : service.unreadMentionRows(groupId);
+  if (rows.isEmpty) {
+    return [V2TimGroupAtInfo(seq: '$unresolvedGroupAtSeq', atType: 1)];
+  }
+  return [
+    for (final row in rows)
+      V2TimGroupAtInfo(seq: '${groupAtSeqOf(row)}', atType: 1),
+  ];
+}
 
 /// Extension methods for Tim2ToxSdkPlatform to handle type conversions
 extension Tim2ToxSdkPlatformConverters on Tim2ToxSdkPlatform {
@@ -343,28 +423,11 @@ extension Tim2ToxSdkPlatformConverters on Tim2ToxSdkPlatform {
     // Set element type based on mediaKind
     // NOTE: elemType is already set when creating V2TimMessage, but we set it again here for clarity
     // This is redundant but harmless
-    if (controlEnvelope is FaceTextEnvelope) {
-      msg.faceElem = V2TimFaceElem(
-        index: controlEnvelope.payload['index'] as int?,
-        data: controlEnvelope.payload['data'] as String?,
-      );
-      msg.elemList.add(msg.faceElem!);
-    } else if (controlEnvelope is LocationTextEnvelope) {
-      final longitude = controlEnvelope.payload['longitude'] as num?;
-      final latitude = controlEnvelope.payload['latitude'] as num?;
-      msg.locationElem = V2TimLocationElem(
-        desc: controlEnvelope.payload['desc'] as String?,
-        longitude: longitude!.toDouble(),
-        latitude: latitude!.toDouble(),
-      );
-      msg.elemList.add(msg.locationElem!);
-    } else if (controlEnvelope is CustomTextEnvelope) {
-      msg.customElem = V2TimCustomElem(
-        data: controlEnvelope.rawPayload,
-        desc: '',
-        extension: '',
-      );
-      msg.elemList.add(msg.customElem!);
+    // Face / location / custom wire envelopes: the shared helper is also what
+    // the native ReceiveNewMessage fan-out uses, so live and reloaded rows
+    // render identically.
+    if (attachControlEnvelopeElem(msg, controlEnvelope)) {
+      // attached
     } else if (chatMsg.mediaKind == 'image') {
       // msg.elemType is already set to MessageElemType.V2TIM_ELEM_TYPE_IMAGE
       if (chatMsg.filePath != null) {
@@ -510,7 +573,8 @@ extension Tim2ToxSdkPlatformConverters on Tim2ToxSdkPlatform {
 
   /// Convert FakeConversation to V2TimConversation
   Future<V2TimConversation> fakeConversationToV2TimConversation(
-      FakeConversation fakeConv) async {
+      FakeConversation fakeConv,
+      {bool openChat = false}) async {
     final conv = V2TimConversation(conversationID: fakeConv.conversationID);
     conv.type = fakeConv.isGroup
         ? ConversationType.V2TIM_GROUP
@@ -526,6 +590,12 @@ extension Tim2ToxSdkPlatformConverters on Tim2ToxSdkPlatform {
     conv.faceUrl = fakeConv.faceUrl;
     conv.unreadCount = fakeConv.unreadCount;
     conv.isPinned = fakeConv.isPinned;
+    if (fakeConv.isGroup) {
+      // Always a list for a group (see [groupAtInfoListFor]): a null left the
+      // "[@me]" marker stuck after the mention was read.
+      conv.groupAtInfoList =
+          groupAtInfoListFor(ffiService, conv.groupID!, openChat: openChat);
+    }
 
     final draft =
         await ffiService.loadConversationDraft(fakeConv.conversationID);

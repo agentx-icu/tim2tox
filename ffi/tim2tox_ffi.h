@@ -67,6 +67,15 @@ int tim2tox_ffi_is_instance_initialized(int64_t instance_id);
 // Unlike ambient APIs, instance_id 0 always means the default instance.
 int tim2tox_ffi_is_instance_event_loop_running(int64_t instance_id);
 
+// Epoch of the exact instance's live InitSDK..UnInitSDK session, or 0 when it
+// has none (not initialized, torn down, unknown handle). Process-unique and
+// never reused. The group notifications without user_data
+// (groupQuitNotification, groupJoinNotification, groupInviteNotification,
+// groupJoinFailedNotification, groupChatIdStored, groupTypeStored) carry
+// "instance_id" and "session_epoch"; a client applies one only while this
+// returns that epoch for that instance. instance_id 0 = the default instance.
+int64_t tim2tox_ffi_get_session_epoch(int64_t instance_id);
+
 // Run N iterations on current instance (for tests: accelerate Tox group peer discovery).
 // Call from test with set_current_instance set to founder then member1 in turn.
 // Returns 1 on success, 0 if current instance or ToxManager is null.
@@ -154,6 +163,15 @@ int tim2tox_ffi_send_group_custom(const char* group_id, const unsigned char* dat
 // Returns number of bytes written (excluding terminating 0), or 0 if none.
 int tim2tox_ffi_poll_text(int64_t instance_id, char* buffer, int buffer_len);
 
+// The text-event queue behind tim2tox_ffi_poll_text is bounded (process-wide
+// 64K events / 32 MiB before eviction). When full, the oldest typing /
+// intermediate-progress events go first, then the oldest chat messages;
+// state events (connection, file requests / completion, profile changes)
+// are never evicted for room and are refused only past a hard cap of twice
+// that. Returns how many events of `event_class` were dropped since process
+// start: 0 = lossy (typing / progress), 1 = chat, 2 = state, -1 = all.
+int64_t tim2tox_ffi_get_text_queue_drop_count(int32_t event_class);
+
 // Poll next received custom/binary message. Returns bytes written into buffer or 0 if none.
 int tim2tox_ffi_poll_custom(unsigned char* buffer, int buffer_len);
 
@@ -218,8 +236,41 @@ int tim2tox_ffi_set_typing(const char* user_id, int typing_on);
 // Create group with optional name; writes groupID into out buffer; returns bytes written
 // group_type: "group" for new Tox Group API, "conference" for old Conference API
 int tim2tox_ffi_create_group(const char* group_name, const char* group_type, char* out_group_id, int out_len);
+// 1 = joined, 0 = failed, 2 = already a member of that group (no change).
 int tim2tox_ffi_join_group(const char* group_id, const char* request_msg);
+// tim2tox_ffi_join_group for a password-protected group (join by chat id or
+// accept an invite to one). Same return values.
+int tim2tox_ffi_join_group_with_password(const char* group_id, const char* password);
+// Group invites waiting for the user's answer (auto-accept off). Writes one
+// line per invite:
+//   "<invite_id>\t<inviter_pubkey_hex>\t<kind>\t<group_name>\t<received_ms>\t<cookie_hex>\n"
+// where kind is "group" | "conference" | "av_conference" and group_name has
+// tab/CR/LF replaced by spaces (empty for conferences). Accept an invite with
+// tim2tox_ffi_join_group(invite_id, ...). Returns bytes written, 0 if none,
+// the negated required size when the buffer is too small, or INT32_MIN when
+// there is no answer to give (instance not initialized, bad arguments). The
+// caller persists this list, so "cannot answer" must not read as "none": an
+// empty answer erases the stored copy.
+#define TIM2TOX_FFI_PENDING_INVITES_UNAVAILABLE (-2147483647 - 1)
+int tim2tox_ffi_get_pending_group_invites(char* buffer, int buffer_len);
+// Decline (forget) a pending invite. 1 = removed, 0 = unknown id.
+int tim2tox_ffi_reject_group_invite(const char* invite_id);
+// Re-create an unanswered invite the client saved in an earlier session (the
+// fields are those of a tim2tox_ffi_get_pending_group_invites line). 1 = now
+// pending, 0 = rejected (bad fields, or the inviter is no longer a friend).
+int tim2tox_ffi_restore_group_invite(const char* invite_id, const char* inviter_pubkey_hex,
+                                     const char* kind, const char* group_name,
+                                     int64_t received_ms, const char* cookie_hex);
 int tim2tox_ffi_send_group_text(const char* group_id, const char* text);
+// Can a message sent to this group reach anyone right now?
+//   1  = yes (NGC group connected to at least one peer at some point this
+//        session, or a legacy conference, which has no such state)
+//   0  = known NGC group still connecting (restored from the savefile and no
+//        peer handshake yet). tox_group_send_message SUCCEEDS in that state —
+//        gc_send_message treats "zero confirmed peers" as success — so the
+//        message would be reported sent and reach nobody.
+//   -1 = no such group mapped (let the send fail the normal way)
+int tim2tox_ffi_group_wire_ready(const char* group_id);
 // Tox NGC pseudo message id of the group message most recently sent on this
 // thread (first fragment), or -1 if the last send produced none. Valid only
 // immediately after a successful group send on the same thread.
@@ -275,6 +326,16 @@ int tim2tox_ffi_get_group_type_from_storage(int64_t instance_id, const char* gro
 // Returns: 1 on success, 0 on error
 int tim2tox_ffi_get_group_chat_id_from_storage(int64_t instance_id, const char* group_id, char* out_chat_id, int out_len);
 
+// Every persistable group identity (NGC chat id / conference id) and kind the
+// native side knows for this instance, one line per group:
+//   "<group_id>\t<chat_id_hex_lower>\t<group_type>\n"   (either value may be empty)
+// The client persists these after it is ready to: the groupChatIdStored /
+// groupTypeStored pushes that fire earlier (restore / rejoin during login,
+// before a SendPort or callback handler exists) are otherwise lost.
+// instance_id: 0 = current instance. Returns bytes written, 0 if none (or
+// unknown instance), or the negated required size when the buffer is too small.
+int tim2tox_ffi_get_group_identity_snapshot(int64_t instance_id, char* buffer, int buffer_len);
+
 // Get count of conferences restored from savedata (for Dart to discover and assign group_ids)
 // instance_id: 0 = current instance
 // Returns: count (>= 0), or -1 on error
@@ -297,6 +358,43 @@ int tim2tox_ffi_rejoin_known_groups(void);
 // enabled: 1 to enable auto-accept, 0 to disable
 // Returns: 1 on success, 0 on failure
 int tim2tox_ffi_set_auto_accept_group_invites(int64_t instance_id, int enabled);
+
+// Highest tox_<n> group-id suffix the account has ever used (including groups
+// it left / was kicked from / dismissed). Newly minted ids are allocated above
+// it so a retired id is never handed to a different group.
+// Returns: 1 on success, 0 on failure
+int tim2tox_ffi_set_retired_group_id_max(int64_t instance_id, uint64_t max_id);
+
+// Long-term public key (64 hex) of the friend behind an NGC per-group member
+// key, when that friend proved it over the friend channel. Writes a
+// NUL-terminated string; returns bytes written, 0 when unknown.
+int tim2tox_ffi_get_group_member_friend(const char* member_key, char* out, int out_len);
+
+// Send a group message receipt ("received"/"read") privately to the message's
+// author (their per-group public key). Returns 1 sent, -2 unsupported on this
+// group kind (legacy conference), 0 failure.
+int tim2tox_ffi_send_group_receipt(int64_t instance_id, const char* group_id,
+                                   const char* author_key_hex, const char* msg_id,
+                                   const char* receipt_type);
+
+// Publish a group edit to the Tox network. field: 1 = name (a conference's
+// title; an NGC group's name is fixed, so only the local alias changes),
+// 3 = notification (the NGC topic; conferences keep it local).
+// Returns: 1 ok, -2 not permitted (topic lock), 0 failure
+int tim2tox_ffi_set_group_info_field(int64_t instance_id, const char* group_id,
+                                     int field, const char* value);
+
+// May we set this NGC group's topic (its announcement) right now? Follows
+// toxcore's rule: observers never; with the topic lock on (a new group's
+// default) only the founder and moderators.
+// Returns: 1 yes, 0 no, -1 unknown (legacy conference, unmapped group, or the
+// state query failed) — the caller falls back to its own role rule.
+int tim2tox_ffi_can_set_group_topic(int64_t instance_id, const char* group_id);
+
+// The group's shared name (NGC name / conference title). Writes a
+// NUL-terminated UTF-8 string into out. Returns bytes written, 0 if unknown.
+int tim2tox_ffi_get_group_name(int64_t instance_id, const char* group_id,
+                               char* out, int out_len);
 
 // Get auto-accept group invites setting (called from C++ before accepting invites)
 // Returns: 1 if enabled, 0 if disabled
@@ -656,6 +754,12 @@ int tim2tox_ffi_av_conference_send_audio_frame(
     size_t sample_count, uint8_t channels, uint32_t sampling_rate);
 int tim2tox_ffi_av_conference_enable(int64_t instance_id, const char* group_id);
 int tim2tox_ffi_av_conference_disable(int64_t instance_id, const char* group_id);
+
+// Is conference audio enabled for this group? 1 = yes, 0 = a known conference
+// with AV off, -1 = nothing to answer about (unknown group, not a conference,
+// no AV manager, or toxav not built). Lets Dart tell a failed disable from a
+// group that is simply gone.
+int tim2tox_ffi_av_conference_is_enabled(int64_t instance_id, const char* group_id);
 int tim2tox_ffi_av_conference_mute(int64_t instance_id, const char* group_id, int mute);
 
 // Helper: Get friend number by user ID

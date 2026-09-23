@@ -16,6 +16,7 @@ import 'package:tencent_cloud_chat_sdk/enum/friend_type_enum.dart';
 import 'package:tencent_cloud_chat_sdk/models/v2_tim_group_member_info.dart';
 import 'package:tencent_cloud_chat_sdk/native_im/adapter/tim_friendship_manager.dart';
 import 'package:tencent_cloud_chat_sdk/native_im/adapter/tim_group_manager.dart';
+import 'package:tencent_cloud_chat_sdk/native_im/adapter/tim_manager.dart';
 import 'package:tim2tox_dart/ffi/tim2tox_ffi.dart' as ffi_lib;
 import 'package:tim2tox_dart/service/toxav_service.dart';
 
@@ -127,6 +128,17 @@ Future<({String senderGroupId, String receiverGroupId})>
       () => TIMGroupManager.instance.removeGroupListener(listener: listener),
     );
   }
+
+  // "Auto-accept group invites" is off by default, and a conference / AV
+  // conference invite now honors it exactly like an NGC invite: it waits for
+  // the user's answer instead of pulling them in (and starting to decode every
+  // peer's audio) unasked. Accept it explicitly, as the app's invite prompt does.
+  final accepted = await bob.runWithInstanceAsync(
+    () async =>
+        TIMManager.instance.joinGroup(groupID: invitedGroupId!, message: ''),
+  );
+  expect(accepted.code, equals(0),
+      reason: 'accepting the AV conference invite failed: ${accepted.desc}');
 
   await _pumpAv(scenario, advanceMs: 5000, iterationsPerInstance: 2);
   final bobJoined = await bob.runWithInstanceAsync(

@@ -34,6 +34,7 @@ class V2TIMFriendshipManagerImpl;
 #include <thread>
 #include "V2TIMStringHash.h"
 #include <unordered_map>
+#include <deque>
 #include <vector>
 #include <string>
 #include "AVConferenceAudioQueue.h"
@@ -103,6 +104,13 @@ public:
     V2TIMString SendGroupTextMessage(const V2TIMString& text, const V2TIMString& groupID, V2TIMMessagePriority priority, const V2TIMBuffer& cloudCustomData, V2TIMSendCallback* callback) override;
     V2TIMString SendGroupActionMessage(const V2TIMString& text, const V2TIMString& groupID, V2TIMMessagePriority priority, V2TIMSendCallback* callback);
     V2TIMString SendGroupPrivateTextMessage(const V2TIMString& groupID, const V2TIMString& receiverPublicKey64, const V2TIMString& text, V2TIMSendCallback* callback);
+    // Deliver a "received"/"read" receipt for one group message to its AUTHOR
+    // only (NGC custom private packet under the tim2tox group-packet header).
+    // Returns 1 sent, -2 not possible on this kind of group (legacy
+    // conference: no private packets), 0 failure (author not reachable).
+    int SendGroupReceipt(const V2TIMString& groupID, const std::string& author_key_hex,
+                         const std::string& msg_id, const std::string& receipt_type);
+    Tox_Group_Peer_Number ResolveGroupPeerIdForKey(Tox_Group_Number group_number, const std::string& receiver_hex);
     V2TIMString SendGroupCustomMessage(const V2TIMBuffer& customData, const V2TIMString& groupID, V2TIMMessagePriority priority, V2TIMSendCallback* callback) override;
 
     // Group Management
@@ -110,6 +118,9 @@ public:
     void RemoveGroupListener(V2TIMGroupListener* listener) override;
     void CreateGroup(const V2TIMString& groupType, const V2TIMString& groupID, const V2TIMString& groupName, V2TIMValueCallback<V2TIMString>* callback) override;
     void JoinGroup(const V2TIMString& groupID, const V2TIMString& message, V2TIMCallback* callback) override;
+    // JoinGroup for a password-protected group (join by chat id, or accepting
+    // an invite to one). Synchronous like JoinGroup.
+    void JoinGroupWithPassword(const V2TIMString& groupID, const std::string& password, V2TIMCallback* callback);
     void QuitGroup(const V2TIMString& groupID, V2TIMCallback* callback) override;
     void DismissGroup(const V2TIMString& groupID, V2TIMCallback* callback) override;
 
@@ -152,6 +163,25 @@ public:
     V2TIMString PromoteTemporaryInviteGroupID(const V2TIMString& temp_group_id,
                                               Tox_Group_Number group_number);
     bool StoreConferenceIdentity(const V2TIMString& groupID, Tox_Group_Number conference_number);
+    // The live 32-byte identity of a mapped group: tox_conference_get_id for a
+    // conference map key (IsConferenceMapKey), the NGC chat id otherwise. Both
+    // kinds share group_id_to_chat_id_, so callers must never read one kind's
+    // identity through the other kind's API. Must not be called with mutex_ held.
+    bool GetLiveGroupIdentity(Tox_Group_Number group_number,
+                              uint8_t out_id[TOX_GROUP_CHAT_ID_SIZE]);
+    // Rebuild the groupID -> map-key mapping of a group that is live in Tox but
+    // missing from group_id_to_group_number_ (e.g. queried after a restart,
+    // before RejoinKnownGroups ran). The stored identity is resolved by the
+    // stored kind: a "conference"/"av_conference" identity only through
+    // tox_conference_by_id (stored as ConferenceMapKey), never as an NGC chat
+    // id; a labelled NGC identity only through the NGC lookup; an unlabelled
+    // identity is tried as NGC, then as a conference. allow_unmapped_ngc_bind
+    // keeps the legacy last-resort "bind the first unmapped NGC group" step for
+    // an identity-less, non-conference groupID. Returns the map key or
+    // UINT32_MAX. Must not be called with mutex_ held.
+    Tox_Group_Number RecoverGroupMapping(const std::string& group_id,
+                                         bool allow_unmapped_ngc_bind,
+                                         bool* has_stored_identity = nullptr);
     bool IsRunning() const;  // Implementation in .cpp file to avoid inline optimization issues
     bool IsEventThreadRunning() const;
     
@@ -171,13 +201,59 @@ public:
     // 2026-06-03 Toxee .hang report: main thread stuck in
     // GetGroupMemberList -> SetGroupChatIdInStorage -> mutex_.lock()).
     // Inside a scope that already holds mutex_, call the *Locked variant.
-    void SetGroupChatIdInStorage(const std::string& group_id, const std::string& chat_id_hex);
+    // from_dart: the value came FROM the Dart preferences (startup replay):
+    // record it as known there instead of echoing it back.
+    void SetGroupChatIdInStorage(const std::string& group_id, const std::string& chat_id_hex,
+                                 bool from_dart = false);
     // Same write, no locking: caller must already hold mutex_.
-    void SetGroupChatIdInStorageLocked(const std::string& group_id, const std::string& chat_id_hex);
+    void SetGroupChatIdInStorageLocked(const std::string& group_id, const std::string& chat_id_hex,
+                                       bool from_dart = false);
     bool GetGroupTypeFromStorage(const std::string& group_id, char* out_type, int out_len);
-    void SetGroupTypeInStorage(const std::string& group_id, const std::string& group_type);
+    void SetGroupTypeInStorage(const std::string& group_id, const std::string& group_type,
+                               bool from_dart = false);
+    // Every persistable (non-temporary) group identity and kind known now, as
+    // "<group_id>\t<chat_id_hex_lower>\t<group_type>\n" lines (either value may
+    // be empty). The pull side of groupChatIdStored / groupTypeStored: those
+    // pushes are lost when they fire before the client can persist them.
+    std::string SnapshotGroupIdentitiesForClient() const;
     bool GetAutoAcceptGroupInvites();
     void SetAutoAcceptGroupInvites(bool enabled);
+    // Highest tox_<n> suffix this account ever used, including groups it has
+    // since left, been kicked from or dismissed (pushed from Dart, which keeps
+    // those ids). Newly minted ids go above it: a reused id inherited the old
+    // group's persisted chat_id (-> silent rejoin of the left group), settings
+    // and retained history.
+    void SetRetiredGroupIdMax(uint64_t max_id) { retired_group_id_max_.store(max_id); }
+    uint64_t GetRetiredGroupIdMax() const { return retired_group_id_max_.load(); }
+    // Publish a group edit to the Tox network (field 1 = name, 3 =
+    // notification; see V2TIMGroupManagerImpl::SetGroupInfo for the wire
+    // mapping). Returns 1 ok, -2 not permitted, 0 failure.
+    int PublishGroupInfoField(const std::string& group_id, int field, const std::string& value);
+    // Would toxcore let us set this NGC group's topic (= its announcement)
+    // right now? Mirrors gc_set_topic's rule: observers never; with the topic
+    // lock on (the default for a new group) only the founder and moderators.
+    // Returns 1 yes, 0 no, -1 unknown (not an NGC group, not mapped, or the
+    // state query failed) — callers fall back to their own role rule.
+    int CanSetGroupTopic(const std::string& group_id);
+    // MM-6 (see friend_group_digests_). friend_number UINT32_MAX = every
+    // friend that is online right now.
+    // only_friend / only_group UINT32_MAX = all online friends / all groups.
+    void AnnounceGroupIdentities(uint32_t only_friend, Tox_Group_Number only_group);
+    void NoteFriendConnectionForIdentity(uint32_t friend_number, bool online);
+    // A friend was deleted: drop every hint, pending challenge, proven member
+    // mapping and rate window tied to it. friend_hex is its long-term key
+    // (toxcore can no longer map the number once the friend is gone).
+    void PurgeFriendIdentityState(uint32_t friend_number, const std::string& friend_hex);
+    void HandleGroupIdentityAnnouncement(uint32_t friend_number, const uint8_t* data, size_t length);
+    // A peer (re)appeared in an NGC group: index its digest and challenge
+    // every friend that claimed it.
+    void MatchGroupIdentityDigests(Tox_Group_Number group_number, const std::string& member_key);
+    void HandleGroupIdentityProof(Tox_Group_Number group_number, Tox_Group_Peer_Number peer_id,
+                                  const uint8_t* data, size_t length);
+    // Long-term key (hex) of the friend behind an NGC per-group member key, or "".
+    std::string FriendForGroupMemberKey(const std::string& member_key_hex);
+    // NGC name / conference title (or a real cached name); "" if unknown.
+    std::string ResolveSharedGroupName(const std::string& group_id);
     
 #ifdef BUILD_TOXAV
     // Helper to resolve group_number (e.g. conference_number) to groupID (for AV callbacks)
@@ -199,12 +275,27 @@ public:
     bool EnableAVConferenceAudio(const V2TIMString& group_id);
     bool DisableAVConferenceAudio(const V2TIMString& group_id);
     bool IsAVConferenceAudioEnabled(const V2TIMString& group_id) const;
+
+    /// Tri-state form of [IsAVConferenceAudioEnabled]: 1 = enabled,
+    /// 0 = a known conference with AV off, -1 = nothing to answer about (no
+    /// mapping, not a conference, no AV manager). Callers that cache "AV is
+    /// on" need the third value: a plain false made "the group is gone" look
+    /// like "still enabled but the disable failed", and the stale cache then
+    /// skipped a later enable and left a joined session with no audio.
+    int QueryAVConferenceAudioEnabled(const V2TIMString& group_id) const;
     bool MuteAVConferenceAudio(const V2TIMString& group_id, bool mute);
 #endif
     void ClearPendingAVConferenceAudioFrames();
     
     // Helper method to get ToxManager instance (for internal use)
     ToxManager* GetToxManager() { return tox_manager_.get(); }
+
+    // Identifies one InitSDK..UnInitSDK session of this object; 0 = no live
+    // session. Process-unique and never reused, so a notification stamped
+    // with it (instance_id + session_epoch, see the DartNotifyGroup* family)
+    // can be told apart from one the previous account's session emitted on
+    // the same instance id (an account switch reuses instance 0).
+    int64_t GetSessionEpoch() const { return session_epoch_.load(std::memory_order_acquire); }
 
     // Test-mode controls (auto_tests harness only). When enabled, InitSDK skips
     // starting the per-instance event_thread and installs a process-global
@@ -355,11 +446,16 @@ private:
     };
 
     struct PendingInvite {
-        uint32_t friend_number;
+        uint32_t friend_number{0};
         std::vector<uint8_t> cookie;
-        Tox_Group_Number group_number;  // Store group_number after accepting invite
+        // UINT32_MAX until the invite has been accepted. Initialized: several
+        // conference paths build a PendingInvite without setting it, and
+        // GetPendingGroupInvites() tells "unanswered" from "accepted" by it.
+        Tox_Group_Number group_number{UINT32_MAX};
         std::string inviter_userID;     // Store inviter's userID for onMemberInvited callback
         PendingInviteKind kind{PendingInviteKind::kGroupInvite};
+        std::string group_name;         // From the invite packet (NGC only; empty for conferences)
+        int64_t received_ms{0};         // Wall clock when the invite arrived
     };
     // Tox profile path used in InitSDK; UnInitSDK and SaveToxProfile use this instead of recomputing
     std::string save_path_;
@@ -381,6 +477,8 @@ private:
     std::thread::id event_thread_id_;  // Set by event thread at start; used to avoid deadlock when RunOnEventThread is called from event thread
     std::atomic<bool> event_thread_running_{false};
     std::atomic<bool> running_{true};  // Use atomic to prevent compiler optimization issues
+    std::shared_ptr<int> uninit_alive_token_ = std::make_shared<int>(0);  // a deferred UnInitSDK no-ops once this object is gone
+    std::atomic<int64_t> session_epoch_{0};  // see GetSessionEpoch()
     // Test mode: when true, InitSDK skips event_thread start and installs the
     // virtual-clock callback on tox->mono_time. Auto_tests harness only.
     std::atomic<bool> test_mode_{false};
@@ -431,6 +529,87 @@ private:
     std::unordered_map<Tox_Group_Number, std::unordered_map<std::string, Tox_Group_Peer_Number>> group_peer_id_cache_;
     // Global counter for generating unique group IDs (to avoid reusing IDs from deleted groups)
     uint64_t next_group_id_counter_;
+    std::atomic<uint64_t> retired_group_id_max_{0};
+    // What the Dart preferences already hold (sent or replayed), guarded by
+    // mutex_. Compared against instead of the live maps: most writers fill the
+    // live maps directly and then call the setter, so "changed vs live map"
+    // was false on exactly the paths that needed persisting.
+    std::unordered_map<std::string, std::string> dart_known_chat_id_;
+    std::unordered_map<std::string, std::string> dart_known_type_;
+    // MM-6: NGC members are named by per-group keys. A friend proves which
+    // per-group key is theirs over the authenticated friend channel by sending
+    // sha256(chat_id || key) digests; a match against our group's peers maps
+    // that member to the friend. Nobody outside the friendship learns anything.
+    // Everything below is guarded by mutex_, bounded (per friend AND
+    // globally) and expires; see the kIdentity* limits in the .cpp.
+    using IdentityClock = std::chrono::steady_clock;
+    // friend pk hex (upper) -> digest hex -> when the friend last sent it.
+    // Held only while the friend is online: it re-announces on reconnect.
+    std::unordered_map<std::string, std::unordered_map<std::string, IdentityClock::time_point>> friend_group_digests_;
+    // Reverse index: digest hex -> EVERY friend claiming it. A hint is not a
+    // proof, so a second claimant must never displace the first.
+    std::unordered_map<std::string, std::unordered_set<std::string>> digest_claimants_;
+    size_t identity_claim_count_ = 0;
+    // Our side of the match: sha256(chat_id || key) of every known NGC peer,
+    // so a hint costs a lookup instead of rehashing every group.
+    struct IndexedGroupMember {
+        Tox_Group_Number group_number;
+        std::string member_key;  // lower-case hex
+    };
+    std::unordered_map<std::string, std::vector<IndexedGroupMember>> member_digest_index_;  // digest hex ->
+    std::unordered_map<std::string, std::string> member_digest_by_slot_;  // "<group>|<key lower>" -> digest hex
+    struct ProvenGroupMember {
+        std::string friend_hex;
+        Tox_Group_Number group_number;
+        IdentityClock::time_point proven_at;
+    };
+    std::unordered_map<std::string, ProvenGroupMember> member_key_to_friend_;  // member key (lower) -> PROVEN friend
+    struct PendingIdentityChallenge {
+        std::string friend_hex;
+        Tox_Group_Number group_number;
+        std::string member_key;
+        IdentityClock::time_point sent_at;
+    };
+    std::unordered_map<std::string, PendingIdentityChallenge> pending_identity_challenges_;  // nonce hex ->
+    // Responder side: challenges already answered, "<friend>|<chat_id>|<nonce>"
+    // -> when; the deque holds the same keys oldest-first for expiry/eviction.
+    std::unordered_map<std::string, IdentityClock::time_point> answered_identity_challenges_;
+    std::deque<std::pair<IdentityClock::time_point, std::string>> answered_identity_challenge_order_;
+    struct IdentityRateWindow {
+        IdentityClock::time_point window_start{};
+        uint32_t hint_packets = 0;
+        uint32_t new_digests = 0;
+        uint32_t proofs_sent = 0;
+    };
+    std::unordered_map<std::string, IdentityRateWindow> identity_rate_by_friend_;  // friend pk hex ->
+    IdentityRateWindow identity_rate_global_;
+    IdentityClock::time_point identity_last_prune_{};
+    std::unordered_set<uint32_t> online_identity_friends_;  // friends already sent our hints this session
+    // Group receipt replay filter: "<group id>|<sender key lower>|<type>|<msgID>"
+    // -> first seen; the deque holds the same keys oldest-first.
+    std::unordered_map<std::string, IdentityClock::time_point> seen_group_receipts_;
+    std::deque<std::pair<IdentityClock::time_point, std::string>> seen_group_receipt_order_;
+    // Helpers for the state above; callers hold mutex_.
+    // (not "force": toxcore's attributes.h #defines that word away)
+    void PruneIdentityStateLocked(IdentityClock::time_point now, bool force_prune);
+    void EraseIdentityClaimLocked(const std::string& friend_hex, const std::string& digest);
+    void DropFriendIdentityClaimsLocked(const std::string& friend_hex);
+    void EraseIndexedGroupMemberLocked(Tox_Group_Number group_number, const std::string& member_key_lower);
+    bool TakeIdentityBudgetLocked(IdentityRateWindow& window, IdentityClock::time_point now,
+                                  uint32_t IdentityRateWindow::*counter, uint32_t limit);
+    // Index every cached NGC peer that is not indexed yet (and drop entries
+    // whose peer left the cache). Takes mutex_ itself; hashes outside it.
+    void SyncMemberDigestIndex(Tox* tox);
+    // Sends one friend-channel challenge per (friend, group, member) candidate,
+    // skipping those already pending and those over the per-friend cap.
+    void IssueIdentityChallenges(Tox* tox, const std::vector<PendingIdentityChallenge>& candidates);
+    // NGC group numbers created by a join/accept in THIS session that have not
+    // connected yet: only these are undone when the group refuses us.
+    std::unordered_set<Tox_Group_Number> fresh_group_joins_;
+    // Invites accepted in this session whose join toxcore has not confirmed
+    // yet: group_number -> (invite id, the invite). Restored on refusal.
+    std::unordered_map<Tox_Group_Number, std::pair<std::string, PendingInvite>> accepted_invites_;
+    void MarkFreshGroupJoin(Tox_Group_Number group_number);
     std::atomic<uint64_t> next_message_seq_{1};
     std::atomic<uint64_t> next_group_seq_{1};
     uint64_t next_pending_delivery_root_id_{1};
@@ -464,6 +643,31 @@ private:
     void TrackPendingDelivery(uint32_t friend_number, const std::vector<uint32_t>& tox_message_numbers, const V2TIMString& msg_id, const V2TIMString& user_id);
     void RemovePendingDeliveryRootLocked(uint64_t root_id);
     void ClearPendingDeliveries();
+public:
+    // An invite the user has not answered yet (auto-accept off). `id` is the
+    // key JoinGroup() accepts it under.
+    struct PendingGroupInviteInfo {
+        std::string id;
+        std::string inviter_userID;
+        PendingInviteKind kind;
+        std::string group_name;
+        int64_t received_ms;
+        std::vector<uint8_t> cookie;
+    };
+    std::vector<PendingGroupInviteInfo> GetPendingGroupInvites();
+    // Re-create an unanswered invite saved by the client in an earlier
+    // session. The inviter is looked up by public key (friend numbers are not
+    // a stable identity); false if they are no longer a friend.
+    bool RestorePendingGroupInvite(const PendingGroupInviteInfo& invite);
+    // Decline: Tox has no "reject" packet, so this only forgets the cookie.
+    bool RejectPendingGroupInvite(const V2TIMString& inviteID);
+private:
+    // Insert an unanswered invite unless the same friend already has the same
+    // cookie pending (inviters re-send; one prompt per invitation). Returns the
+    // id the invite is stored under. Caller must NOT hold mutex_.
+    V2TIMString StorePendingInvite(const V2TIMString& inviteID, PendingInvite&& inv);
+    // Clears all per-session group/conference state; see UnInitSDK.
+    void ResetGroupSessionState();
     void ClearPendingDeliveriesForFriend(uint32_t friend_number);
     void PrunePendingDeliveriesLocked(std::chrono::steady_clock::time_point now);
     V2TIMString SendC2CTextMessageWithType(const V2TIMString& text, const V2TIMString& userID, const V2TIMBuffer& cloudCustomData, V2TIMSendCallback* callback, bool force_action);
@@ -483,6 +687,7 @@ private:
     // Tox group handlers
     void HandleGroupMessageGroup(Tox_Group_Number group_number, Tox_Group_Peer_Number peer_id, TOX_MESSAGE_TYPE type, const uint8_t* message, size_t length, Tox_Group_Message_Id message_id);
     void HandleGroupCustomPacket(Tox_Group_Number group_number, Tox_Group_Peer_Number peer_id, const uint8_t* data, size_t length);
+    void HandleGroupCustomPrivatePacket(Tox_Group_Number group_number, Tox_Group_Peer_Number peer_id, const uint8_t* data, size_t length);
     void HandleGroupPrivateMessage(Tox_Group_Number group_number, Tox_Group_Peer_Number peer_id, TOX_MESSAGE_TYPE type, const uint8_t* message, size_t length, Tox_Group_Message_Id message_id);
     void HandleGroupTopic(Tox_Group_Number group_number, Tox_Group_Peer_Number peer_id, const uint8_t* topic, size_t length);
     void HandleGroupPeerNameGroup(Tox_Group_Number group_number, Tox_Group_Peer_Number peer_id, const uint8_t* name, size_t length);
@@ -494,6 +699,9 @@ private:
     // client is removed from a group WITHOUT a local QuitGroup call (e.g. being
     // kicked). Acquires mutex_ internally — callers must NOT hold it.
     void EraseGroupLocalState(const V2TIMString& groupID);
+    // Drop one (group, public key) -> peer_id cache entry. Case-insensitive on
+    // the key. Acquires mutex_ internally.
+    void ErasePeerIdCacheEntry(Tox_Group_Number group_number, const std::string& public_key_hex);
     void HandleGroupSelfJoin(Tox_Group_Number group_number);
     void HandleGroupJoinFail(Tox_Group_Number group_number, Tox_Group_Join_Fail fail_type);
     void HandleGroupPrivacyState(Tox_Group_Number group_number, Tox_Group_Privacy_State privacy_state);

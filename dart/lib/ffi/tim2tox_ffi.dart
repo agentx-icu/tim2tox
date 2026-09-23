@@ -34,6 +34,9 @@ typedef _send_text_c = ffi.Int32 Function(
 typedef _poll_text_c = ffi.Int32 Function(
     ffi.Int64, ffi.Pointer<ffi.Int8>, ffi.Int32);
 typedef _poll_custom_c = ffi.Int32 Function(ffi.Pointer<ffi.Uint8>, ffi.Int32);
+typedef _get_text_queue_drop_count_c = ffi.Int64 Function(ffi.Int32);
+typedef _get_group_identity_snapshot_c = ffi.Int32 Function(
+    ffi.Int64, ffi.Pointer<ffi.Int8>, ffi.Int32);
 typedef _get_login_user_c = ffi.Int32 Function(
     ffi.Pointer<ffi.Int8>, ffi.Int32);
 typedef _uninit_c = ffi.Void Function();
@@ -64,6 +67,16 @@ typedef _join_group_c = ffi.Int32 Function(
     ffi.Pointer<pkgffi.Utf8>, ffi.Pointer<pkgffi.Utf8>);
 typedef _send_group_text_c = ffi.Int32 Function(
     ffi.Pointer<pkgffi.Utf8>, ffi.Pointer<pkgffi.Utf8>);
+typedef _get_pending_group_invites_c = ffi.Int32 Function(
+    ffi.Pointer<ffi.Int8>, ffi.Int32);
+typedef _reject_group_invite_c = ffi.Int32 Function(ffi.Pointer<pkgffi.Utf8>);
+typedef _restore_group_invite_c = ffi.Int32 Function(
+    ffi.Pointer<pkgffi.Utf8>,
+    ffi.Pointer<pkgffi.Utf8>,
+    ffi.Pointer<pkgffi.Utf8>,
+    ffi.Pointer<pkgffi.Utf8>,
+    ffi.Int64,
+    ffi.Pointer<pkgffi.Utf8>);
 typedef _dismiss_group_c = ffi.Int32 Function(
     ffi.Int64, ffi.Pointer<pkgffi.Utf8>);
 typedef _update_known_groups_c = ffi.Int32 Function(
@@ -91,6 +104,22 @@ typedef _get_group_type_from_storage_c = ffi.Int32 Function(
 typedef _set_auto_accept_group_invites_c = ffi.Int32 Function(
     ffi.Int64, ffi.Int32);
 typedef _get_auto_accept_group_invites_c = ffi.Int32 Function(ffi.Int64);
+typedef _set_retired_group_id_max_c = ffi.Int32 Function(
+    ffi.Int64, ffi.Uint64);
+typedef _set_group_info_field_c = ffi.Int32 Function(ffi.Int64,
+    ffi.Pointer<pkgffi.Utf8>, ffi.Int32, ffi.Pointer<pkgffi.Utf8>);
+typedef _can_set_group_topic_c = ffi.Int32 Function(
+    ffi.Int64, ffi.Pointer<pkgffi.Utf8>);
+typedef _get_group_name_c = ffi.Int32 Function(ffi.Int64,
+    ffi.Pointer<pkgffi.Utf8>, ffi.Pointer<ffi.Int8>, ffi.Int32);
+typedef _get_group_member_friend_c = ffi.Int32 Function(
+    ffi.Pointer<pkgffi.Utf8>, ffi.Pointer<ffi.Int8>, ffi.Int32);
+typedef _send_group_receipt_c = ffi.Int32 Function(
+    ffi.Int64,
+    ffi.Pointer<pkgffi.Utf8>,
+    ffi.Pointer<pkgffi.Utf8>,
+    ffi.Pointer<pkgffi.Utf8>,
+    ffi.Pointer<pkgffi.Utf8>);
 typedef _send_c2c_custom_c = ffi.Int32 Function(
     ffi.Pointer<pkgffi.Utf8>, ffi.Pointer<ffi.Uint8>, ffi.Int32);
 typedef _send_c2c_control_c = ffi.Int32 Function(
@@ -131,6 +160,7 @@ typedef _get_dht_id_for_instance_c = ffi.Int32 Function(
     ffi.Int64, ffi.Pointer<ffi.Int8>, ffi.Int32);
 typedef _is_instance_initialized_c = ffi.Int32 Function(ffi.Int64);
 typedef _is_instance_event_loop_running_c = ffi.Int32 Function(ffi.Int64);
+typedef _get_session_epoch_c = ffi.Int64 Function(ffi.Int64);
 typedef _add_bootstrap_node_c = ffi.Int32 Function(
     ffi.Int64, ffi.Pointer<pkgffi.Utf8>, ffi.Int32, ffi.Pointer<pkgffi.Utf8>);
 // Test instance management functions
@@ -416,6 +446,10 @@ typedef _av_conference_disable_c = ffi.Int32 Function(
   ffi.Int64,
   ffi.Pointer<pkgffi.Utf8>, // group_id
 );
+typedef _av_conference_is_enabled_c = ffi.Int32 Function(
+  ffi.Int64,
+  ffi.Pointer<pkgffi.Utf8>, // group_id
+);
 typedef _av_conference_mute_c = ffi.Int32 Function(
   ffi.Int64,
   ffi.Pointer<pkgffi.Utf8>, // group_id
@@ -578,6 +612,23 @@ class Tim2ToxFfi {
           _poll_text_c,
           int Function(
               int, ffi.Pointer<ffi.Int8>, int)>('tim2tox_ffi_poll_text');
+
+  /// Events the bounded native text queue behind [pollText] has dropped since
+  /// process start. [eventClass]: 0 = typing / intermediate progress,
+  /// 1 = chat messages, 2 = state events, -1 = all.
+  late final int Function(int eventClass) getTextQueueDropCount =
+      _lib.lookupFunction<_get_text_queue_drop_count_c, int Function(int)>(
+          'tim2tox_ffi_get_text_queue_drop_count');
+
+  /// Every group identity (chat id / conference id) and kind the native side
+  /// currently knows for [instanceId], one `<group_id>\t<chat_id>\t<type>\n`
+  /// line each (either value may be empty). Returns bytes written, 0 if none,
+  /// or the negated required capacity when [buffer] is too small.
+  late final int Function(int instanceId, ffi.Pointer<ffi.Int8> buffer,
+          int bufferLen) getGroupIdentitySnapshotNative =
+      _lib.lookupFunction<_get_group_identity_snapshot_c,
+              int Function(int, ffi.Pointer<ffi.Int8>, int)>(
+          'tim2tox_ffi_get_group_identity_snapshot');
   late final int Function(ffi.Pointer<ffi.Uint8>, int) pollCustom =
       _lib.lookupFunction<_poll_custom_c,
           int Function(ffi.Pointer<ffi.Uint8>, int)>('tim2tox_ffi_poll_custom');
@@ -648,6 +699,44 @@ class Tim2ToxFfi {
           _join_group_c,
           int Function(ffi.Pointer<pkgffi.Utf8>,
               ffi.Pointer<pkgffi.Utf8>)>('tim2tox_ffi_join_group');
+  /// joinGroup for a password-protected group; same return values.
+  late final int Function(ffi.Pointer<pkgffi.Utf8>, ffi.Pointer<pkgffi.Utf8>)
+      joinGroupWithPassword = _lib.lookupFunction<
+          _join_group_c,
+          int Function(ffi.Pointer<pkgffi.Utf8>, ffi.Pointer<pkgffi.Utf8>)>(
+          'tim2tox_ffi_join_group_with_password');
+  /// Group invites awaiting the user's answer; see tim2tox_ffi.h for the line
+  /// format. Negative return = required buffer size.
+  late final int Function(ffi.Pointer<ffi.Int8>, int) getPendingGroupInvites =
+      _lib.lookupFunction<
+          _get_pending_group_invites_c,
+          int Function(ffi.Pointer<ffi.Int8>,
+              int)>('tim2tox_ffi_get_pending_group_invites');
+  late final int Function(
+          ffi.Pointer<pkgffi.Utf8>,
+          ffi.Pointer<pkgffi.Utf8>,
+          ffi.Pointer<pkgffi.Utf8>,
+          ffi.Pointer<pkgffi.Utf8>,
+          int,
+          ffi.Pointer<pkgffi.Utf8>) restoreGroupInvite =
+      _lib.lookupFunction<
+          _restore_group_invite_c,
+          int Function(
+              ffi.Pointer<pkgffi.Utf8>,
+              ffi.Pointer<pkgffi.Utf8>,
+              ffi.Pointer<pkgffi.Utf8>,
+              ffi.Pointer<pkgffi.Utf8>,
+              int,
+              ffi.Pointer<pkgffi.Utf8>)>('tim2tox_ffi_restore_group_invite');
+  /// 1 = a group send can reach someone, 0 = NGC group still connecting,
+  /// -1 = unknown group. See tim2tox_ffi.h.
+  late final int Function(ffi.Pointer<pkgffi.Utf8>) groupWireReady = _lib
+      .lookupFunction<_reject_group_invite_c, int Function(ffi.Pointer<pkgffi.Utf8>)>(
+          'tim2tox_ffi_group_wire_ready');
+  late final int Function(ffi.Pointer<pkgffi.Utf8>) rejectGroupInvite =
+      _lib.lookupFunction<_reject_group_invite_c,
+          int Function(ffi.Pointer<pkgffi.Utf8>)>(
+          'tim2tox_ffi_reject_group_invite');
   late final int Function(ffi.Pointer<pkgffi.Utf8>, ffi.Pointer<pkgffi.Utf8>)
       sendGroupText = _lib.lookupFunction<
           _send_group_text_c,
@@ -794,6 +883,14 @@ class Tim2ToxFfi {
   late final int Function(int) isInstanceEventLoopRunning =
       _lib.lookupFunction<_is_instance_event_loop_running_c, int Function(int)>(
           'tim2tox_ffi_is_instance_event_loop_running');
+
+  /// Epoch of [instanceId]'s live native session, 0 when it has none. The
+  /// native group notifications that carry no user_data are stamped with
+  /// `instance_id` + `session_epoch`; one is current only while this returns
+  /// its epoch (see tim2tox_ffi_get_session_epoch).
+  late final int Function(int) getSessionEpoch =
+      _lib.lookupFunction<_get_session_epoch_c, int Function(int)>(
+          'tim2tox_ffi_get_session_epoch');
   late final int Function(
           int, ffi.Pointer<pkgffi.Utf8>, int, ffi.Pointer<pkgffi.Utf8>)
       addBootstrapNode = _lib.lookupFunction<
@@ -1188,6 +1285,12 @@ class Tim2ToxFfi {
           int Function(int, ffi.Pointer<pkgffi.Utf8>)>(
     'tim2tox_ffi_av_conference_disable',
   );
+  late final int Function(int, ffi.Pointer<pkgffi.Utf8>)
+      avConferenceIsEnabledNative = _lib.lookupFunction<
+          _av_conference_is_enabled_c,
+          int Function(int, ffi.Pointer<pkgffi.Utf8>)>(
+    'tim2tox_ffi_av_conference_is_enabled',
+  );
   late final int Function(int, ffi.Pointer<pkgffi.Utf8>, int)
       avConferenceMuteNative = _lib.lookupFunction<_av_conference_mute_c,
           int Function(int, ffi.Pointer<pkgffi.Utf8>, int)>(
@@ -1296,6 +1399,58 @@ class Tim2ToxFfi {
   late final int Function(int) getAutoAcceptGroupInvitesNative =
       _lib.lookupFunction<_get_auto_accept_group_invites_c, int Function(int)>(
           'tim2tox_ffi_get_auto_accept_group_invites');
+
+  /// Highest `tox_<n>` suffix the account ever used (see
+  /// `tim2tox_ffi_set_retired_group_id_max`).
+  late final int Function(int, int) setRetiredGroupIdMaxNative = _lib
+      .lookupFunction<_set_retired_group_id_max_c, int Function(int, int)>(
+          'tim2tox_ffi_set_retired_group_id_max');
+
+  /// Publish a group edit: field 1 = name, 3 = notification. Returns 1 ok,
+  /// -2 not permitted (topic lock), 0 failure.
+  late final int Function(
+          int, ffi.Pointer<pkgffi.Utf8>, int, ffi.Pointer<pkgffi.Utf8>)
+      setGroupInfoFieldNative = _lib.lookupFunction<
+          _set_group_info_field_c,
+          int Function(int, ffi.Pointer<pkgffi.Utf8>, int,
+              ffi.Pointer<pkgffi.Utf8>)>('tim2tox_ffi_set_group_info_field');
+
+  /// May we set this NGC group's topic (announcement) now: 1 yes, 0 no
+  /// (topic lock / observer), -1 unknown (conference, unmapped group).
+  late final int Function(int, ffi.Pointer<pkgffi.Utf8>) canSetGroupTopicNative =
+      _lib.lookupFunction<_can_set_group_topic_c,
+              int Function(int, ffi.Pointer<pkgffi.Utf8>)>(
+          'tim2tox_ffi_can_set_group_topic');
+
+  /// Friend (long-term key) behind an NGC per-group member key; bytes
+  /// written, 0 when unknown.
+  late final int Function(ffi.Pointer<pkgffi.Utf8>, ffi.Pointer<ffi.Int8>, int)
+      getGroupMemberFriendNative = _lib.lookupFunction<
+          _get_group_member_friend_c,
+          int Function(ffi.Pointer<pkgffi.Utf8>, ffi.Pointer<ffi.Int8>,
+              int)>('tim2tox_ffi_get_group_member_friend');
+
+  /// Private group receipt to the author: 1 sent, -2 unsupported (legacy
+  /// conference), 0 failure.
+  late final int Function(int, ffi.Pointer<pkgffi.Utf8>, ffi.Pointer<pkgffi.Utf8>,
+          ffi.Pointer<pkgffi.Utf8>, ffi.Pointer<pkgffi.Utf8>)
+      sendGroupReceiptNative = _lib.lookupFunction<
+          _send_group_receipt_c,
+          int Function(
+              int,
+              ffi.Pointer<pkgffi.Utf8>,
+              ffi.Pointer<pkgffi.Utf8>,
+              ffi.Pointer<pkgffi.Utf8>,
+              ffi.Pointer<pkgffi.Utf8>)>('tim2tox_ffi_send_group_receipt');
+
+  /// The group's shared name (NGC name / conference title); returns bytes
+  /// written, 0 when unknown.
+  late final int Function(
+          int, ffi.Pointer<pkgffi.Utf8>, ffi.Pointer<ffi.Int8>, int)
+      getGroupNameNative = _lib.lookupFunction<
+          _get_group_name_c,
+          int Function(int, ffi.Pointer<pkgffi.Utf8>, ffi.Pointer<ffi.Int8>,
+              int)>('tim2tox_ffi_get_group_name');
 
   late final int Function(
           int, ffi.Pointer<pkgffi.Utf8>, ffi.Pointer<ffi.Int8>, int)
@@ -1442,6 +1597,26 @@ class Tim2ToxFfi {
     final groupIdPointer = groupId.toNativeUtf8();
     try {
       return avConferenceDisableNative(instanceId, groupIdPointer);
+    } finally {
+      pkgffi.malloc.free(groupIdPointer);
+    }
+  }
+
+  /// Returned by [avConferenceIsEnabled] when the native library predates the
+  /// export, i.e. the question could not be put at all. Distinct from native's
+  /// own -1 ("nothing to answer about": unknown group / not a conference),
+  /// because a caller may safely act on that answer but not on this one.
+  static const int conferenceAudioStateUnavailable = -2;
+
+  /// 1 = conference audio is on, 0 = a known conference with it off,
+  /// -1 = nothing to answer about, [conferenceAudioStateUnavailable] = the
+  /// export is missing.
+  int avConferenceIsEnabled(int instanceId, String groupId) {
+    final groupIdPointer = groupId.toNativeUtf8();
+    try {
+      return avConferenceIsEnabledNative(instanceId, groupIdPointer);
+    } on ArgumentError {
+      return conferenceAudioStateUnavailable;
     } finally {
       pkgffi.malloc.free(groupIdPointer);
     }
