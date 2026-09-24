@@ -2,6 +2,8 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -130,7 +132,7 @@ public:
     // this NON-recursive mutex for the whole iterate — so when called ON that
     // thread (from inside a tox callback) it returns an unowned lock: the
     // caller is already serialized with the iterate by construction.
-    std::unique_lock<std::mutex> lockIterate() {
+    std::unique_lock<std::mutex> lockIterate() const {
         if (isIterateOwner()) {
             return std::unique_lock<std::mutex>();
         }
@@ -143,8 +145,23 @@ public:
     }
 
     // 数据保存和加载
+    //
+    // getSaveData() is ATOMIC with respect to every mutator Tim2Tox has.
+    // WHY: toxcore takes its instance mutex separately in
+    // tox_get_savedata_size() and in tox_get_savedata() (which re-reads the
+    // size for its own memzero), and that mutex is NOT recursive, so a caller
+    // cannot hold it across the pair. Anything that enlarges the savedata
+    // between the two — a conference/NGC join, a friend add, a self-name
+    // change — then makes toxcore write MORE bytes than the buffer we sized:
+    // a heap overflow (codex 2026-09-24). So instead of toxcore's lock we
+    // quiesce OUR mutators: iterate_mutex_ stops tox_iterate, and the pin gate
+    // below stops every acquireTox() operation. When they do not drain in
+    // kSaveQuiesceTimeout the save is REFUSED (returns {}) rather than risking
+    // the overflow; the previously written profile stays valid and the next
+    // save retries.
     std::vector<uint8_t> getSaveData() const;
     bool saveTo(const std::string& path) const;
+    static constexpr std::chrono::seconds kSaveQuiesceTimeout{5};
     bool loadFrom(const std::string& path);
 
     // 基本功能接口
@@ -409,9 +426,41 @@ private:
     // the last pin is dropped. See acquireTox().
     std::shared_ptr<Tox> tox_;
     mutable std::mutex mutex_;
-    std::mutex iterate_mutex_;  // Serialize tox_iterate - toxcore requires single-threaded access per instance
+    mutable std::mutex iterate_mutex_;  // Serialize tox_iterate - toxcore requires single-threaded access per instance
     std::atomic<std::thread::id> iterate_owner_{};  // thread holding iterate_mutex_ inside iterate()/shutdown() (see lockIterate)
     std::shared_ptr<int> alive_token_ = std::make_shared<int>(0);  // lets a deferred shutdown() see that this object is gone
+
+    // --- savedata quiescence (see getSaveData) ------------------------------
+    // Accounting for the pins acquireTox() hands out. Held in its own
+    // heap object so the pin's deleter never touches the ToxManager, which a
+    // long-lived pin can outlive.
+    struct PinState {
+        std::mutex mutex;
+        std::condition_variable cv;
+        int count = 0;  // live pins
+        // Per-thread depth. A thread that already holds a pin must not wait on
+        // its own quiesce, and the quiescing thread must not wait for the pins
+        // IT holds (a save from inside a tox callback on the manually-iterating
+        // FFI thread holds one).
+        std::unordered_map<std::thread::id, int> depth;
+        bool quiescing = false;
+        std::thread::id quiescing_owner{};
+    };
+    std::shared_ptr<PinState> pin_state_ = std::make_shared<PinState>();
+    // RAII: blocks new pins from other threads, waits (bounded) for the live
+    // ones to drain, and releases the block on destruction.
+    class SaveQuiesce {
+    public:
+        explicit SaveQuiesce(std::shared_ptr<PinState> state);
+        ~SaveQuiesce();
+        SaveQuiesce(const SaveQuiesce&) = delete;
+        SaveQuiesce& operator=(const SaveQuiesce&) = delete;
+        bool drained() const { return drained_; }
+
+    private:
+        std::shared_ptr<PinState> state_;
+        bool drained_ = false;
+    };
     std::atomic<bool> is_shutting_down_{false};  // Flag to prevent double cleanup; atomic for lock-free read in iterate()
     bool tcp_relay_server_allowed_{true};  // see setTcpRelayServerAllowed
     uint16_t udp_start_port_{0};  // see setUdpPortRange

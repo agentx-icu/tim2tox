@@ -2712,14 +2712,19 @@ int tim2tox_ffi_send_group_text(const char* group_id, const char* text) {
 int tim2tox_ffi_group_wire_ready(const char* group_id) {
     if (!IsCurrentInstanceInited() || !group_id) return -1;
     V2TIMManagerImpl* manager_impl = GetCurrentInstance();
-    if (!manager_impl || !manager_impl->GetToxManager()) return -1;
+    if (!manager_impl) return -1;
+    // Pinned: the old shape null-CHECKED GetToxManager() and then DEREFERENCED
+    // a second, independent lookup, so a logout landing between the two was a
+    // null deref (and, once past it, a use-after-free on the manager).
+    const auto session = manager_impl->AcquireToxSession();
+    if (!session) return -1;
     Tox_Group_Number group_number = UINT32_MAX;
     if (!manager_impl->GetGroupNumberFromID(group_id, group_number)) return -1;
     // Conferences have no per-peer delivery confirmation: always "ready". The
     // map key decides the kind, not a (possibly stale) type label.
     if (IsConferenceMapKey(group_number)) return 1;
     Tox_Err_Group_Is_Connected err_conn;
-    const bool connected = manager_impl->GetToxManager()->isGroupConnected(group_number, &err_conn);
+    const bool connected = session.manager()->isGroupConnected(group_number, &err_conn);
     if (err_conn != TOX_ERR_GROUP_IS_CONNECTED_OK) return -1;
     return connected ? 1 : 0;
 }
@@ -3141,10 +3146,24 @@ int tim2tox_ffi_send_group_custom(const char* group_id, const unsigned char* dat
 
 namespace {
 
+// Carries the pin, not a raw copy of the handle. ResolveFilePeer used to take
+// the guard as a local and return only `Tox*`: the guard died with the return
+// statement and every caller then did its file sizing, context setup and
+// tox_file_send() on an UNPINNED pointer a concurrent UnInitSDK could have
+// tox_kill()ed (codex 2026-09-24). Moving the guard in makes the comment in
+// ResolveFilePeer true — the pin really does cover friend lookup, file_send and
+// the first chunk — because the struct outlives all of them in the caller.
 struct ResolvedFilePeer {
     int64_t instance_id = 0;
-    Tox* tox = nullptr;
+    V2TIMManagerImpl::ToxSessionGuard session;
     uint32_t friend_number = UINT32_MAX;
+
+    // Valid for as long as this object lives; never copied into a local that
+    // could outlive it.
+    Tox* tox() const { return session.tox(); }
+    // The pin keeps the memory valid, it does not keep the session CURRENT.
+    // Work finished after a logout must not be published as success.
+    bool session_ended() const { return session.Expired(); }
 };
 
 bool DecodePeerPublicKey(
@@ -3175,10 +3194,12 @@ int ResolveFilePeer(int64_t instance_id, const char* user_id,
         return -1;
     }
     V2TIMManagerImpl* manager = GetInstanceFromId(resolved_instance_id);
-    // Pinned across the friend lookup + file_send + first chunk sequence.
-    const auto session = manager == nullptr
-                             ? V2TIMManagerImpl::ToxSessionGuard()
-                             : manager->AcquireToxSession();
+    // Pinned across the friend lookup + file_send + first chunk sequence. The
+    // guard is MOVED into *peer below, so it outlives this function and keeps
+    // the caller's tox_file_send() on a live instance.
+    auto session = manager == nullptr
+                       ? V2TIMManagerImpl::ToxSessionGuard()
+                       : manager->AcquireToxSession();
     Tox* tox = session.tox();
     if (tox == nullptr) {
         V2TIM_LOG(kError,
@@ -3213,7 +3234,7 @@ int ResolveFilePeer(int64_t instance_id, const char* user_id,
         return -4;
     }
     peer->instance_id = resolved_instance_id;
-    peer->tox = tox;
+    peer->session = std::move(session);
     peer->friend_number = friend_number;
     return 1;
 }
@@ -3249,14 +3270,25 @@ int tim2tox_ffi_send_file(int64_t instance_id, const char* user_id, const char* 
     if (pos != std::string::npos) name = path.substr(pos + 1);
     const std::string wire_name =
         tim2tox::file_io::TruncateUtf8Filename(name);
+    // Opening and sizing the file took time; refuse rather than start a
+    // transfer nothing will ever pump (the pin kept the handle valid, it did
+    // not keep the session current).
+    if (peer.session_ended()) {
+        V2TIM_LOG(kError, "[ffi] send_file: session ended before tox_file_send");
+        return -1;
+    }
     TOX_ERR_FILE_SEND f_err;
     uint32_t file_no = tox_file_send(
-        peer.tox, peer.friend_number, TOX_FILE_KIND_DATA, file_size, nullptr,
+        peer.tox(), peer.friend_number, TOX_FILE_KIND_DATA, file_size, nullptr,
         reinterpret_cast<const uint8_t*>(wire_name.c_str()), wire_name.size(),
         &f_err);
     if (f_err != TOX_ERR_FILE_SEND_OK) {
         V2TIM_LOG(kError, "[ffi] send_file: tox_file_send failed err={}", f_err);
         return -7;
+    }
+    if (peer.session_ended()) {
+        V2TIM_LOG(kError, "[ffi] send_file: session ended during tox_file_send; not publishing success");
+        return -1;
     }
     StoreSendContext(peer.instance_id,
                      FileTransferKey(peer.friend_number, file_no),
@@ -3295,9 +3327,15 @@ int tim2tox_ffi_send_avatar(int64_t instance_id, const char* user_id, const uint
         return -5;
     }
     const std::string wire_name = LowerHex(file_id.data(), file_id.size());
+    if (peer.session_ended()) {
+        V2TIM_LOG(kError,
+                  "[ffi] file_send: type=avatar status=session_ended count={}",
+                  avatar_size);
+        return -1;
+    }
     TOX_ERR_FILE_SEND send_error;
     const uint32_t file_number = tox_file_send(
-        peer.tox, peer.friend_number, TOX_FILE_KIND_AVATAR, context->size,
+        peer.tox(), peer.friend_number, TOX_FILE_KIND_AVATAR, context->size,
         file_id.data(), reinterpret_cast<const uint8_t*>(wire_name.data()),
         wire_name.size(), &send_error);
     if (send_error != TOX_ERR_FILE_SEND_OK) {
@@ -3305,6 +3343,12 @@ int tim2tox_ffi_send_avatar(int64_t instance_id, const char* user_id, const uint
                   "[ffi] file_send: type=avatar status=send_failed count={}",
                   avatar_size);
         return -7;
+    }
+    if (peer.session_ended()) {
+        V2TIM_LOG(kError,
+                  "[ffi] file_send: type=avatar status=session_ended count={}",
+                  avatar_size);
+        return -1;
     }
     StoreSendContext(peer.instance_id,
                      FileTransferKey(peer.friend_number, file_number),
@@ -3319,8 +3363,13 @@ int tim2tox_ffi_delete_avatar(int64_t instance_id, const char* user_id) {
     const int resolve_result =
         ResolveFilePeer(instance_id, user_id, "avatar_delete", &peer);
     if (resolve_result < 0) return resolve_result;
+    if (peer.session_ended()) {
+        V2TIM_LOG(kError,
+                  "[ffi] file_send: type=avatar_delete status=session_ended count=0");
+        return -1;
+    }
     TOX_ERR_FILE_SEND send_error;
-    tox_file_send(peer.tox, peer.friend_number, TOX_FILE_KIND_AVATAR, 0, nullptr, nullptr, 0, &send_error);
+    tox_file_send(peer.tox(), peer.friend_number, TOX_FILE_KIND_AVATAR, 0, nullptr, nullptr, 0, &send_error);
     if (send_error != TOX_ERR_FILE_SEND_OK) {
         V2TIM_LOG(kError,
                   "[ffi] file_send: type=avatar_delete status=send_failed count=0");
@@ -5212,11 +5261,14 @@ int tim2tox_ffi_get_friend_connection_status(int64_t instance_id, uint32_t frien
     if (instance_id == 0) instance_id = GetCurrentInstanceId();
     V2TIMManagerImpl* manager_impl = GetInstanceFromId(instance_id);
     if (!manager_impl) return -1;
-    ToxManager* tox_mgr = manager_impl->GetToxManager();
-    if (!tox_mgr) return -1;
+    // Pinned: the raw ToxManager* was retained across the call below, so a
+    // logout on another thread freed it mid-query (use-after-free). The guard
+    // keeps the manager AND its Tox alive until this returns.
+    const auto session = manager_impl->AcquireToxSession();
+    if (!session) return -1;
     // ToxManager::getFriendConnectionStatus locks its own mutex; TOX_CONNECTION
     // maps directly onto the documented 0/1/2 return values.
-    return static_cast<int>(tox_mgr->getFriendConnectionStatus(friend_number));
+    return static_cast<int>(session.manager()->getFriendConnectionStatus(friend_number));
 }
 
 #ifdef BUILD_TOXAV

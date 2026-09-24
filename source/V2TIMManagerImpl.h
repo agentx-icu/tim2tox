@@ -672,6 +672,12 @@ private:
         uint32_t proof_verifies = 0;
     };
     std::unordered_map<std::string, IdentityRateWindow> identity_rate_by_friend_;  // friend pk hex ->
+    // Received-proof windows keyed by the AUTHENTICATED NGC group sender (lower
+    // hex). Charged before any per-packet work, so an unchallenged member
+    // cannot make us scan and record for free and a single hostile member
+    // cannot spend the global crypto window. Bounded by kMaxProofVerifySenders
+    // and pruned with the rest of the identity state.
+    std::unordered_map<std::string, IdentityRateWindow> identity_rate_by_group_sender_;
     IdentityRateWindow identity_rate_global_;
     // MM-6 observability (guarded by mutex_). Counters plus the last proof
     // payload we received, verbatim: the auto_tests use it to assert that what
@@ -698,6 +704,17 @@ private:
     void EraseIndexedGroupMemberLocked(Tox_Group_Number group_number, const std::string& member_key_lower);
     bool TakeIdentityBudgetLocked(IdentityRateWindow& window, IdentityClock::time_point now,
                                   uint32_t IdentityRateWindow::*counter, uint32_t limit);
+    // One received-proof verification charged to this NGC sender. False = over
+    // budget, or the sender table is full: drop the packet before spending
+    // anything on it.
+    bool TakeGroupSenderProofBudgetLocked(const std::string& sender_hex,
+                                          IdentityClock::time_point now);
+    // Pending challenges for (group, member) whose asker no longer claims that
+    // member's digest. They hold a slot the verifier scans and an honest
+    // claimant needs; nothing will ever answer them.
+    void DropStaleChallengesForMemberLocked(Tox_Group_Number group_number,
+                                            const std::string& member_key_lower,
+                                            const std::string& digest);
     // Index every cached NGC peer that is not indexed yet (and drop entries
     // whose peer left the cache). Takes mutex_ itself; hashes outside it.
     void SyncMemberDigestIndex(Tox* tox);

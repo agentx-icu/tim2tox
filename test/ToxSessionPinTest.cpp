@@ -39,6 +39,12 @@
 #ifndef TIM2TOX_MANAGER_HEADER_PATH
 #error "TIM2TOX_MANAGER_HEADER_PATH is required"
 #endif
+#ifndef TIM2TOX_FFI_SOURCE_PATH
+#error "TIM2TOX_FFI_SOURCE_PATH is required"
+#endif
+#ifndef TIM2TOX_GROUP_MANAGER_SOURCE_PATH
+#error "TIM2TOX_GROUP_MANAGER_SOURCE_PATH is required"
+#endif
 
 // ToxManager.cpp reaches for the FFI layer's instance registry in one group
 // callback; nothing in this test drives a callback, and linking libtim2tox_ffi
@@ -262,6 +268,242 @@ TEST(ToxSessionPinTest, FfiReachableEntryPointsPinTheSession) {
                                            "void V2TIMManagerImpl::QuitGroup(");
     EXPECT_NE(join.find("session.Expired()"), std::string::npos);
     EXPECT_NE(join.find("join_session_ended()"), std::string::npos);
+}
+
+// --- codex 2026-09-24: the conversion was incomplete in these places --------
+
+// Finding 1. ResolveFilePeer took the guard as a LOCAL, copied the raw Tox* into
+// ResolvedFilePeer and returned — destroying the pin. Every caller then did its
+// file sizing, context setup and tox_file_send() on an unpinned handle, and the
+// comment claiming the pin covered "friend lookup + file_send + first chunk"
+// was false. The guard now lives IN the struct.
+TEST(ToxSessionPinTest, TheFilePathKeepsItsPinPastResolve) {
+    const std::string ffi = StripLineComments(ReadSource(TIM2TOX_FFI_SOURCE_PATH));
+    const std::string resolved =
+        SourceSection(ffi, "struct ResolvedFilePeer {", "bool DecodePeerPublicKey(");
+    EXPECT_NE(resolved.find("ToxSessionGuard session;"), std::string::npos)
+        << "ResolvedFilePeer must CARRY the pin, not a raw handle";
+    EXPECT_EQ(resolved.find("Tox* tox = nullptr;"), std::string::npos)
+        << "a raw Tox* member is exactly the copy that outlived the pin";
+
+    // Each of the three senders must run tox_file_send() off the pinned handle
+    // and must re-check currency before publishing success.
+    struct Sender {
+        const char* name;
+        const char* start;
+        const char* end;
+    };
+    const Sender senders[] = {
+        {"send_file", "int tim2tox_ffi_send_file(", "int tim2tox_ffi_send_avatar("},
+        {"send_avatar", "int tim2tox_ffi_send_avatar(", "int tim2tox_ffi_delete_avatar("},
+        {"delete_avatar", "int tim2tox_ffi_delete_avatar(",
+         "int tim2tox_ffi_iterate_current_instance("},
+    };
+    for (const Sender& sender : senders) {
+        const std::string body = SourceSection(ffi, sender.start, sender.end);
+        EXPECT_EQ(body.find("peer.tox,"), std::string::npos)
+            << sender.name << " must not use a raw handle copied out of the guard";
+        EXPECT_NE(body.find("peer.tox()"), std::string::npos)
+            << sender.name << " must read the handle through the pin";
+        EXPECT_NE(body.find("peer.session_ended()"), std::string::npos)
+            << sender.name
+            << " must refuse a send whose session ended: the pin keeps the memory "
+               "valid, not the session current";
+    }
+}
+
+// Finding 4. Two Dart-exposed entry points still used unpinned managers: one
+// null-checked GetToxManager() and then dereferenced a SECOND lookup, the other
+// retained the raw ToxManager* across the call.
+TEST(ToxSessionPinTest, TheLastTwoFfiEntryPointsPinTheirManager) {
+    const std::string ffi = StripLineComments(ReadSource(TIM2TOX_FFI_SOURCE_PATH));
+    struct Entry {
+        const char* name;
+        const char* start;
+        const char* end;
+    };
+    const Entry entries[] = {
+        {"group_wire_ready", "int tim2tox_ffi_group_wire_ready(",
+         "int tim2tox_ffi_send_group_action("},
+        {"get_friend_connection_status", "int tim2tox_ffi_get_friend_connection_status(",
+         "#ifdef BUILD_TOXAV"},
+    };
+    for (const Entry& entry : entries) {
+        const std::string body = SourceSection(ffi, entry.start, entry.end);
+        EXPECT_NE(body.find("AcquireToxSession()"), std::string::npos)
+            << entry.name << " is reachable from Dart and must pin the session";
+        EXPECT_EQ(body.find("GetToxManager()"), std::string::npos)
+            << entry.name << " must not reach for the unpinned manager";
+    }
+}
+
+// Finding 3. Pinning keeps the memory valid; it does not make the session
+// current. A logout that stops the event thread mid-send leaves the fragments
+// on an instance nothing will ever iterate, so OnSuccess would be a lie.
+TEST(ToxSessionPinTest, C2CSendRejectsAnEndedSession) {
+    const std::string manager = ReadSource(TIM2TOX_MANAGER_SOURCE_PATH);
+    const std::string body = StripLineComments(SourceSection(
+        manager, "V2TIMString V2TIMManagerImpl::SendC2CTextMessage(",
+        "V2TIMString V2TIMManagerImpl::SendC2CCustomMessage("));
+    EXPECT_NE(body.find("AcquireToxSession()"), std::string::npos);
+    // Once before the send loop, once before the result is published.
+    std::size_t checks = 0;
+    for (std::size_t at = body.find("session.Expired()"); at != std::string::npos;
+         at = body.find("session.Expired()", at + 1)) {
+        ++checks;
+    }
+    EXPECT_GE(checks, 2u)
+        << "the send must be refused both before it starts and before its "
+           "success is published";
+}
+
+// Finding 5. HandleGroupSelfJoin dereferenced a raw manager, and CreateGroup
+// invokes it MANUALLY from the FFI caller's thread after the inner guard ended
+// — outside IterateReentryScope, so teardown does not defer there.
+TEST(ToxSessionPinTest, ManualSelfJoinRunsOnAPinnedSession) {
+    const std::string manager = ReadSource(TIM2TOX_MANAGER_SOURCE_PATH);
+    const std::string body = StripLineComments(SourceSection(
+        manager, "void V2TIMManagerImpl::HandleGroupSelfJoin(",
+        "void V2TIMManagerImpl::HandleGroupJoinFail("));
+    EXPECT_NE(body.find("AcquireToxSession()"), std::string::npos)
+        << "the handler itself must pin, so every manual call site is covered";
+    EXPECT_EQ(body.find("GetToxManager()->"), std::string::npos)
+        << "no raw manager dereference may remain in the handler";
+
+    const std::string group_manager =
+        StripLineComments(ReadSource(TIM2TOX_GROUP_MANAGER_SOURCE_PATH));
+    const std::string create = SourceSection(
+        group_manager, "void V2TIMGroupManagerImpl::CreateGroup(",
+        "void V2TIMGroupManagerImpl::GetGroupsInfo(");
+    EXPECT_NE(create.find("AcquireToxSession()"), std::string::npos)
+        << "the outer create must pin for its whole span";
+    EXPECT_EQ(create.find("GetToxManagerFromImpl(manager_impl_)->"), std::string::npos)
+        << "the create path must not re-fetch a raw manager per call";
+    EXPECT_NE(create.find("session.Expired()"), std::string::npos)
+        << "a create finished after a logout must not publish a self-join";
+}
+
+// Finding 2. tox_get_savedata_size() and tox_get_savedata() take toxcore's
+// (non-recursive) instance mutex separately, so a mutation landing between them
+// makes toxcore write more bytes than the buffer we sized. The save therefore
+// quiesces the mutators Tim2Tox owns: tox_iterate and every pin.
+TEST(ToxSessionPinTest, SaveDataWaitsForAnInFlightOperation) {
+    std::unique_ptr<ToxManager> manager = MakeLiveManager();
+    if (!manager) GTEST_SKIP() << "tox_new unavailable on this host";
+
+    // An operation on another thread that could still enlarge the savedata.
+    std::shared_ptr<Tox> pin = manager->acquireTox();
+    ASSERT_NE(pin, nullptr);
+
+    std::atomic<bool> finished{false};
+    std::thread saver([&] {
+        const std::vector<uint8_t> data = manager->getSaveData();
+        EXPECT_FALSE(data.empty());
+        finished.store(true, std::memory_order_release);
+    });
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(250));
+    EXPECT_FALSE(finished.load(std::memory_order_acquire))
+        << "the save read the savedata while a mutator was still in flight";
+
+    pin.reset();
+    saver.join();
+    EXPECT_TRUE(finished.load(std::memory_order_acquire));
+}
+
+// ... and it must NOT wait for a pin the saving thread holds itself: a profile
+// save reached from a tox callback on the manually-iterating FFI thread would
+// otherwise stall for the whole quiesce timeout and then skip the save.
+TEST(ToxSessionPinTest, SaveDataDoesNotWaitForItsOwnPin) {
+    std::unique_ptr<ToxManager> manager = MakeLiveManager();
+    if (!manager) GTEST_SKIP() << "tox_new unavailable on this host";
+
+    std::shared_ptr<Tox> pin = manager->acquireTox();
+    ASSERT_NE(pin, nullptr);
+
+    const auto started = std::chrono::steady_clock::now();
+    const std::vector<uint8_t> data = manager->getSaveData();
+    const auto elapsed = std::chrono::steady_clock::now() - started;
+
+    EXPECT_FALSE(data.empty());
+    EXPECT_LT(elapsed, std::chrono::seconds(2))
+        << "a save on the pin's own thread waited for itself";
+}
+
+// A pin taken while a save is quiescing must wait for it, which is what makes
+// the size/copy pair atomic.
+TEST(ToxSessionPinTest, SaveDataBlocksNewPinsWhileItReads) {
+    std::unique_ptr<ToxManager> manager = MakeLiveManager();
+    if (!manager) GTEST_SKIP() << "tox_new unavailable on this host";
+
+    std::shared_ptr<Tox> blocker = manager->acquireTox();
+    ASSERT_NE(blocker, nullptr);
+
+    std::atomic<bool> save_running{false};
+    std::thread saver([&] {
+        save_running.store(true, std::memory_order_release);
+        (void)manager->getSaveData();
+    });
+    while (!save_running.load(std::memory_order_acquire)) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+    std::atomic<bool> pinned{false};
+    std::thread latecomer([&] {
+        std::shared_ptr<Tox> late = manager->acquireTox();
+        pinned.store(late != nullptr, std::memory_order_release);
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(150));
+    EXPECT_FALSE(pinned.load(std::memory_order_acquire))
+        << "a new operation started while the save was quiescing";
+
+    blocker.reset();
+    saver.join();
+    latecomer.join();
+    EXPECT_TRUE(pinned.load(std::memory_order_acquire));
+}
+
+// The MM-6 caps must agree: the issuing side may never create more unexpired
+// challenges for one (group, member) than HandleGroupIdentityProof scans, and a
+// received proof must be metered by its authenticated sender BEFORE the scan.
+TEST(ToxSessionPinTest, Mm6ProofWorkIsMeteredAndTheCandidateSetCannotOverflow) {
+    const std::string manager = ReadSource(TIM2TOX_MANAGER_SOURCE_PATH);
+
+    const std::string issue = StripLineComments(SourceSection(
+        manager, "void V2TIMManagerImpl::IssueIdentityChallenges(",
+        "void V2TIMManagerImpl::HandleGroupIdentityAnnouncement("));
+    EXPECT_NE(issue.find("pending_for_member >= kMaxClaimantsPerDigest"), std::string::npos)
+        << "without a per-(group, member) cap the verifier truncates the "
+           "candidate set in hash order and can drop the honest asker";
+
+    const std::string proof = StripLineComments(SourceSection(
+        manager, "void V2TIMManagerImpl::HandleGroupIdentityProof(",
+        "std::string V2TIMManagerImpl::FriendForGroupMemberKey("));
+    const std::size_t meter = proof.find("TakeGroupSenderProofBudgetLocked");
+    const std::size_t record = proof.find("last_proof_payload_hex");
+    const std::size_t scan = proof.find("for (const auto& [nonce_hex, pending]");
+    ASSERT_NE(meter, std::string::npos)
+        << "a received proof must be charged to its authenticated NGC sender";
+    ASSERT_NE(record, std::string::npos);
+    ASSERT_NE(scan, std::string::npos);
+    EXPECT_LT(meter, record)
+        << "recording the payload is work an unchallenged member got for free";
+    EXPECT_LT(meter, scan)
+        << "scanning the pending challenges is work an unchallenged member got "
+           "for free";
+    EXPECT_NE(proof.find("DropStaleChallengesForMemberLocked"), std::string::npos)
+        << "askers that no longer claim the member only occupy scan slots";
+    EXPECT_NE(proof.find("kMaxProofVerifiesGlobal"), std::string::npos)
+        << "the global crypto cap stays";
+
+    // A friend going offline must take its pending challenges with its claims;
+    // leaving them behind is what let hostile claimants starve an honest one.
+    const std::string offline = StripLineComments(SourceSection(
+        manager, "void V2TIMManagerImpl::NoteFriendConnectionForIdentity(",
+        "void V2TIMManagerImpl::PurgeFriendIdentityState("));
+    EXPECT_NE(offline.find("pending_identity_challenges_.erase"), std::string::npos)
+        << "an offline friend cannot answer a challenge; the entry must go";
 }
 
 }  // namespace

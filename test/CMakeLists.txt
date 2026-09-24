@@ -136,7 +136,9 @@ target_compile_definitions(control_path_source_regression_test PRIVATE
 add_executable(tox_session_pin_test ToxSessionPinTest.cpp)
 target_compile_definitions(tox_session_pin_test PRIVATE
     TIM2TOX_MANAGER_SOURCE_PATH="${CMAKE_SOURCE_DIR}/source/V2TIMManagerImpl.cpp"
-    TIM2TOX_MANAGER_HEADER_PATH="${CMAKE_SOURCE_DIR}/source/V2TIMManagerImpl.h")
+    TIM2TOX_MANAGER_HEADER_PATH="${CMAKE_SOURCE_DIR}/source/V2TIMManagerImpl.h"
+    TIM2TOX_FFI_SOURCE_PATH="${CMAKE_SOURCE_DIR}/ffi/tim2tox_ffi.cpp"
+    TIM2TOX_GROUP_MANAGER_SOURCE_PATH="${CMAKE_SOURCE_DIR}/source/V2TIMGroupManagerImpl.cpp")
 add_executable(native_log_privacy_source_regression_test
     NativeLogPrivacySourceRegressionTest.cpp)
 target_compile_definitions(native_log_privacy_source_regression_test PRIVATE

@@ -521,18 +521,96 @@ Tox* ToxManager::getTox() const {
 // can safely call this — but the returned handle keeps the instance alive even
 // if shutdown() runs on another thread in the meantime.
 std::shared_ptr<Tox> ToxManager::acquireTox() const {
+    std::shared_ptr<Tox> tox;
     try {
         std::lock_guard<std::mutex> lock(mutex_);
         if (is_shutting_down_.load(std::memory_order_acquire) || !tox_) {
             return nullptr;
         }
-        return tox_;
+        tox = tox_;
     } catch (const std::system_error&) {
         // Mutex may be invalid during static destruction.
         return nullptr;
     } catch (...) {
         return nullptr;
     }
+    // Account the pin so getSaveData() can quiesce against it. mutex_ is
+    // already released: nothing may hold mutex_ and PinState::mutex at once
+    // (getSaveData takes the gate first, then mutex_).
+    const std::shared_ptr<PinState> state = pin_state_;
+    const std::thread::id self = std::this_thread::get_id();
+    {
+        std::unique_lock<std::mutex> gate(state->mutex);
+        // A thread that already holds a pin, and the thread running the save,
+        // must never wait here: they would be waiting on themselves.
+        const auto depth_it = state->depth.find(self);
+        const bool reentrant = (depth_it != state->depth.end() && depth_it->second > 0) ||
+                               state->quiescing_owner == self;
+        if (!reentrant) {
+            state->cv.wait(gate, [&state] { return !state->quiescing; });
+        }
+        ++state->count;
+        ++state->depth[self];
+    }
+    // Aliasing pin. `token` owns BOTH the pin release and a reference to the
+    // Tox, so the returned handle keeps the instance alive exactly as the plain
+    // shared_ptr did — the tox_kill() still happens on the last holder's
+    // thread. The deleter touches only PinState (heap, shared), never `this`:
+    // a pin may outlive the ToxManager.
+    auto token = std::shared_ptr<void>(
+        static_cast<void*>(nullptr), [state, tox, self](void*) mutable {
+            tox.reset();
+            {
+                std::lock_guard<std::mutex> gate(state->mutex);
+                if (state->count > 0) --state->count;
+                const auto it = state->depth.find(self);
+                if (it != state->depth.end() && --it->second <= 0) state->depth.erase(it);
+            }
+            state->cv.notify_all();
+        });
+    return std::shared_ptr<Tox>(token, tox.get());
+}
+
+// See getSaveData() in the header for why a save has to quiesce rather than
+// take toxcore's lock.
+ToxManager::SaveQuiesce::SaveQuiesce(std::shared_ptr<PinState> state)
+    : state_(std::move(state)) {
+    if (!state_) return;
+    const std::thread::id self = std::this_thread::get_id();
+    std::unique_lock<std::mutex> gate(state_->mutex);
+    // One quiesce at a time; a second saver waits for the first.
+    if (!state_->cv.wait_for(gate, kSaveQuiesceTimeout,
+                             [this] { return !state_->quiescing; })) {
+        return;
+    }
+    state_->quiescing = true;
+    state_->quiescing_owner = self;
+    // Wait only for pins held by OTHER threads. A save reached from a tox
+    // callback on the manually-iterating FFI thread holds one itself, and that
+    // thread is the saver, so it cannot be mutating concurrently.
+    const bool drained = state_->cv.wait_for(gate, kSaveQuiesceTimeout, [this, self] {
+        const auto it = state_->depth.find(self);
+        const int mine = it == state_->depth.end() ? 0 : it->second;
+        return state_->count <= mine;
+    });
+    if (!drained) {
+        state_->quiescing = false;
+        state_->quiescing_owner = std::thread::id();
+        gate.unlock();
+        state_->cv.notify_all();
+        return;
+    }
+    drained_ = true;
+}
+
+ToxManager::SaveQuiesce::~SaveQuiesce() {
+    if (!state_ || !drained_) return;
+    {
+        std::lock_guard<std::mutex> gate(state_->mutex);
+        state_->quiescing = false;
+        state_->quiescing_owner = std::thread::id();
+    }
+    state_->cv.notify_all();
 }
 
 // 检查是否正在关闭
@@ -1784,9 +1862,28 @@ bool ToxManager::setConferenceMaxOffline(uint32_t conference_number, uint32_t ma
 
 // 数据保存和加载实现
 std::vector<uint8_t> ToxManager::getSaveData() const {
+    // Order matters: iterate_mutex_ FIRST, then the pin gate. The iterating
+    // thread takes pins from inside tox callbacks, so a saver that blocked new
+    // pins and only then waited for the iterate would deadlock against it.
+    // (On the iterating thread itself lockIterate() returns an unowned lock:
+    // it is already serialized with the iterate by construction.)
+    auto iterate_lock = lockIterate();
+    SaveQuiesce quiesce(pin_state_);
+    if (!quiesce.drained()) {
+        // Refuse rather than size a buffer a concurrent tox_*() can outgrow
+        // before toxcore writes it. The profile already on disk stays valid
+        // and the next save retries.
+        V2TIM_LOG(kError,
+                  "[ToxManager] getSaveData: in-flight Tox operations did not drain in {}s; "
+                  "skipping this save (a concurrent mutation could overflow the buffer)",
+                  static_cast<long long>(kSaveQuiesceTimeout.count()));
+        return {};
+    }
     std::lock_guard<std::mutex> lock(mutex_);
     if (!tox_) return {};
-    
+
+    // Atomic now: no tox_iterate and no pinned operation can run between the
+    // size reading and the copy, so toxcore cannot write more than `size`.
     size_t size = tox_get_savedata_size(tox_.get());
     std::vector<uint8_t> data(size);
     tox_get_savedata(tox_.get(), data.data());

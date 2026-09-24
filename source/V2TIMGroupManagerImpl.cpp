@@ -148,13 +148,24 @@ void V2TIMGroupManagerImpl::CreateGroup(const V2TIMGroupInfo& info,
         return;
     }
 
-    Tox* tox = GetToxManagerFromImpl(manager_impl_)->getTox();
+    // Pinned for the WHOLE create. tox_group_new, the chat-id read, the owner
+    // lookup and the manual HandleGroupSelfJoin at the end each re-fetched a
+    // raw ToxManager*/Tox* that a concurrent UnInitSDK could already have
+    // freed, and none of it runs inside tox_iterate, so teardown does not
+    // defer here (codex 2026-09-24). One pin covers all of them.
+    V2TIMManagerImpl* const impl = manager_impl_;
+    const auto session = impl ? impl->AcquireToxSession()
+                              : V2TIMManagerImpl::ToxSessionGuard();
+    // The default-instance fallback stays for the (test-only) impl == nullptr
+    // shape; the normal path is pinned.
+    ToxManager* const tox_manager = session ? session.manager() : GetToxManagerFromImpl(impl);
+    Tox* tox = tox_manager ? tox_manager->getTox() : nullptr;
     if (!tox) {
         V2TIM_LOG(kError, "CreateGroup: Tox not initialized");
         callback->OnError(ERR_SDK_NOT_INITIALIZED, "Tox not initialized");
         return;
     }
-    
+
     // Determine final Group ID
     V2TIMString finalGroupID = info.groupID;
     if (finalGroupID.Empty()) {
@@ -179,7 +190,7 @@ void V2TIMGroupManagerImpl::CreateGroup(const V2TIMGroupInfo& info,
     }
     
     // Get self name for creating group
-    std::string self_name = GetToxManagerFromImpl(manager_impl_)->getName();
+    std::string self_name = tox_manager->getName();
     if (self_name.empty()) {
         self_name = "User";
     }
@@ -235,7 +246,7 @@ void V2TIMGroupManagerImpl::CreateGroup(const V2TIMGroupInfo& info,
         }
         
         Tox_Err_Group_New err_new;
-        Tox_Group_Number group_number = GetToxManagerFromImpl(manager_impl_)->createGroup(
+        Tox_Group_Number group_number = tox_manager->createGroup(
             privacy_state,
             reinterpret_cast<const uint8_t*>(group_name.c_str()), group_name.length(),
             reinterpret_cast<const uint8_t*>(self_name.c_str()), self_name.length(),
@@ -283,8 +294,7 @@ void V2TIMGroupManagerImpl::CreateGroup(const V2TIMGroupInfo& info,
             
             // Check connection status for network-related errors
             if (err_new == TOX_ERR_GROUP_NEW_ANNOUNCE || err_new == TOX_ERR_GROUP_NEW_INIT) {
-                Tox* tox = GetToxManagerFromImpl(manager_impl_)->getTox();
-                if (tox) {
+                {
                     TOX_CONNECTION connection = tox_self_get_connection_status(tox);
                     V2TIM_LOG(kError, "CreateGroup: Tox connection status: {} (0=NONE, 1=UDP, 2=TCP)", static_cast<int>(connection));
                     if (connection == TOX_CONNECTION_NONE) {
@@ -302,7 +312,7 @@ void V2TIMGroupManagerImpl::CreateGroup(const V2TIMGroupInfo& info,
         // Get chat_id for persistent storage (only for group type)
         uint8_t chat_id[TOX_GROUP_CHAT_ID_SIZE];
         Tox_Err_Group_State_Query err_chat_id;
-        if (!GetToxManagerFromImpl(manager_impl_)->getGroupChatId(group_number, chat_id, &err_chat_id) ||
+        if (!tox_manager->getGroupChatId(group_number, chat_id, &err_chat_id) ||
             err_chat_id != TOX_ERR_GROUP_STATE_QUERY_OK) {
             V2TIM_LOG(kError, "CreateGroup: Failed to get chat_id");
             // Still continue, but chat_id won't be stored
@@ -351,14 +361,11 @@ void V2TIMGroupManagerImpl::CreateGroup(const V2TIMGroupInfo& info,
         }
         // Store creator as owner - needed for conference groups which lack role APIs
         {
-            Tox* tox = GetToxManagerFromImpl(manager_impl_)->getTox();
-            if (tox) {
-                uint8_t self_pubkey[TOX_PUBLIC_KEY_SIZE];
-                tox_self_get_public_key(tox, self_pubkey);
-                std::string self_hex = ToxUtil::tox_bytes_to_hex(self_pubkey, TOX_PUBLIC_KEY_SIZE);
-                groupInfo.owner = V2TIMString(self_hex.c_str());
-                groupInfo.role = V2TIM_GROUP_MEMBER_ROLE_SUPER; // Creator is owner
-            }
+            uint8_t self_pubkey[TOX_PUBLIC_KEY_SIZE];
+            tox_self_get_public_key(tox, self_pubkey);
+            std::string self_hex = ToxUtil::tox_bytes_to_hex(self_pubkey, TOX_PUBLIC_KEY_SIZE);
+            groupInfo.owner = V2TIMString(self_hex.c_str());
+            groupInfo.role = V2TIM_GROUP_MEMBER_ROLE_SUPER; // Creator is owner
         }
         group_info_[finalGroupID.CString()] = groupInfo;
         // Get the number (group_number or conference_number) from mapping
@@ -393,7 +400,12 @@ void V2TIMGroupManagerImpl::CreateGroup(const V2TIMGroupInfo& info,
             }
         }
         
-        if (group_number != UINT32_MAX) {
+        if (group_number != UINT32_MAX && session.Expired()) {
+            // A logout landed mid-create: the pin kept the instance valid, but
+            // this group belongs to a session that is over. Publishing a join
+            // for it would stamp the next account's instance id.
+            V2TIM_LOG(kWarning, "CreateGroup: session ended before HandleGroupSelfJoin; skipping the manual self-join");
+        } else if (group_number != UINT32_MAX) {
             V2TIM_LOG(kInfo, "[V2TIMGroupManagerImpl::CreateGroup] Manually calling HandleGroupSelfJoin(group_number={}) to trigger OnGroupCreated", group_number);
             manager_impl_->HandleGroupSelfJoin(group_number);
             V2TIM_LOG(kInfo, "[tim2tox-debug] V2TIMGroupManagerImpl::CreateGroup: HandleGroupSelfJoin completed");
