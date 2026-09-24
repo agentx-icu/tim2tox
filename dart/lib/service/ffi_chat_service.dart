@@ -2749,19 +2749,20 @@ class FfiChatService {
     // Start this session on the persistence store: undoes a previous
     // dispose() (a re-init of this service object after logout).
     //
-    // The owner key binds the DEFAULT directory to a Tox identity, but on the
-    // path that needs it most it is not known yet: init() runs before
-    // login(), so `getSelfToxId()` is null here and this load still reads
-    // whatever sits in the shared `<AppSupport>/chat_history`. Per-account
-    // isolation therefore comes from the host injecting a historyDirectory,
-    // or calling [installAccountStorage] once the id arrives (toxee does the
-    // latter on its legacy login paths); the owner binding only helps a host
-    // that already knew the identity at construction time.
+    // The owner key binds the DEFAULT directory to a Tox identity. init()
+    // has already opened the Tox profile by the time this runs, so on an
+    // UNENCRYPTED profile `getSelfToxId()` answers here and the default
+    // directory is owner-bound from the first load; on an encrypted one (and
+    // on the legacy login paths, which open an account row carrying no Tox
+    // ID) it is still null and the store stays ownerless until
+    // [installAccountStorage] re-points it. Awaited: an owner change hands the
+    // outgoing session's writes over to the directory that session was bound
+    // to before dropping them.
     String? ownerKey;
     try {
       ownerKey = getSelfToxId();
     } catch (_) {}
-    _messageHistoryPersistence.openSession(ownerKey: ownerKey);
+    await _messageHistoryPersistence.openSession(ownerKey: ownerKey);
     try {
       final quitGroups = historyPurgeGroups;
       final allHistories = await _messageHistoryPersistence.loadAllHistories(

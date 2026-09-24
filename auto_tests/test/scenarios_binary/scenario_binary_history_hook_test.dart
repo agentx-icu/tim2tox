@@ -53,6 +53,10 @@ void main() {
       // Static state — reset between tests so one case can't leak into the
       // next (e.g. a lingering listener / persistence / buffer).
       await BinaryReplacementHistoryHook.uninstallStandalone();
+      // Close the store BEFORE the directory goes away: appends are saved on a
+      // 200 ms debounce, so deleting the temp directory out from under a
+      // pending save raced the write (and made whatever it wrote unobservable).
+      await persistence.dispose();
       try {
         tempDir.deleteSync(recursive: true);
       } catch (_) {
@@ -110,6 +114,19 @@ void main() {
       // Incoming message: sender (bob) != selfId (selfA) -> isSelf false.
       expect(history.first.isSelf, isFalse);
       expect(history.first.fromUserId, 'bob');
+
+      // The poll above observes MEMORY, which the replay fills synchronously —
+      // it would go green with a save path that never writes anything. The
+      // point of the hook is that a replayed row is PERSISTED, so land the
+      // debounced save and read it back through a second store that shares
+      // nothing with this one.
+      await persistence.flushPendingSaves();
+      final reread = MessageHistoryPersistence(historyDirectory: tempDir.path);
+      final fromDisk = await reread.loadHistory('bob');
+      await reread.dispose();
+      expect(fromDisk.map((m) => m.text), ['hi alice']);
+      expect(fromDisk.single.isSelf, isFalse);
+      expect(fromDisk.single.fromUserId, 'bob');
     });
   });
 }
