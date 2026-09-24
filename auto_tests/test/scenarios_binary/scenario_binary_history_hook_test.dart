@@ -95,8 +95,14 @@ void main() {
       expect(persistence.getHistory('bob'), isEmpty);
 
       BinaryReplacementHistoryHook.updateSelfId('selfA');
-      // Let the debounced appendHistory land.
-      await Future<void>.delayed(const Duration(milliseconds: 300));
+      // Poll for the replayed row instead of sleeping past the debounce:
+      // `updateSelfId` replays through a discarded future, so how long it
+      // takes is a property of the host.
+      final deadline = DateTime.now().add(const Duration(seconds: 15));
+      while (persistence.getHistory('bob').isEmpty &&
+          DateTime.now().isBefore(deadline)) {
+        await Future<void>.delayed(const Duration(milliseconds: 10));
+      }
 
       final history = persistence.getHistory('bob');
       expect(history, hasLength(1));

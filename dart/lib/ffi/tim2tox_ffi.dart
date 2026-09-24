@@ -120,6 +120,13 @@ typedef _send_group_receipt_c = ffi.Int32 Function(
     ffi.Pointer<pkgffi.Utf8>,
     ffi.Pointer<pkgffi.Utf8>,
     ffi.Pointer<pkgffi.Utf8>);
+typedef _get_mm6_diag_c = ffi.Int32 Function(
+    ffi.Int64, ffi.Pointer<ffi.Int8>, ffi.Int32);
+typedef _mm6_send_crafted_challenge_c = ffi.Int32 Function(
+    ffi.Int64,
+    ffi.Pointer<pkgffi.Utf8>,
+    ffi.Pointer<pkgffi.Utf8>,
+    ffi.Pointer<pkgffi.Utf8>);
 typedef _send_c2c_custom_c = ffi.Int32 Function(
     ffi.Pointer<pkgffi.Utf8>, ffi.Pointer<ffi.Uint8>, ffi.Int32);
 typedef _send_c2c_control_c = ffi.Int32 Function(
@@ -1442,6 +1449,27 @@ class Tim2ToxFfi {
               ffi.Pointer<pkgffi.Utf8>,
               ffi.Pointer<pkgffi.Utf8>,
               ffi.Pointer<pkgffi.Utf8>)>('tim2tox_ffi_send_group_receipt');
+
+  /// MM-6 identity-proof counters plus the last proof payload received, as a
+  /// JSON object written into the caller's buffer. Returns bytes written.
+  late final int Function(int, ffi.Pointer<ffi.Int8>, int) getMm6DiagNative =
+      _lib.lookupFunction<_get_mm6_diag_c,
+          int Function(int, ffi.Pointer<ffi.Int8>, int)>(
+      'tim2tox_ffi_get_mm6_diag');
+
+  /// MM-6 harness hook: challenge a friend while naming someone else's
+  /// per-group key. Only the auto_tests use it — see the C header for why it
+  /// is not an attack primitive. 1 sent, 0 failure.
+  late final int Function(int, ffi.Pointer<pkgffi.Utf8>,
+          ffi.Pointer<pkgffi.Utf8>, ffi.Pointer<pkgffi.Utf8>)
+      mm6SendCraftedChallengeNative = _lib.lookupFunction<
+          _mm6_send_crafted_challenge_c,
+          int Function(
+              int,
+              ffi.Pointer<pkgffi.Utf8>,
+              ffi.Pointer<pkgffi.Utf8>,
+              ffi.Pointer<pkgffi.Utf8>)>(
+      'tim2tox_ffi_mm6_send_crafted_challenge');
 
   /// The group's shared name (NGC name / conference title); returns bytes
   /// written, 0 when unknown.

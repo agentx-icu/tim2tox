@@ -84,8 +84,15 @@ void main() {
         );
         expect(res.code, equals(0),
             reason: 'acceptFriendApplication should succeed (code 0)');
-        // tox_friend_add_norequest is synchronous; small settle for the FFI cb.
-        await Future<void>.delayed(const Duration(milliseconds: 300));
+        // tox_friend_add_norequest is synchronous, but the FFI callback still
+        // has to land. Poll for it instead of a fixed 300ms settle — a loaded
+        // CI host can miss that window, and if it never lands the expectation
+        // below reports exactly the same failure.
+        final deadline = DateTime.now().add(const Duration(seconds: 15));
+        while (!await hasFriend(acceptPubKey) &&
+            DateTime.now().isBefore(deadline)) {
+          await Future<void>.delayed(const Duration(milliseconds: 20));
+        }
 
         expect(await hasFriend(acceptPubKey), isTrue,
             reason: 'accept must add the friend via tox_friend_add_norequest');

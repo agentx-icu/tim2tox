@@ -370,6 +370,23 @@ int tim2tox_ffi_set_retired_group_id_max(int64_t instance_id, uint64_t max_id);
 // NUL-terminated string; returns bytes written, 0 when unknown.
 int tim2tox_ffi_get_group_member_friend(const char* member_key, char* out, int out_len);
 
+// MM-6 observability. Writes a NUL-terminated JSON object
+// {"proofsSent":N,"proofsIn":N,"proofsAccepted":N,"proofsRejected":N,
+//  "lastProofPayloadHex":"..."} describing this instance's identity-proof
+// traffic. Read-only; returns bytes written, 0 on failure.
+int tim2tox_ffi_get_mm6_diag(int64_t instance_id, char* out, int out_len);
+
+// MM-6 harness hook: send `friend_key_hex` an identity challenge naming
+// `claimed_member_key_hex` as our per-group key in `group_id`. The honest API
+// always names our OWN key there, so this is the only way to reproduce the
+// abuse case the encrypted proof (v2) defends against. It hands an attacker
+// nothing new — any Tox peer can send this frame — and exists so the
+// auto_tests can assert the named member receives only an unreadable box.
+// Returns 1 sent, 0 failure.
+int tim2tox_ffi_mm6_send_crafted_challenge(int64_t instance_id, const char* group_id,
+                                           const char* friend_key_hex,
+                                           const char* claimed_member_key_hex);
+
 // Send a group message receipt ("received"/"read") privately to the message's
 // author (their per-group public key). Returns 1 sent, -2 unsupported on this
 // group kind (legacy conference), 0 failure.

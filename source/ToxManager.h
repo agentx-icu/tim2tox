@@ -100,7 +100,26 @@ public:
     }
 
     // 核心功能接口
+    // Raw, UNPINNED handle. Valid only for as long as the caller can prove the
+    // session cannot end underneath it — i.e. from inside a tox callback (the
+    // iterating thread; teardown defers, see IterateReentryScope) or while a
+    // pin from acquireTox() is alive. Anything reachable from another thread
+    // (the FFI surface) must use acquireTox()/V2TIMManagerImpl::AcquireToxSession
+    // instead: shutdown() can otherwise tox_kill() the instance between two
+    // consecutive tox_*() calls of the same operation.
     Tox* getTox() const;
+    // Pin the live Tox for the duration of a call sequence. Returns null while
+    // shutting down / before initialize (the operation must then refuse).
+    //
+    // Why a shared_ptr and not a lock: a lock held across a whole operation
+    // would have to be ranked against iterate_mutex_ (which shutdown() takes
+    // FIRST and which callers legitimately take via lockIterate()), and either
+    // ranking deadlocks one of the two. A refcount cannot deadlock: shutdown()
+    // still returns immediately, it just hands the last reference — and with it
+    // the tox_kill() — to whoever is still inside an operation. tox_iterate()
+    // is already stopped by then (UnInitSDK joins the event thread before
+    // ToxManager::shutdown), so the pinned instance has exactly one user left.
+    std::shared_ptr<Tox> acquireTox() const;
     void iterate(uint32_t timeout = 0);
     bool isShuttingDown() const;
     // Serialize a toxcore entry point that BYPASSES the per-instance lock
@@ -385,7 +404,10 @@ private:
     static void toxDeleter(Tox* tox);
 
     // 成员变量
-    std::unique_ptr<Tox, decltype(&toxDeleter)> tox_;
+    // shared_ptr (not unique_ptr) so acquireTox() can hand out a pin that
+    // outlives shutdown()'s reset; the tox_kill() in toxDeleter then runs when
+    // the last pin is dropped. See acquireTox().
+    std::shared_ptr<Tox> tox_;
     mutable std::mutex mutex_;
     std::mutex iterate_mutex_;  // Serialize tox_iterate - toxcore requires single-threaded access per instance
     std::atomic<std::thread::id> iterate_owner_{};  // thread holding iterate_mutex_ inside iterate()/shutdown() (see lockIterate)

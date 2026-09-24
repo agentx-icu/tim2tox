@@ -18,6 +18,7 @@
 // Mode-aware: runs wall-clock by default and under RUN_VIRTUAL=1.
 
 import 'dart:convert';
+import 'dart:ffi' as ffi;
 
 import 'package:ffi/ffi.dart' as pkgffi;
 import 'package:test/test.dart';
@@ -213,6 +214,133 @@ void main() {
       expect(resolved.values.whereType<String>().toSet(), equals(expected),
           reason: 'every member key must be proven to exactly its friend');
     }, timeout: const Timeout(Duration(seconds: 150)));
+
+    // MM-6 confidentiality (the leak fixed on 2026-09-23).
+    //
+    // A friend's challenge names "the challenger's per-group key", and that
+    // value is whatever the friend put in the packet. Per-group keys are
+    // visible to every member, so a friend can name ANY member -- and we still
+    // have to answer, because the honest flow cannot tell the two apart in
+    // time (the challenge is fired from the peer-join path, before the asker's
+    // own hint has arrived, and a challenger never retries; see the MM-6 block
+    // comment in V2TIMManagerImpl.cpp). What must hold instead is that the
+    // answer is readable ONLY by the friend that asked.
+    //
+    // Here member1 -- a friend of the founder -- names member2's per-group key.
+    // The founder answers, to member2. member2 must get an opaque box of
+    // exactly the v2 size, must NOT find member1's long-term key (nor its own,
+    // nor the founder's) anywhere in it, and must not resolve anything from it.
+    test('MM-6: a proof for one friend is unreadable by the member it names',
+        () async {
+      final lib = ffi_lib.Tim2ToxFfi.open();
+
+      Map<String, Object?> mm6Diag(TestNode node) => node.runWithInstance(() {
+            final buf = pkgffi.calloc<ffi.Int8>(4096);
+            try {
+              final n = lib.getMm6DiagNative(0, buf, 4096);
+              if (n <= 0) return <String, Object?>{};
+              final decoded = jsonDecode(
+                  buf.cast<pkgffi.Utf8>().toDartString(length: n));
+              return decoded is Map<String, Object?>
+                  ? decoded
+                  : <String, Object?>{};
+            } finally {
+              pkgffi.calloc.free(buf);
+            }
+          });
+      int diagInt(Map<String, Object?> d, String key) =>
+          (d[key] as num?)?.toInt() ?? 0;
+
+      final member1Pk = member1.getPublicKey().toUpperCase();
+      final member2Pk = member2.getPublicKey().toUpperCase();
+      final founderPk = founder.getPublicKey().toUpperCase();
+      final proven = await founderMemberFriends();
+      final member2Key = proven.entries
+          .where((e) => e.value == member2Pk)
+          .map((e) => e.key)
+          .firstOrNull;
+      expect(member2Key, isNotNull,
+          reason: 'needs the member key the MM-6 test proved');
+
+      final founderBefore = mm6Diag(founder);
+      final victimBefore = mm6Diag(member2);
+
+      // The one packet shape the honest API cannot produce: member1 challenges
+      // the founder while claiming member2's per-group key as its own.
+      final sent = member1.runWithInstance(() {
+        final gid = groupId!.toNativeUtf8();
+        final friendKey = founderPk.toNativeUtf8();
+        final claimed = member2Key!.toNativeUtf8();
+        try {
+          return lib.mm6SendCraftedChallengeNative(0, gid, friendKey, claimed);
+        } finally {
+          pkgffi.malloc.free(gid);
+          pkgffi.malloc.free(friendKey);
+          pkgffi.malloc.free(claimed);
+        }
+      });
+      expect(sent, equals(1), reason: 'the crafted challenge must go out');
+
+      var founderAfter = founderBefore;
+      var victimAfter = victimBefore;
+      final deadline = DateTime.now().add(const Duration(seconds: 45));
+      while (DateTime.now().isBefore(deadline)) {
+        founderAfter = mm6Diag(founder);
+        victimAfter = mm6Diag(member2);
+        if (diagInt(victimAfter, 'proofsIn') >
+            diagInt(victimBefore, 'proofsIn')) {
+          break;
+        }
+        await pumpTestTick(scenario, advanceMs: 500, iterationsPerInstance: 2);
+        if (!shouldRunVirtual) {
+          await Future<void>.delayed(const Duration(milliseconds: 250));
+        }
+      }
+      // ignore: avoid_print
+      print('[mm6] founder diag: $founderAfter');
+      // ignore: avoid_print
+      print('[mm6] named-member diag: $victimAfter');
+
+      expect(diagInt(founderAfter, 'proofsSent'),
+          greaterThanOrEqualTo(diagInt(founderBefore, 'proofsSent') + 1),
+          reason: 'the founder still answers whatever key the friend names');
+      expect(diagInt(victimAfter, 'proofsIn'),
+          greaterThanOrEqualTo(diagInt(victimBefore, 'proofsIn') + 1),
+          reason: 'the named member is the one that receives the answer');
+      // The strict one: being named must teach the member nothing.
+      expect(diagInt(victimAfter, 'proofsAccepted'),
+          equals(diagInt(victimBefore, 'proofsAccepted')),
+          reason: 'nothing may be proven to the member that was merely named');
+      expect(diagInt(victimAfter, 'proofsRejected'),
+          greaterThanOrEqualTo(diagInt(victimBefore, 'proofsRejected') + 1),
+          reason: 'it must be rejected, not silently half-processed');
+
+      // The payload itself: a v2 box (24-byte nonce + 160-byte plaintext +
+      // 16-byte MAC = 200 bytes), with no identity readable in it. Before the
+      // fix this was "nonce || member1's long-term public key" in the clear.
+      final payload =
+          (victimAfter['lastProofPayloadHex'] as String? ?? '').toUpperCase();
+      expect(payload.length, equals(200 * 2),
+          reason: 'MM-6 proof v2 is a fixed-size sealed box');
+      for (final secret in <String>[member1Pk, member2Pk, founderPk]) {
+        expect(payload.contains(secret), isFalse,
+            reason: 'no long-term key may be readable in the proof payload');
+      }
+      expect(payload.contains(member2Key!.toUpperCase()), isFalse,
+          reason: 'not even the per-group key it was addressed to');
+
+      // ... and the named member learns no mapping from it.
+      final svc = (TencentCloudChatSdkPlatform.instance as Tim2ToxSdkPlatform)
+          .ffiService;
+      for (final key in proven.keys) {
+        final resolvedTo =
+            member2.runWithInstance(() => svc.friendForGroupMemberKey(key))
+                ?.toUpperCase();
+        expect(resolvedTo, isNot(equals(member1Pk)),
+            reason: 'the crafted challenge must not teach member2 about '
+                'member1 (key $key)');
+      }
+    }, timeout: const Timeout(Duration(seconds: 120)));
 
     // A member can replay one valid kind-2 receipt as often as it likes. The
     // receiving native side must forward it ONCE (per group, authenticated

@@ -123,7 +123,7 @@ bool IterateReentryScope::Defer(std::function<void()> fn) {
 }
 
 // 构造函数（现在是 public，支持多实例）
-ToxManager::ToxManager() : tox_(nullptr, &toxDeleter) {}
+ToxManager::ToxManager() = default;
 
 // 析构函数
 ToxManager::~ToxManager() {
@@ -348,8 +348,9 @@ void ToxManager::initialize(const Tox_Options* options,
     }
     V2TIM_LOG(kInfo, "[ToxManager] initialize: Tox instance created successfully");
     
-    // 使用reset来设置unique_ptr
-    tox_.reset(tox_instance);
+    // shared_ptr so an in-flight operation can pin it (see acquireTox()); the
+    // deleter is unchanged, it just may run later than this object.
+    tox_ = std::shared_ptr<Tox>(tox_instance, &toxDeleter);
 
     // Register Tox* -> ToxManager* mapping for callbacks that don't support user_data
     {
@@ -511,6 +512,25 @@ Tox* ToxManager::getTox() const {
         return nullptr;
     } catch (...) {
         // Catch any other exception during mutex lock
+        return nullptr;
+    }
+}
+
+// Pin the live Tox for a whole call sequence. Same acquisition cost and same
+// lock (mutex_, briefly) as getTox() — callers that could safely call getTox()
+// can safely call this — but the returned handle keeps the instance alive even
+// if shutdown() runs on another thread in the meantime.
+std::shared_ptr<Tox> ToxManager::acquireTox() const {
+    try {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (is_shutting_down_.load(std::memory_order_acquire) || !tox_) {
+            return nullptr;
+        }
+        return tox_;
+    } catch (const std::system_error&) {
+        // Mutex may be invalid during static destruction.
+        return nullptr;
+    } catch (...) {
         return nullptr;
     }
 }

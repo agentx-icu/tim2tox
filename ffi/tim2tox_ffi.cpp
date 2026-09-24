@@ -2476,9 +2476,10 @@ int tim2tox_ffi_set_typing(const char* user_id, int typing_on) {
     if (!IsCurrentInstanceInited() || !user_id) return 0;
     V2TIMManagerImpl* manager_impl = GetCurrentInstance();
     if (!manager_impl) return 0;
-    ToxManager* tox_manager = manager_impl->GetToxManager();
-    if (!tox_manager) return 0;
-    Tox* tox = tox_manager->getTox();
+    // Pinned: this runs on the Dart thread, and UnInitSDK on another thread
+    // may otherwise free the instance between the lookup and the set below.
+    const auto session = manager_impl->AcquireToxSession();
+    Tox* tox = session.tox();
     if (!tox) return 0;
     uint8_t pubkey[TOX_PUBLIC_KEY_SIZE] = {0};
     if (!ToxUtil::tox_hex_to_bytes(user_id, (int)strlen(user_id), pubkey, TOX_PUBLIC_KEY_SIZE)) return 0;
@@ -2991,6 +2992,29 @@ int tim2tox_ffi_get_group_member_friend(const char* member_key, char* out, int o
     return n;
 }
 
+int tim2tox_ffi_get_mm6_diag(int64_t instance_id, char* out, int out_len) {
+    if (!out || out_len <= 1) return 0;
+    if (instance_id == 0) instance_id = GetCurrentInstanceId();
+    V2TIMManagerImpl* manager = GetInstanceFromId(instance_id);
+    if (!manager) return 0;
+    const std::string json = manager->Mm6DiagJson();
+    if (json.empty()) return 0;
+    const int n = static_cast<int>(std::min(json.size(), static_cast<size_t>(out_len - 1)));
+    memcpy(out, json.data(), n);
+    out[n] = '\0';
+    return n;
+}
+
+int tim2tox_ffi_mm6_send_crafted_challenge(int64_t instance_id, const char* group_id,
+                                           const char* friend_key_hex,
+                                           const char* claimed_member_key_hex) {
+    if (!group_id || !friend_key_hex || !claimed_member_key_hex) return 0;
+    if (instance_id == 0) instance_id = GetCurrentInstanceId();
+    V2TIMManagerImpl* manager = GetInstanceFromId(instance_id);
+    if (!manager || !manager->GetToxManager()) return 0;
+    return manager->Mm6SendCraftedChallenge(group_id, friend_key_hex, claimed_member_key_hex);
+}
+
 int tim2tox_ffi_set_retired_group_id_max(int64_t instance_id, uint64_t max_id) {
     if (instance_id == 0) instance_id = GetCurrentInstanceId();
     V2TIMManagerImpl* manager = GetInstanceFromId(instance_id);
@@ -3053,9 +3077,8 @@ int tim2tox_ffi_get_conference_peer_count(int64_t instance_id, uint32_t conferen
     if (instance_id == 0) instance_id = GetCurrentInstanceId();
     V2TIMManagerImpl* manager_impl = GetInstanceFromId(instance_id);
     if (!manager_impl) return -1;
-    ToxManager* tox_manager = manager_impl->GetToxManager();
-    if (!tox_manager) return -1;
-    Tox* tox = tox_manager->getTox();
+    const auto session = manager_impl->AcquireToxSession();
+    Tox* tox = session.tox();
     if (!tox) return -1;
     TOX_ERR_CONFERENCE_PEER_QUERY err;
     uint32_t count = tox_conference_peer_count(tox, conference_number, &err);
@@ -3069,9 +3092,9 @@ int tim2tox_ffi_get_conference_peer_pubkeys(int64_t instance_id, uint32_t confer
     if (instance_id == 0) instance_id = GetCurrentInstanceId();
     V2TIMManagerImpl* manager_impl = GetInstanceFromId(instance_id);
     if (!manager_impl) return -1;
-    ToxManager* tox_manager = manager_impl->GetToxManager();
-    if (!tox_manager) return -1;
-    Tox* tox = tox_manager->getTox();
+    // Pinned across the whole peer-walk below.
+    const auto session = manager_impl->AcquireToxSession();
+    Tox* tox = session.tox();
     if (!tox) return -1;
     TOX_ERR_CONFERENCE_PEER_QUERY err;
     uint32_t peer_count = tox_conference_peer_count(tox, conference_number, &err);
@@ -3082,7 +3105,7 @@ int tim2tox_ffi_get_conference_peer_pubkeys(int64_t instance_id, uint32_t confer
     for (uint32_t i = 0; i < peer_count; i++) {
         uint8_t pubkey[TOX_PUBLIC_KEY_SIZE];
         TOX_ERR_CONFERENCE_PEER_QUERY err_key;
-        if (tox_manager->getConferencePeerPublicKey(conference_number, i, pubkey, &err_key) &&
+        if (session.manager()->getConferencePeerPublicKey(conference_number, i, pubkey, &err_key) &&
             err_key == TOX_ERR_CONFERENCE_PEER_QUERY_OK) {
             if (!result.empty()) result += ',';
             result += ToxUtil::tox_bytes_to_hex(pubkey, TOX_PUBLIC_KEY_SIZE);
@@ -3152,9 +3175,11 @@ int ResolveFilePeer(int64_t instance_id, const char* user_id,
         return -1;
     }
     V2TIMManagerImpl* manager = GetInstanceFromId(resolved_instance_id);
-    ToxManager* tox_manager = manager == nullptr ? nullptr
-                                                  : manager->GetToxManager();
-    Tox* tox = tox_manager == nullptr ? nullptr : tox_manager->getTox();
+    // Pinned across the friend lookup + file_send + first chunk sequence.
+    const auto session = manager == nullptr
+                             ? V2TIMManagerImpl::ToxSessionGuard()
+                             : manager->AcquireToxSession();
+    Tox* tox = session.tox();
     if (tox == nullptr) {
         V2TIM_LOG(kError,
                   "[ffi] file_send: type={} status=unavailable count=0",
@@ -3311,11 +3336,13 @@ int tim2tox_ffi_iterate_current_instance(int count) {
     V2TIMManagerImpl* manager_impl = GetCurrentInstance();
     if (!manager_impl) return 0;
     for (int i = 0; i < count; ++i) {
-        // Re-fetched every round: a callback may UnInitSDK, which runs (and
-        // destroys the ToxManager) when that iterate returns.
-        ToxManager* tox_manager = manager_impl->GetToxManager();
-        if (!tox_manager) return i > 0 ? 1 : 0;
-        tox_manager->iterate(0);
+        // Re-pinned every round: a callback may UnInitSDK, which runs (and
+        // drops the ToxManager) when that iterate returns. The pin makes the
+        // iterate itself safe even if that happens mid-round; re-taking it is
+        // what stops the NEXT round from driving a dead session.
+        const auto session = manager_impl->AcquireToxSession();
+        if (!session) return i > 0 ? 1 : 0;
+        session.manager()->iterate(0);
     }
     return 1;
 }
@@ -3405,9 +3432,8 @@ int tim2tox_ffi_iterate_all_instances(int count) {
     if (copy.empty()) return 0;
     for (int round = 0; round < count; ++round) {
         for (V2TIMManagerImpl* manager : copy) {
-            ToxManager* tox_manager = manager->GetToxManager();
-            if (tox_manager && !tox_manager->isShuttingDown())
-                tox_manager->iterate(0);
+            const auto session = manager->AcquireToxSession();
+            if (session) session.manager()->iterate(0);
         }
     }
     return static_cast<int>(copy.size());
@@ -3417,9 +3443,8 @@ int tim2tox_ffi_get_self_connection_status(void) {
     if (!IsCurrentInstanceInited()) return 0;
     V2TIMManagerImpl* manager_impl = GetCurrentInstance();
     if (!manager_impl) return 0;
-    ToxManager* tox_manager = manager_impl->GetToxManager();
-    if (!tox_manager) return 0;
-    Tox* tox = tox_manager->getTox();
+    const auto session = manager_impl->AcquireToxSession();
+    Tox* tox = session.tox();
     if (!tox) return 0;
     TOX_CONNECTION status = tox_self_get_connection_status(tox);
     return (int)status;
@@ -3432,12 +3457,8 @@ int tim2tox_ffi_get_udp_port(int64_t instance_id) {
         V2TIM_LOG(kError, "[ffi] get_udp_port: instance_id={} V2TIMManagerImpl instance is null", (long long)instance_id);
         return 0;
     }
-    ToxManager* tox_manager = manager_impl->GetToxManager();
-    if (!tox_manager) {
-        V2TIM_LOG(kError, "[ffi] get_udp_port: ToxManager instance is null");
-        return 0;
-    }
-    Tox* tox = tox_manager->getTox();
+    const auto session = manager_impl->AcquireToxSession();
+    Tox* tox = session.tox();
     if (!tox) {
         V2TIM_LOG(kError, "[ffi] get_udp_port: Tox instance is null");
         return 0;
@@ -3463,12 +3484,8 @@ int tim2tox_ffi_get_dht_id_for_instance(int64_t instance_id, char* out_dht_id, i
         V2TIM_LOG(kError, "[ffi] get_dht_id_for_instance: instance_id={} V2TIMManagerImpl instance is null", (long long)instance_id);
         return 0;
     }
-    ToxManager* tox_manager = manager_impl->GetToxManager();
-    if (!tox_manager) {
-        V2TIM_LOG(kError, "[ffi] get_dht_id_for_instance: instance_id={} ToxManager instance is null", (long long)instance_id);
-        return 0;
-    }
-    Tox* tox = tox_manager->getTox();
+    const auto session = manager_impl->AcquireToxSession();
+    Tox* tox = session.tox();
     if (!tox) {
         V2TIM_LOG(kError, "[ffi] get_dht_id_for_instance: instance_id={} Tox instance is null", (long long)instance_id);
         return 0;
@@ -3507,12 +3524,9 @@ int tim2tox_ffi_add_bootstrap_node(int64_t instance_id, const char* host, int po
         V2TIM_LOG(kError, "[ffi] add_bootstrap_node: instance_id={} V2TIMManagerImpl instance is null", (long long)instance_id);
         return 0;
     }
-    ToxManager* tox_manager = manager_impl->GetToxManager();
-    if (!tox_manager) {
-        V2TIM_LOG(kError, "[ffi] add_bootstrap_node: ToxManager instance is null");
-        return 0;
-    }
-    Tox* tox = tox_manager->getTox();
+    // Pinned across the bootstrap + add_tcp_relay sequence below.
+    const auto session = manager_impl->AcquireToxSession();
+    Tox* tox = session.tox();
     if (!tox) {
         V2TIM_LOG(kError, "[ffi] add_bootstrap_node: Tox instance is null");
         return 0;
@@ -3570,13 +3584,9 @@ int tim2tox_ffi_file_control(int64_t instance_id, const char* user_id, uint32_t 
                   "[ffi] file_control: type=file status=manager_unavailable count=0");
         return -1;
     }
-    ToxManager* tox_manager = manager_impl->GetToxManager();
-    if (!tox_manager) {
-        V2TIM_LOG(kError,
-                  "[ffi] file_control: type=file status=manager_unavailable count=0");
-        return -1;
-    }
-    Tox* tox = tox_manager->getTox();
+    // Pinned across the friend lookup + file_control sequence below.
+    const auto session = manager_impl->AcquireToxSession();
+    Tox* tox = session.tox();
     if (!tox) {
         V2TIM_LOG(kError,
                   "[ffi] file_control: type=file status=tox_unavailable count=0");
@@ -5032,12 +5042,8 @@ static uint32_t GetFriendNumberByUserIdOnManager(
         V2TIM_LOG(kError, "[ffi] get_friend_number_by_user_id: V2TIMManagerImpl instance not available");
         return UINT32_MAX;
     }
-    ToxManager* tox_manager = manager_impl->GetToxManager();
-    if (!tox_manager) {
-        V2TIM_LOG(kError, "[ffi] get_friend_number_by_user_id: ToxManager instance not available");
-        return UINT32_MAX;
-    }
-    Tox* tox = tox_manager->getTox();
+    const auto session = manager_impl->AcquireToxSession();
+    Tox* tox = session.tox();
     if (!tox) {
         V2TIM_LOG(kError, "[ffi] get_friend_number_by_user_id: Tox instance not available");
         return UINT32_MAX;
@@ -5166,12 +5172,8 @@ const char* tim2tox_ffi_get_user_id_by_friend_number(uint32_t friend_number) {
         V2TIM_LOG(kError, "[ffi] get_user_id_by_friend_number: V2TIMManagerImpl instance not available");
         return nullptr;
     }
-    ToxManager* tox_manager = manager_impl->GetToxManager();
-    if (!tox_manager) {
-        V2TIM_LOG(kError, "[ffi] get_user_id_by_friend_number: ToxManager instance not available");
-        return nullptr;
-    }
-    Tox* tox = tox_manager->getTox();
+    const auto session = manager_impl->AcquireToxSession();
+    Tox* tox = session.tox();
     if (!tox) {
         V2TIM_LOG(kError, "[ffi] get_user_id_by_friend_number: Tox instance not available");
         return nullptr;
@@ -5413,13 +5415,8 @@ int tim2tox_ffi_dht_send_nodes_request(const char* public_key, const char* ip, u
         return 0;
     }
     
-    ToxManager* tox_manager = manager->GetToxManager();
-    if (!tox_manager) {
-        V2TIM_LOG(kError, "[ffi] dht_send_nodes_request: ToxManager is null");
-        return 0;
-    }
-    
-    Tox* tox = tox_manager->getTox();
+    const auto session = manager->AcquireToxSession();
+    Tox* tox = session.tox();
     if (!tox) {
         V2TIM_LOG(kError, "[ffi] dht_send_nodes_request: Tox instance is null");
         return 0;
@@ -5501,13 +5498,13 @@ void tim2tox_ffi_set_dht_nodes_response_callback(int64_t instance_id, tim2tox_dh
     // Register/unregister internal callback with Tox for this instance
     V2TIMManagerImpl* manager = instance_id == 0 ? V2TIMManagerImpl::GetInstance() : GetInstanceFromId(instance_id);
     if (manager) {
-        ToxManager* tox_manager = manager->GetToxManager();
-        if (tox_manager) {
+        // Pin first (it takes no lock it keeps), then serialize with iterate.
+        const auto session = manager->AcquireToxSession();
+        if (session) {
             // tox_callback_* setters bypass toxcore's instance lock; keep the
-            // write out of a concurrent tox_iterate (ToxManager::lockIterate),
-            // and only fetch the pointer once the lock excludes shutdown().
-            auto iterate_lock = tox_manager->lockIterate();
-            Tox* tox = tox_manager->getTox();
+            // write out of a concurrent tox_iterate (ToxManager::lockIterate).
+            auto iterate_lock = session.manager()->lockIterate();
+            Tox* tox = session.tox();
             if (tox) {
                 if (callback) {
                     // Register callback using tox_callback_dht_nodes_response

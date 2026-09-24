@@ -246,6 +246,42 @@ class MessageHistoryPersistence {
   /// Not `*.json` / `.tmp` / `.bak`, so no load or cleanup pass touches it.
   static const String _ownerMarkerName = '.tim2tox_history_owner';
 
+  /// Identity the HOST has proven owns an UNMARKED default directory.
+  ///
+  /// Ownership of a directory that predates owner binding cannot be decided
+  /// here — the rows in it carry peer ids, not ours. Only the integrator can
+  /// prove it (toxee: `LegacyAccountDataClaim`, via a recorded claim, the
+  /// legacy profile's embedded Tox ID, or byte-identity with the account's own
+  /// profile). Until one identity is declared here, such a directory is used by
+  /// NOBODY: every owner-bound session gets its own isolated directory instead,
+  /// and the legacy rows are left exactly where they are. See
+  /// [declareProvenDefaultOwner] and [_resolveOwnedDirectory].
+  String? _provenDefaultOwner;
+
+  /// Declare, out of band, that [ownerKey] is the proven owner of an unmarked
+  /// default history directory, so this store may ADOPT it in place (claiming
+  /// it with an owner marker) instead of starting empty beside it.
+  ///
+  /// For integrators that migrate the legacy data by copying it into a
+  /// per-account directory (what toxee does) this is unnecessary — they inject
+  /// that directory and the default resolution never runs. It exists for hosts
+  /// that keep using the default directory and can prove who owns it.
+  ///
+  /// Declare it BEFORE [openSession] / the first read: it only changes where
+  /// the default directory resolves to, and rows already read from (or written
+  /// to) the isolated directory are not moved.
+  ///
+  /// Passing null (or an unusable key) withdraws the declaration. Never makes
+  /// a directory SHARED: at most one identity can be declared, and any other
+  /// identity still routes to its own directory.
+  void declareProvenDefaultOwner(String? ownerKey) {
+    final normalized = _normalizeOwnerKey(ownerKey);
+    if (normalized == _provenDefaultOwner) return;
+    _provenDefaultOwner = normalized;
+    // The proof changes where the default resolves to; drop the memo.
+    _resolvedDefaultDirPath = null;
+  }
+
   /// Start (or restart) a session on this store.
   ///
   /// Restores the operational state [dispose] switched off, so a host that
@@ -395,8 +431,15 @@ class MessageHistoryPersistence {
   /// moment the identity is known [openSession] re-resolves to the account's
   /// own directory.
   ///
-  /// An UNMARKED base directory — the only shape a host that never supplies an
-  /// owner produces — is used exactly as before.
+  /// An UNMARKED base directory is still used as is, and deliberately so: with
+  /// no owner there is nothing to isolate BY, and it is the only shape a host
+  /// that never supplies an owner ever produces — isolating it would strand
+  /// that host's entire history (and, in toxee, the rows written in the window
+  /// between login and `installAccountStorage`, which its migration adopts from
+  /// exactly this directory). An identity that IS known never shares an
+  /// unproven directory — see [_resolveOwnedDirectory]; that is where the
+  /// cross-account read is cut off, because only there is there something to
+  /// tell two sessions apart.
   Future<String> _resolveUnownedDirectory(String basePath) async {
     try {
       final marker = File(p.join(basePath, _ownerMarkerName));
@@ -431,10 +474,15 @@ class MessageHistoryPersistence {
   ///    gets its own `<base>_<publicKey>` directory;
   ///  * an UNMARKED directory that already holds history predates owner
   ///    binding. Whose it is cannot be proven here (rows carry peer ids, not
-  ///    ours), so it is neither claimed nor abandoned: it keeps working as
-  ///    before, and the integrator's proven migration (toxee:
-  ///    LegacyAccountDataClaim) decides who adopts it. First-to-ask is not
-  ///    proof of ownership.
+  ///    ours), and first-to-ask is not proof: it used to be handed to whichever
+  ///    account asked first, which is the SAME bug one layer down — two
+  ///    accounts read and overwrote the same per-peer files. It is now given to
+  ///    nobody unless the integrator has proven an owner
+  ///    ([declareProvenDefaultOwner]; toxee proves it with
+  ///    LegacyAccountDataClaim and migrates the rows into a per-account
+  ///    directory instead). Every other identity gets its own
+  ///    `<base>_<publicKey>` directory and the legacy rows are left untouched,
+  ///    so the rightful owner can still claim them later.
   Future<String> _resolveOwnedDirectory(String basePath, String owner) async {
     final base = Directory(basePath);
     final marker = File(p.join(basePath, _ownerMarkerName));
@@ -447,13 +495,21 @@ class MessageHistoryPersistence {
         await base.create(recursive: true);
         await marker.writeAsString(owner, flush: true);
         return basePath;
+      } else if (_provenDefaultOwner == owner) {
+        // The host proved this identity owns the pre-binding directory. Adopt
+        // it in place and mark it, so the next account is isolated by the
+        // marker check above rather than by this declaration.
+        await marker.writeAsString(owner, flush: true);
+        return basePath;
       } else {
         _logger?.logWarning(
           '[MessageHistoryPersistence] default history directory predates '
-          'owner binding and is not provably this account\'s; using it '
-          'unclaimed (inject a per-account historyDirectory to isolate)',
+          'owner binding and is not provably this account\'s; leaving it '
+          'untouched and using an isolated directory (inject a per-account '
+          'historyDirectory, or declare a proven owner, to adopt it)',
         );
-        return basePath;
+        // Falls through to the isolated directory below: an unproven
+        // directory is never shared.
       }
     } catch (e, st) {
       _logger?.logError(
