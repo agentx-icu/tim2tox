@@ -327,6 +327,35 @@ void main() {
       await store.dispose();
     }, skip: Platform.isWindows ? 'chmod-based failure injection' : null);
 
+    test('the deletion of the LAST row survives the hand-over', () async {
+      // Nothing is left to hold for this conversation, so the tombstone is the
+      // only thing that can carry the delete — and it has to be written, not
+      // just remembered (codex 2026-09-26).
+      final store = await opened(ownerKey: _ownerA);
+      await store.appendHistory(_peer, _row('the_only_row'));
+      await store.flushPendingSaves();
+      final ownDir = Directory((await store.ownerBoundDefaultDirectory())!);
+
+      await Process.run('chmod', <String>['500', ownDir.path]);
+      addTearDown(() => Process.run('chmod', <String>['700', ownDir.path]));
+      await expectLater(
+          store.removeMessage(_peer, 'the_only_row'), throwsA(anything));
+      unawaited(store.flushPendingSaves().catchError((Object _) {}));
+
+      await store.openSession(ownerKey: _ownerB);
+      await Process.run('chmod', <String>['700', ownDir.path]);
+      await store.openSession(ownerKey: _ownerA);
+      await store.flushPendingSaves();
+      await store.dispose();
+
+      // A fresh store, nothing cached: only the files can answer.
+      final reopened = MessageHistoryPersistence(appSupportRootOverride: root.path);
+      await reopened.openSession(ownerKey: _ownerA);
+      expect(await reopened.loadHistory(_peer), isEmpty,
+          reason: 'the deleted sole row must not come back next session');
+      await reopened.dispose();
+    }, skip: Platform.isWindows ? 'chmod-based failure injection' : null);
+
     test('a delete whose write failed is not undone when the owner returns',
         () async {
       // The row is on disk first, then deleted with the directory unwritable:
@@ -529,6 +558,51 @@ void main() {
       final decoded = jsonDecode(await peerFile(base()).readAsString())
           as Map<String, dynamic>;
       expect(decoded['lastViewTimestamp'], 9000);
+    });
+
+    test('a source changed after a partial adoption is merged again', () async {
+      // Two conversations in the isolated directory, one of them unreadable, so
+      // the adoption merges the first and then aborts. The session keeps using
+      // the isolated directory and appends to the conversation that DID
+      // transfer; the retry must not skip it on the strength of its name
+      // (codex 2026-09-26).
+      await seedLegacyDirectory();
+      // The destination must already hold 'other' too, or the merge just copies
+      // the source file wholesale and never has to decode it.
+      await File(p.join(base().path, 'other.json')).writeAsString(
+        jsonEncode(<String, Object?>{
+          'conversationId': 'other',
+          'version': 2,
+          'lastViewTimestamp': 0,
+          'messages': <Object?>[_row('legacy_of_other').toJson()],
+        }),
+        flush: true,
+      );
+      final a = await opened(ownerKey: _ownerA);
+      await a.appendHistory(_peer, _row('first_of_peer'));
+      await a.appendHistory('other', _row('only_of_other'));
+      await a.flushPendingSaves();
+      final isolated = Directory((await a.ownerBoundDefaultDirectory())!);
+      final broken = File(p.join(isolated.path, 'other.json'));
+      final rescue = await broken.readAsString();
+      await broken.writeAsString('{ truncated', flush: true);
+
+      await expectLater(a.adoptDefaultHistoryDirectory(ownerKey: _ownerA),
+          throwsA(isA<StateError>()));
+
+      // The session is still on the isolated directory: append there.
+      await a.appendHistory(_peer, _row('after_the_failure'));
+      await a.flushPendingSaves();
+      await broken.writeAsString(rescue, flush: true);
+
+      expect(await a.adoptDefaultHistoryDirectory(ownerKey: _ownerA),
+          base().path);
+      final rows = (await a.loadHistory(_peer)).map((m) => m.msgID);
+      expect(rows, containsAll(<String>['first_of_peer', 'after_the_failure']),
+          reason: 'the row written between the two attempts must not be lost');
+      expect((await a.loadHistory('other')).map((m) => m.msgID),
+          contains('only_of_other'));
+      await a.dispose();
     });
 
     test('adoption refuses to run for an identity this store is not bound to',

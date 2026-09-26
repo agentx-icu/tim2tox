@@ -8,6 +8,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:math';
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 import '../interfaces/logger_service.dart';
@@ -465,6 +466,7 @@ class MessageHistoryPersistence {
       final name = p.basename(entity.path);
       if (name == _ownerMarkerName ||
           name == _mergedManifestName ||
+          name == _dirIdName ||
           name.endsWith('.tmp') ||
           name.contains('.corrupt-')) {
         continue;
@@ -480,6 +482,14 @@ class MessageHistoryPersistence {
       final dest = File(p.join(into.path, name));
       try {
         var transferred = true;
+        final before = await _transferStampOf(entity);
+        // A changed source is always re-merged, never used to REPLACE the
+        // destination: the destination can have gained rows of its own since
+        // (a rebind that could not rename the source aside leaves both live),
+        // and losing those is worse than the one thing replacement bought —
+        // propagating a row deleted between two attempts, which the tombstone
+        // filter in _mergeHistoryFiles covers for this session anyway
+        // (codex 2026-09-26).
         if (!await dest.exists()) {
           await entity.copy(dest.path);
         } else if (name.endsWith('.archive.jsonl')) {
@@ -500,9 +510,23 @@ class MessageHistoryPersistence {
         // manifest is rewritten atomically per file; a crash between the write
         // and the manifest costs one replayed file, whose rows dedupe by
         // identity.
+        //
+        // The stamp is the one taken BEFORE the transfer, and only when the file
+        // still matches it afterwards: stamping after the read would certify
+        // bytes that were never transferred if the session wrote to the source
+        // meanwhile (codex 2026-09-26).
         if (transferred) {
-          alreadyMerged[name] = await _transferStampOf(entity);
-          await _writeMergedManifest(from, into, alreadyMerged);
+          final after = await _transferStampOf(entity);
+          if (_stampsMatch(before, after)) {
+            alreadyMerged[name] = before;
+            await _writeMergedManifest(from, into, alreadyMerged);
+          } else {
+            _logger?.logWarning(
+              '[MessageHistoryPersistence] $name changed while it was being '
+              'merged; it is not recorded as transferred and will be merged '
+              'again',
+            );
+          }
         }
       } catch (e, st) {
         failed++;
@@ -553,6 +577,37 @@ class MessageHistoryPersistence {
   /// destination is part of it because a manifest written while merging into
   /// account B says nothing about a later merge into account C, and skipping
   /// files on its word left C without those rows (codex 2026-09-26).
+  /// Identifies the destination DIRECTORY, not its path: a directory renamed
+  /// aside and recreated at the same path is a different destination, and
+  /// honouring a manifest written for the old one activated the new one without
+  /// the skipped files (codex 2026-09-26). Created on first use.
+  static const String _dirIdName = '.tim2tox_dir_id';
+
+  Future<String?> _directoryId(Directory dir, {required bool create}) async {
+    final file = File(p.join(dir.path, _dirIdName));
+    try {
+      if (await file.exists()) {
+        final value = (await file.readAsString()).trim();
+        if (value.isNotEmpty) return value;
+      }
+      if (!create) return null;
+      final value = '${DateTime.now().microsecondsSinceEpoch}'
+          '-${Random().nextInt(1 << 32).toRadixString(16)}';
+      final temp = File('${file.path}.tmp');
+      final raf = await temp.open(mode: FileMode.write);
+      try {
+        await raf.writeString(value);
+        await raf.flush();
+      } finally {
+        await raf.close();
+      }
+      await _renameWithRetry(temp, file.path);
+      return value;
+    } catch (_) {
+      return null;
+    }
+  }
+
   Future<Map<String, Map<String, Object?>>> _readMergedManifest(
       Directory from, Directory into) async {
     final file = File(p.join(from.path, _mergedManifestName));
@@ -563,6 +618,12 @@ class MessageHistoryPersistence {
       final recordedInto = decoded['into'];
       if (recordedInto is! String ||
           p.canonicalize(recordedInto) != p.canonicalize(into.path)) {
+        return {};
+      }
+      // Same path, different directory: nothing recorded applies.
+      final recordedId = decoded['intoId'];
+      final currentId = await _directoryId(into, create: false);
+      if (recordedId is! String || currentId == null || recordedId != currentId) {
         return {};
       }
       final files = decoded['files'];
@@ -594,6 +655,12 @@ class MessageHistoryPersistence {
   /// Whether [file] is byte-for-byte the file a previous pass transferred, as
   /// far as size and mtime can say. An empty or missing stamp means "not
   /// established", i.e. merge it again.
+  bool _stampsMatch(Map<String, Object?> a, Map<String, Object?> b) =>
+      a['size'] is int &&
+      a['size'] == b['size'] &&
+      a['mtimeMs'] is int &&
+      a['mtimeMs'] == b['mtimeMs'];
+
   Future<bool> _isUnchangedSinceTransfer(
       File file, Map<String, Object?>? stamp) async {
     if (stamp == null) return false;
@@ -614,10 +681,25 @@ class MessageHistoryPersistence {
     final target = p.join(from.path, _mergedManifestName);
     final temp = File('$target.tmp');
     try {
+      final intoId = await _directoryId(into, create: true);
+      if (intoId == null) {
+        // Without it the reader cannot tell this destination from a replacement
+        // at the same path, so it would ignore the manifest anyway. Not writing
+        // one keeps the conservative behaviour (replay, which dedupes) instead
+        // of leaving a file that looks authoritative (codex 2026-09-26).
+        _logger?.logWarning(
+          '[MessageHistoryPersistence] could not identify ${into.path}; no '
+          'merged-file manifest is kept, so a resumed merge re-merges',
+        );
+        return;
+      }
       final raf = await temp.open(mode: FileMode.write);
       try {
-        await raf.writeString(
-            jsonEncode(<String, Object?>{'into': into.path, 'files': files}));
+        await raf.writeString(jsonEncode(<String, Object?>{
+          'into': into.path,
+          'intoId': intoId,
+          'files': files,
+        }));
         await raf.flush();
       } finally {
         await raf.close();
@@ -947,18 +1029,72 @@ class MessageHistoryPersistence {
   /// durable without a blind write.
   final Set<String> _tombstoneReconcile = {};
 
+  /// Whether every row [file] holds is named by [normalizedId]'s tombstones —
+  /// i.e. writing an empty list over it deletes nothing that should survive.
+  /// False when the file cannot be read or decoded, which is the case an empty
+  /// write must never be authorised from.
+  Future<bool> _holdsOnlyTombstonedRows(File file, String normalizedId) async {
+    final tombstones = _recentlyDeleted[normalizedId];
+    if (tombstones == null || tombstones.isEmpty) return false;
+    try {
+      final decoded = jsonDecode(await file.readAsString());
+      final raw = decoded is Map<String, dynamic> ? decoded['messages'] : decoded;
+      if (raw is! List) return false;
+      for (final row in raw) {
+        if (row is! Map<String, dynamic>) return false;
+        final ChatMessage message;
+        try {
+          message = ChatMessage.fromJson(row);
+        } catch (_) {
+          return false;
+        }
+        if (!identitiesOf(message).any(tombstones.containsKey)) return false;
+      }
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
   Future<void> _drainTombstoneReconcile() async {
     if (_tombstoneReconcile.isEmpty) return;
-    final ids = _tombstoneReconcile.toList(growable: false);
-    _tombstoneReconcile.clear();
-    for (final id in ids) {
+    // Each id leaves the queue only once its write has landed: clearing the set
+    // upfront let a flush report success for a deletion that never reached the
+    // file, and dispose then dropped the tombstone with it (codex 2026-09-26).
+    for (final id in _tombstoneReconcile.toList(growable: false)) {
       try {
-        // The load filters what [_recentlyDeleted] names, so what comes back is
-        // already the post-delete state; saving it makes the delete durable.
-        final rows = await loadHistory(id);
-        await saveHistory(id, rows);
+        // The load filters what [_recentlyDeleted] names, so what it installs is
+        // already the post-delete state. The CACHE is what gets saved, not the
+        // returned list: an ordinary save may have added a row between the two
+        // operations, and that row must not be written away.
+        await loadHistory(id);
+        final normalizedId = ConversationIdUtils.normalize(id);
+        var rows = _historyById[normalizedId];
+        if (rows == null) {
+          // The load installed nothing. That is the right state for a
+          // conversation whose every row was deleted, but a READ FAILURE looks
+          // exactly the same from here, and creating an empty entry would let
+          // saveHistory delete a file that still has rows (codex 2026-09-26).
+          // So the file decides.
+          final file = await _getHistoryFile(normalizedId);
+          if (!await file.exists()) {
+            // Nothing on disk: the deletion is already effective.
+            _tombstoneReconcile.remove(id);
+            continue;
+          }
+          if (!await _holdsOnlyTombstonedRows(file, normalizedId)) {
+            _logger?.logWarning(
+              '[MessageHistoryPersistence] a restored deletion for $id could '
+              'not be applied (the file could not be read as deleted-only); it '
+              'stays queued',
+            );
+            continue;
+          }
+          rows = _historyById.putIfAbsent(normalizedId, () => <ChatMessage>[]);
+        }
+        await saveHistory(normalizedId, rows);
+        _tombstoneReconcile.remove(id);
       } catch (e, st) {
-        _tombstoneReconcile.add(id);
         _logger?.logError(
             '[MessageHistoryPersistence] applying a restored deletion for $id '
             'failed; it stays queued',
