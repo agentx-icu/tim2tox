@@ -544,8 +544,14 @@ std::shared_ptr<Tox> ToxManager::acquireTox() const {
         // A thread that already holds a pin, and the thread running the save,
         // must never wait here: they would be waiting on themselves.
         const auto depth_it = state->depth.find(self);
+        // The thread INSIDE tox_iterate() must never wait here either: a save
+        // that has quiesced is next going to wait for iterate_mutex_, which
+        // that thread holds, so blocking its callback's pin would deadlock the
+        // pair (codex 2026-09-26). It is safe to let it through: the save only
+        // reads the savedata once it owns iterate_mutex_, i.e. once this
+        // iterate has returned, and it re-checks the drain then.
         const bool reentrant = (depth_it != state->depth.end() && depth_it->second > 0) ||
-                               state->quiescing_owner == self;
+                               state->quiescing_owner == self || isIterateOwner();
         if (!reentrant) {
             state->cv.wait(gate, [&state] { return !state->quiescing; });
         }
@@ -601,6 +607,22 @@ ToxManager::SaveQuiesce::SaveQuiesce(std::shared_ptr<PinState> state)
         return;
     }
     drained_ = true;
+}
+
+// Re-confirm the drain after the caller has stopped tox_iterate(). A pin taken
+// by an iterate callback (exempt from the gate, see acquireTox) can outlive
+// that iterate; this is where such a straggler is waited out. Non-owner threads
+// are still blocked from pinning, and there is no iterate owner left to use the
+// exemption, so this either drains or the save is refused.
+bool ToxManager::SaveQuiesce::rewait() {
+    if (!state_ || !drained_) return false;
+    const std::thread::id self = std::this_thread::get_id();
+    std::unique_lock<std::mutex> gate(state_->mutex);
+    return state_->cv.wait_for(gate, kSaveQuiesceTimeout, [this, self] {
+        const auto it = state_->depth.find(self);
+        const int mine = it == state_->depth.end() ? 0 : it->second;
+        return state_->count <= mine;
+    });
 }
 
 ToxManager::SaveQuiesce::~SaveQuiesce() {
@@ -1862,23 +1884,45 @@ bool ToxManager::setConferenceMaxOffline(uint32_t conference_number, uint32_t ma
 
 // 数据保存和加载实现
 std::vector<uint8_t> ToxManager::getSaveData() const {
-    // Order matters: iterate_mutex_ FIRST, then the pin gate. The iterating
-    // thread takes pins from inside tox callbacks, so a saver that blocked new
-    // pins and only then waited for the iterate would deadlock against it.
-    // (On the iterating thread itself lockIterate() returns an unowned lock:
-    // it is already serialized with the iterate by construction.)
-    auto iterate_lock = lockIterate();
-    SaveQuiesce quiesce(pin_state_);
-    if (!quiesce.drained()) {
-        // Refuse rather than size a buffer a concurrent tox_*() can outgrow
-        // before toxcore writes it. The profile already on disk stays valid
-        // and the next save retries.
-        V2TIM_LOG(kError,
-                  "[ToxManager] getSaveData: in-flight Tox operations did not drain in {}s; "
-                  "skipping this save (a concurrent mutation could overflow the buffer)",
-                  static_cast<long long>(kSaveQuiesceTimeout.count()));
-        return {};
+    // Order matters, and it is the pin gate FIRST, iterate_mutex_ second.
+    //
+    // The other way round (which this was) deadlocks against every caller that
+    // holds a pin and then waits for iterate_mutex_ — starting with the FFI
+    // poll loop, which pinned the session for the whole round: the saver held
+    // the iterate lock those callers were waiting for, so their pins could not
+    // drain and EVERY save that overlapped a poll round waited out the full
+    // timeout and was skipped (codex 2026-09-26). Quiescing first holds no lock
+    // at all while waiting, so a pin holder can always finish and let go.
+    //
+    // The iterating thread is exempt from the gate (see acquireTox), so its
+    // callbacks cannot deadlock against phase two either; the price is that a
+    // pin can survive the iterate, which is why the drain is re-checked once
+    // the iterate lock is held.
+    //
+    // Two attempts: the first can lose a race with a long single operation,
+    // and a skipped save costs more than the wait.
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        SaveQuiesce quiesce(pin_state_);
+        if (!quiesce.drained()) continue;
+        auto iterate_lock = lockIterate();
+        // tox_iterate() is stopped now and new pins are blocked, so this waits
+        // only for a pin an iterate callback took and handed on.
+        if (!quiesce.rewait()) continue;
+        return readSaveDataQuiesced();
     }
+    // Refuse rather than size a buffer a concurrent tox_*() can outgrow before
+    // toxcore writes it. The profile already on disk stays valid; the caller
+    // must treat this as a failed save and retry (saveTo returns false).
+    V2TIM_LOG(kError,
+              "[ToxManager] getSaveData: in-flight Tox operations did not drain in 2x{}s; "
+              "this save is SKIPPED (a concurrent mutation could overflow the buffer) — "
+              "the profile on disk is the previous one",
+              static_cast<long long>(kSaveQuiesceTimeout.count()));
+    return {};
+}
+
+// Only from getSaveData(), with the pin gate quiesced AND iterate_mutex_ held.
+std::vector<uint8_t> ToxManager::readSaveDataQuiesced() const {
     std::lock_guard<std::mutex> lock(mutex_);
     if (!tox_) return {};
 

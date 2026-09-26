@@ -430,6 +430,66 @@ TEST(ToxSessionPinTest, SaveDataDoesNotWaitForItsOwnPin) {
         << "a save on the pin's own thread waited for itself";
 }
 
+// The poll loop is the one hot caller of the pin-then-iterate order, and the
+// thing that made the stall above happen on ordinary use: it must keep the
+// ToxManager alive across the iterate WITHOUT still holding the Tox pin.
+TEST(ToxSessionPinTest, PollLoopDoesNotHoldAPinAcrossTheIterate) {
+    const std::string ffi = StripLineComments(ReadSource(TIM2TOX_FFI_SOURCE_PATH));
+    const std::string loop =
+        SourceSection(ffi, "int tim2tox_ffi_iterate_current_instance(",
+                      "extern \"C\" uint64_t tim2tox_virtual_time_cb(");
+    ASSERT_FALSE(loop.empty()) << "the poll loop moved; update this test";
+    EXPECT_EQ(loop.find("session.manager()->iterate("), std::string::npos)
+        << "iterating through the guard holds the pin across the iterate";
+    EXPECT_NE(loop.find("manager_shared()"), std::string::npos)
+        << "the loop must keep the manager, not the pin, across the iterate";
+}
+
+// The lock order the quiesce has to survive: a caller holds a pin and THEN
+// waits for iterate_mutex_ (the FFI poll loop did exactly that every round).
+// A saver that took iterate_mutex_ first would hold the lock that caller is
+// waiting for while waiting for its pin — so every save overlapping the poll
+// loop burned the full timeout and was skipped (codex 2026-09-26). Quiescing
+// before taking the iterate lock holds nothing while waiting, so the pin
+// holder always gets through.
+TEST(ToxSessionPinTest, SaveDataDoesNotStallAgainstAPinnedIterateLock) {
+    std::unique_ptr<ToxManager> manager = MakeLiveManager();
+    if (!manager) GTEST_SKIP() << "tox_new unavailable on this host";
+
+    std::atomic<bool> pinned{false};
+    std::atomic<bool> got_iterate{false};
+    std::thread worker([&] {
+        std::shared_ptr<Tox> pin = manager->acquireTox();
+        EXPECT_NE(pin, nullptr);
+        pinned.store(true, std::memory_order_release);
+        // Let the saver reach its quiesce, then do what the poll loop does:
+        // take the iterate lock while still holding the pin.
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+        {
+            auto iterate_lock = manager->lockIterate();
+            got_iterate.store(true, std::memory_order_release);
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+        pin.reset();
+    });
+    while (!pinned.load(std::memory_order_acquire)) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+
+    const auto started = std::chrono::steady_clock::now();
+    const std::vector<uint8_t> data = manager->getSaveData();
+    const auto elapsed = std::chrono::steady_clock::now() - started;
+    worker.join();
+
+    EXPECT_TRUE(got_iterate.load(std::memory_order_acquire))
+        << "the pinned caller never got the iterate lock";
+    EXPECT_FALSE(data.empty())
+        << "the save was skipped: it deadlocked against a pinned iterate until "
+           "the quiesce timed out";
+    EXPECT_LT(elapsed, ToxManager::kSaveQuiesceTimeout)
+        << "the save waited out a timeout it should never have hit";
+}
+
 // A pin taken while a save is quiescing must wait for it, which is what makes
 // the size/copy pair atomic.
 TEST(ToxSessionPinTest, SaveDataBlocksNewPinsWhileItReads) {
@@ -483,12 +543,26 @@ TEST(ToxSessionPinTest, Mm6ProofWorkIsMeteredAndTheCandidateSetCannotOverflow) {
     const std::size_t meter = proof.find("TakeGroupSenderProofBudgetLocked");
     const std::size_t record = proof.find("last_proof_payload_hex");
     const std::size_t scan = proof.find("for (const auto& [nonce_hex, pending]");
+    const std::size_t cheap_gate = proof.find("HasPendingChallengeForSenderLocked");
+    ASSERT_NE(cheap_gate, std::string::npos)
+        << "an unchallenged sender must be dropped before it can reserve one of "
+           "the bounded per-sender metering windows";
+    EXPECT_LT(cheap_gate, meter);
     ASSERT_NE(meter, std::string::npos)
         << "a received proof must be charged to its authenticated NGC sender";
     ASSERT_NE(record, std::string::npos);
     ASSERT_NE(scan, std::string::npos);
-    EXPECT_LT(meter, record)
-        << "recording the payload is work an unchallenged member got for free";
+    // The payload hex is recorded BEFORE the meter, on purpose: the packet is
+    // fixed-size (rejected at entry otherwise), so it is one bounded 200-byte
+    // conversion, and the "is the payload really opaque to a member that was
+    // merely named?" diagnostic can only answer that if it sees the proofs
+    // NOBODY challenged for — which is exactly what the gates below drop.
+    EXPECT_LT(record, meter)
+        << "the payload diagnostic must see dropped proofs too";
+    EXPECT_NE(proof.find("length != kIdentityProofPacketSize"), std::string::npos)
+        << "recording before the meter is only bounded because the packet size "
+           "is validated at entry";
+    // What must stay behind a gate is the state and the crypto.
     EXPECT_LT(meter, scan)
         << "scanning the pending challenges is work an unchallenged member got "
            "for free";

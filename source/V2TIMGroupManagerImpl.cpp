@@ -156,10 +156,15 @@ void V2TIMGroupManagerImpl::CreateGroup(const V2TIMGroupInfo& info,
     V2TIMManagerImpl* const impl = manager_impl_;
     const auto session = impl ? impl->AcquireToxSession()
                               : V2TIMManagerImpl::ToxSessionGuard();
-    // The default-instance fallback stays for the (test-only) impl == nullptr
-    // shape; the normal path is pinned.
-    ToxManager* const tox_manager = session ? session.manager() : GetToxManagerFromImpl(impl);
-    Tox* tox = tox_manager ? tox_manager->getTox() : nullptr;
+    // The default-instance fallback is ONLY for the (test-only) impl == nullptr
+    // shape. With a real impl, an empty guard means there is no live session,
+    // and falling back to an unpinned manager there handed the whole create a
+    // pointer a concurrent InitSDK/UnInitSDK could invalidate (codex
+    // 2026-09-26) — refuse instead.
+    ToxManager* const tox_manager =
+        session ? session.manager() : (impl ? nullptr : GetToxManagerFromImpl(nullptr));
+    // The pinned handle when there is one: getTox() is a raw re-fetch.
+    Tox* tox = session ? session.tox() : (tox_manager ? tox_manager->getTox() : nullptr);
     if (!tox) {
         V2TIM_LOG(kError, "CreateGroup: Tox not initialized");
         callback->OnError(ERR_SDK_NOT_INITIALIZED, "Tox not initialized");
@@ -400,11 +405,16 @@ void V2TIMGroupManagerImpl::CreateGroup(const V2TIMGroupInfo& info,
             }
         }
         
-        if (group_number != UINT32_MAX && session.Expired()) {
+        if (group_number != UINT32_MAX && session && session.Expired()) {
             // A logout landed mid-create: the pin kept the instance valid, but
             // this group belongs to a session that is over. Publishing a join
-            // for it would stamp the next account's instance id.
-            V2TIM_LOG(kWarning, "CreateGroup: session ended before HandleGroupSelfJoin; skipping the manual self-join");
+            // for it would stamp the next account's instance id — and reporting
+            // SUCCESS for a group the active session will never see is just as
+            // wrong (codex 2026-09-26), so the create fails.
+            V2TIM_LOG(kWarning, "CreateGroup: session ended before HandleGroupSelfJoin; failing the create");
+            callback->OnError(ERR_SDK_NOT_INITIALIZED,
+                              "session ended during group creation");
+            return;
         } else if (group_number != UINT32_MAX) {
             V2TIM_LOG(kInfo, "[V2TIMGroupManagerImpl::CreateGroup] Manually calling HandleGroupSelfJoin(group_number={}) to trigger OnGroupCreated", group_number);
             manager_impl_->HandleGroupSelfJoin(group_number);

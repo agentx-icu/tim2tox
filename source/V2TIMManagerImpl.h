@@ -339,6 +339,11 @@ public:
         explicit operator bool() const { return tox_ != nullptr; }
         Tox* tox() const { return tox_.get(); }
         ToxManager* manager() const { return manager_.get(); }
+        // The manager WITHOUT the Tox pin. For the one caller that must keep
+        // the manager alive across a call that waits for iterate_mutex_ and
+        // therefore must not still hold a pin (see
+        // tim2tox_ffi_iterate_current_instance and ToxManager::getSaveData).
+        std::shared_ptr<ToxManager> manager_shared() const { return manager_; }
         int64_t epoch() const { return epoch_; }
         // True once the session this guard belongs to has ended. The pinned
         // pointers stay VALID (that is the point of the pin), but the work is
@@ -707,6 +712,12 @@ private:
     // One received-proof verification charged to this NGC sender. False = over
     // budget, or the sender table is full: drop the packet before spending
     // anything on it.
+    // Whether WE have an unexpired identity challenge outstanding for this
+    // (group, authenticated sender). Cheap, crypto-free, and the gate that
+    // keeps an unchallenged sender from consuming metering state at all.
+    bool HasPendingChallengeForSenderLocked(Tox_Group_Number group_number,
+                                           const std::string& sender_hex,
+                                           IdentityClock::time_point now) const;
     bool TakeGroupSenderProofBudgetLocked(const std::string& sender_hex,
                                           IdentityClock::time_point now);
     // Pending challenges for (group, member) whose asker no longer claims that

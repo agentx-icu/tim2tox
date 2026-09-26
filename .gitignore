@@ -6,6 +6,9 @@ cmake-build-*/
 # follow the same prefix. Without this they sit untracked at ~150 MB and can be
 # swept into a commit by a `git add -A`.
 build-tests*/
+# Same tree, underscore spelling (what the googletest FetchContent invocation in
+# the notes uses); ~150 MB of untracked build output either way.
+build_tests*/
 
 # IDE directories
 .idea/

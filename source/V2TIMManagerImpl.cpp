@@ -6063,6 +6063,19 @@ bool V2TIMManagerImpl::TakeIdentityBudgetLocked(IdentityRateWindow& window, Iden
     return true;
 }
 
+bool V2TIMManagerImpl::HasPendingChallengeForSenderLocked(Tox_Group_Number group_number,
+                                                          const std::string& sender_hex,
+                                                          IdentityClock::time_point now) const {
+    for (const auto& [nonce_hex, pending] : pending_identity_challenges_) {
+        (void)nonce_hex;
+        if (pending.group_number == group_number && now - pending.sent_at <= kIdentityChallengeTtl &&
+            LowerHex(pending.member_key) == sender_hex) {
+            return true;
+        }
+    }
+    return false;
+}
+
 bool V2TIMManagerImpl::TakeGroupSenderProofBudgetLocked(const std::string& sender_hex,
                                                         IdentityClock::time_point now) {
     auto it = identity_rate_by_group_sender_.find(sender_hex);
@@ -6504,10 +6517,26 @@ void V2TIMManagerImpl::HandleGroupIdentityProof(Tox_Group_Number group_number, T
     // was global so one hostile member could exhaust it and starve every
     // honest proof in the window (codex 2026-09-24). The global crypto cap
     // below still bounds the box opens.
+    // Fixed-size packet (checked at entry), so this is bounded work: recorded
+    // for EVERY proof that arrives, including the ones the gate below drops —
+    // the "was the payload really opaque?" diagnostic has to see exactly the
+    // packets nobody challenged for.
+    const std::string proof_payload_hex = ToxUtil::tox_bytes_to_hex(data, length);
     {
         std::lock_guard<std::mutex> lock(mutex_);
         ++mm6_diag_.proofs_in;
+        mm6_diag_.last_proof_payload_hex = proof_payload_hex;
         PruneIdentityStateLocked(now, false);
+        // A sender we never challenged cannot be answering anything: drop it
+        // WITHOUT reserving one of the kMaxProofVerifySenders windows. Metering
+        // first meant 1024 group identities could fill that table with one
+        // bogus proof each and get the next honest member's proof refused for
+        // the whole window (codex 2026-09-26). This scan touches no crypto and
+        // no secret, and the pending table is itself capped.
+        if (!HasPendingChallengeForSenderLocked(group_number, sender_hex, now)) {
+            ++mm6_diag_.proofs_rejected;
+            return;
+        }
         if (!TakeGroupSenderProofBudgetLocked(sender_hex, now)) {
             ++mm6_diag_.proofs_rejected;
             return;
@@ -6531,7 +6560,6 @@ void V2TIMManagerImpl::HandleGroupIdentityProof(Tox_Group_Number group_number, T
     // that stopped claiming it.
     const std::string sender_digest = GroupIdentityDigestHex(chat_id, sender_key);
     std::lock_guard<std::mutex> lock(mutex_);
-    mm6_diag_.last_proof_payload_hex = ToxUtil::tox_bytes_to_hex(data, length);
     // Askers that no longer claim this member cannot answer; they only occupy
     // scan slots an honest claimant needs.
     DropStaleChallengesForMemberLocked(group_number, sender_hex, sender_digest);

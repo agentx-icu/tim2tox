@@ -3375,6 +3375,14 @@ int tim2tox_ffi_delete_avatar(int64_t instance_id, const char* user_id) {
                   "[ffi] file_send: type=avatar_delete status=send_failed count=0");
         return -7;
     }
+    // Same post-send check as the other two senders: a logout that landed
+    // during tox_file_send queued the deletion on an instance that will never
+    // iterate again, so it must not be reported as sent (codex 2026-09-26).
+    if (peer.session_ended()) {
+        V2TIM_LOG(kError,
+                  "[ffi] file_send: type=avatar_delete status=session_ended count=0");
+        return -1;
+    }
     V2TIM_LOG(kInfo,
               "[ffi] file_send: type=avatar_delete status=sent count=0");
     return 1;
@@ -3385,13 +3393,27 @@ int tim2tox_ffi_iterate_current_instance(int count) {
     V2TIMManagerImpl* manager_impl = GetCurrentInstance();
     if (!manager_impl) return 0;
     for (int i = 0; i < count; ++i) {
-        // Re-pinned every round: a callback may UnInitSDK, which runs (and
-        // drops the ToxManager) when that iterate returns. The pin makes the
-        // iterate itself safe even if that happens mid-round; re-taking it is
-        // what stops the NEXT round from driving a dead session.
-        const auto session = manager_impl->AcquireToxSession();
-        if (!session) return i > 0 ? 1 : 0;
-        session.manager()->iterate(0);
+        // Re-taken every round: a callback may UnInitSDK, which runs (and drops
+        // the ToxManager) when that iterate returns, so the NEXT round must not
+        // drive a dead session.
+        //
+        // The Tox PIN is released before the iterate, deliberately. It bought
+        // nothing — ToxManager::iterate() holds iterate_mutex_ across
+        // tox_iterate() and re-checks tox_ under mutex_, which is what makes
+        // the iterate safe — and holding it across the iterate put this loop on
+        // the one forbidden lock order (pin, then wait for iterate_mutex_)
+        // against a saver, so every profile save that overlapped a poll round
+        // was skipped (codex 2026-09-26). The ToxManager itself stays alive
+        // through the call: the guard's shared_ptr keeps it, and a teardown
+        // reached from a callback is deferred to the end of the iterate.
+        std::shared_ptr<ToxManager> manager;
+        {
+            const auto session = manager_impl->AcquireToxSession();
+            if (!session) return i > 0 ? 1 : 0;
+            manager = session.manager_shared();
+        }
+        if (!manager) return i > 0 ? 1 : 0;
+        manager->iterate(0);
     }
     return 1;
 }

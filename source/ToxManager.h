@@ -154,11 +154,18 @@ public:
     // between the two — a conference/NGC join, a friend add, a self-name
     // change — then makes toxcore write MORE bytes than the buffer we sized:
     // a heap overflow (codex 2026-09-24). So instead of toxcore's lock we
-    // quiesce OUR mutators: iterate_mutex_ stops tox_iterate, and the pin gate
-    // below stops every acquireTox() operation. When they do not drain in
-    // kSaveQuiesceTimeout the save is REFUSED (returns {}) rather than risking
-    // the overflow; the previously written profile stays valid and the next
-    // save retries.
+    // quiesce OUR mutators: the pin gate below stops every acquireTox()
+    // operation and iterate_mutex_ stops tox_iterate -- IN THAT ORDER, because
+    // callers legitimately hold a pin and then wait for iterate_mutex_ (the
+    // poll loop did it every round), and a saver holding the iterate lock while
+    // waiting for those pins deadlocks against them until the timeout
+    // (codex 2026-09-26). When they still do not drain the save is REFUSED
+    // (returns {}) rather than risking the overflow; the previously written
+    // profile stays valid and saveTo() returns false so the caller retries.
+    //
+    // The ordering rule this implies, for anything added later: NEVER take
+    // iterate_mutex_ and then wait for a pin. Taking a pin and then
+    // iterate_mutex_ is fine and is what callers do.
     std::vector<uint8_t> getSaveData() const;
     bool saveTo(const std::string& path) const;
     static constexpr std::chrono::seconds kSaveQuiesceTimeout{5};
@@ -456,11 +463,16 @@ private:
         SaveQuiesce(const SaveQuiesce&) = delete;
         SaveQuiesce& operator=(const SaveQuiesce&) = delete;
         bool drained() const { return drained_; }
+        // See ToxManager::getSaveData: re-confirm after tox_iterate is stopped.
+        bool rewait();
 
     private:
         std::shared_ptr<PinState> state_;
         bool drained_ = false;
     };
+    // getSaveData()'s critical section, split out so the retry above reads as
+    // one statement. Requires the quiesce AND iterate_mutex_.
+    std::vector<uint8_t> readSaveDataQuiesced() const;
     std::atomic<bool> is_shutting_down_{false};  // Flag to prevent double cleanup; atomic for lock-free read in iterate()
     bool tcp_relay_server_allowed_{true};  // see setTcpRelayServerAllowed
     uint16_t udp_start_port_{0};  // see setUdpPortRange
