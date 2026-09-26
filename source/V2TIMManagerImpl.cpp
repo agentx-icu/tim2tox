@@ -2253,6 +2253,7 @@ void V2TIMManagerImpl::ResetGroupSessionState() {
         answered_identity_challenge_order_.clear();
         identity_rate_by_friend_.clear();
         identity_rate_by_group_sender_.clear();
+        group_receipt_rate_by_sender_.clear();
         identity_rate_global_ = IdentityRateWindow{};
         identity_last_prune_ = IdentityClock::time_point{};
         seen_group_receipts_.clear();
@@ -5827,11 +5828,35 @@ constexpr size_t kMaxProofVerifySenders = 1024;
 // Received group receipts, PER AUTHENTICATED NGC SENDER, charged before the
 // packet costs a replay-cache slot, a Dart event and the two history scans the
 // tally does. The replay filter only ever stopped the same receipt twice: one
-// member could send unbounded DISTINCT msgIDs and each was work. Honest ceiling
-// per minute is one 'received' per message plus the on-view READ walk, which
-// Dart bounds at 50 rows per open, so 128 leaves a wide margin — this must not
-// clip a member that opens a busy group while its messages keep arriving.
-constexpr uint32_t kMaxGroupReceiptsPerSender = 128;
+// member could send unbounded DISTINCT msgIDs and each was work.
+//
+// DERIVATION of the per-minute ceiling (the 128 this replaces was read off the
+// on-view walk's 50 rows, which is a bound PER VIEW, not per minute, and it
+// ignored the other two senders entirely; a refusal happens HERE, on the
+// receiver, with no signal back, so clipping an honest reader is silent):
+//   * Tim2ToxSdkPlatform.markGroupMessageAsRead walks the WHOLE loaded window
+//     and calls markMessageAsRead per inbound row, with no per-row claim and no
+//     isRead skip. Every row of that window that WE authored yields one receipt
+//     to us, so ONE call can send up to MessageHistoryPersistence's
+//     _maxMessagesInMemory = 1000. UIKit calls it on every chat open, so a user
+//     flipping between two chats twice a minute legitimately triples that.
+//   * FfiChatService._sendGroupReadReceiptsOnView adds <=50 per open (claimed,
+//     so it does not repeat).
+//   * plus one 'received' per message of ours the member ingests, and the
+//     offline flush, bounded at _maxPendingGroupReadReceiptsPerAuthor = 200.
+// 3*1000 + 50 + 200 + a send burst rounds to 4096. Deliberately generous: the
+// per-receipt work here is a hash lookup and a bounded key, and DISTINCT
+// receipts (the ones that reach Dart) are already capped by the replay filter's
+// kMaxSeenGroupReceipts = 4096 over a longer TTL — so at this cap a sender
+// cannot push more work downstream in a window than that cache already holds.
+// The cap's job is bounding "one member, unbounded invented msgIDs", not
+// policing honest volume. Per-sender keys are NGC per-group keys, so the same
+// person in several groups gets one window per group, not one shared window.
+constexpr uint32_t kMaxGroupReceiptsPerSender = 4096;
+// Bound on the RECEIPT sender table. Its own cap, and its own table
+// (group_receipt_rate_by_sender_), so a receipt flood cannot fill the table the
+// MM-6 proof budget lives in and starve the proofs — see the header.
+constexpr size_t kMaxGroupReceiptSenders = 1024;
 // Answering side replay cache.
 constexpr size_t kMaxAnsweredChallenges = 1024;
 constexpr auto kAnsweredChallengeTtl = std::chrono::minutes(10);
@@ -6124,16 +6149,21 @@ bool V2TIMManagerImpl::TakeGroupSenderProofBudgetLocked(const std::string& sende
 
 bool V2TIMManagerImpl::TakeGroupSenderReceiptBudgetLocked(const std::string& sender_hex,
                                                           IdentityClock::time_point now) {
-    // Same table, same bound and the same fail-closed reasoning as the proof
-    // side above: a full table refuses rather than growing, and it drains within
-    // kIdentityRateWindow. The caller must have applied its cheap structural
-    // gates FIRST, so a member sending garbage cannot reserve one of these
-    // windows at all — the lesson HandleGroupIdentityProof records (a bounded
-    // table must not reserve a window for a sender that has nothing pending).
-    auto it = identity_rate_by_group_sender_.find(sender_hex);
-    if (it == identity_rate_by_group_sender_.end()) {
-        if (identity_rate_by_group_sender_.size() >= kMaxProofVerifySenders) return false;
-        it = identity_rate_by_group_sender_.emplace(sender_hex, IdentityRateWindow{}).first;
+    // Its OWN table with its OWN cap, not the proof table (codex 2026-09-26):
+    // sharing one meant 1024 distinct member keys each sending one structurally
+    // valid receipt with an invented msgID could fill it and refuse both the
+    // next honest reader's receipt AND a challenged member's MM-6 proof, i.e.
+    // receipts could starve the identity work. Same fail-closed reasoning as the
+    // proof side above: a full table refuses rather than growing, and it drains
+    // within kIdentityRateWindow (pruned in PruneIdentityStateLocked). The
+    // caller must have applied its cheap structural gates FIRST, so a member
+    // sending garbage cannot reserve one of these windows at all — the lesson
+    // HandleGroupIdentityProof records (a bounded table must not reserve a
+    // window for a sender that has nothing pending).
+    auto it = group_receipt_rate_by_sender_.find(sender_hex);
+    if (it == group_receipt_rate_by_sender_.end()) {
+        if (group_receipt_rate_by_sender_.size() >= kMaxGroupReceiptSenders) return false;
+        it = group_receipt_rate_by_sender_.emplace(sender_hex, IdentityRateWindow{}).first;
     }
     return TakeIdentityBudgetLocked(it->second, now, &IdentityRateWindow::receipts_in,
                                     kMaxGroupReceiptsPerSender);
@@ -6192,6 +6222,13 @@ void V2TIMManagerImpl::PruneIdentityStateLocked(IdentityClock::time_point now, b
     for (auto it = identity_rate_by_group_sender_.begin(); it != identity_rate_by_group_sender_.end();) {
         it = now - it->second.window_start >= kIdentityRateWindow
                  ? identity_rate_by_group_sender_.erase(it)
+                 : std::next(it);
+    }
+    // The receipt meter's own table. Same rule; separate table so neither budget
+    // can fill the other's (see TakeGroupSenderReceiptBudgetLocked).
+    for (auto it = group_receipt_rate_by_sender_.begin(); it != group_receipt_rate_by_sender_.end();) {
+        it = now - it->second.window_start >= kIdentityRateWindow
+                 ? group_receipt_rate_by_sender_.erase(it)
                  : std::next(it);
     }
 }
@@ -6719,6 +6756,14 @@ std::string V2TIMManagerImpl::Mm6DiagJson() {
     return out.str();
 }
 
+#ifdef TIM2TOX_ENABLE_TEST_HOOKS
+// TEST-ONLY primitive, compiled in only with -DTIM2TOX_ENABLE_TEST_HOOKS=ON
+// (OFF by default). The guard belongs HERE and not only on the C wrapper in
+// ffi/tim2tox_ffi.cpp: this method is part of libtim2tox.a, and with only the
+// wrapper gated its mangled symbol stayed exported from a shipped library on
+// Linux, so the attack primitive remained callable even though the C entry
+// point was gone (codex 2026-09-26). CMake defines the macro for the tim2tox
+// target as well as tim2tox_ffi, so an ON build has both halves.
 int V2TIMManagerImpl::Mm6SendCraftedChallenge(const V2TIMString& groupID, const std::string& friend_key_hex,
                                               const std::string& claimed_member_key_hex) {
     if (groupID.Empty() || friend_key_hex.size() != static_cast<size_t>(TOX_PUBLIC_KEY_SIZE * 2) ||
@@ -6764,6 +6809,7 @@ int V2TIMManagerImpl::Mm6SendCraftedChallenge(const V2TIMString& groupID, const 
     SendFriendIdentityFrame(tox, friend_number, body);
     return 1;
 }
+#endif  // TIM2TOX_ENABLE_TEST_HOOKS
 
 std::string V2TIMManagerImpl::ResolveSharedGroupName(const std::string& group_id) {
     auto* group_manager = static_cast<V2TIMGroupManagerImpl*>(GetGroupManager());

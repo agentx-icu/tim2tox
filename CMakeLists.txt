@@ -166,12 +166,23 @@ add_subdirectory(source)
 
 # Add FFI directory for Flutter/Dart bindings
 option(BUILD_FFI "Build FFI shared library for Flutter/Dart" ON)
-# Test-only FFI hooks: entry points that exist purely so auto_tests/ can produce
+# Test-only hooks: entry points that exist purely so auto_tests/ can produce
 # packet shapes the honest API cannot (today: the MM-6 crafted identity
 # challenge). OFF by default so shipping libraries do not carry them; only
 # build_ffi.sh — the build the auto_tests run against — turns it ON.
+#
+# It must reach BOTH targets. The C wrapper lives in libtim2tox_ffi, but the
+# primitive it calls (V2TIMManagerImpl::Mm6SendCraftedChallenge) is compiled into
+# the tim2tox static library, and gating only the wrapper left that method's
+# mangled symbol exported from a shipped library on Linux — the C entry point was
+# gone, the primitive was not (codex 2026-09-26). Both halves are behind the same
+# #ifdef, so the definition must be gated by the same condition or the ON build
+# fails to link.
 option(TIM2TOX_ENABLE_TEST_HOOKS
-       "Compile the auto_tests-only FFI hooks into libtim2tox_ffi" OFF)
+       "Compile the auto_tests-only test hooks into libtim2tox and libtim2tox_ffi" OFF)
+if(TIM2TOX_ENABLE_TEST_HOOKS)
+  target_compile_definitions(tim2tox PRIVATE TIM2TOX_ENABLE_TEST_HOOKS=1)
+endif()
 if(BUILD_FFI)
   add_subdirectory(ffi)
   if(TIM2TOX_ENABLE_TEST_HOOKS)

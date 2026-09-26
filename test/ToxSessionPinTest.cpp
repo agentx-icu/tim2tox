@@ -907,4 +907,183 @@ TEST(ToxSessionPinTest, PerFeatureManagersPinTheirWholeCallSequence) {
            "group";
 }
 
+// Inbound group receipts and MM-6 identity proofs are both metered per
+// authenticated NGC sender, and both tables are BOUNDED — so sharing one table
+// made them each other's DoS: across public groups, kMaxProofVerifySenders
+// distinct member keys can each send one structurally valid receipt with an
+// invented msgID, fill the shared table, and have it refuse both the next
+// honest reader's receipt AND a challenged member's proof until the entries
+// expire (codex 2026-09-26). Separate tables, separate caps, both pruned.
+TEST(ToxSessionPinTest, GroupReceiptMeterHasItsOwnTableAndCannotStarveTheProofBudget) {
+    const std::string manager = ReadSource(TIM2TOX_MANAGER_SOURCE_PATH);
+    const std::string header = ReadSource(TIM2TOX_MANAGER_HEADER_PATH);
+
+    // 1. The receipt meter must key into its OWN table with its OWN cap.
+    const std::string meter = StripLineComments(SourceSection(
+        manager, "bool V2TIMManagerImpl::TakeGroupSenderReceiptBudgetLocked(",
+        "void V2TIMManagerImpl::DropStaleChallengesForMemberLocked("));
+    ASSERT_FALSE(meter.empty())
+        << "TakeGroupSenderReceiptBudgetLocked moved or was renamed; this test "
+           "would pass vacuously";
+    EXPECT_NE(meter.find("group_receipt_rate_by_sender_"), std::string::npos)
+        << "receipts must be metered in their own bounded table";
+    EXPECT_EQ(meter.find("identity_rate_by_group_sender_"), std::string::npos)
+        << "sharing the proof table lets a receipt flood fill it and starve the "
+           "MM-6 proofs";
+    EXPECT_EQ(meter.find("kMaxProofVerifySenders"), std::string::npos)
+        << "the receipt table must not be sized by the proof table's cap";
+    EXPECT_NE(meter.find("kMaxGroupReceiptSenders"), std::string::npos)
+        << "the receipt table needs its own fill-up bound";
+    // Fail-closed on a full table, as on the proof side.
+    EXPECT_NE(meter.find("return false"), std::string::npos)
+        << "a full receipt table must refuse rather than grow without bound";
+    // And the proof meter must still be the one keeping the proof table.
+    const std::string proof_meter = StripLineComments(SourceSection(
+        manager, "bool V2TIMManagerImpl::TakeGroupSenderProofBudgetLocked(",
+        "bool V2TIMManagerImpl::TakeGroupSenderReceiptBudgetLocked("));
+    ASSERT_FALSE(proof_meter.empty());
+    EXPECT_NE(proof_meter.find("identity_rate_by_group_sender_"), std::string::npos)
+        << "the proof budget keeps the identity table; the two must not be merged "
+           "back together";
+    EXPECT_EQ(proof_meter.find("group_receipt_rate_by_sender_"), std::string::npos)
+        << "the proof budget must not spend the receipt table either";
+
+    // 2. A table nobody prunes is a leak, and the fail-closed refusal above
+    //    only drains because of this loop.
+    const std::string prune = StripLineComments(SourceSection(
+        manager, "void V2TIMManagerImpl::PruneIdentityStateLocked(",
+        "void V2TIMManagerImpl::SyncMemberDigestIndex("));
+    ASSERT_FALSE(prune.empty());
+    EXPECT_NE(prune.find("group_receipt_rate_by_sender_.erase("), std::string::npos)
+        << "the receipt table must be pruned where the rest of the identity rate "
+           "state is, or a full table never drains";
+    EXPECT_NE(prune.find("identity_rate_by_group_sender_.erase("), std::string::npos)
+        << "the proof table's prune must survive the split";
+    // Declared next to the table it was split from, so the next reader sees both.
+    EXPECT_NE(header.find("group_receipt_rate_by_sender_"), std::string::npos)
+        << "the new table must be a member of V2TIMManagerImpl";
+    // Reset with the rest of the per-account identity state.
+    EXPECT_NE(manager.find("group_receipt_rate_by_sender_.clear()"), std::string::npos)
+        << "a new account must not inherit the previous one's receipt windows";
+
+    // 3. The cap is a derived number, not a guess. 128 came from the on-view
+    //    walk's 50 rows, which is a bound PER VIEW and not per minute, and it
+    //    ignored both the per-message 'received' receipt and
+    //    Tim2ToxSdkPlatform.markGroupMessageAsRead, which walks the whole loaded
+    //    window with no per-row claim. A refusal happens on the RECEIVER with no
+    //    signal back to the sender, so an honest reader clipped here is silent.
+    const std::string cap = SourceSection(
+        manager, "// DERIVATION of the per-minute ceiling",
+        "constexpr size_t kMaxGroupReceiptSenders");
+    ASSERT_FALSE(cap.empty())
+        << "the per-sender receipt cap must carry the derivation it was picked "
+           "from; a bare number cannot be reviewed";
+    for (const char* path : {"markGroupMessageAsRead", "_maxMessagesInMemory",
+                             "_sendGroupReadReceiptsOnView", "'received'",
+                             "_maxPendingGroupReadReceiptsPerAuthor"}) {
+        EXPECT_NE(cap.find(path), std::string::npos)
+            << "the derivation must account for the " << path << " send path";
+    }
+    EXPECT_EQ(manager.find("kMaxGroupReceiptsPerSender = 128"), std::string::npos)
+        << "128 is below one single markGroupMessageAsRead walk of a full "
+           "1000-row window";
+    EXPECT_NE(manager.find("constexpr uint32_t kMaxGroupReceiptsPerSender ="), std::string::npos)
+        << "the cap itself must stay — bounded still matters";
+
+    // 4. METER FIRST is the whole point of the budget: the ordering must not
+    //    regress into "charge after we already paid for the packet".
+    const std::string handler = StripLineComments(SourceSection(
+        manager, "void V2TIMManagerImpl::HandleGroupCustomPrivatePacket(",
+        "void V2TIMManagerImpl::NotifyGroupActionMessage("));
+    ASSERT_FALSE(handler.empty());
+    const std::size_t charge = handler.find("TakeGroupSenderReceiptBudgetLocked(");
+    const std::size_t replay_slot = handler.find("seen_group_receipts_.emplace(");
+    const std::size_t notify = handler.find("NotifyGroupActionMessage(group_id");
+    ASSERT_NE(charge, std::string::npos)
+        << "a received receipt must be charged to its authenticated NGC sender";
+    ASSERT_NE(replay_slot, std::string::npos)
+        << "the replay-cache insert moved; the ordering check would pass vacuously";
+    ASSERT_NE(notify, std::string::npos)
+        << "the Dart hand-off moved; the ordering check would pass vacuously";
+    EXPECT_LT(charge, replay_slot)
+        << "an over-budget sender must not get a replay-cache slot";
+    EXPECT_LT(charge, notify)
+        << "an over-budget sender must not get the Dart event and the two "
+           "history scans behind it";
+}
+
+// The MM-6 crafted-challenge primitive is an attack shape with no honest use.
+// Gating only its C wrapper (tim2tox_ffi_mm6_send_crafted_challenge) was not
+// enough: V2TIMManagerImpl::Mm6SendCraftedChallenge stayed compiled into
+// libtim2tox.a, and on Linux its mangled symbol stays exported — so a shipped
+// library still carried the primitive (codex 2026-09-26). Declaration,
+// definition and wrapper must all sit behind the SAME macro, and CMake must
+// define it for the tim2tox target as well, or the ON build cannot link.
+TEST(ToxSessionPinTest, TheCraftedChallengePrimitiveIsGatedWithItsFfiWrapper) {
+    const std::string manager = ReadSource(TIM2TOX_MANAGER_SOURCE_PATH);
+    const std::string header = ReadSource(TIM2TOX_MANAGER_HEADER_PATH);
+    const std::string ffi = ReadSource(TIM2TOX_FFI_SOURCE_PATH);
+
+    // Exactly one guarded region per file, so "between an #ifdef and an #endif"
+    // below cannot be satisfied by some unrelated pair.
+    struct Gated {
+        const char* name;
+        const std::string* source;
+        const char* symbol;
+    };
+    const Gated gated[] = {
+        {"the definition in V2TIMManagerImpl.cpp", &manager,
+         "int V2TIMManagerImpl::Mm6SendCraftedChallenge("},
+        {"the declaration in V2TIMManagerImpl.h", &header,
+         "int Mm6SendCraftedChallenge("},
+        {"the C wrapper in tim2tox_ffi.cpp", &ffi,
+         "int tim2tox_ffi_mm6_send_crafted_challenge("},
+    };
+    for (const Gated& site : gated) {
+        std::size_t opens = 0;
+        for (std::size_t at = site.source->find("#ifdef TIM2TOX_ENABLE_TEST_HOOKS");
+             at != std::string::npos;
+             at = site.source->find("#ifdef TIM2TOX_ENABLE_TEST_HOOKS", at + 1)) {
+            ++opens;
+        }
+        ASSERT_EQ(opens, 1u)
+            << site.name << ": expected exactly one TIM2TOX_ENABLE_TEST_HOOKS "
+                            "region, otherwise the containment check below is "
+                            "meaningless";
+        const std::size_t guard = site.source->find("#ifdef TIM2TOX_ENABLE_TEST_HOOKS");
+        const std::size_t close = site.source->find("#endif  // TIM2TOX_ENABLE_TEST_HOOKS");
+        const std::size_t symbol = site.source->find(site.symbol);
+        ASSERT_NE(close, std::string::npos)
+            << site.name << ": the guard must be closed with the commented #endif "
+                            "this test keys on";
+        ASSERT_NE(symbol, std::string::npos)
+            << site.name << ": " << site.symbol
+            << " not found — the probe is stale, not the code clean";
+        EXPECT_LT(guard, symbol)
+            << site.name << " must sit INSIDE the test-hook guard, not before it";
+        EXPECT_LT(symbol, close)
+            << site.name << " must sit INSIDE the test-hook guard, not after it";
+    }
+
+    // The option has to reach BOTH targets: the wrapper lives in tim2tox_ffi,
+    // the primitive in the tim2tox static library. Same condition or the ON
+    // build fails to link (and the OFF build ships the symbol again).
+    const std::string manager_path = TIM2TOX_MANAGER_SOURCE_PATH;
+    const std::string suffix = "/source/V2TIMManagerImpl.cpp";
+    const std::size_t root = manager_path.rfind(suffix);
+    ASSERT_NE(root, std::string::npos)
+        << "cannot locate the project root from " << manager_path;
+    const std::string cmake =
+        ReadSource((manager_path.substr(0, root) + "/CMakeLists.txt").c_str());
+    ASSERT_NE(cmake.find("option(TIM2TOX_ENABLE_TEST_HOOKS"), std::string::npos)
+        << "the test-hook option moved out of the top-level CMakeLists";
+    EXPECT_NE(cmake.find("target_compile_definitions(tim2tox PRIVATE TIM2TOX_ENABLE_TEST_HOOKS=1)"),
+              std::string::npos)
+        << "the static library must get the macro too, or the hook's definition "
+           "is either always compiled in or never compiled at all";
+    EXPECT_NE(cmake.find("target_compile_definitions(tim2tox_ffi PRIVATE TIM2TOX_ENABLE_TEST_HOOKS=1)"),
+              std::string::npos)
+        << "the FFI wrapper's gate must stay";
+}
+
 }  // namespace
