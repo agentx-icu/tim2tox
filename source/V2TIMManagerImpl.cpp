@@ -2185,7 +2185,14 @@ void V2TIMManagerImpl::UnInitSDK() {
             tox_manager.swap(tox_manager_);
         }
         if (tox_manager) {
-            tox_manager->saveTo(save_path);
+            // final_save: the LAST chance for anything still in flight to reach
+            // the profile — a CreateGroup that overlapped this logout is only
+            // durable because this save waits for its pin (codex 2026-09-26).
+            if (!tox_manager->saveTo(save_path, nullptr, /*final_save=*/true)) {
+                V2TIM_LOG(kError,
+                          "[UnInitSDK] the final profile save FAILED; work from this session "
+                          "may not be on disk");
+            }
             tox_manager->shutdown();
         }
     } catch (...) {

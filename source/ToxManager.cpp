@@ -1883,7 +1883,7 @@ bool ToxManager::setConferenceMaxOffline(uint32_t conference_number, uint32_t ma
 }
 
 // 数据保存和加载实现
-std::vector<uint8_t> ToxManager::getSaveData() const {
+std::vector<uint8_t> ToxManager::getSaveData(int attempts) const {
     // Order matters, and it is the pin gate FIRST, iterate_mutex_ second.
     //
     // The other way round (which this was) deadlocks against every caller that
@@ -1901,7 +1901,8 @@ std::vector<uint8_t> ToxManager::getSaveData() const {
     //
     // Two attempts: the first can lose a race with a long single operation,
     // and a skipped save costs more than the wait.
-    for (int attempt = 0; attempt < 2; ++attempt) {
+    if (attempts < 1) attempts = 1;
+    for (int attempt = 0; attempt < attempts; ++attempt) {
         SaveQuiesce quiesce(pin_state_);
         if (!quiesce.drained()) continue;
         auto iterate_lock = lockIterate();
@@ -1914,10 +1915,10 @@ std::vector<uint8_t> ToxManager::getSaveData() const {
     // toxcore writes it. The profile already on disk stays valid; the caller
     // must treat this as a failed save and retry (saveTo returns false).
     V2TIM_LOG(kError,
-              "[ToxManager] getSaveData: in-flight Tox operations did not drain in 2x{}s; "
+              "[ToxManager] getSaveData: in-flight Tox operations did not drain in {}x{}s; "
               "this save is SKIPPED (a concurrent mutation could overflow the buffer) — "
               "the profile on disk is the previous one",
-              static_cast<long long>(kSaveQuiesceTimeout.count()));
+              attempts, static_cast<long long>(kSaveQuiesceTimeout.count()));
     return {};
 }
 
@@ -1934,7 +1935,7 @@ std::vector<uint8_t> ToxManager::readSaveDataQuiesced() const {
     return data;
 }
 
-bool ToxManager::saveTo(const std::string& path, bool* queued) const {
+bool ToxManager::saveTo(const std::string& path, bool* queued, bool final_save) const {
     if (queued) *queued = false;
     // A save reached from inside a tox callback is the one case the quiesce
     // cannot win: another thread may hold a pin and be waiting for the
@@ -1985,7 +1986,7 @@ bool ToxManager::saveTo(const std::string& path, bool* queued) const {
                   "saving inline (the quiesce may have to time out)");
     }
     try {
-        auto data = getSaveData();
+        auto data = getSaveData(final_save ? kFinalSaveQuiesceAttempts : 2);
         if (data.empty()) return false;
 
         // Atomic, durable save: write to a temp file, flush to disk, restrict

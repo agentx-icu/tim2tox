@@ -425,6 +425,13 @@ void V2TIMGroupManagerImpl::CreateGroup(const V2TIMGroupInfo& info,
     // replaces its mapping (codex 2026-09-26). Only the session-scoped
     // publication is skipped (above); the create itself is reported as what it
     // is — done.
+    //
+    // The durability that claim rests on: UnInitSDK's save quiesces against the
+    // pin THIS create holds (ToxManager::getSaveData), with the longer
+    // final-save budget, so it cannot write a profile that predates the group
+    // while the create is still running. If even that save fails it logs an
+    // error of its own — a session-wide loss, not something this create can
+    // report better than the log does.
     if (session && session.Expired()) {
         V2TIM_LOG(kWarning,
                   "CreateGroup: the session ended during the create; the group exists and is "

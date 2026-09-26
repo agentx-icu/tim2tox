@@ -510,7 +510,7 @@ TEST(ToxSessionPinTest, SaveFromInsideAnIterateIsDeferredNotStalled) {
     ASSERT_FALSE(save.empty());
     const std::size_t owner_check = save.find("isIterateOwner()");
     const std::size_t defer = save.find("IterateReentryScope::Defer");
-    const std::size_t quiesce = save.find("getSaveData()");
+    const std::size_t quiesce = save.find("getSaveData(");
     ASSERT_NE(owner_check, std::string::npos)
         << "a save on the iterating thread must be recognised";
     ASSERT_NE(defer, std::string::npos)
@@ -526,6 +526,16 @@ TEST(ToxSessionPinTest, SaveFromInsideAnIterateIsDeferredNotStalled) {
     // ...and the caller must be able to tell a queued save from a written one.
     EXPECT_NE(save.find("*queued = true"), std::string::npos)
         << "a deferred save must not be reported as durable";
+    // The teardown save gets the longer quiesce budget: it is the save an
+    // in-flight operation (a group create racing logout) has to land in, and
+    // there is no later save to retry.
+    EXPECT_NE(save.find("kFinalSaveQuiesceAttempts"), std::string::npos)
+        << "the final save must get more than the ordinary quiesce budget";
+    const std::string uninit = StripLineComments(SourceSection(
+        ReadSource(TIM2TOX_MANAGER_SOURCE_PATH), "void V2TIMManagerImpl::UnInitSDK(",
+        "void V2TIMManagerImpl::SaveToxProfile("));
+    EXPECT_NE(uninit.find("/*final_save=*/true"), std::string::npos)
+        << "the logout save must ask for the final-save budget";
 }
 
 // A pin taken while a save is quiescing must wait for it, which is what makes

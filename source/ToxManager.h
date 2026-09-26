@@ -172,14 +172,23 @@ public:
     // The ordering rule this implies, for anything added later: NEVER take
     // iterate_mutex_ and then wait for a pin. Taking a pin and then
     // iterate_mutex_ is fine and is what callers do.
-    std::vector<uint8_t> getSaveData() const;
+    // `attempts` quiesce rounds of kSaveQuiesceTimeout each. The teardown save
+    // passes more: it is the one save an in-flight operation MUST be allowed to
+    // land in (a group created moments earlier is only durable because this
+    // save waits for that operation's pin), and there is no later save to retry
+    // (codex 2026-09-26).
+    std::vector<uint8_t> getSaveData(int attempts = 2) const;
     // Returns false when the profile was NOT written. Called from inside a tox
     // callback it instead DEFERS the save to the end of the iterate (the quiesce
     // cannot run there, see the implementation): it then returns true and sets
     // *queued, so a caller that reports the outcome can say "queued" rather than
     // claim a write that has not happened yet. The deferred attempt logs its own
     // result.
-    bool saveTo(const std::string& path, bool* queued = nullptr) const;
+    bool saveTo(const std::string& path, bool* queued = nullptr,
+                bool final_save = false) const;
+    // Quiesce rounds the teardown save gets: ~30 s, long enough for any single
+    // in-flight Tox operation.
+    static constexpr int kFinalSaveQuiesceAttempts = 6;
     static constexpr std::chrono::seconds kSaveQuiesceTimeout{5};
     bool loadFrom(const std::string& path);
 
