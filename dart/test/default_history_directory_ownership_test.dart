@@ -261,18 +261,49 @@ void main() {
       );
     });
 
+    test('rows an OWNERLESS session could not write are not handed to the next '
+        'ownerless session', () async {
+      final store = await opened();
+      await store.saveHistory(_peer, [_row('already_durable')]);
+      await store.flushPendingSaves();
+      await Process.run('chmod', <String>['500', base().path]);
+      addTearDown(() => Process.run('chmod', <String>['700', base().path]));
+      unawaited(store
+          .appendHistory(_peer, _row('owed_by_an_unknown_identity'))
+          .catchError((Object _) {}));
+
+      // A -> B -> (pre-login window again). `null` names no identity, so those
+      // rows must not reappear for whoever logs in next (codex 2026-09-26).
+      await store.openSession(ownerKey: _ownerB);
+      await Process.run('chmod', <String>['700', base().path]);
+      await store.openSession();
+
+      expect(store.getHistory(_peer), isEmpty);
+      await store.flushPendingSaves();
+      final shared = peerFile(base());
+      if (await shared.exists()) {
+        expect(await shared.readAsString(),
+            isNot(contains('owed_by_an_unknown_identity')));
+      }
+      await store.dispose();
+    }, skip: Platform.isWindows ? 'chmod-based failure injection' : null);
+
     test('rows the hand-over could not write are held for that identity',
         () async {
       // A write that cannot land (full disk, unwritable directory) used to be
       // dropped outright by the hand-over: carrying it into the next identity
       // would put it in that account's files, so the message was simply lost
       // (codex 2026-09-26). It is now held for the identity it belongs to.
-      final store = await opened();
-      await base().create(recursive: true);
-      await Process.run('chmod', <String>['500', base().path]);
-      addTearDown(() => Process.run('chmod', <String>['700', base().path]));
+      final store = await opened(ownerKey: _ownerA);
+      // One successful write first, so A's directory is resolved and claimed
+      // (an empty unmarked base is claimed rather than side-stepped).
+      await store.saveHistory(_peer, [_row('already_durable')]);
+      await store.flushPendingSaves();
+      final ownDir = Directory((await store.ownerBoundDefaultDirectory())!);
+      await Process.run('chmod', <String>['500', ownDir.path]);
+      addTearDown(() => Process.run('chmod', <String>['700', ownDir.path]));
       unawaited(store
-          .appendHistory(_peer, _row('owed_to_the_ownerless_session'))
+          .appendHistory(_peer, _row('owed_to_a'))
           .catchError((Object _) {}));
 
       await store.openSession(ownerKey: _ownerB);
@@ -283,17 +314,46 @@ void main() {
       await store.flushPendingSaves();
       expect(
         await peerFile(Directory('${base().path}_$_ownerB')).readAsString(),
-        isNot(contains('owed_to_the_ownerless_session')),
+        isNot(contains('owed_to_a')),
         reason: 'the held rows must not be written into B\'s files',
       );
 
-      // Back to that identity, with the directory writable again: the held
-      // rows are restored and land where they always belonged.
-      await Process.run('chmod', <String>['700', base().path]);
-      await store.openSession();
+      // Back to A, with its directory writable again: the held rows are
+      // restored and land where they always belonged.
+      await Process.run('chmod', <String>['700', ownDir.path]);
+      await store.openSession(ownerKey: _ownerA);
       await store.flushPendingSaves();
-      expect(await peerFile(base()).readAsString(),
-          contains('owed_to_the_ownerless_session'));
+      expect(await peerFile(ownDir).readAsString(), contains('owed_to_a'));
+      await store.dispose();
+    }, skip: Platform.isWindows ? 'chmod-based failure injection' : null);
+
+    test('a delete whose write failed is not undone when the owner returns',
+        () async {
+      // The row is on disk first, then deleted with the directory unwritable:
+      // holding only the remaining rows would let the next load merge the
+      // deleted one back in (codex 2026-09-26).
+      final store = await opened(ownerKey: _ownerA);
+      // appendHistory, so the rows are in the cache too: removeMessage works on
+      // the cached list (saveHistory only writes a snapshot).
+      await store.appendHistory(_peer, _row('keep'));
+      await store.appendHistory(_peer, _row('gone'));
+      await store.flushPendingSaves();
+      final ownDir = Directory((await store.ownerBoundDefaultDirectory())!);
+      expect(await peerFile(ownDir).readAsString(), contains('gone'));
+
+      await Process.run('chmod', <String>['500', ownDir.path]);
+      addTearDown(() => Process.run('chmod', <String>['700', ownDir.path]));
+      // The tombstone is recorded before the write, so the delete stands in
+      // memory even though the write cannot land and the call reports it.
+      await expectLater(store.removeMessage(_peer, 'gone'), throwsA(anything));
+      unawaited(store.flushPendingSaves().catchError((Object _) {}));
+
+      await store.openSession(ownerKey: _ownerB);
+      await Process.run('chmod', <String>['700', ownDir.path]);
+      await store.openSession(ownerKey: _ownerA);
+
+      expect((await store.loadHistory(_peer)).map((m) => m.msgID), ['keep'],
+          reason: 'the tombstone must come back with the rows');
       await store.dispose();
     }, skip: Platform.isWindows ? 'chmod-based failure injection' : null);
   });
