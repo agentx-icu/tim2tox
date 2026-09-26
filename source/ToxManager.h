@@ -177,6 +177,11 @@ public:
     // land in (a group created moments earlier is only durable because this
     // save waits for that operation's pin), and there is no later save to retry
     // (codex 2026-09-26).
+    // Refuse every future pin. Call before the final save: after it, an
+    // operation that had not been admitted yet fails cleanly (as "not
+    // initialized", which is what it is) instead of running into a session whose
+    // profile has already been written. Irreversible for this ToxManager.
+    void closeAdmission();
     std::vector<uint8_t> getSaveData(int attempts = 2) const;
     // Returns false when the profile was NOT written. Called from inside a tox
     // callback it instead DEFERS the save to the end of the iterate (the quiesce
@@ -186,9 +191,12 @@ public:
     // result.
     bool saveTo(const std::string& path, bool* queued = nullptr,
                 bool final_save = false) const;
-    // Quiesce rounds the teardown save gets: ~30 s, long enough for any single
-    // in-flight Tox operation.
-    static constexpr int kFinalSaveQuiesceAttempts = 6;
+    // Quiesce rounds the teardown save gets. Deliberately modest: the native
+    // uninit is synchronous on the Dart isolate, so this budget is time the app
+    // looks frozen at logout on mobile (codex 2026-09-26). Three rounds cover a
+    // slow in-flight operation; beyond that the admission gate in acquireTox is
+    // what keeps a late operation out, not a longer wait.
+    static constexpr int kFinalSaveQuiesceAttempts = 3;
     static constexpr std::chrono::seconds kSaveQuiesceTimeout{5};
     bool loadFrom(const std::string& path);
 
@@ -473,6 +481,12 @@ private:
         std::unordered_map<std::thread::id, int> depth;
         bool quiescing = false;
         std::thread::id quiescing_owner{};
+        // Set once, by closeAdmission(), when the session is going away: no new
+        // pin is handed out after it, so the final save's snapshot is the last
+        // word. Without it an operation could be admitted between that save's
+        // quiesce and shutdown() and do work nothing would ever persist
+        // (codex 2026-09-26).
+        bool closed = false;
     };
     std::shared_ptr<PinState> pin_state_ = std::make_shared<PinState>();
     // RAII: blocks new pins from other threads, waits (bounded) for the live

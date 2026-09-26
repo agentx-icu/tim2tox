@@ -520,23 +520,30 @@ Tox* ToxManager::getTox() const {
 // lock (mutex_, briefly) as getTox() — callers that could safely call getTox()
 // can safely call this — but the returned handle keeps the instance alive even
 // if shutdown() runs on another thread in the meantime.
-std::shared_ptr<Tox> ToxManager::acquireTox() const {
-    std::shared_ptr<Tox> tox;
-    try {
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (is_shutting_down_.load(std::memory_order_acquire) || !tox_) {
-            return nullptr;
-        }
-        tox = tox_;
-    } catch (const std::system_error&) {
-        // Mutex may be invalid during static destruction.
-        return nullptr;
-    } catch (...) {
-        return nullptr;
+void ToxManager::closeAdmission() {
+    const std::shared_ptr<PinState> state = pin_state_;
+    if (!state) return;
+    {
+        std::lock_guard<std::mutex> gate(state->mutex);
+        if (state->closed) return;
+        state->closed = true;
     }
-    // Account the pin so getSaveData() can quiesce against it. mutex_ is
-    // already released: nothing may hold mutex_ and PinState::mutex at once
-    // (getSaveData takes the gate first, then mutex_).
+    state->cv.notify_all();
+    V2TIM_LOG(kInfo, "[ToxManager] closeAdmission: no further Tox operations will be admitted");
+}
+
+std::shared_ptr<Tox> ToxManager::acquireTox() const {
+    // ADMISSION FIRST, handle second. The other way round (which this was) left a
+    // window where an operation had already copied the Tox pointer but was not
+    // yet counted: a save could quiesce against a count of zero and snapshot a
+    // profile that predates work which then went ahead (codex 2026-09-26). The
+    // two locks are still never held at once — the gate is released before
+    // mutex_ is taken — and the order (PinState, then mutex_) matches
+    // getSaveData's.
+    // Fast fail, before the gate: a session already shutting down must not make
+    // an FFI caller wait out a quiesce only to be handed null (codex
+    // 2026-09-26).
+    if (is_shutting_down_.load(std::memory_order_acquire)) return nullptr;
     const std::shared_ptr<PinState> state = pin_state_;
     const std::thread::id self = std::this_thread::get_id();
     {
@@ -552,12 +559,50 @@ std::shared_ptr<Tox> ToxManager::acquireTox() const {
         // iterate has returned, and it re-checks the drain then.
         const bool reentrant = (depth_it != state->depth.end() && depth_it->second > 0) ||
                                state->quiescing_owner == self || isIterateOwner();
+        // Admission is closed for good: refuse instead of waiting. A thread that
+        // already holds a pin is finishing work the final save still waits for,
+        // so it is let through.
+        if (state->closed && !reentrant) return nullptr;
         if (!reentrant) {
-            state->cv.wait(gate, [&state] { return !state->quiescing; });
+            state->cv.wait(gate, [&state] { return !state->quiescing || state->closed; });
+            if (state->closed) return nullptr;
         }
         ++state->count;
         ++state->depth[self];
     }
+    // Admitted: from here every exit path must release the pin, so the handle is
+    // fetched through a guard that does.
+    struct AdmissionRelease {
+        std::shared_ptr<PinState> state;
+        std::thread::id self;
+        bool armed = true;
+        ~AdmissionRelease() {
+            if (!armed) return;
+            {
+                std::lock_guard<std::mutex> gate(state->mutex);
+                if (state->count > 0) --state->count;
+                const auto it = state->depth.find(self);
+                if (it != state->depth.end() && --it->second <= 0) state->depth.erase(it);
+            }
+            state->cv.notify_all();
+        }
+    } admission{state, self};
+
+    std::shared_ptr<Tox> tox;
+    try {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (is_shutting_down_.load(std::memory_order_acquire) || !tox_) {
+            return nullptr;
+        }
+        tox = tox_;
+    } catch (const std::system_error&) {
+        // Mutex may be invalid during static destruction.
+        return nullptr;
+    } catch (...) {
+        return nullptr;
+    }
+    // The pin now belongs to the token below.
+    admission.armed = false;
     // Aliasing pin. `token` owns BOTH the pin release and a reference to the
     // Tox, so the returned handle keeps the instance alive exactly as the plain
     // shared_ptr did — the tox_kill() still happens on the last holder's

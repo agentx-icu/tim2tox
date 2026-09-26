@@ -538,6 +538,70 @@ TEST(ToxSessionPinTest, SaveFromInsideAnIterateIsDeferredNotStalled) {
         << "the logout save must ask for the final-save budget";
 }
 
+// Admission order: a pin must be COUNTED before its holder can read the Tox
+// handle, or a save can quiesce against a count of zero while an operation is
+// already under way with the handle in hand (codex 2026-09-26).
+TEST(ToxSessionPinTest, AcquireCountsThePinBeforeItReadsTheHandle) {
+    const std::string manager = StripLineComments(ReadSource(TIM2TOX_TOX_MANAGER_SOURCE_PATH));
+    const std::string acquire = SourceSection(manager, "std::shared_ptr<Tox> ToxManager::acquireTox(",
+                                              "ToxManager::SaveQuiesce::SaveQuiesce(");
+    ASSERT_FALSE(acquire.empty());
+    const std::size_t admit = acquire.find("++state->count");
+    const std::size_t read_handle = acquire.find("tox = tox_;");
+    ASSERT_NE(admit, std::string::npos);
+    ASSERT_NE(read_handle, std::string::npos);
+    EXPECT_LT(admit, read_handle)
+        << "the handle must not be read before the pin is admitted";
+    EXPECT_NE(acquire.find("AdmissionRelease"), std::string::npos)
+        << "an admitted pin must be released on every failure path";
+}
+
+// Admission closes for good at teardown, BEFORE the final save, so no operation
+// can be admitted between that save's snapshot and the shutdown and then do work
+// nothing will ever persist (codex 2026-09-26).
+TEST(ToxSessionPinTest, ClosedAdmissionRefusesNewPinsAndLogoutClosesItFirst) {
+    std::unique_ptr<ToxManager> manager = MakeLiveManager();
+    if (!manager) GTEST_SKIP() << "tox_new unavailable on this host";
+
+    std::shared_ptr<Tox> before = manager->acquireTox();
+    EXPECT_NE(before, nullptr);
+    manager->closeAdmission();
+    // The pin taken earlier stays valid — the final save is waiting for exactly
+    // that work — and the thread holding it may still nest, so an operation
+    // already under way is not broken half-way through.
+    EXPECT_NE(before, nullptr);
+    std::shared_ptr<Tox> nested = manager->acquireTox();
+    EXPECT_NE(nested, nullptr) << "an admitted operation must still be able to nest";
+    nested.reset();
+    // Another thread, which holds nothing, is refused.
+    std::atomic<bool> other_got_a_pin{true};
+    std::thread other([&] {
+        other_got_a_pin.store(manager->acquireTox() != nullptr, std::memory_order_release);
+    });
+    other.join();
+    EXPECT_FALSE(other_got_a_pin.load(std::memory_order_acquire))
+        << "a pin was handed out after admission closed";
+    before.reset();
+    std::atomic<bool> later_got_a_pin{true};
+    std::thread later([&] {
+        later_got_a_pin.store(manager->acquireTox() != nullptr, std::memory_order_release);
+    });
+    later.join();
+    EXPECT_FALSE(later_got_a_pin.load(std::memory_order_acquire))
+        << "closing is irreversible";
+    // ...and the savedata is still readable, so the final save can run.
+    EXPECT_FALSE(manager->getSaveData().empty());
+
+    const std::string uninit = StripLineComments(SourceSection(
+        ReadSource(TIM2TOX_MANAGER_SOURCE_PATH), "void V2TIMManagerImpl::UnInitSDK(",
+        "void V2TIMManagerImpl::SaveToxProfile("));
+    const std::size_t close_at = uninit.find("closeAdmission()");
+    const std::size_t save_at = uninit.find("saveTo(save_path");
+    ASSERT_NE(close_at, std::string::npos) << "logout must close admission";
+    ASSERT_NE(save_at, std::string::npos);
+    EXPECT_LT(close_at, save_at) << "admission must close BEFORE the final save";
+}
+
 // A pin taken while a save is quiescing must wait for it, which is what makes
 // the size/copy pair atomic.
 TEST(ToxSessionPinTest, SaveDataBlocksNewPinsWhileItReads) {
