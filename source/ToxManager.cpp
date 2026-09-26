@@ -1934,7 +1934,56 @@ std::vector<uint8_t> ToxManager::readSaveDataQuiesced() const {
     return data;
 }
 
-bool ToxManager::saveTo(const std::string& path) const {
+bool ToxManager::saveTo(const std::string& path, bool* queued) const {
+    if (queued) *queued = false;
+    // A save reached from inside a tox callback is the one case the quiesce
+    // cannot win: another thread may hold a pin and be waiting for the
+    // iterate_mutex_ THIS thread owns, so its pin can only drain once this
+    // callback returns — the quiesce would time out and the save be refused
+    // (codex 2026-09-26). Run it the moment the iterate unwinds instead, which
+    // is the same mechanism UnInitSDK and shutdown() use.
+    if (isIterateOwner()) {
+        // A STRONG reference for the duration of the deferred save (see the
+        // class declaration): the deferred work runs after iterate_mutex_ is
+        // released, so a teardown on another thread can otherwise destroy the
+        // manager between the token check and the call.
+        std::weak_ptr<const ToxManager> weak_self = weak_from_this();
+        // Taken while the object is certainly alive: >0 means a shared_ptr owns
+        // it (production) and locking is authoritative; 0 means it is owned by
+        // something else (a unique_ptr in a test fixture) and the token is the
+        // only liveness signal there is.
+        const bool shared_owned = weak_self.use_count() > 0;
+        std::weak_ptr<int> alive = alive_token_;
+        std::string deferred_path = path;
+        if (IterateReentryScope::Defer([this, weak_self, shared_owned, alive, deferred_path] {
+                if (shared_owned) {
+                    if (const std::shared_ptr<const ToxManager> self = weak_self.lock()) {
+                        if (!self->saveTo(deferred_path)) {
+                            V2TIM_LOG(kError,
+                                      "[ToxManager] saveTo: the deferred save of {} FAILED",
+                                      deferred_path);
+                        }
+                    }
+                    return;
+                }
+                if (alive.lock() && !saveTo(deferred_path)) {
+                    V2TIM_LOG(kError,
+                              "[ToxManager] saveTo: the deferred save of {} FAILED",
+                              deferred_path);
+                }
+            })) {
+            V2TIM_LOG(kInfo,
+                      "[ToxManager] saveTo: called from inside a tox callback; deferred "
+                      "until the iterate returns");
+            // Accepted, not durable — and the caller is told which, so it does
+            // not log a write that has not happened (codex 2026-09-26).
+            if (queued) *queued = true;
+            return true;
+        }
+        V2TIM_LOG(kWarning,
+                  "[ToxManager] saveTo: called from a tox callback with no iterate scope; "
+                  "saving inline (the quiesce may have to time out)");
+    }
     try {
         auto data = getSaveData();
         if (data.empty()) return false;

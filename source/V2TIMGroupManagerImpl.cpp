@@ -408,13 +408,8 @@ void V2TIMGroupManagerImpl::CreateGroup(const V2TIMGroupInfo& info,
         if (group_number != UINT32_MAX && session && session.Expired()) {
             // A logout landed mid-create: the pin kept the instance valid, but
             // this group belongs to a session that is over. Publishing a join
-            // for it would stamp the next account's instance id — and reporting
-            // SUCCESS for a group the active session will never see is just as
-            // wrong (codex 2026-09-26), so the create fails.
-            V2TIM_LOG(kWarning, "CreateGroup: session ended before HandleGroupSelfJoin; failing the create");
-            callback->OnError(ERR_SDK_NOT_INITIALIZED,
-                              "session ended during group creation");
-            return;
+            // for it would stamp the next account's instance id.
+            V2TIM_LOG(kWarning, "CreateGroup: session ended before HandleGroupSelfJoin; skipping the manual self-join");
         } else if (group_number != UINT32_MAX) {
             V2TIM_LOG(kInfo, "[V2TIMGroupManagerImpl::CreateGroup] Manually calling HandleGroupSelfJoin(group_number={}) to trigger OnGroupCreated", group_number);
             manager_impl_->HandleGroupSelfJoin(group_number);
@@ -424,6 +419,17 @@ void V2TIMGroupManagerImpl::CreateGroup(const V2TIMGroupInfo& info,
         }
     }
     
+    // A session that ended mid-create does NOT make this a failure: the group
+    // exists in Tox and in the profile the logout saves, and answering OnError
+    // invites a retry that creates a SECOND group with the same name and
+    // replaces its mapping (codex 2026-09-26). Only the session-scoped
+    // publication is skipped (above); the create itself is reported as what it
+    // is — done.
+    if (session && session.Expired()) {
+        V2TIM_LOG(kWarning,
+                  "CreateGroup: the session ended during the create; the group exists and is "
+                  "reported as created, but nothing was published for this session");
+    }
     // [tim2tox-debug] Record callback trigger for V2TIMGroupManagerImpl::CreateGroup
     V2TIM_LOG(kInfo, "[tim2tox-debug] V2TIMGroupManagerImpl::CreateGroup: Triggering callback->OnSuccess with groupID={}", 
              finalGroupID.CString());

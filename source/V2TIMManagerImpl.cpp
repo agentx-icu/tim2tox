@@ -2271,10 +2271,16 @@ void V2TIMManagerImpl::SaveToxProfile() {
         (void)tim2tox::path::EnsureDirectoryExists(save_dir, &mkdir_err);
         save_path = tim2tox::path::BuildProfilePath(save_dir, GetInstanceIdFromManager(this)).string();
     }
-    if (tox_manager_->saveTo(save_path)) {
-        V2TIM_LOG(kInfo, "[SaveToxProfile] Saved tox profile to {}", save_path);
-    } else {
+    bool queued = false;
+    if (!tox_manager_->saveTo(save_path, &queued)) {
         V2TIM_LOG(kError, "[SaveToxProfile] Failed to save tox profile to {}", save_path);
+    } else if (queued) {
+        // Reached from inside a tox callback: the write runs when the iterate
+        // returns and logs its own result. Saying "saved" here would claim a
+        // durability this call does not have.
+        V2TIM_LOG(kInfo, "[SaveToxProfile] Queued tox profile save to {}", save_path);
+    } else {
+        V2TIM_LOG(kInfo, "[SaveToxProfile] Saved tox profile to {}", save_path);
     }
 }
 
@@ -6066,10 +6072,15 @@ bool V2TIMManagerImpl::TakeIdentityBudgetLocked(IdentityRateWindow& window, Iden
 bool V2TIMManagerImpl::HasPendingChallengeForSenderLocked(Tox_Group_Number group_number,
                                                           const std::string& sender_hex,
                                                           IdentityClock::time_point now) const {
+    // Allocation-free: this runs for every valid-size proof packet, before any
+    // budget applies, so it must not build a lowercased copy per entry. Both
+    // sides are lowercase by construction (see the insert in
+    // IssueIdentityChallenges and the caller). The scan is bounded by
+    // kMaxPendingIdentityChallenges.
     for (const auto& [nonce_hex, pending] : pending_identity_challenges_) {
         (void)nonce_hex;
         if (pending.group_number == group_number && now - pending.sent_at <= kIdentityChallengeTtl &&
-            LowerHex(pending.member_key) == sender_hex) {
+            pending.member_key == sender_hex) {
             return true;
         }
     }
@@ -6280,8 +6291,12 @@ void V2TIMManagerImpl::IssueIdentityChallenges(Tox* tox, const std::vector<Pendi
                 }
                 pending_identity_challenges_.erase(oldest);
             }
+            // member_key is stored LOWERCASE here, once, so the per-packet gate
+            // in HandleGroupIdentityProof can compare it without allocating for
+            // every entry it scans (codex 2026-09-26).
             pending_identity_challenges_[ToxUtil::tox_bytes_to_hex(nonce, kIdentityNonceSize)] =
-                PendingIdentityChallenge{candidate.friend_hex, candidate.group_number, candidate.member_key, now};
+                PendingIdentityChallenge{candidate.friend_hex, candidate.group_number,
+                                        LowerHex(candidate.member_key), now};
         }
         std::string body(1, static_cast<char>(kIdentityChallenge));
         body.append(prefix_it->second);

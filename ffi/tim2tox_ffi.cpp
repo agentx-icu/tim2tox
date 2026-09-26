@@ -3503,8 +3503,17 @@ int tim2tox_ffi_iterate_all_instances(int count) {
     if (copy.empty()) return 0;
     for (int round = 0; round < count; ++round) {
         for (V2TIMManagerImpl* manager : copy) {
-            const auto session = manager->AcquireToxSession();
-            if (session) session.manager()->iterate(0);
+            // Same rule as tim2tox_ffi_iterate_current_instance: keep the
+            // ToxManager, drop the Tox pin BEFORE the iterate, or a profile
+            // save that overlaps this loop waits out its whole quiesce and is
+            // skipped (codex 2026-09-26).
+            std::shared_ptr<ToxManager> tox_manager;
+            {
+                const auto session = manager->AcquireToxSession();
+                if (!session) continue;
+                tox_manager = session.manager_shared();
+            }
+            if (tox_manager) tox_manager->iterate(0);
         }
     }
     return static_cast<int>(copy.size());

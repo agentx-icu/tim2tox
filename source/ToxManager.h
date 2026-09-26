@@ -58,7 +58,13 @@ public:
     static bool Defer(std::function<void()> fn);
 };
 
-class ToxManager {
+// enable_shared_from_this: a save deferred out of a tox callback has to hold the
+// manager alive while it runs, and the weak alive-token alone cannot do that —
+// it can be locked just as another thread's teardown starts destroying the
+// object (codex 2026-09-26). Production always owns a ToxManager through
+// V2TIMManagerImpl's shared_ptr; a test that owns one by unique_ptr gets an
+// empty weak_from_this() and the token fallback.
+class ToxManager : public std::enable_shared_from_this<ToxManager> {
 public:
     // 删除拷贝构造函数和赋值运算符
     ToxManager(const ToxManager&) = delete;
@@ -167,7 +173,13 @@ public:
     // iterate_mutex_ and then wait for a pin. Taking a pin and then
     // iterate_mutex_ is fine and is what callers do.
     std::vector<uint8_t> getSaveData() const;
-    bool saveTo(const std::string& path) const;
+    // Returns false when the profile was NOT written. Called from inside a tox
+    // callback it instead DEFERS the save to the end of the iterate (the quiesce
+    // cannot run there, see the implementation): it then returns true and sets
+    // *queued, so a caller that reports the outcome can say "queued" rather than
+    // claim a write that has not happened yet. The deferred attempt logs its own
+    // result.
+    bool saveTo(const std::string& path, bool* queued = nullptr) const;
     static constexpr std::chrono::seconds kSaveQuiesceTimeout{5};
     bool loadFrom(const std::string& path);
 

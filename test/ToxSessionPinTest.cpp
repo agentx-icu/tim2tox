@@ -42,6 +42,9 @@
 #ifndef TIM2TOX_FFI_SOURCE_PATH
 #error "TIM2TOX_FFI_SOURCE_PATH is required"
 #endif
+#ifndef TIM2TOX_TOX_MANAGER_SOURCE_PATH
+#error "TIM2TOX_TOX_MANAGER_SOURCE_PATH is required"
+#endif
 #ifndef TIM2TOX_GROUP_MANAGER_SOURCE_PATH
 #error "TIM2TOX_GROUP_MANAGER_SOURCE_PATH is required"
 #endif
@@ -381,6 +384,12 @@ TEST(ToxSessionPinTest, ManualSelfJoinRunsOnAPinnedSession) {
         << "the create path must not re-fetch a raw manager per call";
     EXPECT_NE(create.find("session.Expired()"), std::string::npos)
         << "a create finished after a logout must not publish a self-join";
+    // A create whose session ended is still a create: the group exists in Tox
+    // and in the profile, so it is reported as done and only the session-scoped
+    // publication is skipped. Answering OnError instead invited a retry that
+    // created a second group (codex 2026-09-26).
+    EXPECT_EQ(create.find("session ended during group creation"), std::string::npos)
+        << "a committed create must not be reported as a failure";
 }
 
 // Finding 2. tox_get_savedata_size() and tox_get_savedata() take toxcore's
@@ -488,6 +497,35 @@ TEST(ToxSessionPinTest, SaveDataDoesNotStallAgainstAPinnedIterateLock) {
            "the quiesce timed out";
     EXPECT_LT(elapsed, ToxManager::kSaveQuiesceTimeout)
         << "the save waited out a timeout it should never have hit";
+}
+
+// The residual cycle the quiesce order cannot break: a save reached from a tox
+// callback owns iterate_mutex_, so a pin holder waiting for that mutex can only
+// let go once the callback returns. Such a save is DEFERRED to the end of the
+// iterate rather than left to time out.
+TEST(ToxSessionPinTest, SaveFromInsideAnIterateIsDeferredNotStalled) {
+    const std::string manager = StripLineComments(ReadSource(TIM2TOX_TOX_MANAGER_SOURCE_PATH));
+    const std::string save = SourceSection(manager, "bool ToxManager::saveTo(",
+                                           "bool ToxManager::loadFrom(");
+    ASSERT_FALSE(save.empty());
+    const std::size_t owner_check = save.find("isIterateOwner()");
+    const std::size_t defer = save.find("IterateReentryScope::Defer");
+    const std::size_t quiesce = save.find("getSaveData()");
+    ASSERT_NE(owner_check, std::string::npos)
+        << "a save on the iterating thread must be recognised";
+    ASSERT_NE(defer, std::string::npos)
+        << "it must be deferred to the end of the iterate";
+    ASSERT_NE(quiesce, std::string::npos);
+    EXPECT_LT(defer, quiesce)
+        << "the deferral has to happen BEFORE the quiesce it cannot win";
+    // A strong reference for the deferred run: the deferred work happens after
+    // iterate_mutex_ is released, so a weak liveness token alone can be locked
+    // just as a teardown starts destroying the manager.
+    EXPECT_NE(save.find("weak_from_this()"), std::string::npos)
+        << "the deferred save must hold the manager alive while it runs";
+    // ...and the caller must be able to tell a queued save from a written one.
+    EXPECT_NE(save.find("*queued = true"), std::string::npos)
+        << "a deferred save must not be reported as durable";
 }
 
 // A pin taken while a save is quiescing must wait for it, which is what makes
