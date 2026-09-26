@@ -19,6 +19,7 @@
 
 import 'dart:convert';
 import 'dart:ffi' as ffi;
+import 'dart:io' show Platform;
 
 import 'package:ffi/ffi.dart' as pkgffi;
 import 'package:test/test.dart';
@@ -239,9 +240,18 @@ void main() {
       // do not). Without it this case cannot be constructed at all.
       final sendCraftedChallenge = lib.mm6SendCraftedChallengeNative;
       if (sendCraftedChallenge == null) {
-        markTestSkipped(
+        const message =
             'libtim2tox_ffi lacks tim2tox_ffi_mm6_send_crafted_challenge: '
-            'rebuild with -DTIM2TOX_ENABLE_TEST_HOOKS=ON (build_ffi.sh)');
+            'rebuild with -DTIM2TOX_ENABLE_TEST_HOOKS=ON (build_ffi.sh, or '
+            'toxee tool/ci/build_tim2tox.sh --enable-test-hooks)';
+        // A suite that is SUPPOSED to have the hook (every CI job running this
+        // file sets TIM2TOX_EXPECT_TEST_HOOKS=1) must FAIL on its absence: the
+        // library was built wrong, and skipping would report green for a
+        // confidentiality check that never ran.
+        if (Platform.environment['TIM2TOX_EXPECT_TEST_HOOKS'] == '1') {
+          fail('TIM2TOX_EXPECT_TEST_HOOKS=1 but $message');
+        }
+        markTestSkipped(message);
         return;
       }
 
@@ -811,12 +821,390 @@ void main() {
       svc.setActivePeer(null);
     }, timeout: const Timeout(Duration(seconds: 120)));
 
+    /// The parked-group-READ-receipt blob of the account [node] is logged in
+    /// as, decoded back into `[gid, author, msgID]` triples. Read straight out
+    /// of the injected preferences service, i.e. the DURABLE half — the same
+    /// bytes a restart would recover.
+    Future<List<List<String>>> parkedQueueOf(TestNode node) async {
+      final svc = (TencentCloudChatSdkPlatform.instance as Tim2ToxSdkPlatform)
+          .ffiService;
+      final scope = node.runWithInstance(() => svc.prefsAccountScopeToxId);
+      if (scope == null) return const <List<String>>[];
+      final stored = await svc.preferencesService
+              ?.getStringList('pending_group_read_receipts_$scope') ??
+          const <String>[];
+      return stored
+          .map((e) => (jsonDecode(e) as List).cast<String>())
+          .toList();
+    }
+
+    /// Open and close the group once as [node], so every row an earlier leg
+    /// left unread is flipped read and claimed. Without this, the next leg's
+    /// counter deltas would also contain those rows' receipts.
+    Future<void> drainOnViewWalk(TestNode node) async {
+      final svc = (TencentCloudChatSdkPlatform.instance as Tim2ToxSdkPlatform)
+          .ffiService;
+      node.runWithInstance(() => svc.setActivePeer(groupId!));
+      for (var i = 0; i < 4; i++) {
+        await pumpTestTick(scenario, advanceMs: 250, iterationsPerInstance: 2);
+      }
+      svc.setActivePeer(null);
+    }
+
+    // FIX 1 — the RETRYABLE failure. `SendGroupReceipt` returns 0 both for "this
+    // group is not in our map" and for a toxcore send that failed (a group whose
+    // transport is down), and Dart used to park only the -3 "author is not a
+    // live NGC peer" refusal. Everything else was dropped while the on-view walk
+    // flagged the row read in the same breath — so a mobile user who opens a
+    // group during a connection drop lost those ticks for good, with a retry
+    // that would have worked seconds later.
+    //
+    // HOW THIS IS DRIVEN HONESTLY: 0 is ALL Dart can see — one code for several
+    // causes is the defect — and this harness has no seam to sever a live
+    // group's transport mid-run. So the 0 is produced by the other input the
+    // native side rejects with the SAME code: an author key that is not 64 hex.
+    // The direct probe first pins that the code really is 0 and not -3, which is
+    // what makes this leg exercise the new rule instead of the old one. What is
+    // NOT faked: the native send, the park, the flush trigger and the retry are
+    // all the production ones.
+    test('a READ receipt lost to a send FAILURE, not an absent author, is '
+        'parked and retried', () async {
+      final svc =
+          (TencentCloudChatSdkPlatform.instance as Tim2ToxSdkPlatform)
+              .ffiService;
+      svc.debugSetSelfId(founder.getToxId().substring(0, 64));
+      svc.debugAddKnownGroupForTest(groupId!);
+      await drainOnViewWalk(founder);
+
+      final lib = ffi_lib.Tim2ToxFfi.open();
+      // 62 hex: real group, real msgID, real receipt type — and still
+      // unaddressable, so the native side reports the GENERIC failure.
+      final failingAuthor = 'CD' * 31;
+      final probe = founder.runWithInstance(() {
+        final gid = groupId!.toNativeUtf8();
+        final author = failingAuthor.toNativeUtf8();
+        final id = 'send-failure-probe'.toNativeUtf8();
+        final kind = 'read'.toNativeUtf8();
+        try {
+          return lib.sendGroupReceiptNative(0, gid, author, id, kind);
+        } finally {
+          pkgffi.malloc.free(gid);
+          pkgffi.malloc.free(author);
+          pkgffi.malloc.free(id);
+          pkgffi.malloc.free(kind);
+        }
+      });
+      expect(probe, equals(0),
+          reason: 'this leg needs the GENERIC failure code: -3 is the case the '
+              'previous leg already covers');
+
+      final stamp = DateTime.now().microsecondsSinceEpoch;
+      founder.runWithInstance(() => svc.ingestInboundGroupText(
+            gid: groupId!,
+            from: failingAuthor,
+            text: 'send failure line $stamp',
+            pseudoMsgId: 991001,
+          ));
+
+      final before = Map<String, int>.from(svc.receiptDiag);
+      int delta(String key) =>
+          (svc.receiptDiag[key] ?? 0) - (before[key] ?? 0);
+
+      founder.runWithInstance(() => svc.setActivePeer(groupId!));
+      await pumpTestTick(scenario, advanceMs: 250, iterationsPerInstance: 2);
+      // ignore: avoid_print
+      print('[park-on-failure] queued=${delta('groupReceiptsQueuedOffline')} '
+          'droppedNoPeer=${delta('groupReceiptsDroppedNoPeer')} '
+          'readOut=${delta('groupReceiptsReadOut')}');
+      expect(delta('groupReceiptsQueuedOffline'), greaterThanOrEqualTo(1),
+          reason: 'a 0 is not a definite success: the receipt must be parked, '
+              'not dropped with the row already flagged read');
+      expect(delta('groupReceiptsDroppedNoPeer'), equals(0),
+          reason: 'this park was NOT the -3 refusal — the no-peer counter must '
+              'keep meaning exactly what its name says');
+      expect(delta('groupReceiptsReadOut'), equals(0),
+          reason: 'nothing reached the wire');
+
+      // The durable half must hold it too, or a restart would still lose it.
+      final parked = await parkedQueueOf(founder);
+      expect(parked.where((t) => t[1] == failingAuthor), isNotEmpty,
+          reason: 'the park must survive a restart: $parked');
+
+      // The retry point: a second line from that author. It is still
+      // unaddressable, so the retry fails again and must RE-park rather than
+      // drop — the queue is self-healing, not one-shot.
+      final flushedBefore = svc.receiptDiag['groupReceiptsFlushedOnline'] ?? 0;
+      founder.runWithInstance(() => svc.ingestInboundGroupText(
+            gid: groupId!,
+            from: failingAuthor,
+            text: 'send failure line $stamp b',
+            pseudoMsgId: 991002,
+          ));
+      await waitUntilWithVirtualPump(
+        scenario,
+        () =>
+            (svc.receiptDiag['groupReceiptsFlushedOnline'] ?? 0) >
+            flushedBefore,
+        timeout: const Duration(seconds: 20),
+        description: 'the parked receipt is retried when the author speaks',
+        advanceMs: 100,
+        iterationsPerInstance: 1,
+      );
+      // ignore: avoid_print
+      print('[park-on-failure] retried, requeued='
+          '${delta('groupReceiptsQueuedOffline')}');
+      expect(delta('groupReceiptsQueuedOffline'), greaterThanOrEqualTo(2),
+          reason: 'a retry that fails again must re-park the receipt');
+      expect(delta('groupReceiptsDroppedNoPeer'), equals(0),
+          reason: 'still not a -3 anywhere in this leg');
+      // And the RE-park must be durable too (codex): the flush clears the blob
+      // before it sends, so a re-park that only landed in memory would make the
+      // first retry the last one a restart could ever make.
+      for (var i = 0; i < 4; i++) {
+        await pumpTestTick(scenario, advanceMs: 250, iterationsPerInstance: 1);
+      }
+      final parkedAfterRetry = (await parkedQueueOf(founder))
+          .where((t) => t[1] == failingAuthor)
+          .map((t) => t[2])
+          .toSet();
+      // ignore: avoid_print
+      print('[park-on-failure] durable after retry=${parkedAfterRetry.length}');
+      expect(parkedAfterRetry, isNotEmpty,
+          reason: 'the re-park has to reach the durable half as well');
+      svc.setActivePeer(null);
+    }, timeout: const Timeout(Duration(seconds: 150)));
+
+    // FIX 3 — one group open parks under ONE prefs write. Each park used to
+    // rewrite the whole blob, so a walk near the 64-pair x 200-entry bound
+    // serialized and pushed a large blob across the mobile prefs bridge up to 50
+    // times for a single chat tap. The counter asserted here is incremented at
+    // the real `setStringList` call site, so this measures writes, not intent.
+    test('parking a 50-row walk writes the queue once, completely', () async {
+      final svc =
+          (TencentCloudChatSdkPlatform.instance as Tim2ToxSdkPlatform)
+              .ffiService;
+      svc.debugSetSelfId(founder.getToxId().substring(0, 64));
+      svc.debugAddKnownGroupForTest(groupId!);
+      await drainOnViewWalk(founder);
+
+      // 50 unread inbound rows from one unaddressable author: the walk's bound
+      // is 50, so this is the worst case one open can produce.
+      final burstAuthor = 'CE' * 31; // 62 hex -> the generic failure again
+      final stamp = DateTime.now().microsecondsSinceEpoch;
+      const rows = 50;
+      for (var i = 0; i < rows; i++) {
+        founder.runWithInstance(() => svc.ingestInboundGroupText(
+              gid: groupId!,
+              from: burstAuthor,
+              text: 'burst line $stamp #$i',
+              pseudoMsgId: 992000 + i,
+            ));
+      }
+
+      final writesBefore = svc.debugGroupReadReceiptQueueWrites;
+      final queuedBefore = svc.receiptDiag['groupReceiptsQueuedOffline'] ?? 0;
+      founder.runWithInstance(() => svc.setActivePeer(groupId!));
+      await waitUntilWithVirtualPump(
+        scenario,
+        () => svc.debugGroupReadReceiptQueueWrites > writesBefore,
+        timeout: const Duration(seconds: 20),
+        description: 'the walk persists its parks',
+        advanceMs: 100,
+        iterationsPerInstance: 1,
+      );
+      // Let anything that was going to write a second time do it.
+      for (var i = 0; i < 6; i++) {
+        await pumpTestTick(scenario, advanceMs: 250, iterationsPerInstance: 1);
+      }
+
+      final writes = svc.debugGroupReadReceiptQueueWrites - writesBefore;
+      final queued =
+          (svc.receiptDiag['groupReceiptsQueuedOffline'] ?? 0) - queuedBefore;
+      final parked = (await parkedQueueOf(founder))
+          .where((t) => t[1] == burstAuthor)
+          .map((t) => t[2])
+          .toSet();
+      // ignore: avoid_print
+      print('[coalesce] rows=$rows parked=${parked.length} queued=$queued '
+          'prefsWrites=$writes');
+      expect(queued, equals(rows),
+          reason: 'every row of the walk must park (this is the burst)');
+      expect(writes, equals(1),
+          reason: 'the whole burst must cost ONE whole-blob prefs write, not '
+              'one per park');
+      expect(parked, hasLength(rows),
+          reason: 'coalescing must not lose a single parked id: the durable '
+              'half has to hold the complete walk');
+      svc.setActivePeer(null);
+    }, timeout: const Timeout(Duration(seconds: 150)));
+
+    // FIX 2 — the queue is per ACCOUNT, not per (group, author). This harness
+    // routes every node through ONE FfiChatService, which is exactly the
+    // condition the bug needed: with a queue keyed only by (group, author), a
+    // line from the author observed on ANOTHER account flushed the first
+    // account's parked receipts from the wrong native instance, and the author
+    // credited the read to a reader that never read anything.
+    test('one account must not flush another account parked receipts',
+        () async {
+      final svc =
+          (TencentCloudChatSdkPlatform.instance as Tim2ToxSdkPlatform)
+              .ffiService;
+      svc.debugSetSelfId(founder.getToxId().substring(0, 64));
+      svc.debugAddKnownGroupForTest(groupId!);
+      await drainOnViewWalk(founder);
+
+      final founderScope =
+          founder.runWithInstance(() => svc.prefsAccountScopeToxId);
+      final member1Scope =
+          member1.runWithInstance(() => svc.prefsAccountScopeToxId);
+      expect(founderScope, isNotNull);
+      expect(member1Scope, isNotNull);
+      expect(founderScope, isNot(equals(member1Scope)),
+          reason: 'the two instances must resolve to two account scopes, or '
+              'this leg cannot tell the accounts apart at all');
+
+      // FOUNDER parks a receipt: a row from a key nobody in the group holds.
+      final ghost = 'BC' * 32;
+      final stamp = DateTime.now().microsecondsSinceEpoch;
+      founder.runWithInstance(() => svc.ingestInboundGroupText(
+            gid: groupId!,
+            from: ghost,
+            text: 'scoped park line $stamp',
+            pseudoMsgId: 993001,
+          ));
+      final queuedBefore = svc.receiptDiag['groupReceiptsQueuedOffline'] ?? 0;
+      founder.runWithInstance(() => svc.setActivePeer(groupId!));
+      await waitUntilWithVirtualPump(
+        scenario,
+        () =>
+            (svc.receiptDiag['groupReceiptsQueuedOffline'] ?? 0) > queuedBefore,
+        timeout: const Duration(seconds: 20),
+        description: 'the founder parks a receipt for the absent author',
+        advanceMs: 100,
+        iterationsPerInstance: 1,
+      );
+      svc.setActivePeer(null);
+      // The park reaches memory synchronously but its prefs write is queued
+      // behind the queue's single-writer gate, so wait for the DURABLE half
+      // rather than assuming one pump is enough.
+      var founderParked = <String>{};
+      for (var i = 0; i < 20 && founderParked.isEmpty; i++) {
+        await pumpTestTick(scenario, advanceMs: 250, iterationsPerInstance: 1);
+        founderParked = (await parkedQueueOf(founder))
+            .where((t) => t[1] == ghost)
+            .map((t) => t[2])
+            .toSet();
+      }
+      expect(founderParked, isNotEmpty,
+          reason: 'the founder must have something parked to be stolen; '
+              'durable queue = ${await parkedQueueOf(founder)}');
+      expect(await parkedQueueOf(member1), isEmpty,
+          reason: 'member1 has parked nothing of its own');
+
+      // MEMBER1 now observes that same author speaking in that same group —
+      // the flush trigger. It must move NOTHING: the parked receipt belongs to
+      // the founder, and sending it from member1 instance would report the
+      // wrong reader to the author.
+      final flushedBefore = svc.receiptDiag['groupReceiptsFlushedOnline'] ?? 0;
+      member1.runWithInstance(() => svc.ingestInboundGroupText(
+            gid: groupId!,
+            from: ghost,
+            text: 'scoped park line $stamp seen by member1',
+            pseudoMsgId: 993002,
+          ));
+      for (var i = 0; i < 8; i++) {
+        await pumpTestTick(scenario, advanceMs: 250, iterationsPerInstance: 1);
+      }
+      // ignore: avoid_print
+      print('[scoped] flushedDelta='
+          '${(svc.receiptDiag['groupReceiptsFlushedOnline'] ?? 0) - flushedBefore} '
+          'founderParked=${founderParked.length}');
+      expect(svc.receiptDiag['groupReceiptsFlushedOnline'] ?? 0,
+          equals(flushedBefore),
+          reason: 'the other account observing the author must not flush this '
+              'account queue');
+      expect(
+          (await parkedQueueOf(founder))
+              .where((t) => t[1] == ghost)
+              .map((t) => t[2])
+              .toSet(),
+          equals(founderParked),
+          reason: 'and the founder durable queue must be untouched');
+
+      // AND THE SAME THING WITH AN EMPTY MEMORY HALF (codex): the assertion
+      // above would also hold if the per-account HYDRATION memo were broken,
+      // because it flushed from memory. Forget the memory half and the memo —
+      // what a restart leaves — so the next observation has to decide from the
+      // DURABLE half, per account. member1 must hydrate its own (empty) key and
+      // still flush nothing.
+      svc.debugForgetGroupReadReceiptQueueForTest();
+      member1.runWithInstance(() => svc.ingestInboundGroupText(
+            gid: groupId!,
+            from: ghost,
+            text: 'scoped park line $stamp seen by member1 after a restart',
+            pseudoMsgId: 993003,
+          ));
+      for (var i = 0; i < 8; i++) {
+        await pumpTestTick(scenario, advanceMs: 250, iterationsPerInstance: 1);
+      }
+      expect(svc.receiptDiag['groupReceiptsFlushedOnline'] ?? 0,
+          equals(flushedBefore),
+          reason: 'recovering the queue from disk must recover the OBSERVING '
+              'account queue, and member1 parked nothing');
+      expect(
+          (await parkedQueueOf(founder))
+              .where((t) => t[1] == ghost)
+              .map((t) => t[2])
+              .toSet(),
+          equals(founderParked),
+          reason: 'the founder durable queue must still be intact after the '
+              'other account hydrated');
+
+      // The control: the OWNING account observing the same author does flush —
+      // now from the durable half alone, so the leg proves scoping and recovery
+      // rather than a dead queue.
+      founder.runWithInstance(() => svc.ingestInboundGroupText(
+            gid: groupId!,
+            from: ghost,
+            text: 'scoped park line $stamp seen by the founder',
+            pseudoMsgId: 993004,
+          ));
+      await waitUntilWithVirtualPump(
+        scenario,
+        () =>
+            (svc.receiptDiag['groupReceiptsFlushedOnline'] ?? 0) >
+            flushedBefore,
+        timeout: const Duration(seconds: 20),
+        description: 'the owning account does flush its own parks',
+        advanceMs: 100,
+        iterationsPerInstance: 1,
+      );
+      svc.setActivePeer(null);
+    }, timeout: const Timeout(Duration(seconds: 150)));
+
     // Per-sender metering of INBOUND group receipts. The replay filter only
     // stops the same receipt twice; distinct msgIDs from one member were
-    // unbounded, and each one costs a Dart event plus two history scans. One
-    // member drives far more than the budget allows; the excess must be refused
-    // natively, which is readable through tim2tox_ffi_get_mm6_diag.
-    test('a member driving more receipts than its budget has the excess refused',
+    // unbounded, and each one costs a Dart event plus two history scans, so the
+    // native side meters them per authenticated sender.
+    //
+    // WHAT THIS LEG DOES **NOT** ASSERT, AND WHY. It used to read
+    // `perSenderLimit` from the diag and send `limit * 2` to watch the excess be
+    // refused. That stopped being honest when the budget moved into its own
+    // table and the cap was re-derived to 4096 (one `markGroupMessageAsRead`
+    // call can emit up to the loaded window, and UIKit calls it on every chat
+    // open): out-sending it now means 8192 native sends, which take longer than
+    // the 60s rate window they have to fit inside — the window rolls over
+    // mid-flood, the counter resets, and `refused >= 1` passes or fails by luck.
+    // There is no seam to lower the cap or to fill the sender table honestly
+    // (that would need a native test hook, which is not in this library), and
+    // faking the refusal would assert nothing about the meter. So this leg
+    // asserts the two things it CAN observe deterministically: an honest burst
+    // is metered and forwarded in full and refuses nothing, and the cap is wide
+    // enough that a single chat open can never refuse its own receipts — the
+    // invariant the re-derivation was for. The refusal path itself is covered by
+    // the native side's own reasoning, not by this file; making it testable
+    // needs a hook that sets the cap.
+    test('the per-sender receipt meter counts an honest burst and refuses none',
         () async {
       final svc =
           (TencentCloudChatSdkPlatform.instance as Tim2ToxSdkPlatform)
@@ -833,10 +1221,16 @@ void main() {
       final lib = ffi_lib.Tim2ToxFfi.open();
       final baseline = nativeGroupReceiptDiag(member1);
       final limit = baseline['perSenderLimit'] ?? 0;
-      if (limit <= 0) {
-        markTestSkipped('libtim2tox_ffi predates the groupReceipts diag block');
-        return;
-      }
+      // FAIL, never skip (codex): the `groupReceipts` diag block is part of the
+      // ORDINARY library — `Mm6DiagJson` is not behind a test hook — so a
+      // library that cannot report the budget is a library built from the wrong
+      // tree, and skipping here would report green for the metering assertions
+      // below while they never ran. No env gate for the same reason: there is no
+      // legitimate configuration in which this block is absent.
+      expect(limit, greaterThan(0),
+          reason: 'libtim2tox_ffi reports no groupReceipts.perSenderLimit — it '
+              'predates the group-receipt meter. Rebuild it (build_ffi.sh); do '
+              'not run this suite against a stale library.');
 
       int sendReceipt(String msgId) => founder.runWithInstance(() {
             final gid = groupId!.toNativeUtf8();
@@ -853,23 +1247,25 @@ void main() {
             }
           });
 
-      // Distinct msgIDs, so the replay filter is not what stops them. Enough of
-      // them to overrun the window whatever this test file already spent of the
-      // founder's budget at member1 (each earlier leg sent a handful).
+      // THE CAP ITSELF: a single chat open must never be able to refuse its own
+      // receipts. `Tim2ToxSdkPlatform.markGroupMessageAsRead` can emit one per
+      // inbound row of the loaded window (1000 messages in memory) on a first
+      // open, and FfiChatService's on-view walk up to 50 — so a cap under the
+      // window size would make the product refuse honest readers.
+      expect(limit, greaterThanOrEqualTo(1000),
+          reason: 'the per-sender cap must cover the largest burst one chat '
+              'open can honestly emit; got $limit');
+
+      // Distinct msgIDs, so the replay filter is not what accounts for them,
+      // and a burst small enough to complete far inside the 60s rate window.
       final stamp = DateTime.now().microsecondsSinceEpoch;
-      final target = limit * 2;
+      const burst = 24;
       var sent = 0;
-      for (var i = 0; i < target; i++) {
+      for (var i = 0; i < burst; i++) {
         if (sendReceipt('budget-probe-$stamp-$i') == 1) sent++;
-        // Let the lossless queue drain; a stalled queue would otherwise show up
-        // as "the budget was never reached".
-        if (i % 25 == 24) {
-          await pumpTestTick(scenario, advanceMs: 100, iterationsPerInstance: 2);
-        }
       }
-      expect(sent, greaterThan(limit),
-          reason: 'the sender must actually overrun the window: sent $sent of '
-              '$target, limit $limit');
+      expect(sent, equals(burst),
+          reason: 'every probe must leave the sender: sent $sent of $burst');
 
       var after = baseline;
       await waitUntilWithVirtualPump(
@@ -891,14 +1287,76 @@ void main() {
       print('[budget] sent=$sent limit=$limit metered=$metered '
           'forwarded=$forwarded refused=$refused');
 
-      expect(forwarded, lessThanOrEqualTo(limit),
-          reason: 'the per-sender window must cap what reaches Dart');
-      expect(refused, greaterThanOrEqualTo(metered - limit),
-          reason: 'everything over the window must be refused, not queued');
-      expect(refused, greaterThanOrEqualTo(1),
-          reason: 'the excess must be refused');
-      expect(forwarded, greaterThanOrEqualTo(1),
-          reason: 'honest traffic inside the window still gets through');
+      expect(metered, greaterThanOrEqualTo(sent),
+          reason: 'the meter must see every receipt that arrives — that is what '
+              'makes a cap enforceable at all');
+      expect(refused, equals(0),
+          reason: 'an honest burst this far inside the window must not be '
+              'refused');
+      expect(forwarded, greaterThanOrEqualTo(sent),
+          reason: 'and all of it must be forwarded to Dart');
     }, timeout: const Timeout(Duration(seconds: 300)));
+
+    // The PLATFORM reader trigger, and the load it used to put on the meter
+    // above (codex): UIKit calls `markGroupMessageAsRead` on every group chat
+    // open, and it walked the whole loaded window sending a READ receipt for
+    // every inbound row — no claim, no `isRead` skip — so each visit re-paid for
+    // the entire window (up to `_maxMessagesInMemory` private packets per tap,
+    // per member). It must pay once per ROW, not once per OPEN.
+    test('markGroupMessageAsRead pays for each row once, not once per open',
+        () async {
+      final platform =
+          TencentCloudChatSdkPlatform.instance as Tim2ToxSdkPlatform;
+      final svc = platform.ffiService;
+      svc.debugSetSelfId(founder.getToxId().substring(0, 64));
+      svc.debugAddKnownGroupForTest(groupId!);
+
+      // A REAL member key, so the receipts actually reach the wire: a leg where
+      // every send fails could not tell "claimed" from "never sent".
+      final member1Pk = member1.getPublicKey().toUpperCase();
+      final member1Key = (await founderMemberFriends())
+          .entries
+          .where((e) => e.value == member1Pk)
+          .map((e) => e.key)
+          .firstOrNull;
+      expect(member1Key, isNotNull,
+          reason: 'needs the member key the MM-6 test proved');
+
+      final stamp = DateTime.now().microsecondsSinceEpoch;
+      for (var i = 0; i < 2; i++) {
+        founder.runWithInstance(() => svc.ingestInboundGroupText(
+              gid: groupId!,
+              from: member1Key!,
+              text: 'platform mark-read line $stamp #$i',
+              pseudoMsgId: 994000 + i,
+            ));
+      }
+      await pumpTestTick(scenario, advanceMs: 250, iterationsPerInstance: 2);
+
+      // Everything one row can cost: on the wire, or parked for a retry.
+      int spent() => (svc.receiptDiag['groupReceiptsReadOut'] ?? 0) +
+          (svc.receiptDiag['groupReceiptsQueuedOffline'] ?? 0);
+      final before = spent();
+      final first = await founder.runWithInstanceAsync(
+          () async => platform.markGroupMessageAsRead(groupID: groupId!));
+      expect(first.code, equals(0),
+          reason: 'the API contract must not change: ${first.desc}');
+      await pumpTestTick(scenario, advanceMs: 250, iterationsPerInstance: 2);
+      final afterFirst = spent();
+      final second = await founder.runWithInstanceAsync(
+          () async => platform.markGroupMessageAsRead(groupID: groupId!));
+      expect(second.code, equals(0), reason: second.desc ?? '');
+      await pumpTestTick(scenario, advanceMs: 250, iterationsPerInstance: 2);
+      final afterSecond = spent();
+      // ignore: avoid_print
+      print('[platform-mark-read] first=${afterFirst - before} '
+          'second=${afterSecond - afterFirst}');
+      expect(afterFirst - before, greaterThanOrEqualTo(2),
+          reason: 'the two fresh rows must be reported the first time, or this '
+              'leg proves nothing about the second');
+      expect(afterSecond, equals(afterFirst),
+          reason: 'a second open must cost nothing: every row of the window '
+              'was already reported once');
+    }, timeout: const Timeout(Duration(seconds: 150)));
   });
 }
