@@ -5824,6 +5824,14 @@ constexpr uint32_t kMaxProofVerifiesPerSender = 32;
 // not each be able to open a window. Entries expire with kIdentityRateWindow
 // and are pruned, so a full table clears within a minute.
 constexpr size_t kMaxProofVerifySenders = 1024;
+// Received group receipts, PER AUTHENTICATED NGC SENDER, charged before the
+// packet costs a replay-cache slot, a Dart event and the two history scans the
+// tally does. The replay filter only ever stopped the same receipt twice: one
+// member could send unbounded DISTINCT msgIDs and each was work. Honest ceiling
+// per minute is one 'received' per message plus the on-view READ walk, which
+// Dart bounds at 50 rows per open, so 128 leaves a wide margin — this must not
+// clip a member that opens a busy group while its messages keep arriving.
+constexpr uint32_t kMaxGroupReceiptsPerSender = 128;
 // Answering side replay cache.
 constexpr size_t kMaxAnsweredChallenges = 1024;
 constexpr auto kAnsweredChallengeTtl = std::chrono::minutes(10);
@@ -6112,6 +6120,23 @@ bool V2TIMManagerImpl::TakeGroupSenderProofBudgetLocked(const std::string& sende
     }
     return TakeIdentityBudgetLocked(it->second, now, &IdentityRateWindow::proof_verifies,
                                     kMaxProofVerifiesPerSender);
+}
+
+bool V2TIMManagerImpl::TakeGroupSenderReceiptBudgetLocked(const std::string& sender_hex,
+                                                          IdentityClock::time_point now) {
+    // Same table, same bound and the same fail-closed reasoning as the proof
+    // side above: a full table refuses rather than growing, and it drains within
+    // kIdentityRateWindow. The caller must have applied its cheap structural
+    // gates FIRST, so a member sending garbage cannot reserve one of these
+    // windows at all — the lesson HandleGroupIdentityProof records (a bounded
+    // table must not reserve a window for a sender that has nothing pending).
+    auto it = identity_rate_by_group_sender_.find(sender_hex);
+    if (it == identity_rate_by_group_sender_.end()) {
+        if (identity_rate_by_group_sender_.size() >= kMaxProofVerifySenders) return false;
+        it = identity_rate_by_group_sender_.emplace(sender_hex, IdentityRateWindow{}).first;
+    }
+    return TakeIdentityBudgetLocked(it->second, now, &IdentityRateWindow::receipts_in,
+                                    kMaxGroupReceiptsPerSender);
 }
 
 void V2TIMManagerImpl::DropStaleChallengesForMemberLocked(Tox_Group_Number group_number,
@@ -6682,7 +6707,15 @@ std::string V2TIMManagerImpl::Mm6DiagJson() {
         << ",\"proofsIn\":" << mm6_diag_.proofs_in
         << ",\"proofsAccepted\":" << mm6_diag_.proofs_accepted
         << ",\"proofsRejected\":" << mm6_diag_.proofs_rejected
-        << ",\"lastProofPayloadHex\":\"" << mm6_diag_.last_proof_payload_hex << "\"}";
+        << ",\"lastProofPayloadHex\":\"" << mm6_diag_.last_proof_payload_hex << "\""
+        // Group receipts arriving on the same NGC private channel: what the
+        // per-sender meter, the replay filter and the forward saw. Nested so the
+        // proof keys above keep their exact names (auto_tests read them).
+        << ",\"groupReceipts\":{\"in\":" << mm6_diag_.group_receipts_in
+        << ",\"refused\":" << mm6_diag_.group_receipts_refused
+        << ",\"replayed\":" << mm6_diag_.group_receipts_replayed
+        << ",\"forwarded\":" << mm6_diag_.group_receipts_forwarded
+        << ",\"perSenderLimit\":" << kMaxGroupReceiptsPerSender << "}}";
     return out.str();
 }
 
@@ -7328,6 +7361,32 @@ void V2TIMManagerImpl::HandleGroupCustomPrivatePacket(
     V2TIMString group_id;
     {
         std::lock_guard<std::mutex> lock(mutex_);
+        // METER FIRST, by the toxcore-authenticated sender, before ANYTHING this
+        // packet can make us spend from here on: a replay-cache slot, the Dart
+        // event, and the two history scans the reader/receiver tally does per
+        // event. The replay filter below only ever stopped the SAME receipt
+        // twice — distinct msgIDs from one member were unbounded, and the group
+        // leg now sends a burst of them on every chat open, so "one member, many
+        // ids" is the shape to bound. Same meter-first ordering as
+        // HandleGroupIdentityProof.
+        //
+        // It sits AFTER the envelope query and the payload/envelope match, not
+        // before them, for two reasons: the budget is charged to the
+        // AUTHENTICATED sender, and that identity is exactly what the peer-key
+        // query produces (keying on anything the packet claims would let one
+        // member burn another member's window); and those two gates are the
+        // cheap, crypto-free, allocation-free checks that keep a member sending
+        // garbage from reserving one of the bounded table's windows at all —
+        // HandleGroupIdentityProof's own lesson, that a bounded table must not
+        // reserve a window for a sender that has nothing pending.
+        const auto meter_now = IdentityClock::now();
+        ++mm6_diag_.group_receipts_in;
+        PruneIdentityStateLocked(meter_now, false);
+        if (!TakeGroupSenderReceiptBudgetLocked(sender_lower, meter_now)) {
+            ++mm6_diag_.group_receipts_refused;
+            V2TIM_LOG(kWarning, "[HandleGroupCustomPrivatePacket] refused receipt: sender over budget");
+            return;
+        }
         const auto group_it = group_number_to_group_id_.find(group_number);
         if (group_it == group_number_to_group_id_.end()) return;
         group_id = group_it->second;
@@ -7335,17 +7394,22 @@ void V2TIMManagerImpl::HandleGroupCustomPrivatePacket(
         // is forwarded once per kSeenGroupReceiptTtl. Every copy used to cost
         // Dart an event, a history rewrite and a UI refresh. (Dart's handler
         // is idempotent too, for anything that slips past a bounded cache.)
-        const auto now = IdentityClock::now();
-        PruneIdentityStateLocked(now, false);
+        // Reuses the meter's clock read and its prune above — one of each per
+        // packet, not two.
+        const auto now = meter_now;
         std::string replay_key = std::string(group_id.CString()) + "|" + sender_lower + "|" +
                                  receipt.receipt_type + "|" + receipt.msg_id;
-        if (seen_group_receipts_.count(replay_key) > 0) return;
+        if (seen_group_receipts_.count(replay_key) > 0) {
+            ++mm6_diag_.group_receipts_replayed;
+            return;
+        }
         while (seen_group_receipts_.size() >= kMaxSeenGroupReceipts && !seen_group_receipt_order_.empty()) {
             seen_group_receipts_.erase(seen_group_receipt_order_.front().second);
             seen_group_receipt_order_.pop_front();
         }
         seen_group_receipts_.emplace(replay_key, now);
         seen_group_receipt_order_.emplace_back(now, std::move(replay_key));
+        ++mm6_diag_.group_receipts_forwarded;
     }
     // Hand it to Dart on the group ACTION control line, where receipts have
     // always been consumed (and never rendered); the envelope sender is the
@@ -7376,7 +7440,14 @@ int V2TIMManagerImpl::SendGroupReceipt(const V2TIMString& groupID, const std::st
     Tox* tox = session.tox();
     if (!tox) return 0;
     const Tox_Group_Peer_Number peer_id = ResolveGroupPeerIdForKey(group_number, author_key_hex);
-    if (peer_id == UINT32_MAX) return 0;
+    // -3, distinct from the generic 0: the group is ours and the request is
+    // well formed, the AUTHOR is simply not a live NGC peer right now (offline,
+    // not yet re-synced, or gone). Dart parks the receipt for that author and
+    // re-sends it when the author is a resolvable peer again; a plain failure
+    // would be dropped forever, because the row is flagged read locally the
+    // same moment and never scanned again. Callers that only know the legacy
+    // codes still see "not 1, not -2" and behave exactly as before.
+    if (peer_id == UINT32_MAX) return -3;
     // The payload keeps the legacy receipt schema (type/msgID/receiptType/
     // sender) so every toxee version consumes it, but "sender" is our
     // PER-GROUP key: the long-term key it used to carry deanonymized every

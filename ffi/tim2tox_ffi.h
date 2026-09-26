@@ -395,7 +395,10 @@ int tim2tox_ffi_mm6_send_crafted_challenge(int64_t instance_id, const char* grou
 
 // Send a group message receipt ("received"/"read") privately to the message's
 // author (their per-group public key). Returns 1 sent, -2 unsupported on this
-// group kind (legacy conference), 0 failure.
+// group kind (legacy conference), -3 the author is not a resolvable peer of this
+// group right now (the caller may park the receipt and retry when it is — a
+// READ receipt has no second chance of its own, unlike "received", which the
+// next inbound message re-fires), 0 failure.
 int tim2tox_ffi_send_group_receipt(int64_t instance_id, const char* group_id,
                                    const char* author_key_hex, const char* msg_id,
                                    const char* receipt_type);

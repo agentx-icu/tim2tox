@@ -9,6 +9,9 @@ build-tests*/
 # Same tree, underscore spelling (what the googletest FetchContent invocation in
 # the notes uses); ~150 MB of untracked build output either way.
 build_tests*/
+# Any other scratch configure tree (build_pin/, build_mm6_off/, …): several are
+# created side by side when parallel work needs its own cmake cache.
+build_[a-z]*/
 
 # IDE directories
 .idea/

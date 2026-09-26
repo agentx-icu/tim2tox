@@ -2055,7 +2055,7 @@ class FfiChatService {
     // Wire READ receipts BEFORE the barrier flags the rows (this — the
     // setActivePeer path — is what a real chat OPEN drives; the row-menu
     // mark-read runs through markConversationRead below).
-    _sendC2cReadReceiptsOnView(normalizedId);
+    _sendReadReceiptsOnView(normalizedId);
     _trackReadBarrierWrite(
         _messageHistoryPersistence.markConversationViewed(conversationId));
     _unreadByPeer[normalizedId] = 0;
@@ -2092,8 +2092,29 @@ class FfiChatService {
     }
     // Wire receipts FIRST: markConversationViewed itself flags the non-self
     // rows isRead, so a post-barrier scan would find nothing unread.
-    _sendC2cReadReceiptsOnView(normalizedId);
+    _sendReadReceiptsOnView(normalizedId);
     await _messageHistoryPersistence.markConversationViewed(conversationId);
+  }
+
+  /// Wire READ receipts for the conversation the user just viewed, for BOTH
+  /// conversation kinds — the product half of the read tick.
+  ///
+  /// Groups used to be excluded here, and UIKit's own reader trigger only ever
+  /// fires for rows whose `needReadReceipt` is true. That flag is set on
+  /// OUTGOING rows and never travels on the wire, so an inbound group row is
+  /// always false and the group read tick could never flip no matter how
+  /// complete the transport underneath was. Viewing the conversation is the
+  /// trigger that does exist on every platform, so it drives both kinds.
+  ///
+  /// Deliberately NOT done: propagating `needReadReceipt` in the group text
+  /// frame. It would change the wire format of every group message to carry a
+  /// bit the reader does not need — the reader knows it read the row.
+  void _sendReadReceiptsOnView(String normalizedId) {
+    if (_knownGroups.contains(normalizedId)) {
+      _sendGroupReadReceiptsOnView(normalizedId);
+      return;
+    }
+    _sendC2cReadReceiptsOnView(normalizedId);
   }
 
   /// Wire READ receipts for a C2C conversation the user just viewed — the
@@ -2149,6 +2170,78 @@ class FfiChatService {
       unawaited(_queuePendingReadReceipts(normalizedId, deferred));
     }
     if (sent > 0) unawaited(_saveHistory(normalizedId));
+  }
+
+  /// Group aliases this session already wired an on-view READ receipt for.
+  /// Insertion-ordered and bounded, exactly like [_receiptedGroupAliases]:
+  /// re-opening a conversation must not re-send receipts for rows an earlier
+  /// open already receipted (the local `isRead` flip below normally hides them
+  /// from the next scan, but history reloads and the row-menu mark-read both
+  /// reach the same rows by other routes).
+  final Set<String> _readReceiptedGroupRows = <String>{};
+  static const int _maxReadReceiptedGroupRows = 4096;
+  bool _claimGroupReadReceipt(String key) {
+    if (!_readReceiptedGroupRows.add(key)) return false;
+    if (_readReceiptedGroupRows.length > _maxReadReceiptedGroupRows) {
+      _readReceiptedGroupRows.remove(_readReceiptedGroupRows.first);
+    }
+    return true;
+  }
+
+  /// Wire READ receipts for a GROUP the user just viewed — the product trigger
+  /// the group read tick was missing (see [_sendReadReceiptsOnView]).
+  ///
+  /// One receipt per unread inbound row, addressed to that row's AUTHOR (their
+  /// per-group key) and echoing the cross-peer `gmid:` alias, i.e. exactly the
+  /// payload [markMessageAsRead] builds — no new wire field, no native change.
+  /// Bounded to the 50 most recent unread rows like the C2C walk: a group that
+  /// accumulated a thousand unread lines must not fan out a thousand private
+  /// packets on one tap, and the tick means "at least one member read", so the
+  /// newest rows are the ones worth paying for.
+  ///
+  /// No online gate here (the C2C walk has one because its native send sleeps
+  /// synchronously for an offline friend): the NGC send is non-blocking and
+  /// reports an absent author as -3, which [_sendReceipt] parks in the pending
+  /// group queue.
+  void _sendGroupReadReceiptsOnView(String gid) {
+    final history = _historyById[gid];
+    if (history == null || history.isEmpty) return;
+    // Newest-first BY TIMESTAMP (index order is not a recency order — startup
+    // reverses the shared cache), same rule as the C2C walk.
+    final candidates = <int>[];
+    for (var i = 0; i < history.length; i++) {
+      final msg = history[i];
+      if (!msg.isSelf && !msg.isRead) candidates.add(i);
+    }
+    candidates.sort((a, b) {
+      final byTime = history[b].timestamp.compareTo(history[a].timestamp);
+      return byTime != 0 ? byTime : b.compareTo(a);
+    });
+    var flipped = 0;
+    for (final i in candidates.take(50)) {
+      final msg = history[i];
+      history[i] = msg.copyWith(isRead: true);
+      flipped++;
+      final author = msg.fromUserId;
+      // The author must be a per-group key we can address; a self row cannot
+      // be here (non-self filter above) and reactions are never receipted.
+      if (author.isEmpty ||
+          author == _selfId ||
+          _isReactionMessage(msg.text)) {
+        continue;
+      }
+      // The author has never seen OUR row id, so echo the cross-peer alias
+      // when the row carries one — same rule as [markMessageAsRead] and as
+      // the automatic 'received' receipt in ingestInboundGroupText.
+      final wireMsgID = msg.altMsgIds.firstWhere(
+        (id) => id.startsWith('gmid:'),
+        orElse: () => msg.msgID ?? '',
+      );
+      if (wireMsgID.isEmpty) continue;
+      if (!_claimGroupReadReceipt('$gid|$wireMsgID')) continue;
+      unawaited(_sendReceipt(author, wireMsgID, 'read', groupID: gid));
+    }
+    if (flipped > 0) unawaited(_saveHistory(gid));
   }
 
   /// Preferences key for the per-peer queue of READ receipts that could not
@@ -2255,6 +2348,202 @@ class FfiChatService {
       }
     }
     _bumpDiag('receiptsReadFlushedOnline');
+  }
+
+  // ---------------------------------------------------------------------------
+  // GROUP sibling of the pending-READ-receipt queue above.
+  //
+  // `SendGroupReceipt` fails closed with -3 when the row's author is not a live
+  // NGC peer (offline, not yet re-synced), and nothing retried: the on-view walk
+  // flags the row read in the same breath, so the row never reappears in a
+  // later scan and that reader was lost to the author forever. This parks the
+  // receipt per (group, author) and re-sends it the moment that author is a
+  // resolvable group peer again.
+  //
+  // ONE account-scoped preferences key holds the whole group queue (the C2C
+  // queue can afford a key per peer; a key per (group, author) pair could not
+  // be enumerated back at startup). Entries are JSON triples so a `|` inside a
+  // `gmid:` alias cannot be mistaken for a field separator.
+  // ---------------------------------------------------------------------------
+
+  /// ACCOUNT-SCOPED, exactly like [_pendingReadReceiptsKey]: no account scope
+  /// means no persistence at all, never a shared global slot.
+  static String _pendingGroupReadReceiptsKey(String accountScope) =>
+      'pending_group_read_receipts_$accountScope';
+
+  /// `<groupID>|<authorKey>` -> the row ids (usually `gmid:` aliases) whose
+  /// READ receipt still has to reach that author.
+  final Map<String, Set<String>> _pendingGroupReadReceiptsMem = {};
+
+  /// Memoized one-shot recovery of the durable half. A prefs read per inbound
+  /// group line would be far too hot, so the queue is read back once per
+  /// session (and only once an account scope exists).
+  Future<void>? _groupReadReceiptQueueHydration;
+
+  /// Same per-key bound as the C2C queue, plus a bound on the number of keys:
+  /// an unbounded set of (group, author) pairs must not be able to grow the
+  /// persisted blob without limit.
+  static const int _maxPendingGroupReadReceiptsPerAuthor = 200;
+  static const int _maxPendingGroupReadReceiptAuthors = 64;
+
+  static String _groupReadReceiptQueueKey(String groupID, String authorKey) =>
+      '$groupID|$authorKey';
+
+  Future<void> _hydratePendingGroupReadReceipts() {
+    final prefs = _prefs;
+    final scope = prefsAccountScopeToxId;
+    // Nothing durable to recover (yet): leave the memo unset so a later call,
+    // once the account scope exists, still gets its one read.
+    if (prefs == null || scope == null) return Future<void>.value();
+    return _groupReadReceiptQueueHydration ??= () async {
+      try {
+        final stored =
+            await prefs.getStringList(_pendingGroupReadReceiptsKey(scope));
+        for (final entry in stored ?? const <String>[]) {
+          final decoded = jsonDecode(entry);
+          if (decoded is! List || decoded.length != 3) continue;
+          final gid = decoded[0];
+          final author = decoded[1];
+          final msgID = decoded[2];
+          if (gid is! String || author is! String || msgID is! String) continue;
+          if (gid.isEmpty || author.isEmpty || msgID.isEmpty) continue;
+          _pendingGroupReadReceiptsMem
+              .putIfAbsent(
+                  _groupReadReceiptQueueKey(gid, author), () => <String>{})
+              .add(msgID);
+        }
+      } catch (_) {
+        // Receipt bookkeeping must never break the read path.
+      }
+    }();
+  }
+
+  /// Write the whole in-memory queue back. Called with the queue ALREADY in the
+  /// state we want persisted, so a crash right after leaves the durable half at
+  /// most one operation behind the memory half.
+  Future<void> _persistPendingGroupReadReceipts() async {
+    final prefs = _prefs;
+    final scope = prefsAccountScopeToxId;
+    if (prefs == null || scope == null) return;
+    final flat = <String>[];
+    for (final entry in _pendingGroupReadReceiptsMem.entries) {
+      final sep = entry.key.lastIndexOf('|');
+      if (sep <= 0) continue;
+      final gid = entry.key.substring(0, sep);
+      final author = entry.key.substring(sep + 1);
+      for (final msgID in entry.value) {
+        flat.add(jsonEncode(<String>[gid, author, msgID]));
+      }
+    }
+    await prefs.setStringList(_pendingGroupReadReceiptsKey(scope), flat);
+  }
+
+  /// Park [msgIDs] (row ids / `gmid:` aliases) for [authorKey] in [groupID].
+  Future<void> _queuePendingGroupReadReceipts(
+      String groupID, String authorKey, List<String> msgIDs) async {
+    if (groupID.isEmpty || authorKey.isEmpty || msgIDs.isEmpty) return;
+    // Recover the durable half FIRST: persisting below writes the whole blob,
+    // so an un-hydrated queue would otherwise be erased by the first enqueue
+    // after a restart.
+    await _hydratePendingGroupReadReceipts();
+    final key = _groupReadReceiptQueueKey(groupID, authorKey);
+    if (!_pendingGroupReadReceiptsMem.containsKey(key) &&
+        _pendingGroupReadReceiptsMem.length >=
+            _maxPendingGroupReadReceiptAuthors) {
+      // Insertion-ordered: evict the pair whose receipts have waited longest.
+      _pendingGroupReadReceiptsMem
+          .remove(_pendingGroupReadReceiptsMem.keys.first);
+    }
+    final mem =
+        _pendingGroupReadReceiptsMem.putIfAbsent(key, () => <String>{});
+    mem.addAll(msgIDs);
+    while (mem.length > _maxPendingGroupReadReceiptsPerAuthor) {
+      mem.remove(mem.first);
+    }
+    _bumpDiag('groupReceiptsQueuedOffline');
+    try {
+      await _persistPendingGroupReadReceipts();
+    } catch (_) {
+      // Receipt bookkeeping must never break the read path; the in-memory half
+      // still flushes in this session.
+    }
+  }
+
+  /// Send (and clear) the READ receipts parked for [authorKey] in [groupID].
+  ///
+  /// Both halves are cleared BEFORE any send, exactly like
+  /// [_flushPendingReadReceipts]: a re-sent group receipt costs the author a
+  /// Dart event and two history scans (and burns its per-sender budget), so
+  /// losing one on a crash mid-flush is strictly safer than double-sending.
+  /// [instanceId] pins the native sends to the instance the "author is live"
+  /// signal was observed on — see [_flushPendingReadReceipts] for why the
+  /// caller has to capture it synchronously.
+  Future<void> _flushPendingGroupReadReceipts(String groupID, String authorKey,
+      {int instanceId = 0}) async {
+    final key = _groupReadReceiptQueueKey(groupID, authorKey);
+    final pending = _pendingGroupReadReceiptsMem.remove(key);
+    if (pending == null || pending.isEmpty) return;
+    try {
+      await _persistPendingGroupReadReceipts();
+    } catch (_) {
+      // Prefs unusable mid-flush: sending now would leave the DURABLE half
+      // holding these ids, and a later flush would re-send them. Put them back
+      // and retry on the author's next sign of life (same rule as C2C).
+      _pendingGroupReadReceiptsMem
+          .putIfAbsent(key, () => <String>{})
+          .addAll(pending);
+      return;
+    }
+    for (final msgID in pending) {
+      final prev = instanceId != 0 ? _ffi.getCurrentInstanceId() : 0;
+      if (instanceId != 0) _ffi.setCurrentInstance(instanceId);
+      try {
+        // A still-absent author lands back in the queue through the -3 branch
+        // of [_sendReceipt]; nothing here has to know about the retry.
+        await _sendReceipt(authorKey, msgID, 'read', groupID: groupID);
+      } finally {
+        if (instanceId != 0) _ffi.setCurrentInstance(prev);
+      }
+    }
+    _bumpDiag('groupReceiptsFlushedOnline');
+  }
+
+  /// The came-online hook for the group queue: an inbound group line PROVES its
+  /// author is a resolvable NGC peer right now (the line arrived through it),
+  /// which is exactly the condition `SendGroupReceipt` needs. Synchronous and
+  /// cheap (one map lookup) when nothing is parked for that author.
+  void _flushPendingGroupReadReceiptsForLivePeer(
+      String groupID, String authorKey) {
+    if (groupID.isEmpty || authorKey.isEmpty) return;
+    final instanceId = _ffi.getCurrentInstanceId();
+    final key = _groupReadReceiptQueueKey(groupID, authorKey);
+    final parked = _pendingGroupReadReceiptsMem[key];
+    if (parked == null || parked.isEmpty) {
+      // Nothing in memory — but a queue persisted by a previous run has not
+      // been read back yet. Recover it once, then flush if this author is in
+      // it. Later lines take the cheap path above.
+      if (_groupReadReceiptQueueHydration == null) {
+        unawaited(_hydratePendingGroupReadReceipts().then((_) {
+          if (_pendingGroupReadReceiptsMem[key]?.isNotEmpty ?? false) {
+            return _flushPendingGroupReadReceipts(groupID, authorKey,
+                instanceId: instanceId);
+          }
+          return null;
+        }).catchError((Object e, StackTrace st) {
+          _logger?.logError(
+              '[FfiChatService] recovering parked group read receipts failed',
+              e,
+              st);
+        }));
+      }
+      return;
+    }
+    unawaited(_flushPendingGroupReadReceipts(groupID, authorKey,
+            instanceId: instanceId)
+        .catchError((Object e, StackTrace st) {
+      _logger?.logError(
+          '[FfiChatService] flushing parked group read receipts failed', e, st);
+    }));
   }
 
   /// Unread count for the product sidebar / conversation list.
@@ -6755,6 +7044,12 @@ class FfiChatService {
   }) {
     // Check if this group was quit - if so, don't add it back
     if (_quitGroups.contains(gid)) return false;
+    // This line arrived THROUGH its author, so the author is a resolvable NGC
+    // peer at this instant: flush any READ receipts parked for it while it was
+    // absent (see [_flushPendingGroupReadReceiptsForLivePeer]).
+    if (from != _selfId) {
+      _flushPendingGroupReadReceiptsForLivePeer(gid, from);
+    }
     if (from != _selfId &&
         _activePeerId != _unreadKey(gid) &&
         textMentionsSelf(text)) {
@@ -8010,11 +8305,31 @@ class FfiChatService {
   /// Receipt-path diagnostics (read through l3_dump_state.receiptDiag):
   /// deterministic cross-instance evidence — device log files rotate away
   /// under campaign retries.
+  ///
+  /// The `group*` half is the same evidence for the GROUP leg, whose receipts
+  /// never travel the C2C control transport: `groupReceiptsIn` counts every
+  /// group receipt that reached Dart (kept as-is — the native replay filter is
+  /// asserted through it), and the rest are the send side and the resolution
+  /// side. Zero-initialised so a scenario can assert a DELTA without having to
+  /// tell "absent" from "still zero".
   final Map<String, int> receiptDiag = {
     'receiptsHashOut': 0,
     'receiptsLocalOut': 0,
     'receiptsIn': 0,
     'receiptsRowMatched': 0,
+    // Group leg. `Out` counts every group receipt the native side accepted for
+    // sending, `ReadOut` the 'read' subset (the product trigger's own
+    // evidence), `RowMatched` the receipts that resolved to one of OUR rows,
+    // `DroppedNoPeer` the sends the native side refused because the author is
+    // not a live NGC peer, and `QueuedOffline` the ones that refusal parked in
+    // the pending queue for that author's return.
+    'groupReceiptsIn': 0,
+    'groupReceiptsOut': 0,
+    'groupReceiptsReadOut': 0,
+    'groupReceiptsRowMatched': 0,
+    'groupReceiptsDroppedNoPeer': 0,
+    'groupReceiptsQueuedOffline': 0,
+    'groupReceiptsFlushedOnline': 0,
   };
   void _bumpDiag(String k) => receiptDiag[k] = (receiptDiag[k] ?? 0) + 1;
 
@@ -9545,6 +9860,24 @@ class FfiChatService {
         pkgffi.malloc.free(msgIdPtr);
         pkgffi.malloc.free(typePtr);
       }
+      // Keyed on the native return code (see SendGroupReceipt): 1 = on the
+      // wire, -3 = the author is not a live NGC peer, -2 = legacy conference
+      // (handled below), 0 = anything else.
+      if (rc == 1) {
+        _bumpDiag('groupReceiptsOut');
+        if (receiptType == 'read') _bumpDiag('groupReceiptsReadOut');
+      } else if (rc == -3) {
+        _bumpDiag('groupReceiptsDroppedNoPeer');
+        // Only READ receipts are worth parking. A 'received' receipt is fired
+        // from the ingest of a message that JUST arrived from this author, so
+        // "author not a peer" there means the group view is stale by
+        // milliseconds and the next copy re-fires it; a READ receipt has no
+        // such retry — the row is flagged read locally in the same breath and
+        // never scanned again.
+        if (receiptType == 'read') {
+          unawaited(_queuePendingGroupReadReceipts(groupID, peerId, [msgID]));
+        }
+      }
       if (rc != -2) return;
       // Legacy conferences have no private channel; their peers are named by
       // long-term keys anyway. Keep the ACTION control line there: the body
@@ -9700,6 +10033,10 @@ class FfiChatService {
     // For group messages, track receivers and readers. Guard against the
     // sender's own NGC echo: a self-receipt must not inflate either tally.
     if (groupID != null && sender != _wireSelfSender()) {
+      // A receipt from this member is another proof that it is a live group
+      // peer right now, so it is also a flush point for anything parked for it
+      // (an author that came back but has not spoken since).
+      _flushPendingGroupReadReceiptsForLivePeer(groupID, sender);
       final tallyKey = _localGroupRowId(msgID, groupID);
       // Only our OWN rows have receivers worth counting: receipts from older
       // toxee members still arrive broadcast for everyone's messages, and
@@ -9779,6 +10116,7 @@ class FfiChatService {
         }
         if (matched) {
           _bumpDiag('receiptsRowMatched');
+          if (groupID != null) _bumpDiag('groupReceiptsRowMatched');
           // Update self-sent message receipt status
           ChatMessage updatedMsg;
           if (receiptType == 'received') {
@@ -12069,6 +12407,13 @@ class FfiChatService {
     _receivedAvatarHashes.clear();
     _messageReceivers.clear();
     _messageReaders.clear();
+    // Receipt bookkeeping is ACCOUNT state: carrying the parked group receipts
+    // (or the "already receipted this row" claims) into the next account would
+    // aim them at the wrong identity's groups. The durable half stays on disk
+    // under the previous account's scope and is re-read when it logs back in.
+    _pendingGroupReadReceiptsMem.clear();
+    _groupReadReceiptQueueHydration = null;
+    _readReceiptedGroupRows.clear();
     _progressKeyCache.clear();
     _lastProgressEmitTime.clear();
     _lastProgressTs.clear();

@@ -107,7 +107,9 @@ public:
     // Deliver a "received"/"read" receipt for one group message to its AUTHOR
     // only (NGC custom private packet under the tim2tox group-packet header).
     // Returns 1 sent, -2 not possible on this kind of group (legacy
-    // conference: no private packets), 0 failure (author not reachable).
+    // conference: no private packets), -3 the author is not a live NGC peer
+    // right now (the caller may park the receipt and retry when it is), 0
+    // failure.
     int SendGroupReceipt(const V2TIMString& groupID, const std::string& author_key_hex,
                          const std::string& msg_id, const std::string& receipt_type);
     Tox_Group_Peer_Number ResolveGroupPeerIdForKey(Tox_Group_Number group_number, const std::string& receiver_hex);
@@ -675,6 +677,11 @@ private:
         // sender is an NGC group peer, and its long-term key is precisely what
         // we do not know yet, so there is no friend to charge it to.
         uint32_t proof_verifies = 0;
+        // Received GROUP RECEIPTS, charged per authenticated NGC sender. The
+        // replay filter only stops the SAME receipt twice; distinct msgIDs from
+        // one member were unbounded, and each one costs a Dart event plus two
+        // history scans on the way to the tally.
+        uint32_t receipts_in = 0;
     };
     std::unordered_map<std::string, IdentityRateWindow> identity_rate_by_friend_;  // friend pk hex ->
     // Received-proof windows keyed by the AUTHENTICATED NGC group sender (lower
@@ -693,6 +700,15 @@ private:
         uint64_t proofs_accepted = 0;
         uint64_t proofs_rejected = 0;
         std::string last_proof_payload_hex;
+        // Group receipts arriving on the same private channel. `in` counts every
+        // structurally valid receipt from an authenticated member (i.e. every
+        // one that reached the per-sender meter), and the three below say what
+        // happened to it. Exported as the "groupReceipts" block of
+        // Mm6DiagJson so auto_tests can assert the budget from the outside.
+        uint64_t group_receipts_in = 0;
+        uint64_t group_receipts_refused = 0;
+        uint64_t group_receipts_replayed = 0;
+        uint64_t group_receipts_forwarded = 0;
     };
     Mm6Diag mm6_diag_;
     IdentityClock::time_point identity_last_prune_{};
@@ -720,6 +736,11 @@ private:
                                            IdentityClock::time_point now) const;
     bool TakeGroupSenderProofBudgetLocked(const std::string& sender_hex,
                                           IdentityClock::time_point now);
+    // One received GROUP RECEIPT charged to this NGC sender. False = over
+    // budget, or the sender table is full: drop the packet before it costs a
+    // replay-cache slot, a Dart event and two history scans.
+    bool TakeGroupSenderReceiptBudgetLocked(const std::string& sender_hex,
+                                            IdentityClock::time_point now);
     // Pending challenges for (group, member) whose asker no longer claims that
     // member's digest. They hold a slot the verifier scans and an honest
     // claimant needs; nothing will ever answer them.
