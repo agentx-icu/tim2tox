@@ -379,13 +379,19 @@ int tim2tox_ffi_get_mm6_diag(int64_t instance_id, char* out, int out_len);
 // MM-6 harness hook: send `friend_key_hex` an identity challenge naming
 // `claimed_member_key_hex` as our per-group key in `group_id`. The honest API
 // always names our OWN key there, so this is the only way to reproduce the
-// abuse case the encrypted proof (v2) defends against. It hands an attacker
-// nothing new — any Tox peer can send this frame — and exists so the
-// auto_tests can assert the named member receives only an unreadable box.
+// abuse case the encrypted proof (v2) defends against, and the auto_tests use
+// it to assert the named member receives only an unreadable box.
 // Returns 1 sent, 0 failure.
+//
+// TEST-ONLY: compiled in only with -DTIM2TOX_ENABLE_TEST_HOOKS=ON (OFF by
+// default; `build_ffi.sh` turns it on for the auto_tests build). Shipping
+// libraries must not carry it — inside the product it is nothing but an
+// attack primitive, so callers other than the auto_tests should not exist.
+#ifdef TIM2TOX_ENABLE_TEST_HOOKS
 int tim2tox_ffi_mm6_send_crafted_challenge(int64_t instance_id, const char* group_id,
                                            const char* friend_key_hex,
                                            const char* claimed_member_key_hex);
+#endif  // TIM2TOX_ENABLE_TEST_HOOKS
 
 // Send a group message receipt ("received"/"read") privately to the message's
 // author (their per-group public key). Returns 1 sent, -2 unsupported on this

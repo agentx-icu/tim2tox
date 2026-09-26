@@ -3010,6 +3010,14 @@ int tim2tox_ffi_get_mm6_diag(int64_t instance_id, char* out, int out_len) {
     return n;
 }
 
+#ifdef TIM2TOX_ENABLE_TEST_HOOKS
+// TEST-ONLY hook, gated behind -DTIM2TOX_ENABLE_TEST_HOOKS=ON (OFF by default;
+// only `build_ffi.sh`, which builds the library the auto_tests run against,
+// turns it on). It forges the one MM-6 identity-challenge shape the honest API
+// cannot produce — a member claiming ANOTHER member's per-group key — so
+// scenario_group_receipt_control_row_test can prove the answer comes back as an
+// unreadable box to the member it names. In a shipping library it would be
+// purely an attack primitive, which is why it is not compiled by default.
 int tim2tox_ffi_mm6_send_crafted_challenge(int64_t instance_id, const char* group_id,
                                            const char* friend_key_hex,
                                            const char* claimed_member_key_hex) {
@@ -3019,6 +3027,7 @@ int tim2tox_ffi_mm6_send_crafted_challenge(int64_t instance_id, const char* grou
     if (!manager || !manager->GetToxManager()) return 0;
     return manager->Mm6SendCraftedChallenge(group_id, friend_key_hex, claimed_member_key_hex);
 }
+#endif  // TIM2TOX_ENABLE_TEST_HOOKS
 
 int tim2tox_ffi_set_retired_group_id_max(int64_t instance_id, uint64_t max_id) {
     if (instance_id == 0) instance_id = GetCurrentInstanceId();

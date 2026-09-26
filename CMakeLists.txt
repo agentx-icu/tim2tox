@@ -166,8 +166,17 @@ add_subdirectory(source)
 
 # Add FFI directory for Flutter/Dart bindings
 option(BUILD_FFI "Build FFI shared library for Flutter/Dart" ON)
+# Test-only FFI hooks: entry points that exist purely so auto_tests/ can produce
+# packet shapes the honest API cannot (today: the MM-6 crafted identity
+# challenge). OFF by default so shipping libraries do not carry them; only
+# build_ffi.sh — the build the auto_tests run against — turns it ON.
+option(TIM2TOX_ENABLE_TEST_HOOKS
+       "Compile the auto_tests-only FFI hooks into libtim2tox_ffi" OFF)
 if(BUILD_FFI)
   add_subdirectory(ffi)
+  if(TIM2TOX_ENABLE_TEST_HOOKS)
+    target_compile_definitions(tim2tox_ffi PRIVATE TIM2TOX_ENABLE_TEST_HOOKS=1)
+  endif()
 endif()
 
 # Add test directory if testing is enabled

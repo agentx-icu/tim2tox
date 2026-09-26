@@ -234,6 +234,17 @@ void main() {
         () async {
       final lib = ffi_lib.Tim2ToxFfi.open();
 
+      // The crafted challenge is a test-only FFI hook, compiled in only with
+      // -DTIM2TOX_ENABLE_TEST_HOOKS=ON (build_ffi.sh does that; app/CI builds
+      // do not). Without it this case cannot be constructed at all.
+      final sendCraftedChallenge = lib.mm6SendCraftedChallengeNative;
+      if (sendCraftedChallenge == null) {
+        markTestSkipped(
+            'libtim2tox_ffi lacks tim2tox_ffi_mm6_send_crafted_challenge: '
+            'rebuild with -DTIM2TOX_ENABLE_TEST_HOOKS=ON (build_ffi.sh)');
+        return;
+      }
+
       Map<String, Object?> mm6Diag(TestNode node) => node.runWithInstance(() {
             final buf = pkgffi.calloc<ffi.Int8>(4096);
             try {
@@ -272,7 +283,7 @@ void main() {
         final friendKey = founderPk.toNativeUtf8();
         final claimed = member2Key!.toNativeUtf8();
         try {
-          return lib.mm6SendCraftedChallengeNative(0, gid, friendKey, claimed);
+          return sendCraftedChallenge(0, gid, friendKey, claimed);
         } finally {
           pkgffi.malloc.free(gid);
           pkgffi.malloc.free(friendKey);
