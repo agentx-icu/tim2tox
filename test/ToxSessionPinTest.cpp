@@ -23,6 +23,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <atomic>
 #include <fstream>
 #include <memory>
@@ -47,6 +48,12 @@
 #endif
 #ifndef TIM2TOX_GROUP_MANAGER_SOURCE_PATH
 #error "TIM2TOX_GROUP_MANAGER_SOURCE_PATH is required"
+#endif
+#ifndef TIM2TOX_FRIENDSHIP_MANAGER_SOURCE_PATH
+#error "TIM2TOX_FRIENDSHIP_MANAGER_SOURCE_PATH is required"
+#endif
+#ifndef TIM2TOX_CONVERSATION_MANAGER_SOURCE_PATH
+#error "TIM2TOX_CONVERSATION_MANAGER_SOURCE_PATH is required"
 #endif
 
 // ToxManager.cpp reaches for the FFI layer's instance registry in one group
@@ -690,6 +697,214 @@ TEST(ToxSessionPinTest, Mm6ProofWorkIsMeteredAndTheCandidateSetCannotOverflow) {
         "void V2TIMManagerImpl::PurgeFriendIdentityState("));
     EXPECT_NE(offline.find("pending_identity_challenges_.erase"), std::string::npos)
         << "an offline friend cannot answer a challenge; the entry must go";
+}
+
+// The same conversion, applied to the three per-feature managers. CreateGroup
+// (above) was converted first and the shape spread from there; these eleven
+// entry points were still doing
+//
+//     ToxManager* m = GetToxManager();            // or GetToxManagerFromImpl(...)
+//     Tox* tox = m->getTox();                     // raw, unpinned
+//     ... a SEQUENCE of tox_*() / ToxManager calls ...
+//
+// which is the exact use-after-free the guard exists for: it is the SEQUENCE
+// that matters, because a concurrent UnInitSDK can tox_kill() the instance
+// between two of its calls. Several of them additionally re-fetched a raw
+// ToxManager* inside their loops (GetGroupMemberList did it five times), so one
+// operation could straddle two different sessions' managers.
+TEST(ToxSessionPinTest, PerFeatureManagersPinTheirWholeCallSequence) {
+    const std::string group =
+        StripLineComments(ReadSource(TIM2TOX_GROUP_MANAGER_SOURCE_PATH));
+    const std::string friendship =
+        StripLineComments(ReadSource(TIM2TOX_FRIENDSHIP_MANAGER_SOURCE_PATH));
+    const std::string conversation =
+        StripLineComments(ReadSource(TIM2TOX_CONVERSATION_MANAGER_SOURCE_PATH));
+
+    struct Site {
+        const char* name;
+        const std::string* source;
+        const char* start;
+        const char* end;
+        // The raw-fetch spelling THIS function used; it must be gone.
+        const char* banned;
+        // Also banned, where the function has no legitimate remaining use of
+        // it. The four group-manager sites keep CreateGroup's `tox_manager ?
+        // tox_manager->getTox() : nullptr` tail for the (test-only) manager_impl
+        // == nullptr shape, which is the one path with no session to pin, so
+        // they are exempt from this one — their `banned` entry above is what
+        // proves the real path goes through the guard.
+        const char* also_banned;
+    };
+    const Site sites[] = {
+        // --- group manager -------------------------------------------------
+        {"GetGroupMemberList", &group,
+         "void V2TIMGroupManagerImpl::GetGroupMemberList(",
+         "void V2TIMGroupManagerImpl::GetGroupMembersInfo(",
+         "GetToxManagerFromImpl(target_manager_impl)", nullptr},
+        {"GetGroupMembersInfo", &group,
+         "void V2TIMGroupManagerImpl::GetGroupMembersInfo(",
+         "void V2TIMGroupManagerImpl::SearchGroupMembers(",
+         "GetToxManagerFromImpl(manager_impl_)", nullptr},
+        {"QuitGroup", &group, "void V2TIMGroupManagerImpl::QuitGroup(",
+         "void V2TIMGroupManagerImpl::DismissGroup(",
+         "GetToxManagerFromImpl(manager_impl_)", nullptr},
+        {"SetGroupMemberInfo", &group,
+         "void V2TIMGroupManagerImpl::SetGroupMemberInfo(",
+         "void V2TIMGroupManagerImpl::MuteGroupMember(",
+         "GetToxManagerFromImpl(manager_impl_)", nullptr},
+        // ResolveGroupName is the pin holder for the GetLiveGroupName helper
+        // (asserted separately below).
+        {"ResolveGroupName", &group,
+         "std::string V2TIMGroupManagerImpl::ResolveGroupName(",
+         "void V2TIMGroupManagerImpl::ClearAllState(",
+         "GetLiveGroupName(manager_impl_", "->getTox()"},
+        // --- friendship manager --------------------------------------------
+        {"GetFriendList", &friendship,
+         "void V2TIMFriendshipManagerImpl::GetFriendList(",
+         "void V2TIMFriendshipManagerImpl::GetFriendsInfo(", "GetToxManager()",
+         "->getTox()"},
+        {"GetFriendsInfo", &friendship,
+         "void V2TIMFriendshipManagerImpl::GetFriendsInfo(",
+         "void V2TIMFriendshipManagerImpl::SetFriendInfo(", "GetToxManager()",
+         "->getTox()"},
+        {"SearchFriends", &friendship,
+         "void V2TIMFriendshipManagerImpl::SearchFriends(",
+         "void V2TIMFriendshipManagerImpl::AddFriend(", "GetToxManager()",
+         "->getTox()"},
+        {"AddFriend", &friendship, "void V2TIMFriendshipManagerImpl::AddFriend(",
+         "void V2TIMFriendshipManagerImpl::DeleteFromFriendList(",
+         "GetToxManager()", "->getTox()"},
+        {"DeleteFromFriendList", &friendship,
+         "void V2TIMFriendshipManagerImpl::DeleteFromFriendList(",
+         "void V2TIMFriendshipManagerImpl::CheckFriend(", "GetToxManager()",
+         "->getTox()"},
+        // --- conversation manager ------------------------------------------
+        {"RefreshConversationCache", &conversation,
+         "void V2TIMConversationManagerImpl::RefreshConversationCache(",
+         "void V2TIMConversationManagerImpl::DeleteConversation(",
+         "GetToxManager()", "->getTox()"},
+        {"GetConversation", &conversation,
+         "void V2TIMConversationManagerImpl::GetConversation(const V2TIMString& conversationID,",
+         "void V2TIMConversationManagerImpl::GetConversationList(const V2TIMStringVector&",
+         "GetToxManager()", "->getTox()"},
+    };
+    for (const Site& site : sites) {
+        const std::string body =
+            SourceSection(*site.source, site.start, site.end);
+        EXPECT_NE(body.find("AcquireToxSession()"), std::string::npos)
+            << site.name << " is reachable from the FFI surface and must pin the "
+                            "session for its whole call sequence";
+        EXPECT_EQ(body.find(site.banned), std::string::npos)
+            << site.name << " must not re-fetch an unpinned manager (" << site.banned
+            << ")";
+        if (site.also_banned != nullptr) {
+            EXPECT_EQ(body.find(site.also_banned), std::string::npos)
+                << site.name << " must read the handle through the pin: "
+                << site.also_banned << " is a raw re-fetch";
+        }
+        // ORDER, not just presence: the pin must be taken before the first
+        // toxcore call, so a guard acquired half-way down (leaving the earlier
+        // calls unpinned, which is how several of these were half-converted)
+        // still fails. A source assertion cannot prove the guard stays in
+        // SCOPE — that is what the runtime tests above the source ones are for —
+        // but it can prove nothing touches Tox ahead of it.
+        //
+        // The probe includes GetLiveGroupName(, the pinned helper, because
+        // ResolveGroupName reaches toxcore ONLY through it — without that entry
+        // the order check found nothing to compare against and passed vacuously
+        // for that one site (codex 2026-09-26). A section where no probe hits is
+        // therefore a FAILURE, not a skip: it means this list has gone stale
+        // against the code.
+        const std::size_t pin = body.find("AcquireToxSession()");
+        std::size_t first_tox_reach = std::string::npos;
+        for (const char* probe : {"tox_self_", "tox_friend_", "tox_group_",
+                                  "tox_conference_", "GetLiveGroupName("}) {
+            first_tox_reach = std::min(first_tox_reach, body.find(probe));
+        }
+        EXPECT_NE(first_tox_reach, std::string::npos)
+            << site.name << " reaches toxcore by a spelling this test does not "
+                            "probe for; the order check would pass vacuously";
+        if (first_tox_reach != std::string::npos) {
+            EXPECT_LT(pin, first_tox_reach)
+                << site.name << " reaches toxcore before it pins the session";
+        }
+    }
+
+    // The helper must not re-fetch behind its caller's pin: it takes the pinned
+    // handle, and ResolveGroupName holds the pin across the whole helper.
+    // NOTE: `group` has already had its // comments stripped, so every marker
+    // here must be CODE (the old banner-comment end marker would never match).
+    const std::string live = SourceSection(
+        group, "static std::string GetLiveGroupName(",
+        "void V2TIMGroupManagerImpl::CreateGroup(");
+    EXPECT_NE(live.find("GetLiveGroupName(Tox* tox"), std::string::npos)
+        << "the helper must take the caller's pinned Tox*, not a V2TIMManagerImpl* "
+           "it re-resolves";
+    EXPECT_EQ(live.find("GetToxManagerFromImpl("), std::string::npos)
+        << "re-fetching inside the helper defeats the caller's pin";
+    const std::string resolve =
+        SourceSection(group, "std::string V2TIMGroupManagerImpl::ResolveGroupName(",
+                      "void V2TIMGroupManagerImpl::ClearAllState(");
+    EXPECT_NE(resolve.find("GetLiveGroupName(session.tox()"), std::string::npos)
+        << "the caller must hand the helper the PINNED handle";
+
+    // Two of these both commit something in Tox and then publish it. Pinning
+    // keeps the memory valid; it does not make the session current, so the
+    // session-scoped publication (listeners, profile save, conversation cache —
+    // all of which belong to the account that just left) is skipped when the
+    // guard's epoch is stale. The operation itself stays a SUCCESS: it happened,
+    // and answering OnError invites a retry that duplicates it (CreateGroup's
+    // rule).
+    struct Publisher {
+        const char* name;
+        const char* start;
+        const char* end;
+    };
+    const Publisher publishers[] = {
+        {"AddFriend", "void V2TIMFriendshipManagerImpl::AddFriend(",
+         "void V2TIMFriendshipManagerImpl::DeleteFromFriendList("},
+        {"DeleteFromFriendList",
+         "void V2TIMFriendshipManagerImpl::DeleteFromFriendList(",
+         "void V2TIMFriendshipManagerImpl::CheckFriend("},
+    };
+    for (const Publisher& publisher : publishers) {
+        const std::string body =
+            SourceSection(friendship, publisher.start, publisher.end);
+        // At least TWICE, and that is the point: the listener notification runs
+        // SYNCHRONOUSLY on this thread, so a listener can log out (and log back
+        // in) inside it — the pin does not stop a same-thread teardown. One
+        // check before the notification would still let the profile save and the
+        // cache refresh after it land on the NEXT session (codex 2026-09-26).
+        std::size_t checks = 0;
+        for (std::size_t at = body.find("session.Expired()"); at != std::string::npos;
+             at = body.find("session.Expired()", at + 1)) {
+            ++checks;
+        }
+        EXPECT_GE(checks, 2u)
+            << publisher.name
+            << " must re-check currency after the synchronous notification, not "
+               "only before it";
+        EXPECT_NE(body.find("OnSuccess"), std::string::npos)
+            << publisher.name
+            << " must still report a committed operation as done";
+    }
+
+    // QuitGroup publishes the same way, and its Dart notification carries the
+    // session stamp the handler filters on. That stamp must come from the PIN:
+    // the DeleteConversation just above it fires OnConversationDeleted
+    // listeners synchronously, and a fresh GetSessionEpoch() read after one of
+    // them switched accounts would stamp this quit with the NEW session's epoch
+    // — exactly what the stamp exists to prevent (codex 2026-09-26).
+    const std::string quit = SourceSection(
+        group, "void V2TIMGroupManagerImpl::QuitGroup(",
+        "void V2TIMGroupManagerImpl::DismissGroup(");
+    EXPECT_NE(quit.find("session.epoch()"), std::string::npos)
+        << "the quit notification must be stamped with the pinned session";
+    EXPECT_EQ(quit.find("GetSessionEpoch()"), std::string::npos)
+        << "a fresh epoch read can pick up the session that REPLACED this one";
+    EXPECT_NE(quit.find("session.Expired()"), std::string::npos)
+        << "the conversation-cache cleanup belongs to the session that owned the "
+           "group";
 }
 
 }  // namespace

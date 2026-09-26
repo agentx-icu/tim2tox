@@ -139,6 +139,8 @@ target_compile_definitions(tox_session_pin_test PRIVATE
     TIM2TOX_MANAGER_HEADER_PATH="${CMAKE_SOURCE_DIR}/source/V2TIMManagerImpl.h"
     TIM2TOX_FFI_SOURCE_PATH="${CMAKE_SOURCE_DIR}/ffi/tim2tox_ffi.cpp"
     TIM2TOX_GROUP_MANAGER_SOURCE_PATH="${CMAKE_SOURCE_DIR}/source/V2TIMGroupManagerImpl.cpp"
+    TIM2TOX_FRIENDSHIP_MANAGER_SOURCE_PATH="${CMAKE_SOURCE_DIR}/source/V2TIMFriendshipManagerImpl.cpp"
+    TIM2TOX_CONVERSATION_MANAGER_SOURCE_PATH="${CMAKE_SOURCE_DIR}/source/V2TIMConversationManagerImpl.cpp"
     TIM2TOX_TOX_MANAGER_SOURCE_PATH="${CMAKE_SOURCE_DIR}/source/ToxManager.cpp")
 add_executable(native_log_privacy_source_regression_test
     NativeLogPrivacySourceRegressionTest.cpp)
