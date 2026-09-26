@@ -13,6 +13,7 @@
 // where they are, still claimable by whoever can prove they own them.
 
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter_test/flutter_test.dart';
@@ -259,6 +260,42 @@ void main() {
         isFalse,
       );
     });
+
+    test('rows the hand-over could not write are held for that identity',
+        () async {
+      // A write that cannot land (full disk, unwritable directory) used to be
+      // dropped outright by the hand-over: carrying it into the next identity
+      // would put it in that account's files, so the message was simply lost
+      // (codex 2026-09-26). It is now held for the identity it belongs to.
+      final store = await opened();
+      await base().create(recursive: true);
+      await Process.run('chmod', <String>['500', base().path]);
+      addTearDown(() => Process.run('chmod', <String>['700', base().path]));
+      unawaited(store
+          .appendHistory(_peer, _row('owed_to_the_ownerless_session'))
+          .catchError((Object _) {}));
+
+      await store.openSession(ownerKey: _ownerB);
+
+      expect(store.getHistory(_peer), isEmpty,
+          reason: 'B must not be served the held rows');
+      await store.appendHistory(_peer, _row('from_b'));
+      await store.flushPendingSaves();
+      expect(
+        await peerFile(Directory('${base().path}_$_ownerB')).readAsString(),
+        isNot(contains('owed_to_the_ownerless_session')),
+        reason: 'the held rows must not be written into B\'s files',
+      );
+
+      // Back to that identity, with the directory writable again: the held
+      // rows are restored and land where they always belonged.
+      await Process.run('chmod', <String>['700', base().path]);
+      await store.openSession();
+      await store.flushPendingSaves();
+      expect(await peerFile(base()).readAsString(),
+          contains('owed_to_the_ownerless_session'));
+      await store.dispose();
+    }, skip: Platform.isWindows ? 'chmod-based failure injection' : null);
   });
 
   group('an interrupted claim (H2)', () {
@@ -377,6 +414,78 @@ void main() {
 
       final status = await a.defaultHistoryDirectoryStatus();
       expect(status!.hasUnadoptedHistory, isFalse);
+    });
+
+    test('a file that cannot be merged aborts the adoption and hides nothing',
+        () async {
+      await seedLegacyDirectory();
+      final a = await opened(ownerKey: _ownerA);
+      await a.saveHistory(_peer, [_row('sent_while_empty')]);
+      await a.flushPendingSaves();
+      // The isolated side's file is now unreadable as JSON. Before, the merge
+      // logged it, the caller counted the file as merged, and the whole source
+      // directory was renamed aside — the rows were then in neither the
+      // adopted directory nor the one the app reads (codex 2026-09-26).
+      final isolated = Directory('${base().path}_$_ownerA');
+      await peerFile(isolated).writeAsString('{ truncated', flush: true);
+
+      await expectLater(
+        a.adoptDefaultHistoryDirectory(ownerKey: _ownerA),
+        throwsA(isA<StateError>()),
+      );
+
+      expect(await isolated.exists(), isTrue,
+          reason: 'a partial merge must leave the source in place');
+      expect(await Directory('${isolated.path}.adopted').exists(), isFalse);
+      expect(await marker(base()).exists(), isFalse,
+          reason: 'the base must not be claimed while rows are still only in '
+              'the source directory');
+      expect(await peerFile(base()).readAsString(), contains('legacy_row'));
+      await a.dispose();
+    });
+
+    test('a merge keeps the LATER read barrier of the two sides', () async {
+      // Base: read long ago. Isolated: read just now. Merging must not move
+      // the barrier backwards, or read messages come back as unread.
+      await base().create(recursive: true);
+      await peerFile(base()).writeAsString(
+        '{"conversationId":"$_peer","version":2,"lastViewTimestamp":1000,'
+        '"messages":[]}',
+        flush: true,
+      );
+      final isolated = Directory('${base().path}_$_ownerA');
+      await isolated.create(recursive: true);
+      await peerFile(isolated).writeAsString(
+        '{"conversationId":"$_peer","version":2,"lastViewTimestamp":9000,'
+        '"messages":[${jsonEncode(_row('mine').toJson())}]}',
+        flush: true,
+      );
+
+      final a = await opened(ownerKey: _ownerA);
+      expect(await a.adoptDefaultHistoryDirectory(ownerKey: _ownerA),
+          base().path);
+      await a.dispose();
+
+      final decoded = jsonDecode(await peerFile(base()).readAsString())
+          as Map<String, dynamic>;
+      expect(decoded['lastViewTimestamp'], 9000);
+    });
+
+    test('adoption refuses to run for an identity this store is not bound to',
+        () async {
+      await seedLegacyDirectory();
+      final a = await opened(ownerKey: _ownerA);
+      await a.saveHistory(_peer, [_row('from_a')]);
+
+      // Adoption merges THIS session's directory into the base and marks it
+      // for the given owner: with two different identities that mixes A's rows
+      // into B's account (codex 2026-09-26).
+      await expectLater(
+        a.adoptDefaultHistoryDirectory(ownerKey: _ownerB),
+        throwsA(isA<StateError>()),
+      );
+      expect(await marker(base()).exists(), isFalse);
+      await a.dispose();
     });
 
     test('adoption never overrides another identity\'s claim', () async {
