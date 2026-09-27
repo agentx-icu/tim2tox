@@ -609,6 +609,53 @@ TEST(ToxSessionPinTest, ClosedAdmissionRefusesNewPinsAndLogoutClosesItFirst) {
     EXPECT_LT(close_at, save_at) << "admission must close BEFORE the final save";
 }
 
+// The receipt budget needs BOTH halves: a per-sender window (so one member is
+// bounded) and a shared ceiling (so 1024 of them multiplying does not become two
+// million forwards a minute, each costing Dart two history scans). The shared one
+// is charged SECOND, so a flooder is bounded to its own window before it can
+// spend from the pool (codex 2026-09-27).
+TEST(ToxSessionPinTest, GroupReceiptsAreCappedPerSenderAndGlobally) {
+    const std::string manager = StripLineComments(ReadSource(TIM2TOX_MANAGER_SOURCE_PATH));
+    const std::string handler = SourceSection(
+        manager, "void V2TIMManagerImpl::HandleGroupCustomPrivatePacket(",
+        "int V2TIMManagerImpl::SendGroupReceipt(");
+    ASSERT_FALSE(handler.empty());
+    const std::size_t per_sender = handler.find("TakeGroupSenderReceiptBudgetLocked");
+    const std::size_t global = handler.find("kMaxGroupReceiptsGlobal");
+    const std::size_t replay = handler.find("seen_group_receipts_.count");
+    const std::size_t hand_off = handler.find("NotifyGroupActionMessage");
+    ASSERT_NE(per_sender, std::string::npos);
+    ASSERT_NE(global, std::string::npos) << "the shared ceiling must be charged";
+    ASSERT_NE(replay, std::string::npos);
+    ASSERT_NE(hand_off, std::string::npos);
+    EXPECT_LT(per_sender, global)
+        << "the sender's own window must be charged before the shared pool";
+    EXPECT_LT(global, replay) << "both budgets precede the replay insert";
+    EXPECT_LT(global, hand_off) << "both budgets precede the Dart hand-off";
+    // The global window is its own, not the proofs': a receipt flood must not
+    // spend the budget a challenged member's proof needs.
+    EXPECT_NE(handler.find("group_receipt_rate_global_"), std::string::npos);
+    EXPECT_EQ(handler.find("identity_rate_global_"), std::string::npos)
+        << "receipts must not charge the proof budget's global window";
+
+    // Both caps carry a written derivation, and the per-sender one is no longer
+    // the number derived from the unclaimed markGroupMessageAsRead path.
+    const std::string raw = ReadSource(TIM2TOX_MANAGER_SOURCE_PATH);
+    EXPECT_NE(raw.find("1000 + 50 + 120 + 200 = 1370"), std::string::npos)
+        << "the per-sender cap must state what it was derived from";
+    EXPECT_NE(raw.find("honest worst case"), std::string::npos)
+        << "the global cap must state what it was derived from";
+    EXPECT_EQ(raw.find("kMaxGroupReceiptsPerSender = 4096"), std::string::npos)
+        << "the stale cap was derived from a path that now claims its rows";
+    // Reset with the other windows on an account switch, or the next account
+    // inherits a spent budget.
+    const std::string reset = SourceSection(
+        manager, "identity_rate_global_ = IdentityRateWindow{};", "mm6_diag_");
+    EXPECT_NE(reset.find("group_receipt_rate_global_ = IdentityRateWindow{};"),
+              std::string::npos)
+        << "the shared receipt window must be reset per account";
+}
+
 // A pin taken while a save is quiescing must wait for it, which is what makes
 // the size/copy pair atomic.
 TEST(ToxSessionPinTest, SaveDataBlocksNewPinsWhileItReads) {

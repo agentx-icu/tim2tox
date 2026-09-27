@@ -132,6 +132,7 @@ target_compile_definitions(control_path_source_regression_test PRIVATE
     TIM2TOX_DART_FFI_PATH="${CMAKE_SOURCE_DIR}/dart/lib/ffi/tim2tox_ffi.dart"
     TIM2TOX_ROOT_CMAKE_PATH="${CMAKE_SOURCE_DIR}/CMakeLists.txt"
     TIM2TOX_SOURCE_CMAKE_PATH="${CMAKE_SOURCE_DIR}/source/CMakeLists.txt"
+    TIM2TOX_COMPAT_LISTENERS_PATH="${CMAKE_SOURCE_DIR}/ffi/dart_compat_listeners.cpp"
     TIM2TOX_FFI_CMAKE_PATH="${CMAKE_SOURCE_DIR}/ffi/CMakeLists.txt")
 add_executable(tox_session_pin_test ToxSessionPinTest.cpp)
 target_compile_definitions(tox_session_pin_test PRIVATE

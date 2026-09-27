@@ -2255,6 +2255,7 @@ void V2TIMManagerImpl::ResetGroupSessionState() {
         identity_rate_by_group_sender_.clear();
         group_receipt_rate_by_sender_.clear();
         identity_rate_global_ = IdentityRateWindow{};
+        group_receipt_rate_global_ = IdentityRateWindow{};
         identity_last_prune_ = IdentityClock::time_point{};
         seen_group_receipts_.clear();
         seen_group_receipt_order_.clear();
@@ -5825,38 +5826,46 @@ constexpr uint32_t kMaxProofVerifiesPerSender = 32;
 // not each be able to open a window. Entries expire with kIdentityRateWindow
 // and are pruned, so a full table clears within a minute.
 constexpr size_t kMaxProofVerifySenders = 1024;
-// Received group receipts, PER AUTHENTICATED NGC SENDER, charged before the
-// packet costs a replay-cache slot, a Dart event and the two history scans the
-// tally does. The replay filter only ever stopped the same receipt twice: one
-// member could send unbounded DISTINCT msgIDs and each was work.
+// DERIVATION of the per-minute ceiling for inbound group receipts, per
+// kIdentityRateWindow and per authenticated sender.
 //
-// DERIVATION of the per-minute ceiling (the 128 this replaces was read off the
-// on-view walk's 50 rows, which is a bound PER VIEW, not per minute, and it
-// ignored the other two senders entirely; a refusal happens HERE, on the
-// receiver, with no signal back, so clipping an honest reader is silent):
-//   * Tim2ToxSdkPlatform.markGroupMessageAsRead walks the WHOLE loaded window
-//     and calls markMessageAsRead per inbound row, with no per-row claim and no
-//     isRead skip. Every row of that window that WE authored yields one receipt
-//     to us, so ONE call can send up to MessageHistoryPersistence's
-//     _maxMessagesInMemory = 1000. UIKit calls it on every chat open, so a user
-//     flipping between two chats twice a minute legitimately triples that.
-//   * FfiChatService._sendGroupReadReceiptsOnView adds <=50 per open (claimed,
-//     so it does not repeat).
-//   * plus one 'received' per message of ours the member ingests, and the
-//     offline flush, bounded at _maxPendingGroupReadReceiptsPerAuthor = 200.
-// 3*1000 + 50 + 200 + a send burst rounds to 4096. Deliberately generous: the
-// per-receipt work here is a hash lookup and a bounded key, and DISTINCT
-// receipts (the ones that reach Dart) are already capped by the replay filter's
-// kMaxSeenGroupReceipts = 4096 over a longer TTL — so at this cap a sender
-// cannot push more work downstream in a window than that cache already holds.
+// Derived against the CURRENT senders, all of which are bounded now that
+// Tim2ToxSdkPlatform.markGroupMessageAsRead claims each row and skips the ones
+// already read (it used to re-send the whole loaded window on every chat open,
+// which is what justified the old 4096):
+//   * a FIRST open of a long-unread group: markGroupMessageAsRead can emit one
+//     receipt per unread row we authored, bounded by
+//     MessageHistoryPersistence._maxMessagesInMemory = 1000 — but only once,
+//     because it claims. A repeat open costs only the genuinely new rows.
+//   * FfiChatService._sendGroupReadReceiptsOnView adds <=50 per open, claimed.
+//   * one 'received' per message of ours the member ingests: a very chatty
+//     author at ~2 messages/second is ~120 in the window.
+//   * the offline flush, bounded at _maxPendingGroupReadReceiptsPerAuthor = 200.
+// 1000 + 50 + 120 + 200 = 1370 honest worst case; 2048 keeps ~1.5x headroom.
 // The cap's job is bounding "one member, unbounded invented msgIDs", not
-// policing honest volume. Per-sender keys are NGC per-group keys, so the same
-// person in several groups gets one window per group, not one shared window.
-constexpr uint32_t kMaxGroupReceiptsPerSender = 4096;
+// policing honest volume: the per-receipt work here is a hash lookup and a
+// bounded key. Per-sender keys are NGC per-group keys, so the same person in
+// several groups gets one window per group, not one shared window.
+constexpr uint32_t kMaxGroupReceiptsPerSender = 2048;
 // Bound on the RECEIPT sender table. Its own cap, and its own table
 // (group_receipt_rate_by_sender_), so a receipt flood cannot fill the table the
 // MM-6 proof budget lives in and starve the proofs — see the header.
 constexpr size_t kMaxGroupReceiptSenders = 1024;
+// ...and a GLOBAL ceiling across every sender, because the per-sender cap alone
+// multiplies: 1024 windows x 2048 is over two million forwards in a window, and
+// the replay cache EVICTS rather than caps, so invented msgIDs keep reaching
+// Dart and each one costs two history scans (codex 2026-09-27).
+//
+// Sized for the author's side of a large group, which is where receipts
+// converge: one 'received' per member per message of ours (a 100-member group
+// where we posted 30 messages in the window is ~3000), plus a read burst when
+// those members open the chat (~99 x 50 = ~4950) — call the honest worst case
+// ~8000. 16384 is ~2x that and cuts the absolute worst case by ~128x.
+//
+// Charged AFTER the per-sender budget on purpose: a single sender must first be
+// bounded to its own 2048 before it can spend from the shared pool, so one
+// flooder can take at most 1/8 of it rather than all of it.
+constexpr uint32_t kMaxGroupReceiptsGlobal = 16384;
 // Answering side replay cache.
 constexpr size_t kMaxAnsweredChallenges = 1024;
 constexpr auto kAnsweredChallengeTtl = std::chrono::minutes(10);
@@ -6752,7 +6761,9 @@ std::string V2TIMManagerImpl::Mm6DiagJson() {
         << ",\"refused\":" << mm6_diag_.group_receipts_refused
         << ",\"replayed\":" << mm6_diag_.group_receipts_replayed
         << ",\"forwarded\":" << mm6_diag_.group_receipts_forwarded
-        << ",\"perSenderLimit\":" << kMaxGroupReceiptsPerSender << "}}";
+        << ",\"refusedGlobal\":" << mm6_diag_.group_receipts_refused_global
+        << ",\"perSenderLimit\":" << kMaxGroupReceiptsPerSender
+        << ",\"globalLimit\":" << kMaxGroupReceiptsGlobal << "}}";
     return out.str();
 }
 
@@ -7431,6 +7442,16 @@ void V2TIMManagerImpl::HandleGroupCustomPrivatePacket(
         if (!TakeGroupSenderReceiptBudgetLocked(sender_lower, meter_now)) {
             ++mm6_diag_.group_receipts_refused;
             V2TIM_LOG(kWarning, "[HandleGroupCustomPrivatePacket] refused receipt: sender over budget");
+            return;
+        }
+        // The shared ceiling, after the per-sender one (see
+        // kMaxGroupReceiptsGlobal for why that order).
+        if (!TakeIdentityBudgetLocked(group_receipt_rate_global_, meter_now,
+                                     &IdentityRateWindow::receipts_in,
+                                     kMaxGroupReceiptsGlobal)) {
+            ++mm6_diag_.group_receipts_refused_global;
+            V2TIM_LOG(kWarning,
+                      "[HandleGroupCustomPrivatePacket] refused receipt: global receipt budget spent");
             return;
         }
         const auto group_it = group_number_to_group_id_.find(group_number);

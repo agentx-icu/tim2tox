@@ -710,6 +710,10 @@ private:
     // (kMaxGroupReceiptSenders); both pruned in PruneIdentityStateLocked.
     std::unordered_map<std::string, IdentityRateWindow> group_receipt_rate_by_sender_;
     IdentityRateWindow identity_rate_global_;
+    // The receipt counterpart, kept separate for the same reason its per-sender
+    // table is: a receipt flood must not spend the proofs' global budget
+    // (kMaxGroupReceiptsGlobal explains the ordering and the size).
+    IdentityRateWindow group_receipt_rate_global_;
     // MM-6 observability (guarded by mutex_). Counters plus the last proof
     // payload we received, verbatim: the auto_tests use it to assert that what
     // a named-but-uninvolved member receives is a box, not a readable proof.
@@ -726,6 +730,10 @@ private:
         // Mm6DiagJson so auto_tests can assert the budget from the outside.
         uint64_t group_receipts_in = 0;
         uint64_t group_receipts_refused = 0;
+        // Refused by the SHARED ceiling rather than by the sender's own window:
+        // told apart so "one flooder" and "everyone at once" are distinguishable
+        // in the diag.
+        uint64_t group_receipts_refused_global = 0;
         uint64_t group_receipts_replayed = 0;
         uint64_t group_receipts_forwarded = 0;
     };

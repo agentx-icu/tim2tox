@@ -25,6 +25,9 @@
 #ifndef TIM2TOX_ROOT_CMAKE_PATH
 #error "TIM2TOX_ROOT_CMAKE_PATH must point to CMakeLists.txt"
 #endif
+#ifndef TIM2TOX_COMPAT_LISTENERS_PATH
+#error "TIM2TOX_COMPAT_LISTENERS_PATH is required"
+#endif
 #ifndef TIM2TOX_SOURCE_CMAKE_PATH
 #error "TIM2TOX_SOURCE_CMAKE_PATH must point to source/CMakeLists.txt"
 #endif
@@ -275,6 +278,30 @@ TEST(ControlPathSourceRegressionTest,
     EXPECT_LT(advanced_callback, simple_instance_guard);
     EXPECT_LT(delivery_callback, delivery_catch);
     EXPECT_LT(group_callback, group_catch);
+}
+
+// A GROUP read receipt reaching the binary-replacement path must carry its group
+// id. The SDK takes groupID out of msg_receipt_conv_id and ONLY when conv_type is
+// kTIMConv_Group (2); this emitter hardcoded 1 and always sent userID, which is
+// empty for a group receipt, so the conversation identity was simply dropped.
+// Latent while only the C2C delivery receipt used this callback.
+TEST(ControlPathSourceRegressionTest, ReadReceiptCallbackCarriesTheGroupId) {
+    const std::string listeners =
+        ReadSource(TIM2TOX_COMPAT_LISTENERS_PATH);
+    const std::string receipts = SourceSection(
+        listeners, "void OnRecvMessageReadReceipts(", "fields[\"json_msg_read_receipt_array\"]");
+    ASSERT_FALSE(receipts.empty());
+    EXPECT_EQ(receipts.find("\\\"msg_receipt_conv_type\\\":1,"), std::string::npos)
+        << "the conversation type must not be hardcoded to C2C";
+    EXPECT_NE(receipts.find("receipt.groupID"), std::string::npos)
+        << "the receipt's groupID must be consulted";
+    EXPECT_NE(receipts.find("is_group ? 2 : 1"), std::string::npos)
+        << "a group receipt must be emitted as kTIMConv_Group (2)";
+    // ...and the id that travels with it must be the group's, not the empty
+    // userID a group receipt carries. (Asserted on the emitted expression, not
+    // on the field name, which also appears in the comment above it.)
+    EXPECT_NE(receipts.find("is_group ? group_id"), std::string::npos)
+        << "the conversation id must follow the conversation type";
 }
 
 TEST(ControlPathSourceRegressionTest,
