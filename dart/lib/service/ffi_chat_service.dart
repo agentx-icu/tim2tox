@@ -10312,6 +10312,25 @@ class FfiChatService {
   /// survived, and the partial tally would then be reported as exact (codex).
   final Set<String> _readerTallyPartlyUnknown = <String>{};
 
+  /// The receiver-side mirror of [_readerTallyPartlyUnknown], for the same
+  /// reason and with the same lifetime rule: a row reloaded as already
+  /// `isReceived` starts a tally that is missing whoever received it before the
+  /// restart, so that tally must never be reported as an exact count.
+  final Set<String> _receiverTallyPartlyUnknown = <String>{};
+
+  /// Cap the receiver tally, keeping [_receiverTallyPartlyUnknown] aligned with
+  /// it — see [_capReaderTally] for why the marker cannot be capped separately.
+  void _capReceiverTally() {
+    final before = _messageReceivers.length;
+    _capReceiptTally(_messageReceivers);
+    if (_messageReceivers.length == before ||
+        _receiverTallyPartlyUnknown.isEmpty) {
+      return;
+    }
+    _receiverTallyPartlyUnknown
+        .removeWhere((key) => !_messageReceivers.containsKey(key));
+  }
+
   /// Cap the reader tally, keeping [_readerTallyPartlyUnknown] aligned with it.
   /// Pruning only runs when an eviction actually happened, so the common receipt
   /// costs nothing extra.
@@ -10347,8 +10366,17 @@ class FfiChatService {
                   m.altMsgIds.contains(msgID)));
       if (!ownRow) return;
       if (receiptType == 'received' || receiptType == 'read') {
+        // Same rule as the reader tally below: a row that is ALREADY received
+        // while its tally is empty was received in a previous session by members
+        // whose identities were never stored, so the tally starting now can
+        // never be complete. Remembered BEFORE the add.
+        if (!_messageReceivers.containsKey(tallyKey) &&
+            (_ownGroupRowFor(tallyKey, groupID: groupID)?.isReceived ??
+                false)) {
+          _receiverTallyPartlyUnknown.add(tallyKey);
+        }
         _messageReceivers.putIfAbsent(tallyKey, () => <String>{}).add(sender);
-        _capReceiptTally(_messageReceivers);
+        _capReceiverTally();
       }
       if (receiptType == 'read') {
         // A row that is ALREADY read while its tally is still empty was read in
@@ -10505,6 +10533,34 @@ class FfiChatService {
     );
   }
 
+  /// The receiver-side mirror of [isGroupRowReadByAnyMember]. Same reasoning,
+  /// same limits: `isReceived` on the author's own row survives a restart,
+  /// the receiver IDENTITIES never do.
+  bool isGroupRowReceivedByAnyMember(String msgID, {String? groupID}) {
+    final row = _ownGroupRowFor(msgID, groupID: groupID);
+    return row != null && row.isReceived;
+  }
+
+  /// The receiver-side mirror of [groupRowReadTally].
+  ///
+  /// Why it exists: a row that was RECEIVED but never READ before a restart
+  /// restored neither a floor nor an inexactness marker, so a receiver badge
+  /// showed nothing for a message members really had got — and could later show
+  /// an exact-looking 1 once one live receipt arrived. Hosts must be able to ask
+  /// the receiver question the same way they ask the read one.
+  ({int receiverCount, bool exactCount}) groupRowReceiveTally(String msgID,
+      {String? groupID}) {
+    final live = _messageReceivers[msgID]?.length ?? 0;
+    if (live == 0) {
+      final restored = isGroupRowReceivedByAnyMember(msgID, groupID: groupID);
+      return (receiverCount: restored ? 1 : 0, exactCount: !restored);
+    }
+    return (
+      receiverCount: live,
+      exactCount: !_receiverTallyPartlyUnknown.contains(msgID),
+    );
+  }
+
   /// The author's own group row [msgID] resolves to (primary id or `gmid:`
   /// alias), or null. Scoped to [groupID]'s history when it is known; the
   /// fallback scan is restricted to GROUP rows so a C2C row can never answer a
@@ -10538,6 +10594,7 @@ class FfiChatService {
     _messageReceivers.clear();
     _messageReaders.clear();
     _readerTallyPartlyUnknown.clear();
+    _receiverTallyPartlyUnknown.clear();
   }
 
   // Get list of users who received a group message
@@ -12831,6 +12888,7 @@ class FfiChatService {
     _messageReceivers.clear();
     _messageReaders.clear();
     _readerTallyPartlyUnknown.clear();
+    _receiverTallyPartlyUnknown.clear();
     // Receipt bookkeeping is ACCOUNT state: carrying the parked group receipts
     // (or the "already receipted this row" claims) into the next account would
     // aim them at the wrong identity's groups. The durable half stays on disk
