@@ -3027,6 +3027,22 @@ int tim2tox_ffi_mm6_send_crafted_challenge(int64_t instance_id, const char* grou
     if (!manager || !manager->GetToxManager()) return 0;
     return manager->Mm6SendCraftedChallenge(group_id, friend_key_hex, claimed_member_key_hex);
 }
+
+// TEST-ONLY, in the SAME guarded region as the hook above (one region per file:
+// that is what the pin test checks, and what keeps the C++ half from surviving
+// in libtim2tox.a after the C half is compiled out). Lowers or restores this
+// instance's inbound group-receipt budgets so the auto_tests can drive the
+// refusal path the caps exist for; <= 0 restores a default. Never in a shipping
+// library — shrinking the flood budget of the library that enforces it is a
+// denial-of-service knob, not an observability one.
+int tim2tox_ffi_mm6_set_group_receipt_budgets(int64_t instance_id, int32_t per_sender_limit,
+                                             int32_t global_limit) {
+    if (instance_id == 0) instance_id = GetCurrentInstanceId();
+    V2TIMManagerImpl* manager = GetInstanceFromId(instance_id);
+    if (!manager) return 0;
+    manager->Mm6SetGroupReceiptBudgets(per_sender_limit, global_limit);
+    return 1;
+}
 #endif  // TIM2TOX_ENABLE_TEST_HOOKS
 
 int tim2tox_ffi_set_retired_group_id_max(int64_t instance_id, uint64_t max_id) {

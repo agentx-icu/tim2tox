@@ -150,7 +150,13 @@ private:
     std::mutex manager_impl_mutex_;
 
     void RefreshConversationCache();
-    V2TIMConversation CreateConversationFromFriend(uint32_t friend_number);
+    // Takes the caller's PINNED Tox handle rather than re-resolving one: both
+    // callers already hold a session pin across the friend-list walk this is
+    // called from, and re-fetching inside it opened a window where a concurrent
+    // UnInitSDK could tox_kill() the instance between the caller's list read and
+    // this key read. nullptr yields the degraded "c2c_<friend_number>" row, which
+    // is exactly what the three old early-outs produced.
+    V2TIMConversation CreateConversationFromFriend(Tox* tox, uint32_t friend_number);
     void NotifyNewConversations();
 };
 

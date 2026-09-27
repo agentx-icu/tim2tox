@@ -1188,28 +1188,26 @@ void main() {
     // unbounded, and each one costs a Dart event plus two history scans, so the
     // native side meters them per authenticated sender.
     //
-    // WHAT THIS LEG DOES **NOT** ASSERT, AND WHY. It used to read
-    // `perSenderLimit` from the diag and send `limit * 2` to watch the excess be
-    // refused. That stopped being honest when the budget moved into its own
-    // table and the cap was re-derived to 4096 (one `markGroupMessageAsRead`
-    // call can emit up to the loaded window, and UIKit calls it on every chat
-    // open): out-sending it now means 8192 native sends, which take longer than
-    // the 60s rate window they have to fit inside — the window rolls over
-    // mid-flood, the counter resets, and `refused >= 1` passes or fails by luck.
-    // There is no seam to lower the cap or to fill the sender table honestly
-    // (that would need a native test hook, which is not in this library), and
-    // faking the refusal would assert nothing about the meter. So this leg
-    // asserts the two things it CAN observe deterministically: an honest burst
-    // is metered and forwarded in full and refuses nothing, and the cap is wide
-    // enough that a single chat open can never refuse its own receipts — the
-    // invariant the re-derivation was for. The refusal path itself is covered by
-    // the native side's own reasoning, not by this file; making it testable
-    // needs a hook that sets the cap.
-    test('the per-sender receipt meter counts an honest burst and refuses none',
-        () async {
-      final svc =
-          (TencentCloudChatSdkPlatform.instance as Tim2ToxSdkPlatform)
-              .ffiService;
+    // WHY THIS LEG NEEDS A NATIVE SEAM. It used to send `perSenderLimit * 2`
+    // receipts and watch the excess be refused. That stopped being honest once
+    // the cap was re-derived upward (2048 per sender, 16384 shared): out-sending
+    // it means 4096+ native sends, which take longer than the 60s rate window
+    // they have to land inside — the window rolls over mid-flood, the counter
+    // resets, and `refused >= 1` passes or fails by luck. For a while this leg
+    // therefore asserted only that the cap was WIDE enough and that an honest
+    // burst was forwarded, and said so instead of faking a refusal.
+    //
+    // `tim2tox_ffi_mm6_set_group_receipt_budgets` is the seam that closes that
+    // gap: a test-only FFI entry (same -DTIM2TOX_ENABLE_TEST_HOOKS gate as the
+    // crafted challenge above) that lowers the two caps on the RECEIVING
+    // instance before any traffic starts, so the refusal path can be driven with
+    // a burst small enough to finish far inside one window. Both halves are
+    // proven here: the per-sender window, and the shared ceiling charged after
+    // it, which lands in its own counter. The derived defaults are untouched —
+    // they are read back from the diag first (the "wide enough" invariant) and
+    // restored at the end, so the rest of the file still runs against them.
+    test('the receipt meter forwards up to the cap, refuses past it, and the '
+        'shared ceiling refuses into its own counter', () async {
       final member1Pk = member1.getPublicKey().toUpperCase();
       final member1Key = (await founderMemberFriends())
           .entries
@@ -1220,18 +1218,52 @@ void main() {
           reason: 'needs the member key the MM-6 test proved');
 
       final lib = ffi_lib.Tim2ToxFfi.open();
-      final baseline = nativeGroupReceiptDiag(member1);
-      final limit = baseline['perSenderLimit'] ?? 0;
+      final defaults = nativeGroupReceiptDiag(member1);
+      final defaultPerSender = defaults['perSenderLimit'] ?? 0;
+      final defaultGlobal = defaults['globalLimit'] ?? 0;
       // FAIL, never skip (codex): the `groupReceipts` diag block is part of the
       // ORDINARY library — `Mm6DiagJson` is not behind a test hook — so a
       // library that cannot report the budget is a library built from the wrong
       // tree, and skipping here would report green for the metering assertions
       // below while they never ran. No env gate for the same reason: there is no
       // legitimate configuration in which this block is absent.
-      expect(limit, greaterThan(0),
+      expect(defaultPerSender, greaterThan(0),
           reason: 'libtim2tox_ffi reports no groupReceipts.perSenderLimit — it '
               'predates the group-receipt meter. Rebuild it (build_ffi.sh); do '
               'not run this suite against a stale library.');
+      expect(defaultGlobal, greaterThan(0),
+          reason: 'libtim2tox_ffi reports no groupReceipts.globalLimit — it '
+              'predates the shared receipt ceiling. Rebuild it (build_ffi.sh).');
+
+      // The budget seam is a test-only hook, compiled in only with
+      // -DTIM2TOX_ENABLE_TEST_HOOKS=ON (build_ffi.sh does that; app/CI builds
+      // do not). Without it the refusal path cannot be reached at all.
+      final setBudgets = lib.mm6SetGroupReceiptBudgetsNative;
+      if (setBudgets == null) {
+        const message =
+            'libtim2tox_ffi lacks tim2tox_ffi_mm6_set_group_receipt_budgets: '
+            'rebuild with -DTIM2TOX_ENABLE_TEST_HOOKS=ON (build_ffi.sh, or '
+            'toxee tool/ci/build_tim2tox.sh --enable-test-hooks)';
+        // Same discipline as the crafted-challenge leg: a suite that is
+        // SUPPOSED to have the hook (every CI job running this file sets
+        // TIM2TOX_EXPECT_TEST_HOOKS=1) must FAIL on its absence, because
+        // skipping would report green for a refusal path that never ran.
+        if (Platform.environment['TIM2TOX_EXPECT_TEST_HOOKS'] == '1') {
+          fail('TIM2TOX_EXPECT_TEST_HOOKS=1 but $message');
+        }
+        markTestSkipped(message);
+        return;
+      }
+
+      // member1 is the RECEIVER here (the founder sends receipts naming
+      // member1's authored rows), so the budgets to lower are member1's — and
+      // the call must run in member1's instance context, not the founder's.
+      void setMember1Budgets(int perSender, int global) {
+        final applied =
+            member1.runWithInstance(() => setBudgets(0, perSender, global));
+        expect(applied, equals(1),
+            reason: 'the budget seam must reach member1\'s instance');
+      }
 
       int sendReceipt(String msgId) => founder.runWithInstance(() {
             final gid = groupId!.toNativeUtf8();
@@ -1248,54 +1280,194 @@ void main() {
             }
           });
 
-      // THE CAP ITSELF: a single chat open must never be able to refuse its own
-      // receipts. `Tim2ToxSdkPlatform.markGroupMessageAsRead` can emit one per
-      // inbound row of the loaded window (1000 messages in memory) on a first
-      // open, and FfiChatService's on-view walk up to 50 — so a cap under the
-      // window size would make the product refuse honest readers.
-      expect(limit, greaterThanOrEqualTo(1000),
-          reason: 'the per-sender cap must cover the largest burst one chat '
-              'open can honestly emit; got $limit');
-
-      // Distinct msgIDs, so the replay filter is not what accounts for them,
-      // and a burst small enough to complete far inside the 60s rate window.
-      final stamp = DateTime.now().microsecondsSinceEpoch;
-      const burst = 24;
-      var sent = 0;
-      for (var i = 0; i < burst; i++) {
-        if (sendReceipt('budget-probe-$stamp-$i') == 1) sent++;
+      // Wait until `target` more receipts have reached the meter, and return the
+      // diag read that satisfied it. Refused receipts are counted in `in` too
+      // (the native side bumps it before charging anything), so this waits for
+      // arrival, not for approval.
+      Future<Map<String, int>> meteredAtLeast(
+          int target, Map<String, int> from, String what) async {
+        var seen = from;
+        await waitUntilWithVirtualPump(
+          scenario,
+          () {
+            seen = nativeGroupReceiptDiag(member1);
+            return (seen['in'] ?? 0) - (from['in'] ?? 0) >= target;
+          },
+          timeout: const Duration(seconds: 60),
+          description: what,
+          advanceMs: 100,
+          iterationsPerInstance: 2,
+        );
+        return seen;
       }
-      expect(sent, equals(burst),
-          reason: 'every probe must leave the sender: sent $sent of $burst');
 
-      var after = baseline;
-      await waitUntilWithVirtualPump(
-        scenario,
-        () {
-          after = nativeGroupReceiptDiag(member1);
-          return (after['in'] ?? 0) - (baseline['in'] ?? 0) >= sent;
-        },
-        timeout: const Duration(seconds: 60),
-        description: 'every receipt reaches the meter',
-        advanceMs: 100,
-        iterationsPerInstance: 2,
-      );
-      final forwarded =
-          (after['forwarded'] ?? 0) - (baseline['forwarded'] ?? 0);
-      final refused = (after['refused'] ?? 0) - (baseline['refused'] ?? 0);
-      final metered = (after['in'] ?? 0) - (baseline['in'] ?? 0);
-      // ignore: avoid_print
-      print('[budget] sent=$sent limit=$limit metered=$metered '
-          'forwarded=$forwarded refused=$refused');
+      // THE DERIVED CAP ITSELF, read before anything is lowered: a single chat
+      // open must never be able to refuse its own receipts.
+      // `Tim2ToxSdkPlatform.markGroupMessageAsRead` can emit one per inbound row
+      // of the loaded window (1000 messages in memory) on a first open, and
+      // FfiChatService's on-view walk up to 50 — so a shipped cap under the
+      // window size would make the product refuse honest readers.
+      expect(defaultPerSender, greaterThanOrEqualTo(1000),
+          reason: 'the per-sender cap must cover the largest burst one chat '
+              'open can honestly emit; got $defaultPerSender');
 
-      expect(metered, greaterThanOrEqualTo(sent),
-          reason: 'the meter must see every receipt that arrives — that is what '
-              'makes a cap enforceable at all');
-      expect(refused, equals(0),
-          reason: 'an honest burst this far inside the window must not be '
-              'refused');
-      expect(forwarded, greaterThanOrEqualTo(sent),
-          reason: 'and all of it must be forwarded to Dart');
+      const probeBurst = 6;
+      final stamp = DateTime.now().microsecondsSinceEpoch;
+      try {
+        // ---- LEG 1a: INSIDE the budget, at the derived caps (0 = "keep the
+        // default"). Every receipt is metered, forwarded, and refused by
+        // nobody. It also leaves the founder's 60s per-sender window provably
+        // charged `sent` times, which is what makes 1b deterministic.
+        setMember1Budgets(0, 0);
+        final baseline = nativeGroupReceiptDiag(member1);
+        // Distinct msgIDs, so the replay filter is not what accounts for any of
+        // them, and a burst small enough to finish far inside the 60s window.
+        var sent = 0;
+        for (var i = 0; i < probeBurst; i++) {
+          if (sendReceipt('budget-probe-$stamp-$i') == 1) sent++;
+        }
+        expect(sent, equals(probeBurst),
+            reason: 'every probe must leave the sender: sent $sent of '
+                '$probeBurst');
+
+        final inside = await meteredAtLeast(
+            sent, baseline, 'every receipt reaches the meter');
+        final metered = (inside['in'] ?? 0) - (baseline['in'] ?? 0);
+        final forwarded =
+            (inside['forwarded'] ?? 0) - (baseline['forwarded'] ?? 0);
+        final refused = (inside['refused'] ?? 0) - (baseline['refused'] ?? 0);
+        final refusedGlobal =
+            (inside['refusedGlobal'] ?? 0) - (baseline['refusedGlobal'] ?? 0);
+        // ignore: avoid_print
+        print('[budget] inside: sent=$sent metered=$metered '
+            'forwarded=$forwarded refused=$refused '
+            'refusedGlobal=$refusedGlobal');
+
+        expect(metered, greaterThanOrEqualTo(sent),
+            reason: 'the meter must see every receipt that arrives — that is '
+                'what makes a cap enforceable at all');
+        // (a) traffic inside the budget is forwarded, and nothing is refused.
+        expect(forwarded, greaterThanOrEqualTo(sent),
+            reason: 'every receipt inside the budget must reach Dart');
+        expect(refused, equals(0),
+            reason: 'an honest burst this far inside the window must not be '
+                'refused');
+        expect(refusedGlobal, equals(0),
+            reason: 'nor by the shared ceiling');
+
+        // ---- LEG 1b: PAST the budget — the refusal path, which is what the
+        // budget exists for and what no test could reach before this seam.
+        // Dropping the per-sender cap to 1 puts the founder's window (1a just
+        // charged it $sent times) over budget, so the next receipts are refused.
+        //
+        // Why a cap BELOW what the window already spent, instead of a cap of k
+        // and a burst of k+m: earlier legs in this file also send
+        // founder->member1 receipts, so the window's starting count is not
+        // knowable from here, and only "cap below the count" is deterministic.
+        // What it proves is the same thing — over budget means refused,
+        // counted in `refused`, and not forwarded.
+        setMember1Budgets(1, 0);
+        final capped = nativeGroupReceiptDiag(member1);
+        expect(capped['perSenderLimit'], equals(1),
+            reason: 'the lowered cap must be in force BEFORE the traffic — the '
+                'charge sites read it per packet');
+        expect(capped['globalLimit'], equals(defaultGlobal),
+            reason: '0 must leave the shared ceiling at its derived default, so '
+                'nothing here can be refused by the other budget');
+
+        var sentOver = 0;
+        for (var i = 0; i < probeBurst; i++) {
+          if (sendReceipt('over-probe-$stamp-$i') == 1) sentOver++;
+        }
+        expect(sentOver, equals(probeBurst),
+            reason: 'every probe must leave the sender: sent $sentOver of '
+                '$probeBurst');
+
+        final over = await meteredAtLeast(
+            sentOver, capped, 'every over-budget receipt reaches the meter');
+        final overRefused = (over['refused'] ?? 0) - (capped['refused'] ?? 0);
+        final overForwarded =
+            (over['forwarded'] ?? 0) - (capped['forwarded'] ?? 0);
+        final overRefusedGlobal =
+            (over['refusedGlobal'] ?? 0) - (capped['refusedGlobal'] ?? 0);
+        // ignore: avoid_print
+        print('[budget] over: perSenderLimit=1 sent=$sentOver '
+            'forwarded=$overForwarded refused=$overRefused '
+            'refusedGlobal=$overRefusedGlobal');
+
+        // (b) past the cap: refused, and counted in the PER-SENDER counter. One
+        // may still get through if the 60s window rolls over exactly here
+        // (cap 1, count back to 0), hence >= n - 1.
+        expect(overRefused, greaterThanOrEqualTo(sentOver - 1),
+            reason: 'every receipt past the per-sender budget must be refused '
+                'and counted; got $overRefused of $sentOver');
+        expect(overForwarded, lessThanOrEqualTo(1),
+            reason: 'an over-budget sender must not reach Dart: that forward, '
+                'its replay-cache slot and its two history scans are exactly '
+                'what the cap is paid to prevent');
+        expect(overRefusedGlobal, equals(0),
+            reason: 'these refusals belong to the sender\'s own window, not to '
+                'the shared ceiling');
+
+        // ---- LEG 2: the SHARED ceiling, told apart from the window above. The
+        // per-sender cap goes back up (the founder's window spent a handful of
+        // 2048, so it has room again) and the global ceiling drops to 1, which
+        // 1a already spent. Same sender, same call: the only thing that changed
+        // is which budget is exhausted.
+        setMember1Budgets(defaultPerSender, 1);
+        final tightened = nativeGroupReceiptDiag(member1);
+        expect(tightened['globalLimit'], equals(1),
+            reason: 'the shared ceiling must be in force before leg 2 sends');
+        expect(tightened['perSenderLimit'], equals(defaultPerSender),
+            reason: 'leg 2 must not be able to hit the per-sender window');
+
+        const globalBurst = 6;
+        var sentGlobal = 0;
+        for (var i = 0; i < globalBurst; i++) {
+          if (sendReceipt('global-probe-$stamp-$i') == 1) sentGlobal++;
+        }
+        expect(sentGlobal, equals(globalBurst),
+            reason: 'every probe must leave the sender: sent $sentGlobal of '
+                '$globalBurst');
+
+        final afterGlobal = await meteredAtLeast(
+            sentGlobal, tightened, 'every global-probe receipt reaches the meter');
+        final globalRefused = (afterGlobal['refusedGlobal'] ?? 0) -
+            (tightened['refusedGlobal'] ?? 0);
+        final senderRefused =
+            (afterGlobal['refused'] ?? 0) - (tightened['refused'] ?? 0);
+        final globalForwarded =
+            (afterGlobal['forwarded'] ?? 0) - (tightened['forwarded'] ?? 0);
+        // ignore: avoid_print
+        print('[budget] globalLimit=1 sent=$sentGlobal '
+            'forwarded=$globalForwarded refused=$senderRefused '
+            'refusedGlobal=$globalRefused');
+
+        // (c) the shared ceiling refuses separately, into its OWN counter. One
+        // may still get through if the 60s global window happens to roll over
+        // between the two legs (limit 1, counter back to 0), hence >= n - 1.
+        expect(globalRefused, greaterThanOrEqualTo(sentGlobal - 1),
+            reason: 'the shared ceiling must refuse what it cannot afford and '
+                'count it in refusedGlobal; got $globalRefused of '
+                '$sentGlobal');
+        expect(senderRefused, equals(0),
+            reason: 'a global refusal must NOT be charged to the per-sender '
+                'counter — telling "one flooder" from "everyone at once" apart '
+                'is what the second counter is for');
+        expect(globalForwarded, lessThanOrEqualTo(1),
+            reason: 'a spent shared ceiling must stop the forward, whatever the '
+                'sender\'s own window still allows');
+      } finally {
+        // (d) restore, so the legs below this one meter against the derived
+        // caps. In `finally` on purpose: a failure above must not leave a
+        // one-receipt budget behind for the rest of the file.
+        setMember1Budgets(0, 0);
+      }
+      final restored = nativeGroupReceiptDiag(member1);
+      expect(restored['perSenderLimit'], equals(defaultPerSender),
+          reason: 'a value <= 0 must restore the compiled-in per-sender cap');
+      expect(restored['globalLimit'], equals(defaultGlobal),
+          reason: 'a value <= 0 must restore the compiled-in shared ceiling');
     }, timeout: const Timeout(Duration(seconds: 300)));
 
     // The PLATFORM reader trigger, and the load it used to put on the meter

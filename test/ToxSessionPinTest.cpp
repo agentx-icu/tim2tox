@@ -1133,4 +1133,271 @@ TEST(ToxSessionPinTest, TheCraftedChallengePrimitiveIsGatedWithItsFfiWrapper) {
         << "the FFI wrapper's gate must stay";
 }
 
+// The SECOND batch of per-feature-manager sites, the ones 6aaa4d7 listed as
+// still unpinned in its own commit message. Same bug, same shape: a raw
+// GetToxManagerFromImpl(manager_impl_) / GetToxManager() followed by a SEQUENCE
+// of toxcore calls, which a concurrent UnInitSDK can tox_kill() the instance in
+// the middle of. Several of these were worse than the first batch's: they
+// dereferenced the raw fetch WITHOUT a null check, so a logged-out call was a
+// null deref rather than a refusal, and InviteUserToGroup /
+// SetGroupMemberToxRole re-fetched four and five times inside one operation.
+//
+// Two sites here do not pin at all, by design, and are asserted separately at
+// the bottom: ResolveGroupName's live-name helper path now accepts the CALLER's
+// pinned handle (SearchGroups hoists one pin for a whole search instead of
+// taking two per matched group), and CreateConversationFromFriend takes its
+// caller's pinned handle instead of re-resolving one for a single
+// tox_friend_get_public_key.
+TEST(ToxSessionPinTest, TheSecondBatchOfPerFeatureManagerSitesPinsItsCallSequence) {
+    const std::string group =
+        StripLineComments(ReadSource(TIM2TOX_GROUP_MANAGER_SOURCE_PATH));
+    const std::string friendship =
+        StripLineComments(ReadSource(TIM2TOX_FRIENDSHIP_MANAGER_SOURCE_PATH));
+    const std::string conversation =
+        StripLineComments(ReadSource(TIM2TOX_CONVERSATION_MANAGER_SOURCE_PATH));
+
+    struct Site {
+        const char* name;
+        const std::string* source;
+        const char* start;
+        const char* end;
+        // The raw-fetch spelling THIS function used; it must be gone.
+        const char* banned;
+        // Also banned, where the function has no legitimate remaining use of it.
+        // The sites that keep CreateGroup's `tox_manager ? tox_manager->getTox()
+        // : nullptr` tail for the (test-only) manager_impl_ == nullptr shape are
+        // exempt from this one — their `banned` entry is what proves the real
+        // path goes through the guard.
+        const char* also_banned;
+    };
+    const Site sites[] = {
+        // --- group manager -------------------------------------------------
+        {"GetGroupsInfo", &group, "void V2TIMGroupManagerImpl::GetGroupsInfo(",
+         "void V2TIMGroupManagerImpl::QuitGroup(",
+         "GetToxManagerFromImpl(manager_impl_)", "->getTox()"},
+        {"GetJoinedGroupList", &group,
+         "void V2TIMGroupManagerImpl::GetJoinedGroupList(",
+         "void V2TIMGroupManagerImpl::SearchGroups(",
+         "GetToxManagerFromImpl(manager_impl_)", "->getTox()"},
+        // SearchGroups reaches toxcore ONLY through ResolveGroupName, and the
+        // banned spelling is the un-pinned one-argument call it used to make
+        // twice per matched group.
+        {"SearchGroups", &group, "void V2TIMGroupManagerImpl::SearchGroups(",
+         "void V2TIMGroupManagerImpl::SearchCloudGroups(",
+         "ResolveGroupName(groupID)", "->getTox()"},
+        {"SetGroupInfo", &group, "void V2TIMGroupManagerImpl::SetGroupInfo(",
+         "void V2TIMGroupManagerImpl::UpdateGroupInfoFromTopic(",
+         "GetToxManagerFromImpl(manager_impl_)", nullptr},
+        {"InviteUserToGroup", &group,
+         "void V2TIMGroupManagerImpl::InviteUserToGroup(",
+         "void V2TIMGroupManagerImpl::KickGroupMember(",
+         "GetToxManagerFromImpl(manager_impl_)", nullptr},
+        {"KickGroupMember", &group,
+         "void V2TIMGroupManagerImpl::KickGroupMember(",
+         "void V2TIMGroupManagerImpl::SetGroupMemberRole(",
+         "GetToxManagerFromImpl(manager_impl_)", nullptr},
+        {"SetGroupMemberToxRole", &group,
+         "void V2TIMGroupManagerImpl::SetGroupMemberToxRole(",
+         "void V2TIMGroupManagerImpl::MarkGroupMemberList(",
+         "GetToxManagerFromImpl(manager_impl_)", nullptr},
+        {"TransferGroupOwner", &group,
+         "void V2TIMGroupManagerImpl::TransferGroupOwner(",
+         "void V2TIMGroupManagerImpl::GetGroupApplicationList(",
+         "GetToxManagerFromImpl(manager_impl_)", nullptr},
+        {"GetAllGroupIDsSync", &group,
+         "std::vector<std::string> V2TIMGroupManagerImpl::GetAllGroupIDsSync(",
+         "Tox_Group_Role V2TIMGroupManagerImpl::v2timRoleToToxRole(",
+         "GetToxManagerFromImpl(manager_impl_)", "->getTox()"},
+        // --- friendship manager --------------------------------------------
+        {"CheckFriend", &friendship,
+         "void V2TIMFriendshipManagerImpl::CheckFriend(",
+         "void V2TIMFriendshipManagerImpl::GetFriendApplicationList(",
+         "GetToxManager()", "->getTox()"},
+        {"AcceptFriendApplication", &friendship,
+         "void V2TIMFriendshipManagerImpl::AcceptFriendApplication(const V2TIMFriendApplication& application, V2TIMFriendAcceptType acceptType, V2TIMValueCallback",
+         "void V2TIMFriendshipManagerImpl::RefuseFriendApplication(",
+         "GetToxManager()", "->getTox()"},
+        // --- conversation manager ------------------------------------------
+        {"GetConversationList(nextSeq)", &conversation,
+         "void V2TIMConversationManagerImpl::GetConversationList(uint64_t nextSeq,",
+         "V2TIMConversation V2TIMConversationManagerImpl::CreateConversationFromFriend(",
+         "GetToxManager()", "->getTox()"},
+    };
+    for (const Site& site : sites) {
+        const std::string body =
+            SourceSection(*site.source, site.start, site.end);
+        EXPECT_NE(body.find("AcquireToxSession()"), std::string::npos)
+            << site.name << " is reachable from the FFI surface and must pin the "
+                            "session for its whole call sequence";
+        EXPECT_EQ(body.find(site.banned), std::string::npos)
+            << site.name << " must not re-fetch an unpinned handle ("
+            << site.banned << ")";
+        if (site.also_banned != nullptr) {
+            EXPECT_EQ(body.find(site.also_banned), std::string::npos)
+                << site.name << " must read the handle through the pin: "
+                << site.also_banned << " is a raw re-fetch";
+        }
+        // ORDER, not just presence: a guard acquired half-way down leaves the
+        // calls above it unpinned, which is exactly how these were half-broken.
+        // A section where NO probe hits is a FAILURE, not a skip — it means this
+        // list has gone stale against the code and the order check below would
+        // pass vacuously (the trap codex found in the first batch).
+        const std::size_t pin = body.find("AcquireToxSession()");
+        std::size_t first_tox_reach = std::string::npos;
+        for (const char* probe : {"tox_self_", "tox_friend_", "tox_group_",
+                                  "tox_conference_", "tox_manager->",
+                                  "ResolveGroupName(groupID"}) {
+            first_tox_reach = std::min(first_tox_reach, body.find(probe));
+        }
+        EXPECT_NE(first_tox_reach, std::string::npos)
+            << site.name << " reaches toxcore by a spelling this test does not "
+                            "probe for; the order check would pass vacuously";
+        if (first_tox_reach != std::string::npos) {
+            EXPECT_LT(pin, first_tox_reach)
+                << site.name << " reaches toxcore before it pins the session";
+        }
+        // LOCK ORDER, the trap the first batch hit on cache_mutex_: acquiring a
+        // pin can WAIT (a profile save quiesces the pins in
+        // ToxManager::getSaveData) and pinned operations legitimately take these
+        // mutexes afterwards, so a pin taken UNDER one of them closes a cycle.
+        // Every site in this batch that takes one of them must pin FIRST.
+        //
+        // The three probed mutexes are the ones a PINNED operation is known to
+        // take: cache_mutex_ (AddFriend / DeleteFromFriendList publish through
+        // RefreshCache while holding their pin), group_mutex_ and the manager's
+        // own mutex_ (GetGroupMemberList and friends). The conversation
+        // manager's manager_impl_mutex_ is deliberately NOT probed: it is a leaf
+        // held only long enough to copy a pointer, in a scope that always closes
+        // before any pin is taken, so requiring the pin ahead of it would be a
+        // false positive (it is the one this assertion first reported). Sites
+        // that take none of the three (CheckFriend, AcceptFriendApplication)
+        // have no order to get wrong, so this check is conditional by
+        // construction.
+        std::size_t first_lock = std::string::npos;
+        for (const char* mutex : {"cache_mutex_", "group_mutex_",
+                                  "manager_impl_->mutex_"}) {
+            first_lock = std::min(first_lock, body.find(mutex));
+        }
+        if (first_lock != std::string::npos) {
+            EXPECT_LT(pin, first_lock)
+                << site.name
+                << " takes a lock before it pins: AcquireToxSession() can block "
+                   "on a save's quiesce, so pinning under a lock a pinned "
+                   "operation also takes is a deadlock";
+        }
+    }
+
+    // ResolveGroupName: unchanged for callers that hold no pin (it still takes
+    // one for itself — the first batch's test asserts that), plus a new
+    // pass-down path so SearchGroups can hoist ONE pin over a whole search
+    // instead of taking two per matched group.
+    const std::string resolve =
+        SourceSection(group, "std::string V2TIMGroupManagerImpl::ResolveGroupName(",
+                      "void V2TIMGroupManagerImpl::ClearAllState(");
+    EXPECT_NE(resolve.find("Tox* pinned_tox"), std::string::npos)
+        << "ResolveGroupName must accept the caller's already-pinned handle";
+    EXPECT_NE(resolve.find("GetLiveGroupName(pinned_tox"), std::string::npos)
+        << "the caller's pinned handle must be the one handed to the helper";
+    const std::string search =
+        SourceSection(group, "void V2TIMGroupManagerImpl::SearchGroups(",
+                      "void V2TIMGroupManagerImpl::SearchCloudGroups(");
+    std::size_t hoisted = 0;
+    for (std::size_t at = search.find("ResolveGroupName(groupID, session.tox())");
+         at != std::string::npos;
+         at = search.find("ResolveGroupName(groupID, session.tox())", at + 1)) {
+        ++hoisted;
+    }
+    // BOTH call sites, and that is the point: the keyword test and the result
+    // row each resolved a name, so leaving either one un-hoisted would both keep
+    // the per-call pin and let one result set mix names from two sessions.
+    EXPECT_EQ(hoisted, 2u)
+        << "every ResolveGroupName call in SearchGroups must run on the search's "
+           "own hoisted pin";
+    const std::size_t sweep = search.find("for (const std::string& groupID");
+    ASSERT_NE(sweep, std::string::npos)
+        << "SearchGroups' candidate sweep is spelled differently now; the check "
+           "below would pass vacuously";
+    EXPECT_EQ(search.find("AcquireToxSession()", sweep), std::string::npos)
+        << "the hoisted pin must be taken once before the sweep, not inside it";
+
+    // CreateConversationFromFriend: the helper takes the caller's pinned handle
+    // and does not resolve one of its own, exactly like GetLiveGroupName.
+    const std::string create_conv = SourceSection(
+        conversation,
+        "V2TIMConversation V2TIMConversationManagerImpl::CreateConversationFromFriend(",
+        "void V2TIMConversationManagerImpl::RefreshConversationCache(");
+    EXPECT_NE(create_conv.find("CreateConversationFromFriend(Tox* tox"),
+              std::string::npos)
+        << "the helper must take the caller's pinned Tox*, not re-resolve one "
+           "through manager_impl_";
+    EXPECT_EQ(create_conv.find("GetToxManager()"), std::string::npos)
+        << "re-fetching inside the helper defeats the caller's pin";
+    EXPECT_EQ(create_conv.find("->getTox()"), std::string::npos)
+        << "re-fetching inside the helper defeats the caller's pin";
+    EXPECT_EQ(create_conv.find("AcquireToxSession()"), std::string::npos)
+        << "the helper must not take a pin of its own per friend; its two "
+           "callers already hold one across the friend-list walk";
+    // Both callers hand it the handle they pinned.
+    const std::string refresh = SourceSection(
+        conversation, "void V2TIMConversationManagerImpl::RefreshConversationCache(",
+        "void V2TIMConversationManagerImpl::DeleteConversation(");
+    EXPECT_NE(refresh.find("CreateConversationFromFriend(tox, friend_number)"),
+              std::string::npos)
+        << "RefreshConversationCache must pass its pinned handle down";
+    const std::string get_conv = SourceSection(
+        conversation,
+        "void V2TIMConversationManagerImpl::GetConversation(const V2TIMString& conversationID,",
+        "void V2TIMConversationManagerImpl::GetConversationList(const V2TIMStringVector&");
+    EXPECT_NE(get_conv.find("CreateConversationFromFriend(tox, friend_number)"),
+              std::string::npos)
+        << "GetConversation must pass its pinned handle down";
+
+    // AcceptFriendApplication is a PUBLISHER, like AddFriend: it commits
+    // tox_friend_add_norequest and then notifies listeners, saves the profile and
+    // rebuilds the conversation cache. Pinning keeps the memory valid; it does
+    // not make the session current, so the publication is skipped on a stale
+    // epoch while the accept is still reported as done. At least TWICE, because
+    // the listeners run SYNCHRONOUSLY and one of them can log out inside the
+    // callback — a single check before them would let the cache refresh land on
+    // the NEXT session.
+    const std::string accept = SourceSection(
+        friendship,
+        "void V2TIMFriendshipManagerImpl::AcceptFriendApplication(const V2TIMFriendApplication& application, V2TIMFriendAcceptType acceptType, V2TIMValueCallback",
+        "void V2TIMFriendshipManagerImpl::RefuseFriendApplication(");
+    std::size_t accept_checks = 0;
+    for (std::size_t at = accept.find("session.Expired()"); at != std::string::npos;
+         at = accept.find("session.Expired()", at + 1)) {
+        ++accept_checks;
+    }
+    EXPECT_GE(accept_checks, 2u)
+        << "AcceptFriendApplication must re-check currency after the synchronous "
+           "notification, not only before it";
+    EXPECT_NE(accept.find("OnSuccess"), std::string::npos)
+        << "AcceptFriendApplication must still report a committed accept as done";
+
+    // SetGroupMemberToxRole publishes too, in a way that is easy to miss: its
+    // timed-mute bookkeeping persists into `save_path_ + ".timed_mutes"`, and
+    // save_path_ belongs to whoever is logged in NOW. On a stale epoch that
+    // writes this session's mute decision into the NEXT account's store, where
+    // CheckMuteExpiries would later act on it — the same class of bug as
+    // PurgeFriendIdentityState in the first batch (state that outlives the
+    // session must not be written for one that has ended). The role change
+    // itself stays a success.
+    const std::string role = SourceSection(
+        group, "void V2TIMGroupManagerImpl::SetGroupMemberToxRole(",
+        "void V2TIMGroupManagerImpl::MarkGroupMemberList(");
+    const std::size_t bookkeeping = role.find("RecordTimedMute(");
+    ASSERT_NE(bookkeeping, std::string::npos)
+        << "SetGroupMemberToxRole no longer records timed mutes; this check would "
+           "pass vacuously";
+    const std::size_t currency = role.find("session.Expired()");
+    EXPECT_NE(currency, std::string::npos)
+        << "the timed-mute store belongs to the logged-in account; writing it for "
+           "an ended session lands it in the NEXT account's store";
+    if (currency != std::string::npos) {
+        EXPECT_LT(currency, bookkeeping)
+            << "the currency check must gate the store write, not follow it";
+    }
+}
+
 }  // namespace

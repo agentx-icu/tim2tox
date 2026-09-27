@@ -18,10 +18,6 @@ V2TIMFriendshipManagerImpl::V2TIMFriendshipManagerImpl(V2TIMManagerImpl* owner) 
     V2TIM_LOG(kInfo, "V2TIMFriendshipManagerImpl initialized.");
 }
 
-ToxManager* V2TIMFriendshipManagerImpl::GetToxManager() {
-    return manager_impl_ ? manager_impl_->GetToxManager() : nullptr;
-}
-
 // Destructor
 V2TIMFriendshipManagerImpl::~V2TIMFriendshipManagerImpl() {
     if (refresh_after_accept_thread_.joinable()) {
@@ -997,17 +993,21 @@ void V2TIMFriendshipManagerImpl::DeleteFromFriendList(const V2TIMStringVector& u
 
 void V2TIMFriendshipManagerImpl::CheckFriend(const V2TIMStringVector& userIDList, V2TIMFriendType checkType, V2TIMValueCallback<V2TIMFriendCheckResultVector>* callback) { 
     V2TIM_LOG(kInfo, "CheckFriend called");
-    ToxManager* tox_manager = GetToxManager();
-    if (!tox_manager) {
-        if (callback) callback->OnError(ERR_SDK_NOT_INITIALIZED, "ToxManager not initialized");
-        return;
-    }
-    Tox* tox = tox_manager->getTox();
-    if (!tox) {
+    // Pinned for the WHOLE check: the per-user friend-number lookup and the
+    // friend-exists probe repeat over the whole list off one handle, and a
+    // concurrent UnInitSDK could tox_kill() the instance between any two of
+    // them. None of this runs inside tox_iterate, so teardown does not defer
+    // here (the CreateGroup shape).
+    const auto session = manager_impl_ ? manager_impl_->AcquireToxSession()
+                                       : V2TIMManagerImpl::ToxSessionGuard();
+    // One check replaces the old two: an empty guard means exactly "no
+    // ToxManager, or no live Tox", which is what both branches reported.
+    if (!session) {
         if (callback) callback->OnError(ERR_SDK_NOT_INITIALIZED, "Tox not initialized");
         return;
     }
-    
+    Tox* const tox = session.tox();
+
     // CRITICAL: Copy userIDList immediately to avoid lifetime issues
     std::vector<std::string> user_id_strings;  // Store C-strings safely
     try {
@@ -1093,13 +1093,19 @@ void V2TIMFriendshipManagerImpl::GetFriendApplicationList(V2TIMValueCallback<V2T
 void V2TIMFriendshipManagerImpl::AcceptFriendApplication(const V2TIMFriendApplication& application, V2TIMFriendAcceptType acceptType, V2TIMValueCallback<V2TIMFriendOperationResult>* callback) {
     V2TIM_LOG(kInfo, "[AcceptFriendApplication] ENTRY - userID length={}, userID={}", application.userID.Length(), application.userID.CString());
 
-    ToxManager* tox_manager = GetToxManager();
-    if (!tox_manager) {
-        V2TIM_LOG(kError, "[AcceptFriendApplication] ToxManager not initialized");
-        if (callback) callback->OnError(ERR_SDK_NOT_INITIALIZED, "ToxManager not initialized");
-        return;
-    }
-    Tox* tox = tox_manager->getTox();
+    // Pinned for the WHOLE accept: the key decode, the friend-exists probe,
+    // tox_friend_add_norequest and the follow-up name/status reads are a
+    // sequence a concurrent UnInitSDK could tox_kill() the instance in the
+    // middle of. None of it runs inside tox_iterate, so teardown does not defer
+    // here (the CreateGroup shape).
+    const auto session = manager_impl_ ? manager_impl_->AcquireToxSession()
+                                       : V2TIMManagerImpl::ToxSessionGuard();
+    // One check replaces the old two. It reports through the RESULT rather than
+    // OnError — the richer of the two old answers, and the one this API's
+    // callers read (`resultCode` per userID). The old
+    // "ToxManager not initialized" OnError branch is therefore gone: an empty
+    // guard means exactly "no ToxManager, or no live Tox", and the result-shaped
+    // report covers both.
     V2TIMFriendOperationResult result;
     // Normalize userID to 64-char public key for consistent identification
     std::string accept_norm_uid(application.userID.CString());
@@ -1108,14 +1114,15 @@ void V2TIMFriendshipManagerImpl::AcceptFriendApplication(const V2TIMFriendApplic
     }
     result.userID = V2TIMString(accept_norm_uid.c_str());
 
-    if (!tox) {
+    if (!session) {
         V2TIM_LOG(kError, "[AcceptFriendApplication] Tox not initialized");
         result.resultCode = ERR_SDK_NOT_INITIALIZED;
         result.resultInfo = "Tox not initialized";
         if (callback) callback->OnSuccess(result);
         return;
     }
-    
+    Tox* const tox = session.tox();
+
     // Use the NORMALIZED 64-char public key (accept_norm_uid), not the raw
     // userID: a full Tox ID is 76 hex chars (32-byte pubkey + nospam + checksum)
     // and tox_hex_to_bytes into a TOX_PUBLIC_KEY_SIZE (32-byte) buffer requires
@@ -1148,6 +1155,19 @@ void V2TIMFriendshipManagerImpl::AcceptFriendApplication(const V2TIMFriendApplic
         result.resultInfo = "Friend added successfully";
         V2TIM_LOG(kInfo, "[AcceptFriendApplication] Success: Friend added");
 
+        // A logout landed mid-accept: the pin kept the instance valid, but this
+        // friend belongs to a session that is over, so nothing session-scoped may
+        // be published for it (listeners, the profile save and the conversation
+        // cache all belong to the account that just left; the cache would be
+        // rebuilt for the NEXT one). This does NOT make the accept a failure —
+        // tox_friend_add_norequest succeeded and UnInitSDK's own save quiesces
+        // against the pin this call holds, so the friend is in the profile it
+        // writes. Reporting an error here would invite a retry (AddFriend's rule).
+        if (session.Expired()) {
+            V2TIM_LOG(kWarning, "[AcceptFriendApplication] the session ended during the accept; the "
+                                "friend was added and is reported as added, but nothing was "
+                                "published for this session");
+        } else {
         // Save Tox profile to disk so the accepted friend persists
         if (manager_impl_) manager_impl_->SaveToxProfile();
 
@@ -1170,6 +1190,16 @@ void V2TIMFriendshipManagerImpl::AcceptFriendApplication(const V2TIMFriendApplic
         V2TIMStringVector deleted_ids;
         deleted_ids.PushBack(V2TIMString(accept_norm_uid.c_str()));
         NotifyFriendApplicationListDeleted(deleted_ids);
+        // RE-CHECKED after the notifications, not only before them: the listeners
+        // above run SYNCHRONOUSLY on this thread and one of them may log out — and
+        // log back in — inside the callback, which the pin does not prevent (a save
+        // excludes its own thread's pin from the drain). Without this second check
+        // the refresher below would rebuild the NEXT session's conversation cache
+        // off this session's accept (AddFriend's rule).
+        if (session.Expired()) {
+            V2TIM_LOG(kWarning, "[AcceptFriendApplication] a listener ended the session during the "
+                                "notification; skipping the conversation-cache refresh");
+        } else {
         // OPTIMIZATION: Refresh conversation cache asynchronously without blocking
         // The debounce mechanism in RefreshConversationCache will prevent excessive refreshes
         // if multiple friend applications are accepted in quick succession
@@ -1184,13 +1214,21 @@ void V2TIMFriendshipManagerImpl::AcceptFriendApplication(const V2TIMFriendApplic
                 if (cm) static_cast<V2TIMConversationManagerImpl*>(cm)->RefreshCache();
             }
         });
+        }
+        }
     } else {
         V2TIM_LOG(kInfo, "[AcceptFriendApplication] Error case: err_add={}", err_add);
         if (err_add == TOX_ERR_FRIEND_ADD_ALREADY_SENT || err_add == TOX_ERR_FRIEND_ADD_SET_NEW_NOSPAM) {
             result.resultCode = 0;
             result.resultInfo = "Friend already added";
             V2TIM_LOG(kInfo, "[AcceptFriendApplication] Treated as success: Friend already added (err: {})", err_add);
-            
+
+            // Same rule as the OK branch: still a success to report, but the
+            // listeners belong to the session that has ended.
+            if (session.Expired()) {
+                V2TIM_LOG(kWarning, "[AcceptFriendApplication] the session ended before the "
+                                    "already-added notification; publishing nothing for it");
+            } else {
             // Still notify OnFriendListAdded to ensure UI is updated
             // Normalize to 64-char public key (see AddFriend for explanation)
             V2TIMFriendInfo friendInfo;
@@ -1206,6 +1244,7 @@ void V2TIMFriendshipManagerImpl::AcceptFriendApplication(const V2TIMFriendApplic
             V2TIMStringVector deleted_ids;
             deleted_ids.PushBack(application.userID);
             NotifyFriendApplicationListDeleted(deleted_ids);
+            }
         } else if (err_add == TOX_ERR_FRIEND_ADD_OWN_KEY) {
             result.resultCode = ERR_SDK_FRIEND_ADD_SELF;
             result.resultInfo = "Cannot add yourself as friend";
