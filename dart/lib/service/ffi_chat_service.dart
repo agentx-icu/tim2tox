@@ -8307,7 +8307,17 @@ class FfiChatService {
 
   String _detectKind(String path) {
     final p = path.toLowerCase();
-    const img = ['.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp', '.heic'];
+    // .heif is the other extension HEIF stills use (e.g. macOS exports).
+    const img = [
+      '.png',
+      '.jpg',
+      '.jpeg',
+      '.gif',
+      '.webp',
+      '.bmp',
+      '.heic',
+      '.heif',
+    ];
     // P2-1: previously missed common Windows/legacy mobile container
     // formats; UIKit was rendering these as generic file attachments.
     const vid = [
