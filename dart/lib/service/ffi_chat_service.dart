@@ -10298,6 +10298,34 @@ class FfiChatService {
     }
   }
 
+  /// Rows whose live reader tally can no longer be an EXACT count of readers.
+  ///
+  /// A row reloaded as already `isRead` carries a read fact whose READERS were
+  /// never persisted (see [isGroupRowReadByAnyMember]). Once such a row starts
+  /// a fresh tally, that tally is missing whoever read it before the restart,
+  /// so deriving "unread = members - 1 - readers" from it would state a number
+  /// nobody knows.
+  ///
+  /// A marker lives and dies with its row's [_messageReaders] entry — see
+  /// [_capReaderTally], which is the ONLY thing that bounds this set. Capping it
+  /// independently would let a marker be evicted while its reader entry
+  /// survived, and the partial tally would then be reported as exact (codex).
+  final Set<String> _readerTallyPartlyUnknown = <String>{};
+
+  /// Cap the reader tally, keeping [_readerTallyPartlyUnknown] aligned with it.
+  /// Pruning only runs when an eviction actually happened, so the common receipt
+  /// costs nothing extra.
+  void _capReaderTally() {
+    final before = _messageReaders.length;
+    _capReceiptTally(_messageReaders);
+    if (_messageReaders.length == before ||
+        _readerTallyPartlyUnknown.isEmpty) {
+      return;
+    }
+    _readerTallyPartlyUnknown
+        .removeWhere((key) => !_messageReaders.containsKey(key));
+  }
+
   Future<void> _handleReceipt(
       String msgID, String receiptType, String sender, String? groupID) async {
     // For group messages, track receivers and readers. Guard against the
@@ -10323,12 +10351,21 @@ class FfiChatService {
         _capReceiptTally(_messageReceivers);
       }
       if (receiptType == 'read') {
+        // A row that is ALREADY read while its tally is still empty was read in
+        // a previous session, by members whose identities were never stored.
+        // The tally starting now can therefore never be complete — remember
+        // that before adding to it, so the exact-count claim dies with the
+        // restart rather than being rebuilt from a partial set.
+        if (!_messageReaders.containsKey(tallyKey) &&
+            (_ownGroupRowFor(tallyKey, groupID: groupID)?.isRead ?? false)) {
+          _readerTallyPartlyUnknown.add(tallyKey);
+        }
         // Idempotent: a replayed READ from a reader already counted changes
         // nothing, so it must not re-fire the live read-receipt event.
         final newReader = _messageReaders
             .putIfAbsent(tallyKey, () => <String>{})
             .add(sender);
-        _capReceiptTally(_messageReaders);
+        _capReaderTally();
         if (newReader) {
           _receiptEventsCtrl.add((
             msgID: tallyKey,
@@ -10411,10 +10448,96 @@ class FfiChatService {
   }
 
   /// Members that sent a READ receipt for a group message (excludes self).
-  /// In-memory tally: counts reset on restart — receipts are re-tallied from
-  /// live traffic, not persisted. See getMessageReadReceipts on the platform.
+  /// In-memory tally: the reader KEYS reset on restart — they are re-tallied
+  /// from live traffic and never persisted (see
+  /// [isGroupRowReadByAnyMember] for the part that does survive).
   List<String> getMessageReaders(String msgID) {
     return _messageReaders[msgID]?.toList() ?? [];
+  }
+
+  /// Whether the PERSISTED row for [msgID] already records that at least one
+  /// group member READ it — the half of the tally that survives a restart.
+  ///
+  /// [getMessageReaders] is a live tally keyed by reader identity and starts
+  /// empty on every launch, so it cannot answer for a message that was read in
+  /// a previous session. The FACT that somebody read it does survive: a group
+  /// READ receipt flips `isRead` (and a `received` one `isReceived`) on the
+  /// AUTHOR's own row in [_handleReceipt] and saves it, exactly as the C2C path
+  /// does, and "at least one member read this" is precisely what the group tick
+  /// renders. So a reloaded row can report read again without the tally.
+  ///
+  /// The reader IDENTITIES are deliberately NOT persisted, and must not be: a
+  /// member's per-group public key rotates per group, so a stored reader set
+  /// would de-anonymize who read what across restarts. It would also be a
+  /// second, unbounded copy of a tally [_capReceiptTally] exists to bound.
+  /// There is therefore no exact read COUNT to restore — only the boolean.
+  ///
+  /// Alias-aware and self-only, like [_localGroupRowId]: a group row is
+  /// reachable through its local id or the cross-peer `gmid:` alias, and only
+  /// our OWN rows ever carry a reader tally.
+  bool isGroupRowReadByAnyMember(String msgID, {String? groupID}) {
+    final row = _ownGroupRowFor(msgID, groupID: groupID);
+    return row != null && row.isRead;
+  }
+
+  /// The group read tally for [msgID] as the platform reports it: the number of
+  /// readers we can honestly claim, and whether that number is an EXACT count
+  /// of the members who read (as opposed to a floor).
+  ///
+  /// Exact when the whole tally was built in this session — that is the only
+  /// case where "unread = members - 1 - readCount" is a fact rather than a
+  /// guess. A row whose read state came back from disk contributes readers
+  /// whose identities were never stored ([isGroupRowReadByAnyMember]), so it
+  /// reports the floor of 1 and stays inexact even once live receipts start
+  /// arriving again ([_readerTallyPartlyUnknown]).
+  ({int readCount, bool exactCount}) groupRowReadTally(String msgID,
+      {String? groupID}) {
+    final live = _messageReaders[msgID]?.length ?? 0;
+    if (live == 0) {
+      // Either nobody has read it — an exact zero — or the fact was restored
+      // and only the boolean survived, which makes 1 a lower bound.
+      final restored = isGroupRowReadByAnyMember(msgID, groupID: groupID);
+      return (readCount: restored ? 1 : 0, exactCount: !restored);
+    }
+    return (
+      readCount: live,
+      exactCount: !_readerTallyPartlyUnknown.contains(msgID),
+    );
+  }
+
+  /// The author's own group row [msgID] resolves to (primary id or `gmid:`
+  /// alias), or null. Scoped to [groupID]'s history when it is known; the
+  /// fallback scan is restricted to GROUP rows so a C2C row can never answer a
+  /// group question.
+  ChatMessage? _ownGroupRowFor(String msgID, {String? groupID}) {
+    if (msgID.isEmpty) return null;
+    Iterable<List<ChatMessage>> buckets;
+    if (groupID != null && groupID.isNotEmpty) {
+      final list = _historyById[ConversationIdUtils.normalize(groupID)] ??
+          _historyById[groupID];
+      if (list == null) return null;
+      buckets = [list];
+    } else {
+      buckets = _historyById.values;
+    }
+    for (final bucket in buckets) {
+      for (final msg in bucket) {
+        if (!msg.isSelf) continue;
+        if (msg.groupId == null) continue;
+        if (msg.msgID == msgID || msg.altMsgIds.contains(msgID)) return msg;
+      }
+    }
+    return null;
+  }
+
+  /// TEST-ONLY: drop the in-memory receipt tallies, leaving the persisted row
+  /// flags alone — i.e. put this service in exactly the state a restart
+  /// produces (the maps are rebuilt from live traffic only). Lets a scenario
+  /// assert the reload behaviour without tearing the shared service down.
+  void debugClearReceiptTalliesForTest() {
+    _messageReceivers.clear();
+    _messageReaders.clear();
+    _readerTallyPartlyUnknown.clear();
   }
 
   // Get list of users who received a group message
@@ -12707,6 +12830,7 @@ class FfiChatService {
     _receivedAvatarHashes.clear();
     _messageReceivers.clear();
     _messageReaders.clear();
+    _readerTallyPartlyUnknown.clear();
     // Receipt bookkeeping is ACCOUNT state: carrying the parked group receipts
     // (or the "already receipted this row" claims) into the next account would
     // aim them at the wrong identity's groups. The durable half stays on disk

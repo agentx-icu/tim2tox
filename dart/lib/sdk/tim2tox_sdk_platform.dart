@@ -8517,7 +8517,9 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
       };
       // Counts come from the live read-receipt tally (see
       // FfiChatService.getMessageReaders): in-memory, rebuilt from traffic,
-      // deliberately not persisted.
+      // never persisted by reader identity. A row whose readers were tallied
+      // in a PREVIOUS session falls back to the persisted read FACT on the row
+      // (FfiChatService.groupRowReadTally) — see below.
       final memberCountByGroup = <String, int>{};
       for (final msgID in ids) {
         final msg = byId[msgID];
@@ -8540,10 +8542,23 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
           }
           memberCountByGroup[gid] = total;
         }
-        final readCount = ffiService.getMessageReaders(msgID).length;
+        // RESTART: the live tally starts empty every launch, so a message a
+        // member read in a previous session had no readers here and the group
+        // tick vanished on reload while the C2C one survived. The read FACT is
+        // persisted on the author's own row (isRead, flipped and saved by
+        // FfiChatService._handleReceipt exactly as for C2C), and the group tick
+        // renders nothing finer than "at least one member read it", so such a
+        // row reports the honest lower bound of 1 rather than a made up reader
+        // count. Reader identities are NOT persisted (per-group member keys
+        // rotate), so a restored row has no exact count to report — and never
+        // regains one this session, even once live receipts arrive again.
+        final tally = ffiService.groupRowReadTally(msgID, groupID: gid);
+        final readCount = tally.readCount;
         // Unknown membership (failed/empty lookup) -> unreadCount stays null
-        // rather than inventing a zero; readCount alone is still truthful.
-        final int? unread = total > 0
+        // rather than inventing a zero; readCount alone is still truthful. An
+        // inexact readCount is the same situation: unread stays UNKNOWN instead
+        // of being derived from a floor.
+        final int? unread = tally.exactCount && total > 0
             ? ((total - 1 - readCount) < 0 ? 0 : total - 1 - readCount)
             : null;
         receipts.add(
