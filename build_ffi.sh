@@ -44,8 +44,16 @@ else
     # Get library modification time
     LIB_TIME=$(stat -f "%m" "$LIB_FILE" 2>/dev/null || stat -c "%Y" "$LIB_FILE" 2>/dev/null)
     
-    # Check FFI source files
-    for file in "$FFI_SOURCE_DIR"/*.cpp "$FFI_SOURCE_DIR"/*.h "$FFI_SOURCE_DIR"/*.hpp; do
+    # Check FFI source files, the CORE sources and the ROOT CMakeLists.
+    #
+    # source/ and the root CMakeLists.txt were missing here, and that is not a
+    # cosmetic gap: the option that gates the MM-6 crafted-challenge primitive
+    # lives in the root CMakeLists and the primitive itself in source/, so a
+    # change to either left an existing library looking current and a stale one
+    # — still carrying the primitive — got reused (codex 2026-09-27).
+    for file in "$FFI_SOURCE_DIR"/*.cpp "$FFI_SOURCE_DIR"/*.h "$FFI_SOURCE_DIR"/*.hpp \
+                "$SCRIPT_DIR/source"/*.cpp "$SCRIPT_DIR/source"/*.h \
+                "$SCRIPT_DIR/CMakeLists.txt"; do
         if [[ -f "$file" ]]; then
             FILE_TIME=$(stat -f "%m" "$file" 2>/dev/null || stat -c "%Y" "$file" 2>/dev/null)
             if [[ $FILE_TIME -gt $LIB_TIME ]]; then

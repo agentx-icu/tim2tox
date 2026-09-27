@@ -32,6 +32,7 @@ import 'package:tencent_cloud_chat_sdk/enum/group_add_opt_enum.dart';
 import 'package:tencent_cloud_chat_sdk/tencent_cloud_chat_sdk_platform_interface.dart';
 import 'package:tim2tox_dart/models/chat_message.dart';
 import 'package:tim2tox_dart/sdk/tim2tox_sdk_platform.dart';
+import 'package:tim2tox_dart/utils/message_history_persistence.dart';
 import '../test_helper.dart';
 import '../test_fixtures.dart';
 
@@ -1358,5 +1359,164 @@ void main() {
           reason: 'a second open must cost nothing: every row of the window '
               'was already reported once');
     }, timeout: const Timeout(Duration(seconds: 150)));
+
+    // THE RESTART LEG. A C2C read tick survives a relaunch because the receipt
+    // flips `isRead` on the row and the row is persisted. The GROUP tick used to
+    // vanish: `Tim2ToxSdkPlatform.getMessageReadReceipts` derived readCount
+    // purely from `getMessageReaders`, a live tally keyed by READER IDENTITY
+    // that starts empty on every launch. So a user who saw "read" on their own
+    // group message, restarted, and reopened the conversation saw it unread
+    // again.
+    //
+    // The fact that somebody read it IS persisted, on the author's own row and
+    // through the same flags C2C uses. The reader identities are NOT, and must
+    // not be: a member's per-group key rotates, so a stored reader set would
+    // de-anonymize who read what across restarts. So only the boolean comes
+    // back, and "at least one member read it" is exactly what the group tick
+    // renders.
+    //
+    // LAST in this group on purpose: it closes and reopens the SHARED history
+    // store, which is the only honest way to prove the flag came off disk.
+    test('the group read tick survives a history-store restart', () async {
+      final platform =
+          TencentCloudChatSdkPlatform.instance as Tim2ToxSdkPlatform;
+      final svc = platform.ffiService;
+      svc.debugSetSelfId(founder.getToxId().substring(0, 64));
+      svc.debugAddKnownGroupForTest(groupId!);
+
+      final probe = 'restart tick probe ${DateTime.now().microsecondsSinceEpoch}';
+      final authored = await founder.runWithInstanceAsync(
+          () => svc.sendGroupTextWithResult(groupId!, probe));
+      final localId = authored.msgID!;
+      final alias = authored.altMsgIds
+          .firstWhere((id) => id.startsWith('gmid:'), orElse: () => '');
+      expect(alias, isNotEmpty,
+          reason: 'the author row must carry the cross-peer alias — it is the '
+              'only id a receipt can reference, and the id the reload has to '
+              'be able to find');
+
+      // A member reads it. Injected at the ingest seam (same shape the native
+      // group ACTION line delivers, same technique as the second reader in the
+      // parity leg above) so this leg does not depend on a second peer's copy
+      // of the row surviving the shared-harness dedup.
+      final member2Pk = member2.getToxId().substring(0, 64);
+      // In the FOUNDER's instance context (codex): applying a receipt runs the
+      // pending-receipt flush and its account-scope lookup synchronously off
+      // the CURRENT native instance, so ingesting outside it would touch
+      // another node's queue.
+      expect(
+        founder.runWithInstance(
+          () => svc.ingestActionEvent(
+            'gaction:$groupId|$member2Pk:${jsonEncode({
+                  'type': 'receipt',
+                  'msgID': alias,
+                  'receiptType': 'read',
+                  'sender': member2Pk,
+                })}',
+          ),
+        ),
+        isTrue,
+        reason: 'a receipt is consumed as a control, never rendered',
+      );
+      await waitUntilWithVirtualPump(
+        scenario,
+        () => svc.getMessageReaders(localId).isNotEmpty,
+        timeout: const Duration(seconds: 30),
+        description: 'the READ receipt lands on the author row',
+        advanceMs: 100,
+        iterationsPerInstance: 2,
+      );
+      expect(
+        svc.getHistory(groupId!).firstWhere((m) => m.msgID == localId).isRead,
+        isTrue,
+        reason: 'the receipt must flip the row flag, exactly as C2C does — '
+            'that flag IS the persisted half of the tally',
+      );
+
+      // The restart: close the store (which flushes what it owes) and reopen a
+      // session on the same identity, so everything read back came off disk.
+      final MessageHistoryPersistence store = svc.messageHistoryPersistence;
+      final owner = (await store.defaultHistoryDirectoryStatus())?.sessionOwner;
+      await store.flushPendingSaves();
+      await store.dispose();
+      expect(store.getHistory(groupId!), isEmpty,
+          reason: 'a closed store keeps nothing in memory; anything found '
+              'after this came from the file');
+      await store.openSession(ownerKey: owner);
+      final reloaded = await store.loadHistory(groupId!);
+      final restoredRow =
+          reloaded.where((m) => m.msgID == localId).toList().single;
+      expect(restoredRow.isSelf, isTrue);
+      expect(restoredRow.isRead, isTrue,
+          reason: "the tick's underlying flag must survive the restart");
+      expect(restoredRow.altMsgIds, contains(alias),
+          reason: 'and the row must still be findable by the alias a later '
+              'receipt would carry');
+
+      // A real relaunch also loses the live tally: that is the state the tick
+      // used to be rendered from, and the whole reason it disappeared.
+      svc.debugClearReceiptTalliesForTest();
+      expect(svc.getMessageReaders(localId), isEmpty);
+      expect(svc.isGroupRowReadByAnyMember(localId, groupID: groupId), isTrue,
+          reason: 'the persisted fact answers where the tally cannot');
+
+      final receipts = await founder.runWithInstanceAsync(
+          () => platform.getMessageReadReceipts(messageIDList: [localId]));
+      expect(receipts.code, equals(0), reason: receipts.desc ?? '');
+      final receipt = (receipts.data ?? const [])
+          .where((r) => r.msgID == localId)
+          .toList()
+          .single;
+      // ignore: avoid_print
+      print('[restart-tick] readCount=${receipt.readCount} '
+          'unread=${receipt.unreadCount}');
+      expect(receipt.readCount ?? 0, greaterThanOrEqualTo(1),
+          reason: 'the fork renders the group tick from readCount > 0, so a '
+              'restored row must report at least one reader');
+      expect(receipt.unreadCount, isNull,
+          reason: 'only the boolean was restored: there is no exact count, so '
+              'unread must stay unknown rather than be derived from a floor');
+
+      // And the count must NOT become falsely precise again once live receipts
+      // resume (codex): a tally rebuilt after a restart is still missing
+      // whoever read the row before it, so "members - 1 - readers" remains a
+      // guess no matter how many fresh receipts arrive.
+      final member1Pk = member1.getToxId().substring(0, 64);
+      expect(
+        founder.runWithInstance(
+          () => svc.ingestActionEvent(
+            'gaction:$groupId|$member1Pk:${jsonEncode({
+                  'type': 'receipt',
+                  'msgID': alias,
+                  'receiptType': 'read',
+                  'sender': member1Pk,
+                })}',
+          ),
+        ),
+        isTrue,
+      );
+      await waitUntilWithVirtualPump(
+        scenario,
+        () => svc.getMessageReaders(localId).isNotEmpty,
+        timeout: const Duration(seconds: 30),
+        description: 'the post-restart receipt rebuilds a partial tally',
+        advanceMs: 100,
+        iterationsPerInstance: 2,
+      );
+      final relive = await founder.runWithInstanceAsync(
+          () => platform.getMessageReadReceipts(messageIDList: [localId]));
+      expect(relive.code, equals(0), reason: relive.desc ?? '');
+      final receiptAgain = (relive.data ?? const [])
+          .where((r) => r.msgID == localId)
+          .toList()
+          .single;
+      // ignore: avoid_print
+      print('[restart-tick] relive readCount=${receiptAgain.readCount} '
+          'unread=${receiptAgain.unreadCount}');
+      expect(receiptAgain.readCount ?? 0, greaterThanOrEqualTo(1));
+      expect(receiptAgain.unreadCount, isNull,
+          reason: 'the identities lost at restart stay lost: the rebuilt tally '
+              'must not be presented as an exact count');
+    }, timeout: const Timeout(Duration(seconds: 180)));
   });
 }
