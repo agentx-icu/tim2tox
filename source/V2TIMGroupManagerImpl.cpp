@@ -84,16 +84,17 @@ static ToxManager* GetToxManagerFromImpl(V2TIMManagerImpl* manager_impl) {
 // Takes the group NUMBER rather than the id: `group_id_to_group_number_` is
 // private to V2TIMManagerImpl and only its friends (the member functions of
 // this class) may look it up, so the caller resolves it.
-static std::string GetLiveGroupName(V2TIMManagerImpl* manager_impl,
+// Takes the caller's PINNED Tox* rather than re-fetching one: the two tox_*()
+// calls below (size query, then read) are a sequence, and a concurrent
+// UnInitSDK that tox_kill()s the instance between them is a use-after-free.
+// The caller holds the pin for the whole helper (codex 2026-09-24's shape).
+static std::string GetLiveGroupName(Tox* tox,
                                     Tox_Group_Number group_number) {
-    ToxManager* tox_manager = GetToxManagerFromImpl(manager_impl);
-    if (!tox_manager) return std::string();
+    if (!tox) return std::string();
     // Call toxcore directly instead of ToxManager::getGroupName: that wrapper
     // takes ToxManager's mutex, which this call path can already hold, and the
     // search then deadlocks (observed: searchGroups never returned). Every
-    // other tox_* use in this file goes through the raw handle the same way.
-    Tox* tox = tox_manager->getTox();
-    if (!tox) return std::string();
+    // other tox_* use in this file goes through the pinned handle the same way.
     if (IsConferenceMapKey(group_number)) {
         // A legacy conference's shared name is its title.
         const uint32_t conference_number = ConferenceNumberFromKey(group_number);
@@ -148,13 +149,29 @@ void V2TIMGroupManagerImpl::CreateGroup(const V2TIMGroupInfo& info,
         return;
     }
 
-    Tox* tox = GetToxManagerFromImpl(manager_impl_)->getTox();
+    // Pinned for the WHOLE create. tox_group_new, the chat-id read, the owner
+    // lookup and the manual HandleGroupSelfJoin at the end each re-fetched a
+    // raw ToxManager*/Tox* that a concurrent UnInitSDK could already have
+    // freed, and none of it runs inside tox_iterate, so teardown does not
+    // defer here (codex 2026-09-24). One pin covers all of them.
+    V2TIMManagerImpl* const impl = manager_impl_;
+    const auto session = impl ? impl->AcquireToxSession()
+                              : V2TIMManagerImpl::ToxSessionGuard();
+    // The default-instance fallback is ONLY for the (test-only) impl == nullptr
+    // shape. With a real impl, an empty guard means there is no live session,
+    // and falling back to an unpinned manager there handed the whole create a
+    // pointer a concurrent InitSDK/UnInitSDK could invalidate (codex
+    // 2026-09-26) — refuse instead.
+    ToxManager* const tox_manager =
+        session ? session.manager() : (impl ? nullptr : GetToxManagerFromImpl(nullptr));
+    // The pinned handle when there is one: getTox() is a raw re-fetch.
+    Tox* tox = session ? session.tox() : (tox_manager ? tox_manager->getTox() : nullptr);
     if (!tox) {
         V2TIM_LOG(kError, "CreateGroup: Tox not initialized");
         callback->OnError(ERR_SDK_NOT_INITIALIZED, "Tox not initialized");
         return;
     }
-    
+
     // Determine final Group ID
     V2TIMString finalGroupID = info.groupID;
     if (finalGroupID.Empty()) {
@@ -179,7 +196,7 @@ void V2TIMGroupManagerImpl::CreateGroup(const V2TIMGroupInfo& info,
     }
     
     // Get self name for creating group
-    std::string self_name = GetToxManagerFromImpl(manager_impl_)->getName();
+    std::string self_name = tox_manager->getName();
     if (self_name.empty()) {
         self_name = "User";
     }
@@ -235,7 +252,7 @@ void V2TIMGroupManagerImpl::CreateGroup(const V2TIMGroupInfo& info,
         }
         
         Tox_Err_Group_New err_new;
-        Tox_Group_Number group_number = GetToxManagerFromImpl(manager_impl_)->createGroup(
+        Tox_Group_Number group_number = tox_manager->createGroup(
             privacy_state,
             reinterpret_cast<const uint8_t*>(group_name.c_str()), group_name.length(),
             reinterpret_cast<const uint8_t*>(self_name.c_str()), self_name.length(),
@@ -283,8 +300,7 @@ void V2TIMGroupManagerImpl::CreateGroup(const V2TIMGroupInfo& info,
             
             // Check connection status for network-related errors
             if (err_new == TOX_ERR_GROUP_NEW_ANNOUNCE || err_new == TOX_ERR_GROUP_NEW_INIT) {
-                Tox* tox = GetToxManagerFromImpl(manager_impl_)->getTox();
-                if (tox) {
+                {
                     TOX_CONNECTION connection = tox_self_get_connection_status(tox);
                     V2TIM_LOG(kError, "CreateGroup: Tox connection status: {} (0=NONE, 1=UDP, 2=TCP)", static_cast<int>(connection));
                     if (connection == TOX_CONNECTION_NONE) {
@@ -302,7 +318,7 @@ void V2TIMGroupManagerImpl::CreateGroup(const V2TIMGroupInfo& info,
         // Get chat_id for persistent storage (only for group type)
         uint8_t chat_id[TOX_GROUP_CHAT_ID_SIZE];
         Tox_Err_Group_State_Query err_chat_id;
-        if (!GetToxManagerFromImpl(manager_impl_)->getGroupChatId(group_number, chat_id, &err_chat_id) ||
+        if (!tox_manager->getGroupChatId(group_number, chat_id, &err_chat_id) ||
             err_chat_id != TOX_ERR_GROUP_STATE_QUERY_OK) {
             V2TIM_LOG(kError, "CreateGroup: Failed to get chat_id");
             // Still continue, but chat_id won't be stored
@@ -351,14 +367,11 @@ void V2TIMGroupManagerImpl::CreateGroup(const V2TIMGroupInfo& info,
         }
         // Store creator as owner - needed for conference groups which lack role APIs
         {
-            Tox* tox = GetToxManagerFromImpl(manager_impl_)->getTox();
-            if (tox) {
-                uint8_t self_pubkey[TOX_PUBLIC_KEY_SIZE];
-                tox_self_get_public_key(tox, self_pubkey);
-                std::string self_hex = ToxUtil::tox_bytes_to_hex(self_pubkey, TOX_PUBLIC_KEY_SIZE);
-                groupInfo.owner = V2TIMString(self_hex.c_str());
-                groupInfo.role = V2TIM_GROUP_MEMBER_ROLE_SUPER; // Creator is owner
-            }
+            uint8_t self_pubkey[TOX_PUBLIC_KEY_SIZE];
+            tox_self_get_public_key(tox, self_pubkey);
+            std::string self_hex = ToxUtil::tox_bytes_to_hex(self_pubkey, TOX_PUBLIC_KEY_SIZE);
+            groupInfo.owner = V2TIMString(self_hex.c_str());
+            groupInfo.role = V2TIM_GROUP_MEMBER_ROLE_SUPER; // Creator is owner
         }
         group_info_[finalGroupID.CString()] = groupInfo;
         // Get the number (group_number or conference_number) from mapping
@@ -393,7 +406,12 @@ void V2TIMGroupManagerImpl::CreateGroup(const V2TIMGroupInfo& info,
             }
         }
         
-        if (group_number != UINT32_MAX) {
+        if (group_number != UINT32_MAX && session && session.Expired()) {
+            // A logout landed mid-create: the pin kept the instance valid, but
+            // this group belongs to a session that is over. Publishing a join
+            // for it would stamp the next account's instance id.
+            V2TIM_LOG(kWarning, "CreateGroup: session ended before HandleGroupSelfJoin; skipping the manual self-join");
+        } else if (group_number != UINT32_MAX) {
             V2TIM_LOG(kInfo, "[V2TIMGroupManagerImpl::CreateGroup] Manually calling HandleGroupSelfJoin(group_number={}) to trigger OnGroupCreated", group_number);
             manager_impl_->HandleGroupSelfJoin(group_number);
             V2TIM_LOG(kInfo, "[tim2tox-debug] V2TIMGroupManagerImpl::CreateGroup: HandleGroupSelfJoin completed");
@@ -402,6 +420,24 @@ void V2TIMGroupManagerImpl::CreateGroup(const V2TIMGroupInfo& info,
         }
     }
     
+    // A session that ended mid-create does NOT make this a failure: the group
+    // exists in Tox and in the profile the logout saves, and answering OnError
+    // invites a retry that creates a SECOND group with the same name and
+    // replaces its mapping (codex 2026-09-26). Only the session-scoped
+    // publication is skipped (above); the create itself is reported as what it
+    // is — done.
+    //
+    // The durability that claim rests on: UnInitSDK's save quiesces against the
+    // pin THIS create holds (ToxManager::getSaveData), with the longer
+    // final-save budget, so it cannot write a profile that predates the group
+    // while the create is still running. If even that save fails it logs an
+    // error of its own — a session-wide loss, not something this create can
+    // report better than the log does.
+    if (session && session.Expired()) {
+        V2TIM_LOG(kWarning,
+                  "CreateGroup: the session ended during the create; the group exists and is "
+                  "reported as created, but nothing was published for this session");
+    }
     // [tim2tox-debug] Record callback trigger for V2TIMGroupManagerImpl::CreateGroup
     V2TIM_LOG(kInfo, "[tim2tox-debug] V2TIMGroupManagerImpl::CreateGroup: Triggering callback->OnSuccess with groupID={}", 
              finalGroupID.CString());
@@ -596,7 +632,38 @@ void V2TIMGroupManagerImpl::GetGroupsInfo(const V2TIMStringVector& groupIDList,
 
 void V2TIMGroupManagerImpl::QuitGroup(const V2TIMString& groupID, V2TIMCallback* callback) {
     V2TIM_LOG(kInfo, "V2TIMGroupManagerImpl::QuitGroup: ENTRY - groupID={}", groupID.CString());
-    
+
+    // Pinned for the WHOLE quit. The recovery lookups (getConferenceById,
+    // getConferenceType, getGroupByChatId) and the leave itself each re-fetched
+    // a raw ToxManager*/Tox* that a concurrent UnInitSDK could already have
+    // freed, and none of it runs inside tox_iterate, so teardown does not defer
+    // here. One pin covers all of them.
+    V2TIMManagerImpl* const impl = manager_impl_;
+    const auto session = impl ? impl->AcquireToxSession()
+                              : V2TIMManagerImpl::ToxSessionGuard();
+    // The default-instance fallback is ONLY for the (test-only) impl == nullptr
+    // shape. With a real impl, an empty guard means there is no live session,
+    // and reaching for an unpinned manager there would hand the whole quit a
+    // pointer a concurrent InitSDK/UnInitSDK can invalidate — refuse instead.
+    ToxManager* const tox_manager =
+        session ? session.manager() : (impl ? nullptr : GetToxManagerFromImpl(nullptr));
+    // The pinned handle when there is one: getTox() is a raw re-fetch.
+    Tox* const tox = session ? session.tox() : (tox_manager ? tox_manager->getTox() : nullptr);
+    // DELIBERATE precedence change (codex 2026-09-26): this check used to sit
+    // AFTER the "Group number not found" return, so quitting an unknown group
+    // with no live Tox answered ERR_INVALID_PARAMETERS. It has to come first
+    // now, because the recovery lookups below (getConferenceById /
+    // getGroupByChatId) call into Tox — running them without a live instance is
+    // the use-after-free this pin exists to remove. An unknown group on a dead
+    // SDK is an uninitialized-SDK failure, which is also the truer answer.
+    if (!tox) {
+        V2TIM_LOG(kError, "V2TIMGroupManagerImpl::QuitGroup: Tox instance not available");
+        if (callback) {
+            callback->OnError(ERR_SDK_NOT_INITIALIZED, "Tox not initialized");
+        }
+        return;
+    }
+
     // Get group_number from groupID
     Tox_Group_Number group_number = UINT32_MAX;
     if (manager_impl_) {
@@ -661,8 +728,6 @@ void V2TIMGroupManagerImpl::QuitGroup(const V2TIMString& groupID, V2TIMCallback*
                         stored_chat_id, identity_length, conference_id,
                         TOX_CONFERENCE_ID_SIZE)) {
                     Tox_Err_Conference_By_Id lookup_error;
-                    ToxManager* tox_manager =
-                        GetToxManagerFromImpl(manager_impl_);
                     const Tox_Conference_Number conference_number =
                         tox_manager->getConferenceById(conference_id,
                                                        &lookup_error);
@@ -688,8 +753,7 @@ void V2TIMGroupManagerImpl::QuitGroup(const V2TIMString& groupID, V2TIMCallback*
                 if (hexStringToChatId(std::string(stored_chat_id),
                                       target_chat_id)) {
                     matched_group_number =
-                        GetToxManagerFromImpl(manager_impl_)
-                            ->getGroupByChatId(target_chat_id);
+                        tox_manager->getGroupByChatId(target_chat_id);
                 }
             }
 
@@ -718,16 +782,6 @@ void V2TIMGroupManagerImpl::QuitGroup(const V2TIMString& groupID, V2TIMCallback*
         }
         return;
     }
-
-    Tox* tox = GetToxManagerFromImpl(manager_impl_)->getTox();
-    if (!tox) {
-        V2TIM_LOG(kError, "V2TIMGroupManagerImpl::QuitGroup: Tox instance not available");
-        if (callback) {
-            callback->OnError(ERR_SDK_NOT_INITIALIZED, "Tox not initialized");
-        }
-        return;
-    }
-
 
     // The map key decides the kind (see ConferenceMapKey); the stored type
     // label only distinguishes text from AV. A stale label must never send a
@@ -758,7 +812,7 @@ void V2TIMGroupManagerImpl::QuitGroup(const V2TIMString& groupID, V2TIMCallback*
     } else {
         V2TIM_LOG(kInfo, "V2TIMGroupManagerImpl::QuitGroup: Calling ToxManager::deleteGroup for group_number={}", group_number);
         Tox_Err_Group_Leave error;
-        deleted = GetToxManagerFromImpl(manager_impl_)->deleteGroup(group_number, &error);
+        deleted = tox_manager->deleteGroup(group_number, &error);
         if (!deleted) {
             V2TIM_LOG(kWarning, "V2TIMGroupManagerImpl::QuitGroup: Failed to leave group from Tox, error: {}", error);
         } else {
@@ -801,16 +855,25 @@ void V2TIMGroupManagerImpl::QuitGroup(const V2TIMString& groupID, V2TIMCallback*
     // Always delete conversation cache, even if group_number is not found
     // This handles cases where the group mapping is missing but we still need to clean up
     std::string conv_id = "group_" + std::string(groupID.CString());
-    V2TIM_LOG(kInfo, "V2TIMGroupManagerImpl::QuitGroup: Deleting conversation {} from cache", conv_id);
-    // Use manager_impl_ instead of V2TIMManager::GetInstance() for multi-instance support
-    if (manager_impl_) {
-        manager_impl_->GetConversationManager()->DeleteConversation(
-            V2TIMString(conv_id.c_str()),
-            nullptr  // No callback needed for conversation deletion
-        );
+    // Only for the session that owned the group. The conversation cache belongs
+    // to the logged-in account, so deleting `group_<id>` after a logout+login
+    // would remove a row from the NEXT account's list (codex 2026-09-26). The
+    // leave itself already happened and is still reported as done below.
+    if (session.Expired()) {
+        V2TIM_LOG(kWarning, "V2TIMGroupManagerImpl::QuitGroup: session ended before the cache "
+                            "cleanup; leaving conversation {} to the next session", conv_id);
+    } else {
+        V2TIM_LOG(kInfo, "V2TIMGroupManagerImpl::QuitGroup: Deleting conversation {} from cache", conv_id);
+        // Use manager_impl_ instead of V2TIMManager::GetInstance() for multi-instance support
+        if (manager_impl_) {
+            manager_impl_->GetConversationManager()->DeleteConversation(
+                V2TIMString(conv_id.c_str()),
+                nullptr  // No callback needed for conversation deletion
+            );
+        }
+        V2TIM_LOG(kInfo, "V2TIMGroupManagerImpl::QuitGroup: Deleted conversation {} from cache", conv_id);
     }
-    V2TIM_LOG(kInfo, "V2TIMGroupManagerImpl::QuitGroup: Deleted conversation {} from cache", conv_id);
-    
+
     // Notify Dart layer to clean up group state (knownGroups, quitGroups, etc.)
     // This ensures Dart layer state is synchronized even when quitGroup is called directly from C++ layer
     // Note: DartNotifyGroupQuit is already declared with extern "C" at file scope (line 27)
@@ -818,9 +881,15 @@ void V2TIMGroupManagerImpl::QuitGroup(const V2TIMString& groupID, V2TIMCallback*
     // ignore it on any other instance / after an account switch. Without an
     // owner there is no session to attribute it to (-1 / 0 never match one);
     // GetInstanceIdFromManager(nullptr) would claim the default instance.
+    // The epoch comes from the PIN, not from a fresh GetSessionEpoch() read:
+    // DeleteConversation above notifies OnConversationDeleted listeners
+    // synchronously, so one of them can switch accounts before this line — and a
+    // fresh read would then stamp this quit with the NEW session's epoch, which
+    // is the one thing the stamp exists to prevent (codex 2026-09-26). An empty
+    // guard yields 0, which is what the no-owner case passed before.
     DartNotifyGroupQuit(groupID.CString(),
                         manager_impl_ ? GetInstanceIdFromManager(manager_impl_) : -1,
-                        manager_impl_ ? manager_impl_->GetSessionEpoch() : 0);
+                        session.epoch());
     V2TIM_LOG(kInfo, "V2TIMGroupManagerImpl::QuitGroup: Notified Dart layer to clean up group state");
     
     // Notify listeners through V2TIMManagerImpl
@@ -1303,7 +1372,15 @@ std::string V2TIMGroupManagerImpl::ResolveGroupName(const std::string& groupID) 
                                              group_number)) {
         return cached;
     }
-    const std::string live = GetLiveGroupName(manager_impl_, group_number);
+    // Pinned for the helper's whole tox_*() sequence. Without it the helper
+    // re-fetched a raw Tox* and a concurrent UnInitSDK could tox_kill() the
+    // instance between its size query and its read (the CreateGroup shape).
+    // No live session simply means there is no live name to read; the cached
+    // one (possibly the id placeholder) is the best answer, and this returns a
+    // name rather than an error.
+    const auto session = manager_impl_->AcquireToxSession();
+    if (!session) return cached;
+    const std::string live = GetLiveGroupName(session.tox(), group_number);
     return live.empty() ? cached : live;
 }
 
@@ -1423,14 +1500,30 @@ void V2TIMGroupManagerImpl::GetGroupMemberList(
     V2TIM_LOG(kInfo, "[GetGroupMemberList] Using manager_impl: current={} stored={} target={} instance_id={}",
               static_cast<void*>(current_manager_impl), static_cast<void*>(manager_impl_), static_cast<void*>(target_manager_impl), current_instance_id);
 
-    ToxManager* tox_manager = GetToxManagerFromImpl(target_manager_impl);
+    // Pinned for the WHOLE enumeration. This function makes ~23 tox_*() /
+    // ToxManager calls off one handle and re-fetched a raw ToxManager* five
+    // more times inside its loops; a concurrent UnInitSDK could tox_kill() the
+    // instance between any two of them, and none of this runs inside
+    // tox_iterate, so teardown does not defer here. One pin covers all of them.
+    const auto session = target_manager_impl
+                             ? target_manager_impl->AcquireToxSession()
+                             : V2TIMManagerImpl::ToxSessionGuard();
+    // The default-instance fallback is ONLY for the (test-only)
+    // target_manager_impl == nullptr shape. With a real impl an empty guard
+    // means there is no live session, and reaching for an unpinned manager
+    // there would hand the whole enumeration a pointer a concurrent
+    // InitSDK/UnInitSDK can invalidate — refuse instead.
+    ToxManager* const tox_manager =
+        session ? session.manager()
+                : (target_manager_impl ? nullptr : GetToxManagerFromImpl(nullptr));
     if (!tox_manager) {
         V2TIM_LOG(kError, "[GetGroupMemberList] ToxManager is null for groupID={} instance_id={}", groupID.CString(), current_instance_id);
         callback->OnError(ERR_SDK_NOT_INITIALIZED, "ToxManager not available");
         return;
     }
 
-    Tox* tox = tox_manager->getTox();
+    // The pinned handle when there is one: getTox() is a raw re-fetch.
+    Tox* const tox = session ? session.tox() : tox_manager->getTox();
     if (!tox) {
         V2TIM_LOG(kError, "[GetGroupMemberList] Tox instance is null for groupID={} instance_id={} ToxManager={}",
                   groupID.CString(), current_instance_id, static_cast<void*>(tox_manager));
@@ -1509,8 +1602,7 @@ void V2TIMGroupManagerImpl::GetGroupMemberList(
         } else {
             error_msg += " (no stored chat_id)";
         }
-        V2TIMManagerImpl* err_lookup = target_manager_impl ? target_manager_impl : manager_impl_;
-        size_t group_count = err_lookup ? GetToxManagerFromImpl(err_lookup)->getGroupListSize() : 0;
+        size_t group_count = tox_manager->getGroupListSize();
         error_msg += ". Total groups in Tox: " + std::to_string(group_count);
         
         if (group_count == 0) {
@@ -1582,7 +1674,7 @@ void V2TIMGroupManagerImpl::GetGroupMemberList(
         }
 
         Tox_Err_Group_Is_Connected err_connected;
-        is_connected = GetToxManagerFromImpl(target_manager_impl)->isGroupConnected(group_number, &err_connected);
+        is_connected = tox_manager->isGroupConnected(group_number, &err_connected);
         V2TIM_LOG(kInfo, "[GetGroupMemberList] Group connection: is_connected={} err={}", is_connected ? 1 : 0, static_cast<int>(err_connected));
         if (!is_connected) {
             V2TIM_LOG(kWarning, "[GetGroupMemberList] Group is NOT connected - peer discovery may not work");
@@ -1621,7 +1713,7 @@ void V2TIMGroupManagerImpl::GetGroupMemberList(
         // Verify peer is still present; cache may contain stale entries if exit cleanup was missed.
         uint8_t peer_pubkey[TOX_PUBLIC_KEY_SIZE];
         Tox_Err_Group_Peer_Query err_key;
-        bool got_key = GetToxManagerFromImpl(target_manager_impl)->getGroupPeerPublicKey(group_number, peer_id, peer_pubkey, &err_key);
+        bool got_key = tox_manager->getGroupPeerPublicKey(group_number, peer_id, peer_pubkey, &err_key);
 
         if (!got_key || err_key != TOX_ERR_GROUP_PEER_QUERY_OK) {
             V2TIM_LOG(kInfo, "[GetGroupMemberList] Cached peer_id={} no longer valid (err={}), skipping",
@@ -1640,7 +1732,7 @@ void V2TIMGroupManagerImpl::GetGroupMemberList(
         uint8_t name_buffer[TOX_MAX_NAME_LENGTH + 1] = {};
         std::string peer_name;
         Tox_Err_Group_Peer_Query err_name;
-        if (GetToxManagerFromImpl(target_manager_impl)->getGroupPeerName(group_number, peer_id, name_buffer, TOX_MAX_NAME_LENGTH, &err_name) &&
+        if (tox_manager->getGroupPeerName(group_number, peer_id, name_buffer, TOX_MAX_NAME_LENGTH, &err_name) &&
             err_name == TOX_ERR_GROUP_PEER_QUERY_OK) {
             size_t name_len = strnlen(reinterpret_cast<const char*>(name_buffer), TOX_MAX_NAME_LENGTH);
             peer_name = std::string(reinterpret_cast<const char*>(name_buffer), name_len);
@@ -1795,7 +1887,7 @@ void V2TIMGroupManagerImpl::GetGroupMemberList(
         V2TIM_LOG(kWarning, "[GetGroupMemberList] Only 1 peer found - DHT sync may be incomplete or peers not visible");
         TOX_CONNECTION self_conn = tox_self_get_connection_status(tox);
         Tox_Err_Group_Is_Connected err_conn_check;
-        bool is_connected_check = GetToxManagerFromImpl(target_manager_impl)->isGroupConnected(group_number, &err_conn_check);
+        bool is_connected_check = tox_manager->isGroupConnected(group_number, &err_conn_check);
         Tox_Err_Group_Self_Query err_self_check;
         Tox_Group_Peer_Number self_peer_id_check = tox_group_self_get_peer_id(tox, group_number, &err_self_check);
         V2TIM_LOG(kInfo, "[GetGroupMemberList] DEBUG: self_conn={} group_connected={} err_conn={} self_peer_id={} friend_count={} privacy={}",
@@ -1917,7 +2009,21 @@ void V2TIMGroupManagerImpl::GetGroupMembersInfo(
         return;
     }
     
-    Tox* tox = GetToxManagerFromImpl(manager_impl_)->getTox();
+    // Pinned for the WHOLE lookup. The nine tox_*() / ToxManager calls below
+    // are a sequence a concurrent UnInitSDK could tox_kill() the instance in
+    // the middle of, and the old raw fetch dereferenced
+    // GetToxManagerFromImpl() without a null check on top of that. None of this
+    // runs inside tox_iterate, so teardown does not defer here.
+    V2TIMManagerImpl* const impl = manager_impl_;
+    const auto session = impl ? impl->AcquireToxSession()
+                              : V2TIMManagerImpl::ToxSessionGuard();
+    // The default-instance fallback is ONLY for the (test-only) impl == nullptr
+    // shape; with a real impl an empty guard means no live session, so refuse
+    // rather than reach for an unpinned manager.
+    ToxManager* const tox_manager =
+        session ? session.manager() : (impl ? nullptr : GetToxManagerFromImpl(nullptr));
+    // The pinned handle when there is one: getTox() is a raw re-fetch.
+    Tox* const tox = session ? session.tox() : (tox_manager ? tox_manager->getTox() : nullptr);
     if (!tox) {
         V2TIM_LOG(kError, "GetGroupMembersInfo: Tox instance not available");
         callback->OnError(ERR_SDK_NOT_INITIALIZED, "Tox instance not available");
@@ -2098,7 +2204,7 @@ void V2TIMGroupManagerImpl::GetGroupMembersInfo(
             for (Tox_Group_Peer_Number peer_id = 0; peer_id < 1000; ++peer_id) {
                 uint8_t peer_pubkey[TOX_PUBLIC_KEY_SIZE];
                 Tox_Err_Group_Peer_Query err_key;
-                bool got_key = GetToxManagerFromImpl(manager_impl_)->getGroupPeerPublicKey(group_number, peer_id, peer_pubkey, &err_key);
+                bool got_key = tox_manager->getGroupPeerPublicKey(group_number, peer_id, peer_pubkey, &err_key);
 
                 if (!got_key || err_key != TOX_ERR_GROUP_PEER_QUERY_OK) {
                     continue;
@@ -2119,7 +2225,7 @@ void V2TIMGroupManagerImpl::GetGroupMembersInfo(
                     uint8_t name_buffer[TOX_MAX_NAME_LENGTH + 1] = {};
                     std::string peer_name;
                     Tox_Err_Group_Peer_Query err_name;
-                    if (GetToxManagerFromImpl(manager_impl_)->getGroupPeerName(group_number, peer_id, name_buffer, TOX_MAX_NAME_LENGTH, &err_name) &&
+                    if (tox_manager->getGroupPeerName(group_number, peer_id, name_buffer, TOX_MAX_NAME_LENGTH, &err_name) &&
                         err_name == TOX_ERR_GROUP_PEER_QUERY_OK) {
                         size_t name_len = strnlen(reinterpret_cast<const char*>(name_buffer), TOX_MAX_NAME_LENGTH);
                         peer_name = std::string(reinterpret_cast<const char*>(name_buffer), name_len);
@@ -2209,7 +2315,22 @@ void V2TIMGroupManagerImpl::SetGroupMemberInfo(const V2TIMString& groupID,
         return;
     }
     
-    Tox* tox = GetToxManagerFromImpl(manager_impl_)->getTox();
+    // Pinned for the WHOLE set: the self-key read, the peer scan (a
+    // getGroupPeerPublicKey loop over the pinned manager) and
+    // tox_group_self_set_name are a sequence a concurrent UnInitSDK could
+    // tox_kill() the instance in the middle of, and the old raw fetch
+    // dereferenced GetToxManagerFromImpl() without a null check on top of that.
+    // None of this runs inside tox_iterate, so teardown does not defer here.
+    V2TIMManagerImpl* const impl = manager_impl_;
+    const auto session = impl ? impl->AcquireToxSession()
+                              : V2TIMManagerImpl::ToxSessionGuard();
+    // The default-instance fallback is ONLY for the (test-only) impl == nullptr
+    // shape; with a real impl an empty guard means no live session, so refuse
+    // rather than reach for an unpinned manager.
+    ToxManager* const tox_manager =
+        session ? session.manager() : (impl ? nullptr : GetToxManagerFromImpl(nullptr));
+    // The pinned handle when there is one: getTox() is a raw re-fetch.
+    Tox* const tox = session ? session.tox() : (tox_manager ? tox_manager->getTox() : nullptr);
     if (!tox) {
         if (callback) {
             callback->OnError(ERR_SDK_NOT_INITIALIZED, "Tox not initialized");
@@ -2304,7 +2425,7 @@ void V2TIMGroupManagerImpl::SetGroupMemberInfo(const V2TIMString& groupID,
     for (Tox_Group_Peer_Number p = 0; p < 1000; ++p) {
         uint8_t peer_pubkey[TOX_PUBLIC_KEY_SIZE];
         Tox_Err_Group_Peer_Query err_key;
-        if (GetToxManagerFromImpl(manager_impl_)->getGroupPeerPublicKey(group_number, p, peer_pubkey, &err_key) &&
+        if (tox_manager->getGroupPeerPublicKey(group_number, p, peer_pubkey, &err_key) &&
             err_key == TOX_ERR_GROUP_PEER_QUERY_OK) {
             peer_search_count++;
             if (memcmp(peer_pubkey, target_pubkey, TOX_PUBLIC_KEY_SIZE) == 0) {

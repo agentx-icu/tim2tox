@@ -107,7 +107,9 @@ public:
     // Deliver a "received"/"read" receipt for one group message to its AUTHOR
     // only (NGC custom private packet under the tim2tox group-packet header).
     // Returns 1 sent, -2 not possible on this kind of group (legacy
-    // conference: no private packets), 0 failure (author not reachable).
+    // conference: no private packets), -3 the author is not a live NGC peer
+    // right now (the caller may park the receipt and retry when it is), 0
+    // failure.
     int SendGroupReceipt(const V2TIMString& groupID, const std::string& author_key_hex,
                          const std::string& msg_id, const std::string& receipt_type);
     Tox_Group_Peer_Number ResolveGroupPeerIdForKey(Tox_Group_Number group_number, const std::string& receiver_hex);
@@ -252,6 +254,27 @@ public:
                                   const uint8_t* data, size_t length);
     // Long-term key (hex) of the friend behind an NGC per-group member key, or "".
     std::string FriendForGroupMemberKey(const std::string& member_key_hex);
+    // MM-6 observability: counters plus the last identity-proof payload we
+    // received (hex), as a small JSON object. Read-only.
+    std::string Mm6DiagJson();
+#ifdef TIM2TOX_ENABLE_TEST_HOOKS
+    // TEST-ONLY, and gated by the SAME macro as its C wrapper
+    // (tim2tox_ffi_mm6_send_crafted_challenge) on purpose: gating only the
+    // wrapper left this method compiled into libtim2tox.a, where on Linux its
+    // mangled symbol stays exported and the primitive remains callable from a
+    // shipped library (codex 2026-09-26). CMake defines the macro for BOTH the
+    // tim2tox and tim2tox_ffi targets, so the two halves can never disagree.
+    //
+    // MM-6 harness hook: send `friend_key_hex` an identity challenge that
+    // names `claimed_member_key_hex` as OUR per-group key in `groupID`. That
+    // is the shape of the MM-6 abuse case -- naming a member key that is not
+    // ours -- and there is no way to reach it through the honest API, because
+    // the honest path always fills that slot with our own key. Exposed so the
+    // auto_tests can prove the answer is unreadable to the member named; it
+    // grants an attacker nothing it could not already send by hand.
+    int Mm6SendCraftedChallenge(const V2TIMString& groupID, const std::string& friend_key_hex,
+                                const std::string& claimed_member_key_hex);
+#endif  // TIM2TOX_ENABLE_TEST_HOOKS
     // NGC name / conference title (or a real cached name); "" if unknown.
     std::string ResolveSharedGroupName(const std::string& group_id);
     
@@ -287,8 +310,71 @@ public:
 #endif
     void ClearPendingAVConferenceAudioFrames();
     
-    // Helper method to get ToxManager instance (for internal use)
+    // Helper method to get ToxManager instance (for internal use).
+    // UNPINNED: UnInitSDK() destroys the ToxManager and tox_kill()s the Tox
+    // from whatever thread calls it, so the returned pointer (and any Tox*
+    // fetched from it) is only safe while the caller is provably serialized
+    // with teardown — i.e. inside a tox callback, where UnInitSDK /
+    // ToxManager::shutdown defer themselves (IterateReentryScope). Every entry
+    // point reachable from ANOTHER thread — the whole FFI surface — must use
+    // AcquireToxSession() instead.
     ToxManager* GetToxManager() { return tox_manager_.get(); }
+
+    // RAII pin over one session's ToxManager + Tox.
+    //
+    // Holding it guarantees only that the objects stay ALIVE for the duration
+    // of a call sequence; it does not block UnInitSDK and does not make the
+    // sequence atomic. That is deliberate: a lock held across whole operations
+    // would have to be ranked against ToxManager::iterate_mutex_ (which
+    // shutdown() takes first, and which callers take via lockIterate()) and
+    // would deadlock one way or the other, and blocking teardown would break
+    // the deferred-teardown-from-a-callback contract. What it removes is the
+    // use-after-free: without it, a concurrent UnInitSDK can free the Tox
+    // BETWEEN two tox_*() calls of the same operation (codex 2026-09-23 on
+    // SendGroupReceipt's tox_group_self_get_public_key +
+    // tox_group_send_custom_private_packet pair). Callers that also need
+    // "still the same session" semantics keep their session_epoch_ re-checks —
+    // Expired() exposes the same test for loops that pump between calls.
+    class ToxSessionGuard {
+    public:
+        ToxSessionGuard() = default;
+        ToxSessionGuard(std::shared_ptr<ToxManager> manager, std::shared_ptr<Tox> tox,
+                        const V2TIMManagerImpl* owner, int64_t epoch)
+            : manager_(std::move(manager)), tox_(std::move(tox)), owner_(owner), epoch_(epoch) {}
+        ToxSessionGuard(const ToxSessionGuard&) = delete;
+        ToxSessionGuard& operator=(const ToxSessionGuard&) = delete;
+        ToxSessionGuard(ToxSessionGuard&&) = default;
+        ToxSessionGuard& operator=(ToxSessionGuard&&) = default;
+
+        // False when there is no live session (refuse the operation).
+        explicit operator bool() const { return tox_ != nullptr; }
+        Tox* tox() const { return tox_.get(); }
+        ToxManager* manager() const { return manager_.get(); }
+        // The manager WITHOUT the Tox pin. For the one caller that must keep
+        // the manager alive across a call that waits for iterate_mutex_ and
+        // therefore must not still hold a pin (see
+        // tim2tox_ffi_iterate_current_instance and ToxManager::getSaveData).
+        std::shared_ptr<ToxManager> manager_shared() const { return manager_; }
+        int64_t epoch() const { return epoch_; }
+        // True once the session this guard belongs to has ended. The pinned
+        // pointers stay VALID (that is the point of the pin), but the work is
+        // pointless and must not be published; pump loops break on it.
+        bool Expired() const {
+            return owner_ == nullptr || epoch_ == 0 ||
+                   owner_->GetSessionEpoch() != epoch_;
+        }
+
+    private:
+        std::shared_ptr<ToxManager> manager_;
+        std::shared_ptr<Tox> tox_;
+        const V2TIMManagerImpl* owner_{nullptr};
+        int64_t epoch_{0};
+    };
+
+    // Pin the current session. Empty (operator bool == false) when the SDK is
+    // not initialized / is tearing down. Takes no long-lived lock, so it can
+    // be called from anywhere GetToxManager() could be called.
+    ToxSessionGuard AcquireToxSession() const;
 
     // Identifies one InitSDK..UnInitSDK session of this object; 0 = no live
     // session. Process-unique and never reused, so a notification stamped
@@ -460,8 +546,17 @@ private:
     // Tox profile path used in InitSDK; UnInitSDK and SaveToxProfile use this instead of recomputing
     std::string save_path_;
 
-    // ToxManager instance (owned by this V2TIMManagerImpl instance)
-    std::unique_ptr<ToxManager> tox_manager_;
+    // ToxManager instance (owned by this V2TIMManagerImpl instance).
+    // shared_ptr so AcquireToxSession() can pin it across a call sequence:
+    // UnInitSDK drops this reference from an arbitrary thread, and an
+    // in-flight operation must not be left with a dangling manager. Only
+    // AcquireToxSession() / UnInitSDK touch it under tox_manager_mutex_;
+    // everything else keeps using GetToxManager().
+    std::shared_ptr<ToxManager> tox_manager_;
+    // Guards ONLY the tox_manager_ pointer itself (not the object). Separate
+    // from mutex_ so acquiring a session never participates in the group-state
+    // lock order. Never held while calling into ToxManager.
+    mutable std::mutex tox_manager_mutex_;
     
 #ifdef BUILD_TOXAV
     // ToxAVManager instance (owned by this V2TIMManagerImpl instance).
@@ -539,7 +634,14 @@ private:
     // MM-6: NGC members are named by per-group keys. A friend proves which
     // per-group key is theirs over the authenticated friend channel by sending
     // sha256(chat_id || key) digests; a match against our group's peers maps
-    // that member to the friend. Nobody outside the friendship learns anything.
+    // that member to the friend, which it confirms with a proof sealed to our
+    // long-term key (MM-6 proof v2; see the block comment in the .cpp).
+    // Confidentiality, stated exactly: no third party can READ any of it --
+    // the hint is a digest of two values every member already knows, and the
+    // proof is an authenticated box only the asker can open. What a third
+    // party can still OBSERVE is traffic: a friend that names its per-group
+    // key makes us address one unreadable NGC private packet to that key, so
+    // a member can tell it was named, but not by whom or as what.
     // Everything below is guarded by mutex_, bounded (per friend AND
     // globally) and expires; see the kIdentity* limits in the .cpp.
     using IdentityClock = std::chrono::steady_clock;
@@ -580,9 +682,54 @@ private:
         uint32_t hint_packets = 0;
         uint32_t new_digests = 0;
         uint32_t proofs_sent = 0;
+        // Opening received proofs. Only ever charged to the GLOBAL window: the
+        // sender is an NGC group peer, and its long-term key is precisely what
+        // we do not know yet, so there is no friend to charge it to.
+        uint32_t proof_verifies = 0;
+        // Received GROUP RECEIPTS, charged per authenticated NGC sender. The
+        // replay filter only stops the SAME receipt twice; distinct msgIDs from
+        // one member were unbounded, and each one costs a Dart event plus two
+        // history scans on the way to the tally.
+        uint32_t receipts_in = 0;
     };
     std::unordered_map<std::string, IdentityRateWindow> identity_rate_by_friend_;  // friend pk hex ->
+    // Received-proof windows keyed by the AUTHENTICATED NGC group sender (lower
+    // hex). Charged before any per-packet work, so an unchallenged member
+    // cannot make us scan and record for free and a single hostile member
+    // cannot spend the global crypto window. Bounded by kMaxProofVerifySenders
+    // and pruned with the rest of the identity state.
+    std::unordered_map<std::string, IdentityRateWindow> identity_rate_by_group_sender_;
+    // Received-RECEIPT windows, keyed the same way but in a SEPARATE table on
+    // purpose (codex 2026-09-26): sharing the proof table let the two budgets
+    // evict each other. Across public groups, kMaxProofVerifySenders distinct
+    // member keys can each send one structurally valid receipt with an invented
+    // msgID, fill the table, and have it refuse both a new honest reader's
+    // receipt AND a challenged member's MM-6 proof until the entries expire —
+    // i.e. a receipt flood could starve the identity proofs the fill-up bound
+    // exists to protect. Separate tables, separate caps
+    // (kMaxGroupReceiptSenders); both pruned in PruneIdentityStateLocked.
+    std::unordered_map<std::string, IdentityRateWindow> group_receipt_rate_by_sender_;
     IdentityRateWindow identity_rate_global_;
+    // MM-6 observability (guarded by mutex_). Counters plus the last proof
+    // payload we received, verbatim: the auto_tests use it to assert that what
+    // a named-but-uninvolved member receives is a box, not a readable proof.
+    struct Mm6Diag {
+        uint64_t proofs_sent = 0;
+        uint64_t proofs_in = 0;
+        uint64_t proofs_accepted = 0;
+        uint64_t proofs_rejected = 0;
+        std::string last_proof_payload_hex;
+        // Group receipts arriving on the same private channel. `in` counts every
+        // structurally valid receipt from an authenticated member (i.e. every
+        // one that reached the per-sender meter), and the three below say what
+        // happened to it. Exported as the "groupReceipts" block of
+        // Mm6DiagJson so auto_tests can assert the budget from the outside.
+        uint64_t group_receipts_in = 0;
+        uint64_t group_receipts_refused = 0;
+        uint64_t group_receipts_replayed = 0;
+        uint64_t group_receipts_forwarded = 0;
+    };
+    Mm6Diag mm6_diag_;
     IdentityClock::time_point identity_last_prune_{};
     std::unordered_set<uint32_t> online_identity_friends_;  // friends already sent our hints this session
     // Group receipt replay filter: "<group id>|<sender key lower>|<type>|<msgID>"
@@ -597,6 +744,30 @@ private:
     void EraseIndexedGroupMemberLocked(Tox_Group_Number group_number, const std::string& member_key_lower);
     bool TakeIdentityBudgetLocked(IdentityRateWindow& window, IdentityClock::time_point now,
                                   uint32_t IdentityRateWindow::*counter, uint32_t limit);
+    // One received-proof verification charged to this NGC sender. False = over
+    // budget, or the sender table is full: drop the packet before spending
+    // anything on it.
+    // Whether WE have an unexpired identity challenge outstanding for this
+    // (group, authenticated sender). Cheap, crypto-free, and the gate that
+    // keeps an unchallenged sender from consuming metering state at all.
+    bool HasPendingChallengeForSenderLocked(Tox_Group_Number group_number,
+                                           const std::string& sender_hex,
+                                           IdentityClock::time_point now) const;
+    bool TakeGroupSenderProofBudgetLocked(const std::string& sender_hex,
+                                          IdentityClock::time_point now);
+    // One received GROUP RECEIPT charged to this NGC sender. False = over
+    // budget, or the receipt sender table is full: drop the packet before it
+    // costs a replay-cache slot, a Dart event and two history scans. Metered in
+    // group_receipt_rate_by_sender_, NOT the proof table, so neither budget can
+    // evict the other.
+    bool TakeGroupSenderReceiptBudgetLocked(const std::string& sender_hex,
+                                            IdentityClock::time_point now);
+    // Pending challenges for (group, member) whose asker no longer claims that
+    // member's digest. They hold a slot the verifier scans and an honest
+    // claimant needs; nothing will ever answer them.
+    void DropStaleChallengesForMemberLocked(Tox_Group_Number group_number,
+                                            const std::string& member_key_lower,
+                                            const std::string& digest);
     // Index every cached NGC peer that is not indexed yet (and drop entries
     // whose peer left the cache). Takes mutex_ itself; hashes outside it.
     void SyncMemberDigestIndex(Tox* tox);

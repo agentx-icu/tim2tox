@@ -8215,10 +8215,23 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
       await ffiService.messageHistoryPersistence.loadHistory(groupID);
       final history = ffiService.getHistory(groupID);
       for (final msg in history) {
-        if (!msg.isSelf) {
-          await ffiService.markMessageAsRead(groupID, msg.msgID ?? '',
-              groupID: groupID);
-        }
+        if (msg.isSelf) continue;
+        // CLAIM + SKIP (codex): UIKit calls this on EVERY group chat open, and
+        // this walk used to re-send a READ receipt for every inbound row of the
+        // loaded window each time — up to `_maxMessagesInMemory` private
+        // packets per tap, per member, which is the load the native per-sender
+        // receipt budget had to be widened to absorb. A row that is already
+        // read has nothing to report, and a row this session already receipted
+        // (here, or through FfiChatService's on-view walk, which shares this
+        // bounded claim set) must not be paid for twice. The API contract is
+        // unchanged: marking read is idempotent, so the rows it skips are rows
+        // whose read state and receipt are already accounted for, and a
+        // receipt that never reached the wire is retried by the pending group
+        // queue, not by re-walking the window.
+        final rowId = msg.msgID ?? '';
+        if (rowId.isEmpty || msg.isRead) continue;
+        if (!ffiService.claimGroupReadReceiptForRow(groupID, msg)) continue;
+        await ffiService.markMessageAsRead(groupID, rowId, groupID: groupID);
       }
 
       return V2TimCallback(

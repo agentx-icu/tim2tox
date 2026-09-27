@@ -251,4 +251,80 @@ void main() {
       expect(() => queue.rebindQueueFile(''), throwsA(isA<ArgumentError>()));
     });
   });
+
+  group('rebinding off an OWNER-BOUND default directory (H4)', () {
+    const ownerA =
+        'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA';
+
+    test('carries the session\'s rows across, merged with what is there',
+        () async {
+      // The upgraded-install shape. `<AppSupport>/chat_history` predates owner
+      // binding, so the owner-bound session is routed to
+      // `<AppSupport>/chat_history_<publicKey>` and writes THERE while the
+      // host's own legacy migration copies the old directory into the account
+      // directory. Both sets are the same account's, and both must survive.
+      final legacy = dirIn('chat_history');
+      await legacy.create(recursive: true);
+      final seed = MessageHistoryPersistence(historyDirectory: legacy.path);
+      await seed.saveHistory(_conversationId, [
+        _message('predates-owner-binding', id: 'old'),
+      ]);
+      await seed.dispose();
+
+      final store =
+          MessageHistoryPersistence(appSupportRootOverride: tempRoot.path);
+      addTearDown(store.dispose);
+      await store.openSession(ownerKey: ownerA);
+      expect(await store.loadHistory(_conversationId), isEmpty,
+          reason: 'the unproven legacy directory is not this session\'s');
+      await store.saveHistory(_conversationId, [
+        _message('written-during-login', id: 'new'),
+      ]);
+      final isolated = dirIn('chat_history_$ownerA');
+      expect(_historyText(isolated), contains('written-during-login'));
+
+      // The host's legacy migration lands its copy first, then re-points the
+      // store — exactly the order `installAccountScopedStorage` uses.
+      final account = dirIn('account_data/AAAA/chat_history');
+      await account.create(recursive: true);
+      await File('${legacy.path}/${_historyFiles(legacy).single}')
+          .copy('${account.path}/${_historyFiles(legacy).single}');
+
+      await store.rebindHistoryDirectory(account.path);
+
+      final rows = await store.loadHistory(_conversationId);
+      expect(rows.map((m) => m.msgID), containsAll(<String>['old', 'new']),
+          reason: 'neither the migrated rows nor the ones written during this '
+              'login may be dropped by the rebind');
+      expect(_historyFiles(isolated), isEmpty,
+          reason: 'the carried directory is renamed aside, not left to be '
+              'read again');
+      expect(dirIn('chat_history_$ownerA.adopted').existsSync(), isTrue,
+          reason: 'renamed aside, never deleted');
+    });
+
+    test('carries nothing from the unproven shared default', () async {
+      final legacy = dirIn('chat_history');
+      await legacy.create(recursive: true);
+      final seed = MessageHistoryPersistence(historyDirectory: legacy.path);
+      await seed.saveHistory(_conversationId, [
+        _message('somebody-elses', id: 'old'),
+      ]);
+      await seed.dispose();
+
+      // No owner: the store legitimately uses the unmarked shared directory,
+      // but whose rows those are is not decidable here, so the rebind must
+      // not move them into an account directory on its own.
+      final store =
+          MessageHistoryPersistence(appSupportRootOverride: tempRoot.path);
+      addTearDown(store.dispose);
+      await store.openSession();
+      final account = dirIn('account_data/BBBB/chat_history');
+      await store.rebindHistoryDirectory(account.path);
+
+      expect(_historyFiles(account), isEmpty);
+      expect(_historyText(legacy), contains('somebody-elses'));
+      expect(dirIn('chat_history.adopted').existsSync(), isFalse);
+    });
+  });
 }

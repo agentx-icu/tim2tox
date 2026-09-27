@@ -8,6 +8,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:math';
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 import '../interfaces/logger_service.dart';
@@ -242,9 +243,645 @@ class MessageHistoryPersistence {
   /// The owner-bound default directory, once resolved for [_ownerKey].
   String? _resolvedDefaultDirPath;
 
+  /// The default directory an OWNERLESS session last resolved to, so a
+  /// mid-session flip (another instance claimed the base directory while this
+  /// one was using it) is reported instead of happening silently. See H3 in
+  /// [_getHistoryDirectory].
+  String? _unownedPathInUse;
+
+  /// Drop the memo of where the DEFAULT directory resolves to. Every input to
+  /// that resolution — the owner, the proof, the injected directory, the
+  /// directory's own existence — changes through one of the callers of this.
+  void _forgetResolvedDefaultDirectory() {
+    _resolvedDefaultDirPath = null;
+    _unownedPathInUse = null;
+  }
+
   /// Marker recording which identity a default history directory belongs to.
   /// Not `*.json` / `.tmp` / `.bak`, so no load or cleanup pass touches it.
   static const String _ownerMarkerName = '.tim2tox_history_owner';
+
+  /// Identity the HOST has proven owns an UNMARKED default directory.
+  ///
+  /// Ownership of a directory that predates owner binding cannot be decided
+  /// here — the rows in it carry peer ids, not ours. Only the integrator can
+  /// prove it (toxee: `LegacyAccountDataClaim`, via a recorded claim, the
+  /// legacy profile's embedded Tox ID, or byte-identity with the account's own
+  /// profile). Until one identity is declared here, such a directory is used by
+  /// NOBODY: every owner-bound session gets its own isolated directory instead,
+  /// and the legacy rows are left exactly where they are. See
+  /// [declareProvenDefaultOwner] and [_resolveOwnedDirectory].
+  String? _provenDefaultOwner;
+
+  /// Declare, out of band, that [ownerKey] is the proven owner of an unmarked
+  /// default history directory, so this store may ADOPT it in place (claiming
+  /// it with an owner marker) instead of starting empty beside it.
+  ///
+  /// For integrators that migrate the legacy data by copying it into a
+  /// per-account directory (what toxee does) this is unnecessary — they inject
+  /// that directory and the default resolution never runs. It exists for hosts
+  /// that keep using the default directory and can prove who owns it.
+  ///
+  /// Declare it BEFORE [openSession] / the first read: it only changes where
+  /// the default directory resolves to, and rows already read from (or written
+  /// to) the isolated directory are not moved.
+  ///
+  /// Passing null (or an unusable key) withdraws the declaration. Never makes
+  /// a directory SHARED: at most one identity can be declared, and any other
+  /// identity still routes to its own directory.
+  void declareProvenDefaultOwner(String? ownerKey) {
+    final normalized = _normalizeOwnerKey(ownerKey);
+    if (normalized == _provenDefaultOwner) return;
+    _provenDefaultOwner = normalized;
+    // The proof changes where the default resolves to; drop the memo.
+    _forgetResolvedDefaultDirectory();
+  }
+
+  /// What the DEFAULT history directory looks like to this session, or null
+  /// when an explicit `historyDirectory` was injected (the default is then
+  /// never consulted).
+  ///
+  /// H4: an upgraded install whose `<AppSupport>/chat_history` predates owner
+  /// binding is routed to an isolated, EMPTY directory the moment the host
+  /// supplies an identity — correct (nobody can prove whose those rows are)
+  /// but indistinguishable from data loss. This is how a host finds out, so it
+  /// can offer [adoptDefaultHistoryDirectory] or run its own migration instead
+  /// of showing an empty chat list and nothing else.
+  Future<DefaultHistoryDirectoryStatus?> defaultHistoryDirectoryStatus() async {
+    if (_historyDirectory != null && _historyDirectory!.isNotEmpty) return null;
+    final basePath = await _defaultBasePath();
+    final state =
+        await _readOwnerMarker(File(p.join(basePath, _ownerMarkerName)));
+    final resolved = (await _getHistoryDirectory()).path;
+    return DefaultHistoryDirectoryStatus(
+      basePath: basePath,
+      resolvedPath: resolved,
+      markedOwner: state.owner,
+      markerInvalid: state.isInvalid,
+      baseHoldsHistory: await _holdsHistory(Directory(basePath)),
+      sessionOwner: _ownerKey,
+    );
+  }
+
+  /// The DEFAULT directory this session is bound to, when it PROVABLY belongs
+  /// to the session's own identity: the owner-suffixed isolated directory, or
+  /// a base directory whose marker names this owner.
+  ///
+  /// Null when a `historyDirectory` was injected, when the session has no
+  /// owner, or when the directory in use is the unproven shared base. A host
+  /// must never copy THAT anywhere on its own: it is the pre-binding dataset,
+  /// and it may belong to a different account (toxee gates it behind
+  /// `LegacyAccountDataClaim`). What this method returns needs no such gate —
+  /// the directory name, or its marker, is the proof.
+  ///
+  /// Exists for hosts that create the store before the identity is known and
+  /// re-point it later ([rebindHistoryDirectory]): the rows written in that
+  /// window live here, and nothing else knows where "here" is.
+  Future<String?> ownerBoundDefaultDirectory() async {
+    if (_historyDirectory != null && _historyDirectory!.isNotEmpty) return null;
+    final owner = _ownerKey;
+    if (owner == null) return null;
+    final basePath = await _defaultBasePath();
+    final path = (await _getHistoryDirectory()).path;
+    if (p.canonicalize(path) != p.canonicalize(basePath)) return path;
+    final state =
+        await _readOwnerMarker(File(p.join(basePath, _ownerMarkerName)));
+    return state.owner == owner ? path : null;
+  }
+
+  /// Adopt the unadopted DEFAULT history directory for [ownerKey] — the
+  /// claim-or-migrate door behind [DefaultHistoryDirectoryStatus].
+  ///
+  /// The CALLER vouches for the identity (toxee: `LegacyAccountDataClaim`,
+  /// including its explicit user-authorized path); this method only does the
+  /// data work, and it makes the decision permanent by writing the owner
+  /// marker, so no second account can take the directory afterwards.
+  ///
+  /// What it guarantees:
+  ///  * every row this session already wrote into its isolated directory is
+  ///    MERGED into the adopted one, by row identity — adopting must not hide
+  ///    the messages the user sent while the history looked empty;
+  ///  * the isolated directory is renamed aside, never deleted, so a wrong
+  ///    adoption stays recoverable;
+  ///  * pending writes land in the isolated directory BEFORE the merge reads
+  ///    it (a [HistoryFlushException] aborts the adoption rather than lose
+  ///    them);
+  ///  * the marker is written last and atomically;
+  ///  * all in-memory state is dropped, so the next read comes from the
+  ///    adopted directory. The caller reloads.
+  ///
+  /// Returns the adopted directory, or null when there is nothing to adopt: a
+  /// `historyDirectory` was injected, or the base directory is already marked
+  /// for a DIFFERENT identity (which this never overrides).
+  Future<String?> adoptDefaultHistoryDirectory(
+      {required String ownerKey}) async {
+    final owner = _normalizeOwnerKey(ownerKey);
+    if (owner == null) {
+      throw ArgumentError.value(
+        ownerKey,
+        'ownerKey',
+        'must be a 64-hex Tox public key or a full Tox address',
+      );
+    }
+    if (_historyDirectory != null && _historyDirectory!.isNotEmpty) return null;
+    // Adoption merges THE DIRECTORY THIS SESSION IS USING into the base and
+    // marks the base for [ownerKey]. If those are two different identities,
+    // that mixes one account's rows into the other's (codex 2026-09-26): the
+    // session's own directory is the only one it may hand over. A store with
+    // no owner yet is free to adopt on behalf of the identity it is told.
+    final sessionOwner = _ownerKey;
+    if (sessionOwner != null && sessionOwner != owner) {
+      throw StateError(
+        'adoptDefaultHistoryDirectory: this store is bound to another '
+        'identity; open a session for the adopting owner first',
+      );
+    }
+    final basePath = await _defaultBasePath();
+    final marker = File(p.join(basePath, _ownerMarkerName));
+    final state = await _readOwnerMarker(marker);
+    if (state.owner != null && state.owner != owner) {
+      _logger?.logWarning(
+        '[MessageHistoryPersistence] adoptDefaultHistoryDirectory refused: '
+        'the default history directory is already claimed by another identity',
+      );
+      return null;
+    }
+
+    // Land what this session still owes to the directory it is using NOW,
+    // before that directory is merged away underneath it.
+    try {
+      await flushPendingSaves();
+    } on HistoryFlushException catch (e, st) {
+      _logger?.logError(
+        '[MessageHistoryPersistence] adoptDefaultHistoryDirectory refused: '
+        '${e.conversationIds.length} conversation(s) still owe a write to the '
+        'directory this session is using',
+        e,
+        st,
+      );
+      rethrow;
+    }
+
+    final from = (await _getHistoryDirectory()).path;
+    await Directory(basePath).create(recursive: true);
+    if (p.canonicalize(from) != p.canonicalize(basePath) &&
+        !await _mergeHistoryDirectory(
+            from: Directory(from), into: Directory(basePath))) {
+      // The marker is NOT written: with rows still only in the isolated
+      // directory, claiming the base would leave them unreachable (this
+      // session keeps routing to the isolated directory, so nothing is lost —
+      // the caller can retry once the unreadable file is dealt with).
+      throw StateError(
+        'adoptDefaultHistoryDirectory: not every history file could be merged '
+        'into the default directory; nothing was adopted',
+      );
+    }
+    // Last: a crash before this leaves the rows merged into an unmarked
+    // directory, which is exactly the state adoption started from — so
+    // re-running it finishes the job.
+    await _writeOwnerMarker(marker, owner);
+    _provenDefaultOwner = owner;
+    _applyNewOwner(owner);
+    _disposed = false;
+    return basePath;
+  }
+
+  /// Merge every history file of [from] into [into], then rename [from] aside.
+  /// Nothing is deleted.
+  /// Returns true when EVERY file of [from] was merged (and [from] was then
+  /// renamed aside). False when at least one file could not be read or
+  /// written: [from] is then left exactly where it is, unrenamed, so its rows
+  /// stay reachable and the next rebind / adoption merges them again. Renaming
+  /// it aside on a partial merge is what hid rows before (codex 2026-09-26).
+  Future<bool> _mergeHistoryDirectory({
+    required Directory from,
+    required Directory into,
+  }) async {
+    if (!await from.exists()) return true;
+    var merged = 0;
+    var failed = 0;
+    final alreadyMerged = await _readMergedManifest(from, into);
+    await for (final entity in from.list(followLinks: false)) {
+      if (entity is! File) continue;
+      final name = p.basename(entity.path);
+      if (name == _ownerMarkerName ||
+          name == _mergedManifestName ||
+          name == _dirIdName ||
+          name.endsWith('.tmp') ||
+          name.contains('.corrupt-')) {
+        continue;
+      }
+      // Already transferred by an earlier, partially failed pass INTO THIS
+      // destination, and unchanged since. Replaying it could copy back a row
+      // the user deleted in between; the file itself STAYS where it is, because
+      // this directory may still be the one the app reads (codex 2026-09-26).
+      // A source the session has written since is merged again — the manifest
+      // records its size and mtime exactly so a filename cannot vouch for
+      // content that has moved on.
+      if (await _isUnchangedSinceTransfer(entity, alreadyMerged[name])) continue;
+      final dest = File(p.join(into.path, name));
+      try {
+        var transferred = true;
+        final before = await _transferStampOf(entity);
+        // A changed source is always re-merged, never used to REPLACE the
+        // destination: the destination can have gained rows of its own since
+        // (a rebind that could not rename the source aside leaves both live),
+        // and losing those is worse than the one thing replacement bought —
+        // propagating a row deleted between two attempts, which the tombstone
+        // filter in _mergeHistoryFiles covers for this session anyway
+        // (codex 2026-09-26).
+        if (!await dest.exists()) {
+          await entity.copy(dest.path);
+        } else if (name.endsWith('.archive.jsonl')) {
+          await _appendArchiveLines(entity, dest);
+        } else if (name.endsWith('.json')) {
+          if (!await _mergeHistoryFiles(entity, dest)) {
+            failed++;
+            continue;
+          }
+        } else {
+          // A `.json.bak` whose destination already exists adds nothing: the
+          // destination's own backup is the newer safety net.
+          transferred = false;
+        }
+        merged++;
+        // Record it as transferred as soon as its rows are in the destination,
+        // so a retry after a LATER file fails does not merge it twice. The
+        // manifest is rewritten atomically per file; a crash between the write
+        // and the manifest costs one replayed file, whose rows dedupe by
+        // identity.
+        //
+        // The stamp is the one taken BEFORE the transfer, and only when the file
+        // still matches it afterwards: stamping after the read would certify
+        // bytes that were never transferred if the session wrote to the source
+        // meanwhile (codex 2026-09-26).
+        if (transferred) {
+          final after = await _transferStampOf(entity);
+          if (_stampsMatch(before, after)) {
+            alreadyMerged[name] = before;
+            await _writeMergedManifest(from, into, alreadyMerged);
+          } else {
+            _logger?.logWarning(
+              '[MessageHistoryPersistence] $name changed while it was being '
+              'merged; it is not recorded as transferred and will be merged '
+              'again',
+            );
+          }
+        }
+      } catch (e, st) {
+        failed++;
+        _logger?.logError(
+            '[MessageHistoryPersistence] adopting $name failed', e, st);
+      }
+    }
+    if (failed > 0) {
+      _logger?.logWarning(
+        '[MessageHistoryPersistence] $failed of ${merged + failed} file(s) '
+        'could not be merged out of ${from.path}; it is left in place '
+        '(unrenamed) so those rows stay reachable and a later merge retries '
+        'them',
+      );
+      return false;
+    }
+    // Nothing was there (a directory that only ever held its own marker):
+    // leave it alone rather than scatter empty `.adopted` directories.
+    if (merged == 0) return true;
+    var aside = '${from.path}.adopted';
+    if (await Directory(aside).exists() || await File(aside).exists()) {
+      aside = '${from.path}.adopted-${DateTime.now().millisecondsSinceEpoch}';
+    }
+    try {
+      await from.rename(aside);
+    } catch (e, st) {
+      _logger?.logWarning(
+        '[MessageHistoryPersistence] adopted directory could not be renamed '
+        'aside ($e); its rows are already merged, but it will be merged again '
+        'if adoption re-runs',
+      );
+      _logger?.logError(
+          '[MessageHistoryPersistence] rename aside failed', e, st);
+    }
+    return true;
+  }
+
+  /// Names the files of a source directory whose rows are already in the
+  /// destination, so a merge that resumes after a partial failure does not
+  /// transfer them twice.
+  ///
+  /// A MANIFEST rather than renaming the files: the source directory may still
+  /// be the one this session reads (an aborted adoption leaves it bound), and
+  /// renaming its history files aside hid them (codex 2026-09-26).
+  static const String _mergedManifestName = '.tim2tox_merged';
+
+  /// `{into: <canonical destination>, files: {name: {size, mtimeMs}}}`. The
+  /// destination is part of it because a manifest written while merging into
+  /// account B says nothing about a later merge into account C, and skipping
+  /// files on its word left C without those rows (codex 2026-09-26).
+  /// Identifies the destination DIRECTORY, not its path: a directory renamed
+  /// aside and recreated at the same path is a different destination, and
+  /// honouring a manifest written for the old one activated the new one without
+  /// the skipped files (codex 2026-09-26). Created on first use.
+  static const String _dirIdName = '.tim2tox_dir_id';
+
+  Future<String?> _directoryId(Directory dir, {required bool create}) async {
+    final file = File(p.join(dir.path, _dirIdName));
+    try {
+      if (await file.exists()) {
+        final value = (await file.readAsString()).trim();
+        if (value.isNotEmpty) return value;
+      }
+      if (!create) return null;
+      final value = '${DateTime.now().microsecondsSinceEpoch}'
+          '-${Random().nextInt(1 << 32).toRadixString(16)}';
+      final temp = File('${file.path}.tmp');
+      final raf = await temp.open(mode: FileMode.write);
+      try {
+        await raf.writeString(value);
+        await raf.flush();
+      } finally {
+        await raf.close();
+      }
+      await _renameWithRetry(temp, file.path);
+      return value;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  Future<Map<String, Map<String, Object?>>> _readMergedManifest(
+      Directory from, Directory into) async {
+    final file = File(p.join(from.path, _mergedManifestName));
+    try {
+      if (!await file.exists()) return {};
+      final decoded = jsonDecode(await file.readAsString());
+      if (decoded is! Map<String, dynamic>) return {};
+      final recordedInto = decoded['into'];
+      if (recordedInto is! String ||
+          p.canonicalize(recordedInto) != p.canonicalize(into.path)) {
+        return {};
+      }
+      // Same path, different directory: nothing recorded applies.
+      final recordedId = decoded['intoId'];
+      final currentId = await _directoryId(into, create: false);
+      if (recordedId is! String || currentId == null || recordedId != currentId) {
+        return {};
+      }
+      final files = decoded['files'];
+      if (files is! Map<String, dynamic>) return {};
+      final out = <String, Map<String, Object?>>{};
+      for (final entry in files.entries) {
+        final value = entry.value;
+        if (value is Map<String, dynamic>) out[entry.key] = value;
+      }
+      return out;
+    } catch (_) {
+      // An unreadable manifest only costs a replay, which dedupes.
+      return {};
+    }
+  }
+
+  Future<Map<String, Object?>> _transferStampOf(File file) async {
+    try {
+      final stat = await file.stat();
+      return <String, Object?>{
+        'size': stat.size,
+        'mtimeMs': stat.modified.millisecondsSinceEpoch,
+      };
+    } catch (_) {
+      return <String, Object?>{};
+    }
+  }
+
+  /// Whether [file] is byte-for-byte the file a previous pass transferred, as
+  /// far as size and mtime can say. An empty or missing stamp means "not
+  /// established", i.e. merge it again.
+  bool _stampsMatch(Map<String, Object?> a, Map<String, Object?> b) =>
+      a['size'] is int &&
+      a['size'] == b['size'] &&
+      a['mtimeMs'] is int &&
+      a['mtimeMs'] == b['mtimeMs'];
+
+  Future<bool> _isUnchangedSinceTransfer(
+      File file, Map<String, Object?>? stamp) async {
+    if (stamp == null) return false;
+    final size = stamp['size'];
+    final mtime = stamp['mtimeMs'];
+    if (size is! int || mtime is! int) return false;
+    try {
+      final stat = await file.stat();
+      return stat.size == size &&
+          stat.modified.millisecondsSinceEpoch == mtime;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  Future<void> _writeMergedManifest(Directory from, Directory into,
+      Map<String, Map<String, Object?>> files) async {
+    final target = p.join(from.path, _mergedManifestName);
+    final temp = File('$target.tmp');
+    try {
+      final intoId = await _directoryId(into, create: true);
+      if (intoId == null) {
+        // Without it the reader cannot tell this destination from a replacement
+        // at the same path, so it would ignore the manifest anyway. Not writing
+        // one keeps the conservative behaviour (replay, which dedupes) instead
+        // of leaving a file that looks authoritative (codex 2026-09-26).
+        _logger?.logWarning(
+          '[MessageHistoryPersistence] could not identify ${into.path}; no '
+          'merged-file manifest is kept, so a resumed merge re-merges',
+        );
+        return;
+      }
+      final raf = await temp.open(mode: FileMode.write);
+      try {
+        await raf.writeString(jsonEncode(<String, Object?>{
+          'into': into.path,
+          'intoId': intoId,
+          'files': files,
+        }));
+        await raf.flush();
+      } finally {
+        await raf.close();
+      }
+      await _renameWithRetry(temp, target);
+    } catch (e, st) {
+      _logger?.logError(
+          '[MessageHistoryPersistence] recording the merged-file manifest in '
+          '${from.path} failed; those files may be merged again',
+          e,
+          st);
+    }
+  }
+
+  /// Row-level merge of one conversation file into another.
+  ///
+  /// Rows are collapsed the way a load collapses them ([_dedupeByIdentity]),
+  /// so a message present in both files stays ONE row and keeps every id
+  /// either copy carried. Stored `filePath` values round-trip verbatim: both
+  /// files were written by this device, so no placeholder rewriting applies.
+  /// False when neither side could be decoded — the caller must then leave the
+  /// source file where it is.
+  Future<bool> _mergeHistoryFiles(File from, File into) async {
+    // Rows this session has deleted must not come back through the merge: the
+    // destination copy made by an earlier, partially failed pass still holds
+    // them, and dedupe would keep it (codex 2026-09-26).
+    final conversationKey =
+        ConversationIdUtils.normalize(p.basenameWithoutExtension(into.path));
+    final tombstones = _recentlyDeleted[conversationKey];
+    bool isTombstoned(ChatMessage m) =>
+        tombstones != null &&
+        identitiesOf(m).any((id) => tombstones.containsKey(id));
+    List<ChatMessage> rowsOf(dynamic decoded) {
+      final raw = decoded is Map<String, dynamic> ? decoded['messages'] : decoded;
+      if (raw is! List) return const <ChatMessage>[];
+      final out = <ChatMessage>[];
+      for (final row in raw) {
+        try {
+          out.add(ChatMessage.fromJson(row as Map<String, dynamic>));
+        } catch (_) {
+          // One undecodable row costs that row only, as everywhere else.
+        }
+      }
+      return out;
+    }
+
+    var mustWrite = false;
+    dynamic decodedFrom;
+    List<ChatMessage> source;
+    try {
+      decodedFrom = jsonDecode(await from.readAsString());
+      source = rowsOf(decodedFrom);
+    } catch (e, st) {
+      // Nothing can be done with a source we cannot read. It stays where it is
+      // (the caller does not retire it and does not rename the directory
+      // aside), so it remains recoverable.
+      _logger?.logError(
+        '[MessageHistoryPersistence] reading ${p.basename(from.path)} to merge '
+        'it failed; it is left in place',
+        e,
+        st,
+      );
+      return false;
+    }
+
+    dynamic decodedInto;
+    List<ChatMessage> target;
+    try {
+      decodedInto = jsonDecode(await into.readAsString());
+      target = rowsOf(decodedInto);
+    } catch (e, st) {
+      // A DESTINATION we cannot decode must not make readable source rows
+      // unreachable (codex 2026-09-26): it is renamed aside — never deleted —
+      // and its own BACKUP is consulted first, because that backup is where
+      // its rows and its read barrier still are (a plain replacement then let
+      // the next save overwrite the backup and lose them).
+      final aside = '${into.path}.corrupt-'
+          '${DateTime.now().millisecondsSinceEpoch}';
+      _logger?.logError(
+        '[MessageHistoryPersistence] the destination ${p.basename(into.path)} '
+        'could not be decoded; it is moved to ${p.basename(aside)} and its '
+        'backup, if any, is merged with the incoming file',
+        e,
+        st,
+      );
+      try {
+        final backup = File('${into.path}.bak');
+        dynamic decodedBackup;
+        if (await backup.exists()) {
+          try {
+            decodedBackup = jsonDecode(await backup.readAsString());
+          } catch (_) {
+            decodedBackup = null;
+          }
+        }
+        await into.rename(aside);
+        if (decodedBackup == null) {
+          // Nothing recoverable: the source file takes the slot, atomically.
+          final temp = File('${into.path}.tmp');
+          await from.copy(temp.path);
+          await _renameWithRetry(temp, into.path);
+          return true;
+        }
+        decodedInto = decodedBackup;
+        target = rowsOf(decodedBackup);
+        // The primary is GONE now, so the write below is no longer optional:
+        // returning early would leave the conversation with no main file at all
+        // (codex 2026-09-26).
+        mustWrite = true;
+      } catch (e2, st2) {
+        _logger?.logError(
+            '[MessageHistoryPersistence] replacing the undecodable '
+            '${p.basename(into.path)} failed', e2, st2);
+        return false;
+      }
+    }
+    final merged =
+        List<ChatMessage>.from(_dedupeByIdentity(<ChatMessage>[...target, ...source]))
+          ..removeWhere(isTombstoned);
+    sortChatMessagesChronologically(merged);
+    final conversationId = (decodedInto is Map<String, dynamic>
+            ? decodedInto['conversationId'] as String?
+            : null) ??
+        ConversationIdUtils.normalize(p.basenameWithoutExtension(into.path));
+    // The LATER of the two read barriers: the same conversation may have been
+    // read more recently through the source directory, and keeping only the
+    // destination's value re-marked already-read messages unread
+    // (codex 2026-09-26).
+    int? readBarrierOf(dynamic decoded) =>
+        decoded is Map<String, dynamic> ? decoded['lastViewTimestamp'] as int? : null;
+    final intoBarrier = readBarrierOf(decodedInto) ?? 0;
+    final fromBarrier = readBarrierOf(decodedFrom) ?? 0;
+    final lastView = intoBarrier > fromBarrier ? intoBarrier : fromBarrier;
+    // Nothing to carry: a source with no rows and no later read barrier does not
+    // justify rewriting the destination. (The barrier alone does: skipping it
+    // here left already-read messages unread, codex 2026-09-26.) `mustWrite`
+    // wins: the primary may already have been moved aside.
+    if (!mustWrite && source.isEmpty && fromBarrier <= intoBarrier) return true;
+    final jsonString = jsonEncode({
+      'conversationId': conversationId,
+      'version': _historyFormatVersion,
+      'lastViewTimestamp': lastView,
+      'messages': merged.map((m) => m.toJson()).toList(),
+    });
+    final temp = File('${into.path}.tmp');
+    final raf = await temp.open(mode: FileMode.write);
+    try {
+      await raf.writeString(jsonString);
+      await raf.flush();
+    } finally {
+      await raf.close();
+    }
+    await _renameWithRetry(temp, into.path);
+    return true;
+  }
+
+  /// Append one archive file's lines to another's. Append-only by
+  /// construction, so concatenation is the merge.
+  Future<void> _appendArchiveLines(File from, File into) async {
+    final lines = await from.readAsString();
+    if (lines.trim().isEmpty) return;
+    var needsNewline = false;
+    final destLength = await into.length();
+    if (destLength > 0) {
+      final probe = await into.open();
+      try {
+        await probe.setPosition(destLength - 1);
+        final last = await probe.read(1);
+        needsNewline = last.isNotEmpty && last[0] != 0x0A;
+      } finally {
+        await probe.close();
+      }
+    }
+    final sink = into.openWrite(mode: FileMode.append);
+    try {
+      if (needsNewline) sink.write('\n');
+      sink.write(lines.endsWith('\n') ? lines : '$lines\n');
+      await sink.flush();
+    } finally {
+      await sink.close();
+    }
+  }
 
   /// Start (or restart) a session on this store.
   ///
@@ -266,15 +903,294 @@ class MessageHistoryPersistence {
   /// and loaded A's history into B's session. With the owner unknown the
   /// default directory is only used while nothing claims it — see
   /// [_resolveUnownedDirectory].
-  void openSession({String? ownerKey}) {
+  ///
+  /// AWAIT IT. When the outgoing session still holds state, the hand-over is
+  /// asynchronous: what is owed to the directory the store is bound to RIGHT
+  /// NOW is written there before that state is dropped. The returned future
+  /// completes once the new identity is in effect; the cache is then empty, so
+  /// the next read comes from the new owner's directory.
+  ///
+  /// H1: the reset used to be skipped whenever the PREVIOUS owner was null —
+  /// that is, on the ownerless -> owned transition, which is the one every
+  /// host makes (the identity only exists once the Tox profile is open). The
+  /// store kept the rows it had loaded from the unmarked shared default
+  /// directory, served them to the new owner, and the first append copied them
+  /// into that owner's own files. Every owner change now hands over.
+  Future<void> openSession({String? ownerKey}) {
     final normalizedOwner = _normalizeOwnerKey(ownerKey);
-    if (normalizedOwner != _ownerKey) {
-      if (_ownerKey != null) _resetSessionState();
-      _ownerKey = normalizedOwner;
-      _resolvedDefaultDirPath = null;
-    }
     _disposed = false;
+    if (normalizedOwner == _ownerKey) return Future<void>.value();
+    if (!_hasSessionState) {
+      // Nothing is owed to the outgoing directory (a freshly constructed
+      // store, or one a dispose() already emptied). Switch SYNCHRONOUSLY, so
+      // a caller that does not await still cannot observe the old binding.
+      _applyNewOwner(normalizedOwner);
+      return Future<void>.value();
+    }
+    return _handOverSession(normalizedOwner);
   }
+
+  void _applyNewOwner(String? nextOwner) {
+    _resetSessionState();
+    _ownerKey = nextOwner;
+    _forgetResolvedDefaultDirectory();
+    _restoreHeldRows(nextOwner);
+  }
+
+  /// Rows an owner change could not write to the OUTGOING owner's directory,
+  /// held until that identity comes back.
+  ///
+  /// They must not be carried into the next session (they would be written
+  /// into another account's files), and dropping them loses a message the user
+  /// sent — a full disk or one unwritable conversation during an account
+  /// switch was enough (codex 2026-09-26). So they stay here, keyed by the
+  /// owner they belong to, and [_applyNewOwner] puts them back when that owner
+  /// is opened again — including the common `null -> owner -> null` shape.
+  ///
+  /// In-memory only, and bounded: an app that never returns to that identity
+  /// loses them at exit exactly as before.
+  final Map<String?, _HeldRows> _heldRowsByOwner = {};
+  static const int _maxHeldOwners = 8;
+
+  /// Hold what [flushPendingSaves] could not land for [owner].
+  void _holdUnflushedRows(String? owner, Iterable<String> conversationIds) {
+    if (owner == null) {
+      // An OWNERLESS session's rows cannot be held: `null` names no identity,
+      // so restoring them on the next ownerless session would serve one
+      // account's unwritten messages to the next account that logs in through
+      // the same pre-identity window (codex 2026-09-26). They stay lost, which
+      // is what the log says.
+      _logger?.logWarning(
+        '[MessageHistoryPersistence] the outgoing session had no identity, so '
+        'its unwritten rows cannot be attributed and are dropped',
+      );
+      return;
+    }
+    final rows = <String, List<ChatMessage>>{};
+    final lastView = <String, int>{};
+    final deleted = <String, Map<String, int>>{};
+    for (final id in conversationIds) {
+      final cached = _historyById[id];
+      if (cached != null && cached.isNotEmpty) {
+        rows[id] = List<ChatMessage>.from(cached);
+      }
+      final seen = _lastViewTimestampById[id];
+      if (seen != null) lastView[id] = seen;
+      // The tombstones of the SAME conversation: a delete whose write failed is
+      // undone by the next load merging the disk row back in, and dropping the
+      // sole row of a conversation leaves nothing else to hold (codex
+      // 2026-09-26).
+      final tombstones = _recentlyDeleted[id];
+      if (tombstones != null && tombstones.isNotEmpty) {
+        deleted[id] = Map<String, int>.from(tombstones);
+      }
+    }
+    if (rows.isEmpty && lastView.isEmpty && deleted.isEmpty) return;
+    final existing = _heldRowsByOwner.remove(owner);
+    if (existing != null) {
+      // Merge, so a second failed switch does not discard the first one's rows.
+      for (final entry in existing.rows.entries) {
+        rows.putIfAbsent(entry.key, () => entry.value);
+      }
+      for (final entry in existing.lastView.entries) {
+        lastView.putIfAbsent(entry.key, () => entry.value);
+      }
+      for (final entry in existing.deleted.entries) {
+        deleted.putIfAbsent(entry.key, () => entry.value);
+      }
+    }
+    _heldRowsByOwner[owner] =
+        _HeldRows(rows: rows, lastView: lastView, deleted: deleted);
+    while (_heldRowsByOwner.length > _maxHeldOwners) {
+      final oldest = _heldRowsByOwner.keys.first;
+      _heldRowsByOwner.remove(oldest);
+      _logger?.logWarning(
+        '[MessageHistoryPersistence] more than $_maxHeldOwners '
+        'identities hold unwritten rows; the oldest one\'s are dropped',
+      );
+    }
+    _logger?.logWarning(
+      '[MessageHistoryPersistence] ${rows.length} conversation(s) could not be '
+      'written to the outgoing session\'s directory; they are held in memory '
+      'and re-written if that identity is opened again',
+    );
+  }
+
+  /// Conversations whose only copy of some rows is [_heldRowsByOwner]'s, for
+  /// the owner this session is bound to. They are in the cache (the restore put
+  /// them there) but not necessarily on disk yet, so a listing built purely
+  /// from files would miss them.
+  Iterable<String> get _restoredConversationIds => _restoredForThisOwner;
+  final Set<String> _restoredForThisOwner = {};
+
+  /// Conversations whose restored TOMBSTONES still have to be applied to the
+  /// file. Drained by [flushPendingSaves] (and therefore by [dispose]) through
+  /// a load-then-save under the conversation lock, so the deletion becomes
+  /// durable without a blind write.
+  final Set<String> _tombstoneReconcile = {};
+
+  /// Whether every row [file] holds is named by [normalizedId]'s tombstones —
+  /// i.e. writing an empty list over it deletes nothing that should survive.
+  /// False when the file cannot be read or decoded, which is the case an empty
+  /// write must never be authorised from.
+  Future<bool> _holdsOnlyTombstonedRows(File file, String normalizedId) async {
+    final tombstones = _recentlyDeleted[normalizedId];
+    if (tombstones == null || tombstones.isEmpty) return false;
+    try {
+      final decoded = jsonDecode(await file.readAsString());
+      final raw = decoded is Map<String, dynamic> ? decoded['messages'] : decoded;
+      if (raw is! List) return false;
+      for (final row in raw) {
+        if (row is! Map<String, dynamic>) return false;
+        final ChatMessage message;
+        try {
+          message = ChatMessage.fromJson(row);
+        } catch (_) {
+          return false;
+        }
+        if (!identitiesOf(message).any(tombstones.containsKey)) return false;
+      }
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  Future<void> _drainTombstoneReconcile() async {
+    if (_tombstoneReconcile.isEmpty) return;
+    // Each id leaves the queue only once its write has landed: clearing the set
+    // upfront let a flush report success for a deletion that never reached the
+    // file, and dispose then dropped the tombstone with it (codex 2026-09-26).
+    for (final id in _tombstoneReconcile.toList(growable: false)) {
+      try {
+        // The load filters what [_recentlyDeleted] names, so what it installs is
+        // already the post-delete state. The CACHE is what gets saved, not the
+        // returned list: an ordinary save may have added a row between the two
+        // operations, and that row must not be written away.
+        await loadHistory(id);
+        final normalizedId = ConversationIdUtils.normalize(id);
+        var rows = _historyById[normalizedId];
+        if (rows == null) {
+          // The load installed nothing. That is the right state for a
+          // conversation whose every row was deleted, but a READ FAILURE looks
+          // exactly the same from here, and creating an empty entry would let
+          // saveHistory delete a file that still has rows (codex 2026-09-26).
+          // So the file decides.
+          final file = await _getHistoryFile(normalizedId);
+          if (!await file.exists()) {
+            // Nothing on disk: the deletion is already effective.
+            _tombstoneReconcile.remove(id);
+            continue;
+          }
+          if (!await _holdsOnlyTombstonedRows(file, normalizedId)) {
+            _logger?.logWarning(
+              '[MessageHistoryPersistence] a restored deletion for $id could '
+              'not be applied (the file could not be read as deleted-only); it '
+              'stays queued',
+            );
+            continue;
+          }
+          rows = _historyById.putIfAbsent(normalizedId, () => <ChatMessage>[]);
+        }
+        await saveHistory(normalizedId, rows);
+        _tombstoneReconcile.remove(id);
+      } catch (e, st) {
+        _logger?.logError(
+            '[MessageHistoryPersistence] applying a restored deletion for $id '
+            'failed; it stays queued',
+            e,
+            st);
+      }
+    }
+  }
+
+  /// Put back what a previous failed hand-over held for [owner], and re-arm
+  /// the write so the next flush (or dispose) tries again.
+  void _restoreHeldRows(String? owner) {
+    if (owner == null) return;
+    final held = _heldRowsByOwner.remove(owner);
+    if (held == null) return;
+    // Before the rows: a tombstone must be in place when the next load of that
+    // conversation merges the file, or the delete is undone.
+    for (final entry in held.deleted.entries) {
+      final into = _recentlyDeleted.putIfAbsent(entry.key, () => <String, int>{});
+      for (final tombstone in entry.value.entries) {
+        into.putIfAbsent(tombstone.key, () => tombstone.value);
+      }
+      // NOT an empty cached list: rows can survive on disk that the cache never
+      // held (an overflow row whose archive write failed), and writing `[]`
+      // over the file would delete them (codex 2026-09-26). The conversation is
+      // queued for reconciliation instead — load the file under the
+      // conversation lock, which applies these tombstones, then save that.
+      _tombstoneReconcile.add(entry.key);
+      _restoredForThisOwner.add(entry.key);
+    }
+    for (final entry in held.rows.entries) {
+      final existing = _historyById[entry.key];
+      _historyById[entry.key] = existing == null
+          ? entry.value
+          : _dedupeByIdentity(<ChatMessage>[...existing, ...entry.value]);
+      sortChatMessagesChronologically(_historyById[entry.key]!);
+      _dirtyAfterLoad.add(entry.key);
+      _restoredForThisOwner.add(entry.key);
+    }
+    for (final entry in held.lastView.entries) {
+      final existing = _lastViewTimestampById[entry.key];
+      if (existing == null || entry.value > existing) {
+        _lastViewTimestampById[entry.key] = entry.value;
+      }
+    }
+    _logger?.log(
+      '[MessageHistoryPersistence] ${held.rows.length} conversation(s) held '
+      'from an earlier failed session hand-over were restored for this owner',
+    );
+  }
+
+  /// Land everything owed to the directory the session is bound to now, then
+  /// drop that session and adopt [nextOwner].
+  Future<void> _handOverSession(String? nextOwner) async {
+    final outgoing = _ownerKey;
+    try {
+      await flushPendingSaves();
+    } on HistoryFlushException catch (e, st) {
+      // Carrying the rows across would be worse than losing them: they would
+      // be written under the NEXT identity, in that account's files. So they
+      // are QUARANTINED under the outgoing owner instead of dropped — a full
+      // disk during an account switch used to lose the message outright
+      // (codex 2026-09-26).
+      _logger?.logError(
+        '[MessageHistoryPersistence] openSession: '
+        '${e.conversationIds.length} conversation(s) could not be written to '
+        'the outgoing session\'s directory; they are held for that identity '
+        'rather than carried into the next one',
+        e,
+        st,
+      );
+      _holdUnflushedRows(outgoing, e.conversationIds);
+    } catch (e, st) {
+      _logger?.logError(
+        '[MessageHistoryPersistence] openSession: flushing the outgoing '
+        'session failed; its unwritten rows are held for that identity rather '
+        'than carried into the next one',
+        e,
+        st,
+      );
+      // No per-conversation detail: hold everything the session still has.
+      _holdUnflushedRows(outgoing, _historyById.keys.toList(growable: false));
+    }
+    _applyNewOwner(nextOwner);
+  }
+
+  /// Whether this store is holding anything a session change must not carry
+  /// across (or silently drop without flushing first).
+  bool get _hasSessionState =>
+      _historyById.isNotEmpty ||
+      _lastViewTimestampById.isNotEmpty ||
+      _recentlyDeleted.isNotEmpty ||
+      _pendingArchive.isNotEmpty ||
+      _appendDebounceTimers.isNotEmpty ||
+      _saveRetryTimers.isNotEmpty ||
+      _dirtyAfterLoad.isNotEmpty;
 
   /// Re-point this store at a per-account [historyDirectory] after
   /// construction, for hosts that only learn the account identity once the
@@ -296,7 +1212,11 @@ class MessageHistoryPersistence {
   ///    are dropped, and in-flight work is invalidated via the epoch bump;
   ///  * the owner binding set by [openSession] survives. It only ever governed
   ///    the DEFAULT directory, which an injected directory supersedes, and the
-  ///    identity itself has not changed.
+  ///    identity itself has not changed;
+  ///  * rows already written to this session's OWNER-BOUND default directory
+  ///    come with it, merged by row identity — see
+  ///    [ownerBoundDefaultDirectory]. Nothing is carried from a directory that
+  ///    is not provably this identity's.
   ///
   /// Idempotent: rebinding to the directory already in use is a no-op.
   Future<void> rebindHistoryDirectory(String historyDirectory) async {
@@ -335,11 +1255,60 @@ class MessageHistoryPersistence {
       );
       rethrow;
     }
+    // Carry over the rows this session wrote to its OWNER-BOUND default
+    // directory.
+    //
+    // H4: a host that cannot know the identity until the Tox profile is open
+    // creates the store on the default directory, and tim2tox routes an
+    // owner-bound session there to `<base>_<publicKey>` rather than let it
+    // read a directory it cannot prove is its own. Everything written between
+    // that point and this rebind therefore lives in `<base>_<publicKey>` — and
+    // nothing else looks there: a host's own legacy migration knows only the
+    // pre-binding `<base>`, and this rebind moves the STORE, not the files. So
+    // the messages of the very login that is in progress would vanish the
+    // moment per-account storage is installed. Merged, not copied over: the
+    // destination may already hold a legacy migration's copy of the same
+    // conversation.
+    //
+    // Only the provably-ours directory is carried
+    // ([ownerBoundDefaultDirectory] returns null for the unproven shared
+    // base, which stays the host's decision to claim).
+    try {
+      final carryOver = await ownerBoundDefaultDirectory();
+      if (carryOver != null &&
+          p.canonicalize(carryOver) != p.canonicalize(historyDirectory)) {
+        await Directory(historyDirectory).create(recursive: true);
+        if (!await _mergeHistoryDirectory(
+          from: Directory(carryOver),
+          into: Directory(historyDirectory),
+        )) {
+          // The rebind still happens — the per-account directory IS this
+          // account's storage from here on, and refusing would fail the login
+          // over one unreadable file. What did not merge stays in $carryOver,
+          // which is not renamed aside, so the next rebind of this account
+          // picks it up.
+          _logger?.logWarning(
+            '[MessageHistoryPersistence] part of $carryOver could not be '
+            'carried into $historyDirectory; those rows stay there and are '
+            'merged again on the next rebind of this account',
+          );
+        }
+      }
+    } catch (e, st) {
+      // Not fatal: the rows stay where they are and the directory is named in
+      // the log, so they remain recoverable.
+      _logger?.logError(
+        '[MessageHistoryPersistence] carrying the owner-bound default history '
+        'directory into $historyDirectory failed',
+        e,
+        st,
+      );
+    }
     _resetSessionState();
     _historyDirectory = historyDirectory;
     // The owner-bound default no longer applies; drop the memo so a later
     // fallback (should the injected directory ever be cleared) re-resolves.
-    _resolvedDefaultDirPath = null;
+    _forgetResolvedDefaultDirectory();
     _disposed = false;
   }
 
@@ -368,21 +1337,57 @@ class MessageHistoryPersistence {
       if (!await dir.exists()) await dir.create(recursive: true);
       return dir;
     }
-    final appRoot =
-        _appSupportRootOverride ?? (await getApplicationSupportDirectory()).path;
-    final basePath = _instanceId != null && _instanceId != 0
-        ? '$appRoot/chat_history_instance_$_instanceId'
-        : '$appRoot/chat_history';
+    final basePath = await _defaultBasePath();
     final owner = _ownerKey;
     if (owner == null) {
       final path = await _resolveUnownedDirectory(basePath);
-      if (_ownerKey == null) _resolvedDefaultDirPath = path;
+      // H3: an UNMARKED base directory is only ours until somebody claims it.
+      // That answer must NOT be memoized: another instance of the app running
+      // against the same app-support root can write the owner marker at any
+      // moment, and a cached path would keep this session writing into — and
+      // `clearAllHistories` deleting — the new owner's files. Re-checking is
+      // one `stat` per directory resolution. The `_unowned` answer IS stable
+      // (a marker is never withdrawn), so that one is cached.
+      //
+      // What this can and cannot do: it stops THIS process from touching the
+      // base directory after the claim becomes visible. It is not cross-
+      // process coordination — there is no lock, the claim and the writes
+      // that follow it are not atomic with respect to another process, and
+      // rows written into the base directory before the claim became visible
+      // stay there. Hosts must not run two instances against one app-support
+      // root; that is a host-level constraint this layer cannot enforce.
+      final previous = _unownedPathInUse;
+      if (previous != null && previous != path) {
+        _logger?.logError(
+          '[MessageHistoryPersistence] the default history directory was '
+          'claimed while this ownerless session was using it; switching from '
+          '$previous to $path. Rows written before the claim became visible '
+          'remain in the claimed directory — there is no cross-process lock '
+          'here.',
+          StateError('default history directory claimed mid-session'),
+          StackTrace.current,
+        );
+      }
+      if (_ownerKey == null) {
+        _unownedPathInUse = path;
+        if (path != basePath) _resolvedDefaultDirPath = path;
+      }
       return Directory(path);
     }
     final path = await _resolveOwnedDirectory(basePath, owner);
     // Only cache if the owner did not change while we resolved.
     if (_ownerKey == owner) _resolvedDefaultDirPath = path;
     return Directory(path);
+  }
+
+  /// `<AppSupport>/chat_history`, instance-suffixed for a multi-instance
+  /// store. The parent of every DEFAULT (non-injected) history directory.
+  Future<String> _defaultBasePath() async {
+    final appRoot =
+        _appSupportRootOverride ?? (await getApplicationSupportDirectory()).path;
+    return _instanceId != null && _instanceId != 0
+        ? '$appRoot/chat_history_instance_$_instanceId'
+        : '$appRoot/chat_history';
   }
 
   /// The default directory for a session whose owning identity is NOT known.
@@ -395,12 +1400,19 @@ class MessageHistoryPersistence {
   /// moment the identity is known [openSession] re-resolves to the account's
   /// own directory.
   ///
-  /// An UNMARKED base directory — the only shape a host that never supplies an
-  /// owner produces — is used exactly as before.
+  /// An UNMARKED base directory is still used as is, and deliberately so: with
+  /// no owner there is nothing to isolate BY, and it is the only shape a host
+  /// that never supplies an owner ever produces — isolating it would strand
+  /// that host's entire history (and, in toxee, the rows written in the window
+  /// between login and `installAccountStorage`, which its migration adopts from
+  /// exactly this directory). An identity that IS known never shares an
+  /// unproven directory — see [_resolveOwnedDirectory]; that is where the
+  /// cross-account read is cut off, because only there is there something to
+  /// tell two sessions apart.
   Future<String> _resolveUnownedDirectory(String basePath) async {
     try {
       final marker = File(p.join(basePath, _ownerMarkerName));
-      if (await marker.exists()) {
+      if ((await _readOwnerMarker(marker)).exists) {
         _logger?.logWarning(
           '[MessageHistoryPersistence] the default history directory is '
           'claimed by an identity and this session has none yet; using an '
@@ -431,29 +1443,59 @@ class MessageHistoryPersistence {
   ///    gets its own `<base>_<publicKey>` directory;
   ///  * an UNMARKED directory that already holds history predates owner
   ///    binding. Whose it is cannot be proven here (rows carry peer ids, not
-  ///    ours), so it is neither claimed nor abandoned: it keeps working as
-  ///    before, and the integrator's proven migration (toxee:
-  ///    LegacyAccountDataClaim) decides who adopts it. First-to-ask is not
-  ///    proof of ownership.
+  ///    ours), and first-to-ask is not proof: it used to be handed to whichever
+  ///    account asked first, which is the SAME bug one layer down — two
+  ///    accounts read and overwrote the same per-peer files. It is now given to
+  ///    nobody unless the integrator has proven an owner
+  ///    ([declareProvenDefaultOwner]; toxee proves it with
+  ///    LegacyAccountDataClaim and migrates the rows into a per-account
+  ///    directory instead). Every other identity gets its own
+  ///    `<base>_<publicKey>` directory and the legacy rows are left untouched,
+  ///    so the rightful owner can still claim them later.
   Future<String> _resolveOwnedDirectory(String basePath, String owner) async {
     final base = Directory(basePath);
     final marker = File(p.join(basePath, _ownerMarkerName));
     try {
-      if (await marker.exists()) {
-        if ((await marker.readAsString()).trim().toUpperCase() == owner) {
-          return basePath;
-        }
-      } else if (!await _holdsHistory(base)) {
-        await base.create(recursive: true);
-        await marker.writeAsString(owner, flush: true);
+      final state = await _readOwnerMarker(marker);
+      if (state.owner == owner) {
         return basePath;
+      } else if (state.owner != null) {
+        // Marked for somebody else. Never touched.
+      } else if (!await _holdsHistory(base)) {
+        // A fresh directory — or one an interrupted claim left with an
+        // unusable marker and nothing in it. Either way there is nothing to
+        // lose: claim it.
+        await base.create(recursive: true);
+        await _writeOwnerMarker(marker, owner);
+        return basePath;
+      } else if (_provenDefaultOwner == owner) {
+        // The host proved this identity owns the pre-binding directory. Adopt
+        // it in place and mark it, so the next account is isolated by the
+        // marker check above rather than by this declaration.
+        //
+        // H2: this is also the recovery path for an UNUSABLE marker. A marker
+        // that exists but names nobody (what a crash mid-write used to leave
+        // behind) matches no owner, so without this the rightful owner was
+        // routed away from its own history for good. The marker is rewritten
+        // whole, atomically.
+        await _writeOwnerMarker(marker, owner);
+        return basePath;
+      } else if (state.isInvalid) {
+        _logger?.logWarning(
+          '[MessageHistoryPersistence] the default history directory carries '
+          'an unusable owner marker (an interrupted claim) and holds history; '
+          'it names nobody, so it is left untouched and this session uses an '
+          'isolated directory. Declare a proven owner to repair and adopt it.',
+        );
       } else {
         _logger?.logWarning(
           '[MessageHistoryPersistence] default history directory predates '
-          'owner binding and is not provably this account\'s; using it '
-          'unclaimed (inject a per-account historyDirectory to isolate)',
+          'owner binding and is not provably this account\'s; leaving it '
+          'untouched and using an isolated directory (inject a per-account '
+          'historyDirectory, or declare a proven owner, to adopt it)',
         );
-        return basePath;
+        // Falls through to the isolated directory below: an unproven
+        // directory is never shared.
       }
     } catch (e, st) {
       _logger?.logError(
@@ -463,14 +1505,57 @@ class MessageHistoryPersistence {
     final isolated = Directory(isolatedPath);
     if (!await isolated.exists()) await isolated.create(recursive: true);
     final isolatedMarker = File(p.join(isolatedPath, _ownerMarkerName));
-    if (!await isolatedMarker.exists()) {
+    if (!(await _readOwnerMarker(isolatedMarker)).exists) {
       try {
-        await isolatedMarker.writeAsString(owner, flush: true);
+        await _writeOwnerMarker(isolatedMarker, owner);
       } catch (_) {
         // The name already isolates it; the marker is informational here.
       }
     }
     return isolatedPath;
+  }
+
+  /// Read [marker]'s recorded owner.
+  ///
+  /// Three outcomes, and the caller must distinguish all three: no marker at
+  /// all, a marker holding a usable 64-hex public key, and a marker that
+  /// exists but names NOBODY — empty, truncated or garbage. The last one is
+  /// what an interrupted claim leaves behind; treating it as "belongs to some
+  /// other account" is what locked the rightful owner out (H2).
+  Future<_OwnerMarkerState> _readOwnerMarker(File marker) async {
+    if (!await marker.exists()) return const _OwnerMarkerState.missing();
+    String raw;
+    try {
+      raw = await marker.readAsString();
+    } catch (e, st) {
+      _logger?.logError(
+          '[MessageHistoryPersistence] owner marker unreadable', e, st);
+      return const _OwnerMarkerState.invalid();
+    }
+    final owner = _normalizeOwnerKey(raw.trim());
+    return owner == null
+        ? const _OwnerMarkerState.invalid()
+        : _OwnerMarkerState.of(owner);
+  }
+
+  /// Write an owner marker so it appears WHOLE or not at all.
+  ///
+  /// H2: `writeAsString` truncates the file and then writes, so a crash (or a
+  /// full disk, or a killed mobile app) in that window left an empty or
+  /// half-written marker on disk. The next launch then found a marker that
+  /// matched nobody and routed even the account that owns the directory to an
+  /// isolated, empty one — history that looks lost, from a single interrupted
+  /// write. Temp file + fsync + atomic rename removes the window.
+  Future<void> _writeOwnerMarker(File marker, String owner) async {
+    final temp = File('${marker.path}.tmp');
+    final raf = await temp.open(mode: FileMode.write);
+    try {
+      await raf.writeString(owner);
+      await raf.flush();
+    } finally {
+      await raf.close();
+    }
+    await _renameWithRetry(temp, marker.path);
   }
 
   static Future<bool> _holdsHistory(Directory dir) async {
@@ -1357,6 +2442,28 @@ class MessageHistoryPersistence {
       // Return whatever we've loaded so far
     }
 
+    // Conversations restored from a previous failed hand-over ([_HeldRows]) are
+    // in the cache but not necessarily in a file yet, so a listing built from
+    // the directory alone would leave them out of the conversation list for the
+    // whole session (codex 2026-09-26).
+    for (final id in _restoredConversationIds) {
+      if (result.containsKey(id)) continue;
+      final cached = _historyById[id];
+      if (cached == null || cached.isEmpty) continue;
+      // Matched on the ROW's groupId, exactly as loadHistory does: the
+      // conversation id is normalized ('group_g1' -> 'g1') and comparing that
+      // against quitGroups let a quit group's rows through (codex 2026-09-26).
+      if (quitGroups != null) {
+        final groupId = cached.first.groupId;
+        if (groupId != null &&
+            groupId.isNotEmpty &&
+            quitGroups.contains(groupId)) {
+          continue;
+        }
+      }
+      result[id] = List<ChatMessage>.from(cached);
+    }
+
     // M1: drain post-load normalization writes serially so we don't fan out
     // hundreds of concurrent fence-contending saves on cold start.
     await flushDirtyAfterLoad();
@@ -1924,6 +3031,9 @@ class MessageHistoryPersistence {
     // left armed, never cancelled here), and the flush then throws a
     // [HistoryFlushException] naming what is still only in memory, instead
     // of returning as if everything were durable.
+    // Restored deletions first: they turn into ordinary dirty writes, which
+    // the rounds below then flush.
+    await _drainTombstoneReconcile();
     final failures = <String, Object>{};
     // Set when the round cap below is reached with dirty work still arriving:
     // that is NOT "flushed", and callers that reset session state on the
@@ -2080,6 +3190,8 @@ class MessageHistoryPersistence {
     _archiveCacheRows = null;
     _lastViewTimestampById.clear();
     _dirtyAfterLoad.clear();
+    _restoredForThisOwner.clear();
+    _tombstoneReconcile.clear();
   }
 
   /// Whether [msg] is identified by [id] — either its current primary
@@ -2510,7 +3622,7 @@ class MessageHistoryPersistence {
           '[MessageHistoryPersistence] clearAllHistories failed', e, st);
     } finally {
       // The owner marker went with the directory; resolve again next time.
-      _resolvedDefaultDirPath = null;
+      _forgetResolvedDefaultDirectory();
       barrier.complete();
       if (identical(_clearAllBarrier, barrier.future)) {
         _clearAllBarrier = null;
@@ -3004,6 +4116,89 @@ class MessageHistoryPersistence {
 /// Epoch + per-conversation generation captured when an operation is called;
 /// see "One concurrency model per conversation" in [MessageHistoryPersistence].
 typedef _OpToken = ({int epoch, int gen});
+
+/// What a default history directory's `.tim2tox_history_owner` file says.
+///
+/// [exists] without an [owner] is the state an interrupted claim leaves: a
+/// marker is present but names nobody. See
+/// `MessageHistoryPersistence._writeOwnerMarker`.
+/// Rows held for an identity whose directory could not be written during an
+/// owner change. See [MessageHistoryPersistence._heldRowsByOwner].
+class _HeldRows {
+  _HeldRows({required this.rows, required this.lastView, required this.deleted});
+
+  final Map<String, List<ChatMessage>> rows;
+  final Map<String, int> lastView;
+  /// Tombstones owed with the rows: conversation id -> msgID -> delete seq.
+  final Map<String, Map<String, int>> deleted;
+}
+
+class _OwnerMarkerState {
+  const _OwnerMarkerState._(this.owner, this.exists);
+  const _OwnerMarkerState.missing() : this._(null, false);
+  const _OwnerMarkerState.invalid() : this._(null, true);
+  const _OwnerMarkerState.of(String owner) : this._(owner, true);
+
+  /// The normalized 64-hex public key recorded, when the marker holds one.
+  final String? owner;
+
+  /// A marker file is present (whatever it contains).
+  final bool exists;
+
+  /// Present, but it does not name a usable identity.
+  bool get isInvalid => exists && owner == null;
+}
+
+/// What the DEFAULT history directory looks like to a session.
+///
+/// Returned by [MessageHistoryPersistence.defaultHistoryDirectoryStatus] so a
+/// host can tell "this account has no history yet" apart from "this account's
+/// history is on disk but nobody has proven who owns it", which look identical
+/// from the UI and only the second of which is recoverable.
+class DefaultHistoryDirectoryStatus {
+  const DefaultHistoryDirectoryStatus({
+    required this.basePath,
+    required this.resolvedPath,
+    required this.markedOwner,
+    required this.markerInvalid,
+    required this.baseHoldsHistory,
+    required this.sessionOwner,
+  });
+
+  /// `<AppSupport>/chat_history` (instance-suffixed when multi-instance).
+  final String basePath;
+
+  /// The directory this session actually reads and writes.
+  final String resolvedPath;
+
+  /// Identity recorded by [basePath]'s owner marker, when it holds a usable
+  /// one.
+  final String? markedOwner;
+
+  /// [basePath] carries a marker that names nobody (an interrupted claim).
+  final bool markerInvalid;
+
+  /// [basePath] holds conversation files.
+  final bool baseHoldsHistory;
+
+  /// The identity this session was opened for, when it has one.
+  final String? sessionOwner;
+
+  /// History sits in [basePath], nobody has claimed it, and this session was
+  /// routed to [resolvedPath] instead — so the app shows an EMPTY history
+  /// while every row is still on disk. Indistinguishable from data loss to a
+  /// user, so the host must offer a way out:
+  /// [MessageHistoryPersistence.adoptDefaultHistoryDirectory] when it can
+  /// vouch for the identity, or its own per-account migration.
+  bool get hasUnadoptedHistory =>
+      baseHoldsHistory && markedOwner == null && resolvedPath != basePath;
+
+  @override
+  String toString() => 'DefaultHistoryDirectoryStatus(base: $basePath, '
+      'resolved: $resolvedPath, markedOwner: $markedOwner, '
+      'markerInvalid: $markerInvalid, baseHoldsHistory: $baseHoldsHistory, '
+      'sessionOwner: $sessionOwner)';
+}
 
 /// [MessageHistoryPersistence.flushPendingSaves] could not write every
 /// conversation. Their rows are still in memory and a retry is armed; the

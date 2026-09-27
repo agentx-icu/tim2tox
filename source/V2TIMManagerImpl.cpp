@@ -3,8 +3,9 @@
 #include "V2TIMUtils.h"
 #include "Tim2ToxControlPacket.h"
 extern "C" {
-#include "toxcore/crypto_core.h"  // crypto_sha256 (MM-6 identity digests)
-#include "toxcore/os_random.h"    // os_random (MM-6 challenge nonces)
+#include "toxcore/crypto_core.h"  // crypto_sha256 / encrypt_data (MM-6 digests + sealed proof)
+#include "toxcore/os_random.h"    // os_random (MM-6 challenge + box nonces)
+#include "toxcore/os_memory.h"    // os_memory (the Memory* encrypt_data/decrypt_data take)
 }
 #include "Tim2ToxPacketIds.h"
 #include <random>
@@ -708,7 +709,12 @@ bool V2TIMManagerImpl::InitSDK(uint32_t sdkAppID, const V2TIMSDKConfig& config) 
 
     V2TIM_LOG(kInfo, "[InitSDK] creating new ToxManager instance for this={} (instance_id={})",
               (void*)this, (long long)this_instance_id);
-    tox_manager_ = std::make_unique<ToxManager>();
+    {
+        // Published under tox_manager_mutex_ so AcquireToxSession() on another
+        // thread either sees no session or sees a fully constructed one.
+        std::lock_guard<std::mutex> manager_lock(tox_manager_mutex_);
+        tox_manager_ = std::make_shared<ToxManager>();
+    }
     // Only the default/session instance may run the harness TCP relay server on
     // its fixed port; an auxiliary instance that tried would fail tox_new with
     // TOX_ERR_NEW_PORT_ALLOC and never come up at all.
@@ -2086,6 +2092,23 @@ bool V2TIMManagerImpl::InitSDK(uint32_t sdkAppID, const V2TIMSDKConfig& config) 
     return true;
 }
 
+// See ToxSessionGuard in the header for why this pins rather than locks.
+V2TIMManagerImpl::ToxSessionGuard V2TIMManagerImpl::AcquireToxSession() const {
+    std::shared_ptr<ToxManager> manager;
+    {
+        std::lock_guard<std::mutex> manager_lock(tox_manager_mutex_);
+        manager = tox_manager_;
+    }
+    if (!manager) return ToxSessionGuard();
+    // Released tox_manager_mutex_ first: ToxManager takes its own mutex here,
+    // and nothing may hold the two at once (UnInitSDK holds tox_manager_mutex_
+    // only to swap the pointer out).
+    std::shared_ptr<Tox> tox = manager->acquireTox();
+    if (!tox) return ToxSessionGuard();
+    return ToxSessionGuard(std::move(manager), std::move(tox), this,
+                           session_epoch_.load(std::memory_order_acquire));
+}
+
 void V2TIMManagerImpl::UnInitSDK() {
     // Called from a listener/callback while this thread is inside a
     // tox_iterate() or toxav_iterate() (possibly ON event_thread_): the
@@ -2151,10 +2174,30 @@ void V2TIMManagerImpl::UnInitSDK() {
             toxav_manager_.reset();
         }
 #endif
-        if (tox_manager_) {
-            tox_manager_->saveTo(save_path);
-            tox_manager_->shutdown();
-            tox_manager_.reset();
+        // Unpublish FIRST, so an AcquireToxSession() racing with this teardown
+        // refuses outright instead of starting an operation we are about to
+        // tear down. Whoever already holds a pin keeps the manager and the Tox
+        // alive through the end of their call sequence; the tox_kill() then
+        // runs when that last pin drops (see ToxManager::acquireTox).
+        std::shared_ptr<ToxManager> tox_manager;
+        {
+            std::lock_guard<std::mutex> manager_lock(tox_manager_mutex_);
+            tox_manager.swap(tox_manager_);
+        }
+        if (tox_manager) {
+            // Admission first: from here no NEW operation is handed a pin, so
+            // the save below is the last word on this session. Operations
+            // already admitted keep their pins and the save waits for them.
+            tox_manager->closeAdmission();
+            // final_save: the LAST chance for anything still in flight to reach
+            // the profile — a CreateGroup that overlapped this logout is only
+            // durable because this save waits for its pin (codex 2026-09-26).
+            if (!tox_manager->saveTo(save_path, nullptr, /*final_save=*/true)) {
+                V2TIM_LOG(kError,
+                          "[UnInitSDK] the final profile save FAILED; work from this session "
+                          "may not be on disk");
+            }
+            tox_manager->shutdown();
         }
     } catch (...) {
         // Ignore exceptions during shutdown
@@ -2209,6 +2252,8 @@ void V2TIMManagerImpl::ResetGroupSessionState() {
         answered_identity_challenges_.clear();
         answered_identity_challenge_order_.clear();
         identity_rate_by_friend_.clear();
+        identity_rate_by_group_sender_.clear();
+        group_receipt_rate_by_sender_.clear();
         identity_rate_global_ = IdentityRateWindow{};
         identity_last_prune_ = IdentityClock::time_point{};
         seen_group_receipts_.clear();
@@ -2238,10 +2283,16 @@ void V2TIMManagerImpl::SaveToxProfile() {
         (void)tim2tox::path::EnsureDirectoryExists(save_dir, &mkdir_err);
         save_path = tim2tox::path::BuildProfilePath(save_dir, GetInstanceIdFromManager(this)).string();
     }
-    if (tox_manager_->saveTo(save_path)) {
-        V2TIM_LOG(kInfo, "[SaveToxProfile] Saved tox profile to {}", save_path);
-    } else {
+    bool queued = false;
+    if (!tox_manager_->saveTo(save_path, &queued)) {
         V2TIM_LOG(kError, "[SaveToxProfile] Failed to save tox profile to {}", save_path);
+    } else if (queued) {
+        // Reached from inside a tox callback: the write runs when the iterate
+        // returns and logs its own result. Saying "saved" here would claim a
+        // durability this call does not have.
+        V2TIM_LOG(kInfo, "[SaveToxProfile] Queued tox profile save to {}", save_path);
+    } else {
+        V2TIM_LOG(kInfo, "[SaveToxProfile] Saved tox profile to {}", save_path);
     }
 }
 
@@ -2292,20 +2343,23 @@ void V2TIMManagerImpl::Login(const V2TIMString& userID, const V2TIMString& userS
         login_user_alias_ = userID;
     }
 
-    // Set logged_in_user_ from tox when available (used for status/self identity in callbacks)
-    Tox* tox = tox_manager_->getTox();
+    // Set logged_in_user_ from tox when available (used for status/self identity
+    // in callbacks). Pinned: this is an FFI entry point, and the pubkey read and
+    // the address read must see the same live instance.
+    const ToxSessionGuard session = AcquireToxSession();
+    Tox* tox = session.tox();
     if (tox) {
         uint8_t pubkey[TOX_PUBLIC_KEY_SIZE];
         tox_self_get_public_key(tox, pubkey);
         std::string pk_hex = ToxUtil::tox_bytes_to_hex(pubkey, TOX_PUBLIC_KEY_SIZE);
-        std::string address = tox_manager_->getAddress();
+        std::string address = session.manager()->getAddress();
         if (address.length() >= 76) {
             logged_in_user_ = (pk_hex + address.substr(64, 12)).c_str();
         } else {
             logged_in_user_ = pk_hex.c_str();
         }
-    } else {
-        std::string address = tox_manager_->getAddress();
+    } else if (session.manager()) {
+        std::string address = session.manager()->getAddress();
         if (address.length() > 0) {
             logged_in_user_ = address.c_str();
         }
@@ -2442,7 +2496,10 @@ V2TIMString V2TIMManagerImpl::SendC2CTextMessageWithType(
     // Step 3: Look up friend number by public key
     // ===================================================================
     std::unique_lock<std::mutex> lock(mutex_); // Use the main mutex
-    Tox* tox = GetToxManager()->getTox();
+    // Pinned for the whole send sequence below (FFI caller thread); same lock
+    // cost as the getTox() it replaces, and taken in the same order.
+    const ToxSessionGuard session = AcquireToxSession();
+    Tox* tox = session.tox();
     if (!tox) {
          if (callback) callback->OnError(ERR_SDK_NOT_INITIALIZED, "Tox instance not available");
          return "";
@@ -2539,6 +2596,19 @@ V2TIMString V2TIMManagerImpl::SendC2CTextMessageWithType(
         return "";
     }
 
+    // The pin keeps the instance ALIVE; it does not keep the session CURRENT.
+    // After a logout the event thread is stopped, so the old Tox still accepts
+    // the fragments and nothing will ever iterate to put them on the wire —
+    // reporting OnSuccess for that is a lie the user only discovers later.
+    // Checked here and again after the loop (codex 2026-09-24).
+    if (session.Expired()) {
+        lock.unlock();
+        if (callback) {
+            callback->OnError(ERR_SDK_NOT_INITIALIZED,
+                              "Session ended before the message could be sent");
+        }
+        return "";
+    }
     TOX_ERR_FRIEND_SEND_MESSAGE send_err = TOX_ERR_FRIEND_SEND_MESSAGE_OK;
     std::vector<uint32_t> tox_message_numbers;
     tox_message_numbers.reserve(fragments->size());
@@ -2560,6 +2630,19 @@ V2TIMString V2TIMManagerImpl::SendC2CTextMessageWithType(
 
     lock.unlock();
 
+    // A logout that landed mid-loop: toxcore queued the fragments on an
+    // instance that will never be iterated again. Fail instead of tracking a
+    // delivery that can never complete and calling it a success.
+    if (session.Expired()) {
+        V2TIM_LOG(kWarning,
+                  "SendC2CTextMessage: session ended during send; not publishing success");
+        if (callback) {
+            callback->OnError(ERR_SDK_NOT_INITIALIZED,
+                              "Session ended before the message could be sent");
+        }
+        return "";
+    }
+
     // ===================================================================
     // Step 5: Handle send result
     // ===================================================================
@@ -2580,7 +2663,7 @@ V2TIMString V2TIMManagerImpl::SendC2CTextMessageWithType(
                 std::chrono::system_clock::now().time_since_epoch()).count();
             resultMsg.status = V2TIM_MSG_STATUS_SEND_SUCC;
             resultMsg.userID = userID;
-            resultMsg.sender = GetToxManager()->getAddress();
+            resultMsg.sender = session.manager()->getAddress();
             // 保留cloudCustomData
             resultMsg.cloudCustomData = cloudCustomData;
             
@@ -2671,8 +2754,9 @@ V2TIMString V2TIMManagerImpl::SendC2CCustomMessageWithType(
         return "";
     }
 
-    // Resolve friend number
-    Tox* tox = GetToxManager()->getTox();
+    // Resolve friend number (pinned for the whole send sequence below).
+    const ToxSessionGuard session = AcquireToxSession();
+    Tox* tox = session.tox();
     if (!tox) {
         if (callback) callback->OnError(ERR_SDK_NOT_INITIALIZED, "Tox instance not available");
         return "";
@@ -2748,7 +2832,7 @@ V2TIMString V2TIMManagerImpl::SendC2CCustomMessageWithType(
                 std::chrono::system_clock::now().time_since_epoch()).count();
             resultMsg.status = V2TIM_MSG_STATUS_SEND_SUCC;
             resultMsg.userID = userID;
-            resultMsg.sender = GetToxManager()->getAddress();
+            resultMsg.sender = session.manager()->getAddress();
             callback->OnSuccess(resultMsg);
         }
         return msg_id;
@@ -2897,16 +2981,25 @@ V2TIMString V2TIMManagerImpl::SendGroupTextMessageWithType(
     // API below is ever handed a tagged conference key.
     const bool use_conference = IsConferenceMapKey(group_number);
 
+    // Pinned for everything below (preflight, fragment loop, result build):
+    // this runs on the FFI caller's thread, so a concurrent UnInitSDK could
+    // otherwise free the manager/Tox between two of these calls.
+    const ToxSessionGuard session = AcquireToxSession();
+    if (!session) {
+        if (callback) callback->OnError(ERR_SDK_NOT_INITIALIZED, "Tox not initialized");
+        return "";
+    }
+
     // NGC-only diagnostic preflight (group connection, self peer, peer scan).
     if (!use_conference) {
         Tox_Err_Group_Is_Connected err_conn;
-        bool group_connected = GetToxManager()->isGroupConnected(group_number, &err_conn);
+        bool group_connected = session.manager()->isGroupConnected(group_number, &err_conn);
         V2TIM_LOG(kInfo, "[V2TIMManagerImpl::SendGroupTextMessage] Group connection status: connected={}, err={}",
                  group_connected, static_cast<int>(err_conn));
     }
 
     // Check self connection status
-    Tox* tox = GetToxManager()->getTox();
+    Tox* tox = session.tox();
     if (tox && !use_conference) {
         TOX_CONNECTION self_conn = tox_self_get_connection_status(tox);
         V2TIM_LOG(kInfo, "[V2TIMManagerImpl::SendGroupTextMessage] Self connection status: {}", static_cast<int>(self_conn));
@@ -3024,7 +3117,7 @@ V2TIMString V2TIMManagerImpl::SendGroupTextMessageWithType(
             continue;
         }
 
-        success = GetToxManager()->groupSendMessage(
+        success = session.manager()->groupSendMessage(
             group_number,
             prepared->type,
             reinterpret_cast<const uint8_t*>(fragment.data()),
@@ -3054,7 +3147,7 @@ V2TIMString V2TIMManagerImpl::SendGroupTextMessageWithType(
     // Step 5: Forward to IRC if this is an IRC channel (handled by dynamic library)
     // ===================================================================
     // Forward Tox message to IRC via FFI (if library is loaded)
-    std::string sender_nick = GetToxManager()->getName();
+    std::string sender_nick = session.manager()->getName();
     if (sender_nick.empty()) {
         sender_nick = "ToxUser";
     }
@@ -3081,7 +3174,7 @@ V2TIMString V2TIMManagerImpl::SendGroupTextMessageWithType(
                  std::chrono::system_clock::now().time_since_epoch()).count();
              resultMsg.status = V2TIM_MSG_STATUS_SEND_SUCC;
              resultMsg.groupID = groupID;
-             resultMsg.sender = GetToxManager()->getAddress();
+             resultMsg.sender = session.manager()->getAddress();
              // 保留cloudCustomData
              resultMsg.cloudCustomData = cloudCustomData;
 
@@ -3129,6 +3222,14 @@ V2TIMString V2TIMManagerImpl::SendGroupTextMessageWithType(
 // the lowest free id, so a stale entry would address whoever joined after the
 // member left.
 Tox_Group_Peer_Number V2TIMManagerImpl::ResolveGroupPeerIdForKey(Tox_Group_Number group_number, const std::string& receiver_hex) {
+    // Own pin: callers reach this from the FFI thread (send / receipt paths)
+    // and from tox callbacks alike, and the loop below makes up to 256 manager
+    // calls. Without it, an UnInitSDK mid-loop leaves GetToxManager() null
+    // (the manager is unpublished before it is torn down) and the unchecked
+    // derefs below would fault.
+    const ToxSessionGuard session = AcquireToxSession();
+    ToxManager* tox_manager = session.manager();
+    if (!tox_manager) return UINT32_MAX;
     Tox_Group_Peer_Number peer_id = UINT32_MAX;
     {
         std::string key_lower = receiver_hex;
@@ -3152,7 +3253,7 @@ Tox_Group_Peer_Number V2TIMManagerImpl::ResolveGroupPeerIdForKey(Tox_Group_Numbe
         Tox_Err_Group_Peer_Query err_current;
         const bool still_owner =
             ToxUtil::tox_hex_to_bytes(receiver_hex.c_str(), receiver_hex.size(), expected_pubkey, TOX_PUBLIC_KEY_SIZE) &&
-            GetToxManager()->getGroupPeerPublicKey(group_number, peer_id, current_pubkey, &err_current) &&
+            tox_manager->getGroupPeerPublicKey(group_number, peer_id, current_pubkey, &err_current) &&
             err_current == TOX_ERR_GROUP_PEER_QUERY_OK &&
             memcmp(expected_pubkey, current_pubkey, TOX_PUBLIC_KEY_SIZE) == 0;
         if (!still_owner) {
@@ -3171,7 +3272,7 @@ Tox_Group_Peer_Number V2TIMManagerImpl::ResolveGroupPeerIdForKey(Tox_Group_Numbe
         for (Tox_Group_Peer_Number p = 0; p < 256; ++p) {
             uint8_t peer_pubkey[TOX_PUBLIC_KEY_SIZE];
             Tox_Err_Group_Peer_Query err;
-            if (GetToxManager()->getGroupPeerPublicKey(group_number, p, peer_pubkey, &err) && err == TOX_ERR_GROUP_PEER_QUERY_OK) {
+            if (tox_manager->getGroupPeerPublicKey(group_number, p, peer_pubkey, &err) && err == TOX_ERR_GROUP_PEER_QUERY_OK) {
                 consecutive_fail = 0;
                 if (memcmp(peer_pubkey, target_pubkey, TOX_PUBLIC_KEY_SIZE) == 0) {
                     peer_id = p;
@@ -3217,7 +3318,9 @@ V2TIMString V2TIMManagerImpl::SendGroupPrivateTextMessage(const V2TIMString& gro
         if (callback) callback->OnError(ERR_SDK_INTERFACE_NOT_SUPPORT, "Private messages are not supported in conferences");
         return "";
     }
-    Tox* tox = GetToxManager()->getTox();
+    // Pinned across the peer lookup + send below (FFI caller thread).
+    const ToxSessionGuard session = AcquireToxSession();
+    Tox* tox = session.tox();
     if (!tox) {
         if (callback) callback->OnError(ERR_SDK_NET_DISCONNECT, "Tox not available");
         return "";
@@ -3250,7 +3353,7 @@ V2TIMString V2TIMManagerImpl::SendGroupPrivateTextMessage(const V2TIMString& gro
         resultMsg.timestamp = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
         resultMsg.status = V2TIM_MSG_STATUS_SEND_SUCC;
         resultMsg.groupID = groupID;
-        resultMsg.sender = GetToxManager()->getAddress();
+        resultMsg.sender = session.manager()->getAddress();
         callback->OnSuccess(resultMsg);
     }
     return msgID;
@@ -3264,8 +3367,10 @@ V2TIMString V2TIMManagerImpl::SendGroupCustomMessage(const V2TIMBuffer& customDa
         return "";
     }
 
-    ToxManager* tox_manager = GetToxManager();
-    Tox* tox = tox_manager ? tox_manager->getTox() : nullptr;
+    // Pinned for the whole send sequence (FFI caller thread).
+    const ToxSessionGuard session = AcquireToxSession();
+    ToxManager* tox_manager = session.manager();
+    Tox* tox = session.tox();
     if (!tox || !running_) {
         if (callback) callback->OnError(ERR_SDK_NOT_INITIALIZED, "ToxManager not initialized");
         return "";
@@ -3338,10 +3443,13 @@ void V2TIMManagerImpl::CreateGroup(const V2TIMString& groupType, const V2TIMStri
               groupName.CString() ? groupName.CString() : "null",
               (void*)callback);
     
-    // Step 1: Get ToxManager
+    // Step 1: Get ToxManager. Pinned for the whole create sequence (group
+    // creation, name/topic writes, the optional AV groupchat) — an FFI entry
+    // point, so UnInitSDK can otherwise land between any two of those calls.
     V2TIM_LOG(kInfo, "CreateGroup: Step 1 - Getting ToxManager");
-    ToxManager* tox_manager = GetToxManager();
-    V2TIM_LOG(kInfo, "CreateGroup: Step 1 - GetToxManager() returned {}", (void*)tox_manager);
+    const ToxSessionGuard session = AcquireToxSession();
+    ToxManager* tox_manager = session.manager();
+    V2TIM_LOG(kInfo, "CreateGroup: Step 1 - AcquireToxSession() returned {}", (void*)tox_manager);
     
     if (!tox_manager) {
         V2TIM_LOG(kError, "CreateGroup: ERROR - ToxManager is null, cannot proceed");
@@ -3357,8 +3465,8 @@ void V2TIMManagerImpl::CreateGroup(const V2TIMString& groupType, const V2TIMStri
     
     // Step 2: Get Tox instance
     V2TIM_LOG(kInfo, "CreateGroup: Step 2 - Getting Tox instance from ToxManager");
-    Tox* tox = tox_manager->getTox();
-    V2TIM_LOG(kInfo, "CreateGroup: Step 2 - tox_manager->getTox() returned {}", (void*)tox);
+    Tox* tox = session.tox();
+    V2TIM_LOG(kInfo, "CreateGroup: Step 2 - pinned Tox is {}", (void*)tox);
     
     if (!tox) {
         V2TIM_LOG(kError, "CreateGroup: ERROR - Tox instance is null, cannot proceed");
@@ -3462,7 +3570,7 @@ void V2TIMManagerImpl::CreateGroup(const V2TIMString& groupType, const V2TIMStri
                 return;
             }
         }
-        Tox* av_tox = tox_manager->getTox();
+        Tox* av_tox = session.tox();
         // Legacy group AV takes no toxcore lock; keep it out of tox_iterate()
         // (see ToxAVManager::lockToxIterate).
         int32_t created = -1;
@@ -3966,8 +4074,14 @@ void V2TIMManagerImpl::JoinGroup(const V2TIMString& groupID, const V2TIMString& 
     V2TIM_LOG(kInfo, "[JoinGroup] message: {}", message.CString() ? message.CString() : "null");
     V2TIM_LOG(kInfo, "[JoinGroup] callback: {}", (void*)callback);
     
-    // Get ToxManager and verify it's valid
-    ToxManager* tox_manager = GetToxManager();
+    // Get ToxManager and verify it's valid. PINNED for the whole join — this
+    // runs on the FFI caller's thread AND pumps tox_iterate() below, so a
+    // listener's UnInitSDK (deferred to the end of that iterate) used to free
+    // the manager and the Tox while this function still held raw pointers to
+    // both. The pin keeps them valid; join_session_ended() below still stops
+    // the work, because valid is not the same as current.
+    const ToxSessionGuard session = AcquireToxSession();
+    ToxManager* tox_manager = session.manager();
     if (!tox_manager) {
         static_cast<void>(0);
         static_cast<void>(0);
@@ -3976,7 +4090,7 @@ void V2TIMManagerImpl::JoinGroup(const V2TIMString& groupID, const V2TIMString& 
         return;
     }
     
-    Tox* tox = tox_manager->getTox();
+    Tox* tox = session.tox();
     if (!tox) {
         static_cast<void>(0);
         static_cast<void>(0);
@@ -4095,7 +4209,7 @@ void V2TIMManagerImpl::JoinGroup(const V2TIMString& groupID, const V2TIMString& 
         // group's number: gc_group_join() routes to gc_rejoin_group() and hands
         // back its 0-on-success status, which reads as "group number 0" here.
         // Resolve the real number up front (RejoinKnownGroups does the same).
-        const Tox_Group_Number existing_group_number = GetToxManager()->getGroupByChatId(chat_id);
+        const Tox_Group_Number existing_group_number = tox_manager->getGroupByChatId(chat_id);
         if (existing_group_number != UINT32_MAX) {
             V2TIMString existing_group_id;
             {
@@ -4119,15 +4233,15 @@ void V2TIMManagerImpl::JoinGroup(const V2TIMString& groupID, const V2TIMString& 
         }
 
         // Join group using chat_id
-        std::string self_name = GetToxManager()->getName();
+        std::string self_name = tox_manager->getName();
         if (self_name.empty()) {
             self_name = "User";
         }
         V2TIM_LOG(kInfo, "[JoinGroup] Using self_name: {} (length={})", self_name, self_name.length());
         
-        V2TIM_LOG(kInfo, "[JoinGroup] Calling GetToxManager()->joinGroup with chat_id");
+        V2TIM_LOG(kInfo, "[JoinGroup] Calling ToxManager::joinGroup with chat_id");
         Tox_Err_Group_Join err_join;
-        group_number = GetToxManager()->joinGroup(
+        group_number = tox_manager->joinGroup(
             chat_id,
             reinterpret_cast<const uint8_t*>(self_name.c_str()), self_name.length(),
             JoinPasswordData(), JoinPasswordLength(),
@@ -4249,7 +4363,7 @@ void V2TIMManagerImpl::JoinGroup(const V2TIMString& groupID, const V2TIMString& 
                 {
                     // Legacy group AV takes no toxcore lock (see
                     // ToxAVManager::lockToxIterate).
-                    auto av_iterate_lock = GetToxManager()->lockIterate();
+                    auto av_iterate_lock = tox_manager->lockIterate();
                     joined = toxav_join_av_groupchat(
                         tox, inv.friend_number, inv.cookie.data(),
                         static_cast<uint16_t>(inv.cookie.size()),
@@ -4318,7 +4432,7 @@ void V2TIMManagerImpl::JoinGroup(const V2TIMString& groupID, const V2TIMString& 
         }
         
         // Accept invite using tox_group_invite_accept
-        std::string self_name = GetToxManager()->getName();
+        std::string self_name = tox_manager->getName();
         if (self_name.empty()) {
             self_name = "User";
         }
@@ -4362,7 +4476,7 @@ void V2TIMManagerImpl::JoinGroup(const V2TIMString& groupID, const V2TIMString& 
         V2TIM_LOG(kInfo, "[JoinGroup] Attempting to get chat_id for group_number={}", group_number);
         uint8_t chat_id[TOX_GROUP_CHAT_ID_SIZE];
         Tox_Err_Group_State_Query err_chat_id;
-        bool got_chat_id = GetToxManager()->getGroupChatId(group_number, chat_id, &err_chat_id);
+        bool got_chat_id = tox_manager->getGroupChatId(group_number, chat_id, &err_chat_id);
         V2TIM_LOG(kInfo, "[JoinGroup] getGroupChatId returned: got_chat_id={}, err_chat_id={}", 
                  got_chat_id, static_cast<int>(err_chat_id));
         
@@ -4428,7 +4542,7 @@ void V2TIMManagerImpl::JoinGroup(const V2TIMString& groupID, const V2TIMString& 
                 // Build member list (contains self)
                 V2TIMGroupMemberInfoVector memberList;
                 V2TIMGroupMemberInfo selfMember;
-                Tox* tox = GetToxManager()->getTox();
+                Tox* tox = session.tox();
                 if (tox) {
                     uint8_t self_pubkey[TOX_PUBLIC_KEY_SIZE];
                     tox_self_get_public_key(tox, self_pubkey);
@@ -4443,7 +4557,7 @@ void V2TIMManagerImpl::JoinGroup(const V2TIMString& groupID, const V2TIMString& 
                     opUser.userID = V2TIMString(pending_inviter_userID.c_str());
                 } else {
                     // Fallback: get inviter's public key from friend_number
-                    Tox* tox = GetToxManager()->getTox();
+                    Tox* tox = session.tox();
                     if (tox) {
                         uint8_t inviter_pubkey[TOX_PUBLIC_KEY_SIZE];
                         if (tox_friend_get_public_key(tox, pending_friend_number, inviter_pubkey, nullptr)) {
@@ -4529,21 +4643,21 @@ void V2TIMManagerImpl::JoinGroup(const V2TIMString& groupID, const V2TIMString& 
     // Every pump below runs tox callbacks on this thread. One that ends the
     // session (a listener calling UnInitSDK) is deferred by
     // IterateReentryScope to the moment that iterate returns — so by the time
-    // control is back here it has already run: tox_manager_ is null, the raw
-    // `tox` taken above is freed, and (after a re-InitSDK) the group numbers
-    // belong to another profile. Re-check after every pump and abandon the
-    // join rather than touch any of it.
-    const int64_t join_session_epoch = GetSessionEpoch();
-    auto join_session_ended = [this, join_session_epoch]() {
-        return !tox_manager_ || !running_.load(std::memory_order_acquire) ||
-               GetSessionEpoch() != join_session_epoch;
+    // control is back here it has already run: tox_manager_ is null and (after
+    // a re-InitSDK) the group numbers belong to another profile. The manager
+    // and the Tox themselves stay ALIVE for as long as `session` is held, so a
+    // pump that returns into this frame no longer touches freed memory; this
+    // check is about currency, not validity — abandon the join rather than
+    // publish work for a session that is over.
+    auto join_session_ended = [this, &session]() {
+        return session.Expired() || !running_.load(std::memory_order_acquire);
     };
     auto abandon_join = [&groupID, callback]() {
         V2TIM_LOG(kWarning, "[JoinGroup] session ended while pumping the join of {}; abandoning it",
                   groupID.CString() ? groupID.CString() : "null");
         if (callback) callback->OnError(ERR_SDK_NOT_INITIALIZED, "SDK uninitialized during JoinGroup");
     };
-    if (tox_manager_) {
+    if (tox_manager) {
         V2TIM_LOG(kInfo, "[JoinGroup] Waiting for group to become connected (up to 1 second)...");
         static_cast<void>(0);
         static_cast<void>(0);
@@ -4558,7 +4672,7 @@ void V2TIMManagerImpl::JoinGroup(const V2TIMString& groupID, const V2TIMString& 
         for (int i = 0; pump_on_caller && i < max_wait_iterations; i++) {
             // Check if group is connected
             Tox_Err_Group_Is_Connected err_connected;
-            is_connected = tox_manager_->isGroupConnected(group_number, &err_connected);
+            is_connected = tox_manager->isGroupConnected(group_number, &err_connected);
             
             if (is_connected) {
                 auto connected_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -4571,7 +4685,7 @@ void V2TIMManagerImpl::JoinGroup(const V2TIMString& groupID, const V2TIMString& 
             }
             
             // Trigger tox_iterate to process network events
-            tox_manager_->iterate(0);
+            tox_manager->iterate(0);
             if (join_session_ended()) {
                 abandon_join();
                 return;
@@ -4592,7 +4706,7 @@ void V2TIMManagerImpl::JoinGroup(const V2TIMString& groupID, const V2TIMString& 
         static_cast<void>(0);
         static_cast<void>(0);
         for (int i = 0; pump_on_caller && i < 10; i++) {  // Reduced to 10 iterations (0.5 seconds) for local bootstrap
-            tox_manager_->iterate(0);
+            tox_manager->iterate(0);
             if (join_session_ended()) {
                 abandon_join();
                 return;
@@ -4613,7 +4727,7 @@ void V2TIMManagerImpl::JoinGroup(const V2TIMString& groupID, const V2TIMString& 
         for (Tox_Group_Peer_Number peer_id = 0; peer_id < 100; ++peer_id) {
             uint8_t peer_pubkey[TOX_PUBLIC_KEY_SIZE];
             Tox_Err_Group_Peer_Query err_key;
-            if (GetToxManager()->getGroupPeerPublicKey(group_number, peer_id, peer_pubkey, &err_key) &&
+            if (tox_manager->getGroupPeerPublicKey(group_number, peer_id, peer_pubkey, &err_key) &&
                 err_key == TOX_ERR_GROUP_PEER_QUERY_OK) {
                 final_peer_count++;
             } else {
@@ -4641,7 +4755,7 @@ void V2TIMManagerImpl::JoinGroup(const V2TIMString& groupID, const V2TIMString& 
             static_cast<void>(0);
             // Wait additional 1 second (reduced from 2 seconds) with more iterations for DHT peer discovery
             for (int i = 0; pump_on_caller && i < 10; i++) {
-                GetToxManager()->iterate();
+                tox_manager->iterate();
                 if (join_session_ended()) {
                     abandon_join();
                     return;
@@ -4654,7 +4768,7 @@ void V2TIMManagerImpl::JoinGroup(const V2TIMString& groupID, const V2TIMString& 
                     for (Tox_Group_Peer_Number peer_id = 0; peer_id < 100; ++peer_id) {
                         uint8_t peer_pubkey[TOX_PUBLIC_KEY_SIZE];
                         Tox_Err_Group_Peer_Query err_key;
-                        if (GetToxManager()->getGroupPeerPublicKey(group_number, peer_id, peer_pubkey, &err_key) &&
+                        if (tox_manager->getGroupPeerPublicKey(group_number, peer_id, peer_pubkey, &err_key) &&
                             err_key == TOX_ERR_GROUP_PEER_QUERY_OK) {
                             current_peer_count++;
                         } else {
@@ -4746,7 +4860,7 @@ void V2TIMManagerImpl::JoinGroup(const V2TIMString& groupID, const V2TIMString& 
                 for (int i = 0; pump_on_caller && i < 20; i++) {
                     // Call iterate on both instances to help DHT discovery
                     // The event_thread_ should be doing this, but we can help by calling it directly
-                    tox_manager_->iterate(0);
+                    tox_manager->iterate(0);
                     if (join_session_ended()) {
                         abandon_join();
                         return;
@@ -5059,7 +5173,9 @@ void V2TIMManagerImpl::DismissGroup(const V2TIMString& groupID, V2TIMCallback* c
 // User Info
 void V2TIMManagerImpl::GetUsersInfo(const V2TIMStringVector& userIDList, V2TIMValueCallback<V2TIMUserFullInfoVector>* callback) {
     V2TIMUserFullInfoVector infos; // Corrected typo: TXV2TIMUserFullInfoVector -> V2TIMUserFullInfoVector
-    Tox* tox = GetToxManager()->getTox();
+    // Pinned across the whole per-user query loop below (FFI entry point).
+    const ToxSessionGuard session = AcquireToxSession();
+    Tox* tox = session.tox();
     if (!tox) {
         if (callback) callback->OnError(ERR_SDK_NOT_INITIALIZED, "Tox not initialized");
         return;
@@ -5195,7 +5311,9 @@ void V2TIMManagerImpl::UnsubscribeUserInfo(const V2TIMStringVector& userIDList, 
 }
 
 void V2TIMManagerImpl::SetSelfInfo(const V2TIMUserFullInfo& info, V2TIMCallback* callback) {
-    Tox* tox = GetToxManager()->getTox();
+    // Pinned across the name + status writes below (FFI entry point).
+    const ToxSessionGuard session = AcquireToxSession();
+    Tox* tox = session.tox();
     if (!tox) {
         if (callback) callback->OnError(ERR_SDK_NOT_INITIALIZED, "Tox not initialized");
         return;
@@ -5567,11 +5685,33 @@ int V2TIMManagerImpl::CanSetGroupTopic(const std::string& group_id) {
 //     A hint proves nothing: both inputs are public to every group member.
 //  2. CHALLENGE. When a hint matches member K of group G, we send that friend
 //     F a nonce over the friend channel: chat_id || our per-group key || nonce.
-//  3. PROOF. F sends, from its per-group key and over NGC's authenticated
-//     private channel, nonce || the long-term key of the friend who asked.
-//     Accepted only from K itself, for our pending nonce, naming US as the
-//     asker — so F cannot claim another member's key, and a member M cannot
-//     be used as a relay (M names F, not us, when F forwards our nonce).
+//  3. PROOF (v2, encrypted). F sends, from its per-group key and over NGC's
+//     authenticated private channel, an authenticated box that only the ASKER
+//     can open: it is sealed with F's long-term SECRET key to the asker's
+//     long-term PUBLIC key, and the asker's public key is taken from the
+//     authenticated friend connection the challenge arrived on — never from
+//     the challenge body. Accepted only from K itself, for an unexpired
+//     pending nonce of ours, with every transcript field matching what we
+//     asked. See kIdentityProof* below for the byte layout and for what each
+//     bound field buys.
+//
+//     Why encrypted (the MM-6 leak, fixed 2026-09-23): the challenge body
+//     names "the challenger's per-group key", and that value is whatever the
+//     friend put in the packet. Per-group keys are visible to every member,
+//     so a friend F could name ANY member M and we would then send M, from
+//     our per-group key, a PLAINTEXT "nonce || F's long-term key" — telling M
+//     that our per-group key belongs to a friend of F's, one member per
+//     challenge and 32 per minute. Gating the answer on "F must have hinted
+//     that key" does NOT work, and the reason is ORDERING, not reachability:
+//     the asker does announce its own digests to every online friend, but
+//     MatchGroupIdentityDigests fires the challenge from the peer-join path
+//     before that announcement has gone out, and a challenger never retries.
+//     Encrypting the proof to the asker's long-term key fixes it without
+//     touching the honest flow: we still answer whatever key F names, but
+//     only F can read the answer. What M can still observe is that our
+//     per-group key sent it one unreadable tim2tox private packet — a traffic
+//     fact, not an identity. Wire-format change with no v1 fallback: the
+//     plaintext proof is neither sent nor accepted any more.
 //
 // Everything a friend can make us do here runs on the tox event thread, so
 // every step is bounded per friend and globally and every cache expires:
@@ -5583,13 +5723,70 @@ int V2TIMManagerImpl::CanSetGroupTopic(const std::string& group_id) {
 //  - challenges: at most one pending per (friend, group, member), a per-friend
 //    cap, a TTL; a proof consumes only the entry it exactly matches.
 //  - answering: each (friend, chat id, nonce) is answered at most once, and
-//    proofs sent per friend are rate limited.
+//    proofs sent per friend are rate limited. Sealing the answer costs one
+//    box per answered challenge, so the same budgets still bound the work.
+//  - verifying: a received proof is only opened against OUR pending
+//    challenges for (this group, this authenticated NGC sender) — at most
+//    kMaxClaimantsPerDigest of them — and the attempts share a global rate
+//    window, so a member cannot turn NGC packets into unbounded crypto.
 // ---------------------------------------------------------------------------
 namespace {
 constexpr uint8_t kIdentityHints = 1;
 constexpr uint8_t kIdentityChallenge = 2;
 constexpr size_t kIdentityNonceSize = 16;
 constexpr size_t kDigestsPerPacket = 40;
+// --- MM-6 proof v2 wire format -------------------------------------------
+// NGC private packet payload (after the 6-byte tim2tox group-packet header,
+// kind = kTim2ToxGroupPacketIdentityProof):
+//
+//   box_nonce[CRYPTO_NONCE_SIZE=24] || box(plain)[kIdentityProofPlainSize+16]
+//
+// box() = toxcore encrypt_data(responder long-term SECRET, asker long-term
+// PUBLIC, box_nonce) — an authenticated (crypto_box) seal, so only the asker
+// can open it and only the responder can have produced it. toxcore has no
+// sealed-box primitive, hence the explicit nonce prefix.
+//
+//   plain = kIdentityProofDomain[16]      domain separation: a box made for
+//                                         any other tim2tox purpose between
+//                                         the same two long-term keys can
+//                                         never be replayed as a proof.
+//        || chat_id[32]                   binds the group: a proof earned in
+//                                         one group cannot be replayed into
+//                                         another.
+//        || asker_group_key[32]           the per-group key the challenge
+//                                         claimed for the asker; the asker
+//                                         re-derives its own and compares, so
+//                                         a proof cannot be lifted from a
+//                                         challenge we did not send.
+//        || responder_group_key[32]       the responder's per-group key. The
+//                                         asker requires it to equal the
+//                                         toxcore-authenticated NGC envelope
+//                                         sender: that is what ties "this
+//                                         long-term key" (box authorship) to
+//                                         "this member" (envelope) and is the
+//                                         whole MM-6 claim.
+//        || challenge_nonce[16]           identifies the pending challenge:
+//                                         freshness + replay protection.
+//        || asker_long_term_key[32]       names US as the asker, so a friend
+//                                         cannot relay our nonce to a third
+//                                         member and pass that member's proof
+//                                         back as its own.
+constexpr char kIdentityProofDomain[] = "T2T-MM6-proof-v2";
+constexpr size_t kIdentityProofDomainSize = sizeof(kIdentityProofDomain) - 1;  // no NUL on the wire
+static_assert(kIdentityProofDomainSize == 16, "proof domain tag must stay 16 bytes");
+constexpr size_t kIdentityProofPlainSize = kIdentityProofDomainSize + TOX_GROUP_CHAT_ID_SIZE +
+                                           TOX_PUBLIC_KEY_SIZE + TOX_PUBLIC_KEY_SIZE +
+                                           kIdentityNonceSize + TOX_PUBLIC_KEY_SIZE;
+constexpr size_t kIdentityProofPacketSize =
+    CRYPTO_NONCE_SIZE + kIdentityProofPlainSize + CRYPTO_MAC_SIZE;
+// Offsets inside plain.
+constexpr size_t kIdentityProofOffChatId = kIdentityProofDomainSize;
+constexpr size_t kIdentityProofOffAskerGroupKey = kIdentityProofOffChatId + TOX_GROUP_CHAT_ID_SIZE;
+constexpr size_t kIdentityProofOffResponderGroupKey =
+    kIdentityProofOffAskerGroupKey + TOX_PUBLIC_KEY_SIZE;
+constexpr size_t kIdentityProofOffNonce =
+    kIdentityProofOffResponderGroupKey + TOX_PUBLIC_KEY_SIZE;
+constexpr size_t kIdentityProofOffAskerLongTermKey = kIdentityProofOffNonce + kIdentityNonceSize;
 // Asking side.
 constexpr size_t kMaxPendingIdentityChallenges = 256;
 constexpr size_t kMaxPendingChallengesPerFriend = 32;
@@ -5611,6 +5808,55 @@ constexpr uint32_t kMaxProofsPerFriend = 32;
 // from a fifth friend went unanswered for 60s (the challenger times out and
 // does not retry).
 constexpr uint32_t kMaxProofsGlobal = 2048;
+// Opening a received proof: capped globally because the box opens are the
+// expensive part. Far above any honest volume (one proof per member per group).
+constexpr uint32_t kMaxProofVerifiesGlobal = 4096;
+// ... and capped PER AUTHENTICATED NGC SENDER, charged before we do any
+// per-packet work at all. The global window alone was not enough (codex
+// 2026-09-24): an unchallenged member got the payload recording and the whole
+// pending-challenge scan for free, and a challenged malicious member could
+// spend the entire global window inside one minute and make every honest
+// proof arriving in it rejected until the honest challenges expired. The
+// sender key comes from toxcore's NGC envelope, so it cannot be spoofed.
+// Honest volume per sender is one proof per challenge; 32/min leaves room for
+// a member we hold challenges for in several groups plus retries.
+constexpr uint32_t kMaxProofVerifiesPerSender = 32;
+// Bound on the sender table itself: an arbitrary number of group members must
+// not each be able to open a window. Entries expire with kIdentityRateWindow
+// and are pruned, so a full table clears within a minute.
+constexpr size_t kMaxProofVerifySenders = 1024;
+// Received group receipts, PER AUTHENTICATED NGC SENDER, charged before the
+// packet costs a replay-cache slot, a Dart event and the two history scans the
+// tally does. The replay filter only ever stopped the same receipt twice: one
+// member could send unbounded DISTINCT msgIDs and each was work.
+//
+// DERIVATION of the per-minute ceiling (the 128 this replaces was read off the
+// on-view walk's 50 rows, which is a bound PER VIEW, not per minute, and it
+// ignored the other two senders entirely; a refusal happens HERE, on the
+// receiver, with no signal back, so clipping an honest reader is silent):
+//   * Tim2ToxSdkPlatform.markGroupMessageAsRead walks the WHOLE loaded window
+//     and calls markMessageAsRead per inbound row, with no per-row claim and no
+//     isRead skip. Every row of that window that WE authored yields one receipt
+//     to us, so ONE call can send up to MessageHistoryPersistence's
+//     _maxMessagesInMemory = 1000. UIKit calls it on every chat open, so a user
+//     flipping between two chats twice a minute legitimately triples that.
+//   * FfiChatService._sendGroupReadReceiptsOnView adds <=50 per open (claimed,
+//     so it does not repeat).
+//   * plus one 'received' per message of ours the member ingests, and the
+//     offline flush, bounded at _maxPendingGroupReadReceiptsPerAuthor = 200.
+// 3*1000 + 50 + 200 + a send burst rounds to 4096. Deliberately generous: the
+// per-receipt work here is a hash lookup and a bounded key, and DISTINCT
+// receipts (the ones that reach Dart) are already capped by the replay filter's
+// kMaxSeenGroupReceipts = 4096 over a longer TTL — so at this cap a sender
+// cannot push more work downstream in a window than that cache already holds.
+// The cap's job is bounding "one member, unbounded invented msgIDs", not
+// policing honest volume. Per-sender keys are NGC per-group keys, so the same
+// person in several groups gets one window per group, not one shared window.
+constexpr uint32_t kMaxGroupReceiptsPerSender = 4096;
+// Bound on the RECEIPT sender table. Its own cap, and its own table
+// (group_receipt_rate_by_sender_), so a receipt flood cannot fill the table the
+// MM-6 proof budget lives in and starve the proofs — see the header.
+constexpr size_t kMaxGroupReceiptSenders = 1024;
 // Answering side replay cache.
 constexpr size_t kMaxAnsweredChallenges = 1024;
 constexpr auto kAnsweredChallengeTtl = std::chrono::minutes(10);
@@ -5645,11 +5891,61 @@ void SendFriendIdentityFrame(Tox* tox, uint32_t friend_number, const std::string
     Tox_Err_Friend_Custom_Packet err_send;
     tox_friend_send_lossless_packet(tox, friend_number, frame->data(), frame->size(), &err_send);
 }
+
+// A scratch copy of our long-term secret key, wiped on scope exit. Fetching it
+// costs a tox call, so callers pull it once and keep it out of inner loops (and
+// out of any scope that holds V2TIMManagerImpl::mutex_ across a tox call).
+class SelfSecretKey {
+public:
+    explicit SelfSecretKey(const Tox* tox) { tox_self_get_secret_key(tox, key_); }
+    ~SelfSecretKey() { crypto_memzero(key_, sizeof(key_)); }
+    SelfSecretKey(const SelfSecretKey&) = delete;
+    SelfSecretKey& operator=(const SelfSecretKey&) = delete;
+    const uint8_t* get() const { return key_; }
+
+private:
+    uint8_t key_[CRYPTO_SECRET_KEY_SIZE];
+};
+
+// Build the MM-6 proof v2 NGC packet (header + box). Sealed with OUR long-term
+// secret key to the asker's long-term public key, which the caller must have
+// taken from the authenticated friend connection -- never from the challenge
+// body, or the box would be readable by whoever the challenge named.
+// Returns false (and sends nothing) when the CSPRNG or the box is unavailable:
+// a proof that cannot be sealed must not fall back to plaintext.
+bool SealIdentityProof(const Tox* tox, const uint8_t chat_id[TOX_GROUP_CHAT_ID_SIZE],
+                       const uint8_t asker_group_key[TOX_PUBLIC_KEY_SIZE],
+                       const uint8_t responder_group_key[TOX_PUBLIC_KEY_SIZE],
+                       const uint8_t challenge_nonce[kIdentityNonceSize],
+                       const uint8_t asker_long_term_key[TOX_PUBLIC_KEY_SIZE],
+                       std::vector<uint8_t>* out_packet) {
+    const Random* rng = os_random();
+    const Memory* mem = os_memory();
+    if (rng == nullptr || mem == nullptr || out_packet == nullptr) return false;
+    uint8_t plain[kIdentityProofPlainSize];
+    memcpy(plain, kIdentityProofDomain, kIdentityProofDomainSize);
+    memcpy(plain + kIdentityProofOffChatId, chat_id, TOX_GROUP_CHAT_ID_SIZE);
+    memcpy(plain + kIdentityProofOffAskerGroupKey, asker_group_key, TOX_PUBLIC_KEY_SIZE);
+    memcpy(plain + kIdentityProofOffResponderGroupKey, responder_group_key, TOX_PUBLIC_KEY_SIZE);
+    memcpy(plain + kIdentityProofOffNonce, challenge_nonce, kIdentityNonceSize);
+    memcpy(plain + kIdentityProofOffAskerLongTermKey, asker_long_term_key, TOX_PUBLIC_KEY_SIZE);
+    std::vector<uint8_t> payload(kIdentityProofPacketSize);
+    random_nonce(rng, payload.data());
+    const SelfSecretKey self_secret(tox);
+    const int32_t sealed = encrypt_data(mem, asker_long_term_key, self_secret.get(), payload.data(),
+                                        plain, sizeof(plain), payload.data() + CRYPTO_NONCE_SIZE);
+    crypto_memzero(plain, sizeof(plain));
+    if (sealed != static_cast<int32_t>(kIdentityProofPlainSize + CRYPTO_MAC_SIZE)) return false;
+    *out_packet = WrapTim2ToxGroupPacket(kTim2ToxGroupPacketIdentityProof, payload.data(), payload.size());
+    return true;
+}
 }  // namespace
 
 void V2TIMManagerImpl::AnnounceGroupIdentities(uint32_t only_friend, Tox_Group_Number only_group) {
-    ToxManager* tox_manager = GetToxManager();
-    Tox* tox = tox_manager ? tox_manager->getTox() : nullptr;
+    // Reachable from the FFI thread (group create/join) as well as from tox
+    // callbacks, and it walks every group with the same handle: pinned.
+    const ToxSessionGuard session = AcquireToxSession();
+    Tox* tox = session.tox();
     if (!tox || !running_) return;
     std::vector<Tox_Group_Number> groups;
     if (only_group != UINT32_MAX) {
@@ -5712,7 +6008,20 @@ void V2TIMManagerImpl::NoteFriendConnectionForIdentity(uint32_t friend_number, b
         }
         std::lock_guard<std::mutex> lock(mutex_);
         online_identity_friends_.erase(friend_number);
-        if (!friend_hex.empty()) DropFriendIdentityClaimsLocked(friend_hex);
+        if (!friend_hex.empty()) {
+            DropFriendIdentityClaimsLocked(friend_hex);
+            // The challenges go with the claims. An offline friend cannot
+            // answer one (it travelled over the friend channel), so leaving
+            // them behind only kept dead entries in the per-(group, member)
+            // candidate set the verifier scans — the starvation codex found on
+            // 2026-09-24. It re-announces its hints on reconnect and is
+            // re-challenged with a fresh nonce.
+            for (auto it = pending_identity_challenges_.begin();
+                 it != pending_identity_challenges_.end();) {
+                it = it->second.friend_hex == friend_hex ? pending_identity_challenges_.erase(it)
+                                                         : std::next(it);
+            }
+        }
         return;
     }
     bool newly_online = false;
@@ -5804,6 +6113,75 @@ bool V2TIMManagerImpl::TakeIdentityBudgetLocked(IdentityRateWindow& window, Iden
     return true;
 }
 
+bool V2TIMManagerImpl::HasPendingChallengeForSenderLocked(Tox_Group_Number group_number,
+                                                          const std::string& sender_hex,
+                                                          IdentityClock::time_point now) const {
+    // Allocation-free: this runs for every valid-size proof packet, before any
+    // budget applies, so it must not build a lowercased copy per entry. Both
+    // sides are lowercase by construction (see the insert in
+    // IssueIdentityChallenges and the caller). The scan is bounded by
+    // kMaxPendingIdentityChallenges.
+    for (const auto& [nonce_hex, pending] : pending_identity_challenges_) {
+        (void)nonce_hex;
+        if (pending.group_number == group_number && now - pending.sent_at <= kIdentityChallengeTtl &&
+            pending.member_key == sender_hex) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool V2TIMManagerImpl::TakeGroupSenderProofBudgetLocked(const std::string& sender_hex,
+                                                        IdentityClock::time_point now) {
+    auto it = identity_rate_by_group_sender_.find(sender_hex);
+    if (it == identity_rate_by_group_sender_.end()) {
+        if (identity_rate_by_group_sender_.size() >= kMaxProofVerifySenders) {
+            // Every slot holds a live window. Refusing here is the fail-closed
+            // choice: an honest member's proof is retried after the challenge
+            // is reissued, and the table drains within kIdentityRateWindow.
+            return false;
+        }
+        it = identity_rate_by_group_sender_.emplace(sender_hex, IdentityRateWindow{}).first;
+    }
+    return TakeIdentityBudgetLocked(it->second, now, &IdentityRateWindow::proof_verifies,
+                                    kMaxProofVerifiesPerSender);
+}
+
+bool V2TIMManagerImpl::TakeGroupSenderReceiptBudgetLocked(const std::string& sender_hex,
+                                                          IdentityClock::time_point now) {
+    // Its OWN table with its OWN cap, not the proof table (codex 2026-09-26):
+    // sharing one meant 1024 distinct member keys each sending one structurally
+    // valid receipt with an invented msgID could fill it and refuse both the
+    // next honest reader's receipt AND a challenged member's MM-6 proof, i.e.
+    // receipts could starve the identity work. Same fail-closed reasoning as the
+    // proof side above: a full table refuses rather than growing, and it drains
+    // within kIdentityRateWindow (pruned in PruneIdentityStateLocked). The
+    // caller must have applied its cheap structural gates FIRST, so a member
+    // sending garbage cannot reserve one of these windows at all — the lesson
+    // HandleGroupIdentityProof records (a bounded table must not reserve a
+    // window for a sender that has nothing pending).
+    auto it = group_receipt_rate_by_sender_.find(sender_hex);
+    if (it == group_receipt_rate_by_sender_.end()) {
+        if (group_receipt_rate_by_sender_.size() >= kMaxGroupReceiptSenders) return false;
+        it = group_receipt_rate_by_sender_.emplace(sender_hex, IdentityRateWindow{}).first;
+    }
+    return TakeIdentityBudgetLocked(it->second, now, &IdentityRateWindow::receipts_in,
+                                    kMaxGroupReceiptsPerSender);
+}
+
+void V2TIMManagerImpl::DropStaleChallengesForMemberLocked(Tox_Group_Number group_number,
+                                                          const std::string& member_key_lower,
+                                                          const std::string& digest) {
+    const auto claim_it = digest_claimants_.find(digest);
+    for (auto it = pending_identity_challenges_.begin(); it != pending_identity_challenges_.end();) {
+        const bool same_member = it->second.group_number == group_number &&
+                                 LowerHex(it->second.member_key) == member_key_lower;
+        const bool still_claiming = claim_it != digest_claimants_.end() &&
+                                    claim_it->second.count(it->second.friend_hex) > 0;
+        it = same_member && !still_claiming ? pending_identity_challenges_.erase(it) : std::next(it);
+    }
+}
+
 void V2TIMManagerImpl::PruneIdentityStateLocked(IdentityClock::time_point now, bool force_prune) {
     const bool pruned_before = identity_last_prune_ != IdentityClock::time_point();
     const bool pruned_recently = pruned_before && (now - identity_last_prune_) < kIdentityPruneInterval;
@@ -5840,6 +6218,18 @@ void V2TIMManagerImpl::PruneIdentityStateLocked(IdentityClock::time_point now, b
     for (auto it = identity_rate_by_friend_.begin(); it != identity_rate_by_friend_.end();) {
         it = now - it->second.window_start >= kIdentityRateWindow ? identity_rate_by_friend_.erase(it)
                                                                   : std::next(it);
+    }
+    for (auto it = identity_rate_by_group_sender_.begin(); it != identity_rate_by_group_sender_.end();) {
+        it = now - it->second.window_start >= kIdentityRateWindow
+                 ? identity_rate_by_group_sender_.erase(it)
+                 : std::next(it);
+    }
+    // The receipt meter's own table. Same rule; separate table so neither budget
+    // can fill the other's (see TakeGroupSenderReceiptBudgetLocked).
+    for (auto it = group_receipt_rate_by_sender_.begin(); it != group_receipt_rate_by_sender_.end();) {
+        it = now - it->second.window_start >= kIdentityRateWindow
+                 ? group_receipt_rate_by_sender_.erase(it)
+                 : std::next(it);
     }
 }
 
@@ -5942,16 +6332,29 @@ void V2TIMManagerImpl::IssueIdentityChallenges(Tox* tox, const std::vector<Pendi
             const auto now = IdentityClock::now();
             if (member_key_to_friend_.count(candidate.member_key) > 0) continue;  // proven meanwhile
             size_t pending_for_friend = 0;
+            size_t pending_for_member = 0;
             bool already_pending = false;
             for (const auto& [n, pending] : pending_identity_challenges_) {
-                if (now - pending.sent_at > kIdentityChallengeTtl || pending.friend_hex != candidate.friend_hex) continue;
+                if (now - pending.sent_at > kIdentityChallengeTtl) continue;  // expired: holds no slot
+                const bool same_member = pending.group_number == candidate.group_number &&
+                                         pending.member_key == candidate.member_key;
+                if (same_member) ++pending_for_member;
+                if (pending.friend_hex != candidate.friend_hex) continue;
                 ++pending_for_friend;
-                if (pending.group_number == candidate.group_number && pending.member_key == candidate.member_key) {
+                if (same_member) {
                     already_pending = true;
                     break;
                 }
             }
             if (already_pending || pending_for_friend >= kMaxPendingChallengesPerFriend) continue;
+            // Never let more unexpired challenges exist for ONE (group, member)
+            // than the verifier scans (kMaxClaimantsPerDigest). Without this the
+            // two caps disagreed: eight hostile friends claim a member's digest,
+            // go offline (which dropped their CLAIMS but left their CHALLENGES),
+            // an honest ninth claimant is then let in and its challenge becomes
+            // the one HandleGroupIdentityProof drops in hash order — its valid
+            // proof rejected, with nothing to retry (codex 2026-09-24).
+            if (pending_for_member >= kMaxClaimantsPerDigest) continue;
             if (pending_identity_challenges_.size() >= kMaxPendingIdentityChallenges) {
                 // Evict the oldest, never everything: proofs still on their
                 // way for the rest must keep resolving.
@@ -5961,8 +6364,12 @@ void V2TIMManagerImpl::IssueIdentityChallenges(Tox* tox, const std::vector<Pendi
                 }
                 pending_identity_challenges_.erase(oldest);
             }
+            // member_key is stored LOWERCASE here, once, so the per-packet gate
+            // in HandleGroupIdentityProof can compare it without allocating for
+            // every entry it scans (codex 2026-09-26).
             pending_identity_challenges_[ToxUtil::tox_bytes_to_hex(nonce, kIdentityNonceSize)] =
-                PendingIdentityChallenge{candidate.friend_hex, candidate.group_number, candidate.member_key, now};
+                PendingIdentityChallenge{candidate.friend_hex, candidate.group_number,
+                                        LowerHex(candidate.member_key), now};
         }
         std::string body(1, static_cast<char>(kIdentityChallenge));
         body.append(prefix_it->second);
@@ -5986,7 +6393,7 @@ void V2TIMManagerImpl::HandleGroupIdentityAnnouncement(uint32_t friend_number, c
 
     if (subtype == kIdentityChallenge) {
         // chat_id || challenger's per-group key || nonce: answer from OUR
-        // per-group key in that group, naming the friend who asked.
+        // per-group key in that group, in a box only THIS friend can open.
         if (length != TOX_GROUP_CHAT_ID_SIZE + TOX_PUBLIC_KEY_SIZE + kIdentityNonceSize) return;
         {
             // Answer each (friend, group, nonce) once, and only so many per
@@ -5999,25 +6406,15 @@ void V2TIMManagerImpl::HandleGroupIdentityAnnouncement(uint32_t friend_number, c
                 ToxUtil::tox_bytes_to_hex(data + TOX_GROUP_CHAT_ID_SIZE + TOX_PUBLIC_KEY_SIZE, kIdentityNonceSize);
             std::lock_guard<std::mutex> lock(mutex_);
             PruneIdentityStateLocked(now, false);
-            // KNOWN GAP (review 2026-09-20, unfixed): `challenger_key` is
-            // whatever the friend put in the packet. A friend can name ANY
-            // member's per-group key -- they are visible to every member --
-            // and we then send that member, authenticated by our per-group
-            // key, "nonce || that friend's long-term key", so a third party
-            // learns our key belongs to a friend of theirs. Gating on "the
-            // friend must have hinted this key" does NOT work, and the
-            // reason is ORDERING, not reachability: the asker does announce
-            // its own per-group digests to every online friend (see
-            // AnnounceGroupIdentities, on self-join and on friend-online),
-            // but MatchGroupIdentityDigests fires a challenge from the
-            // peer-join path before that announcement has gone out, and a
-            // challenger never retries -- so gating on the hint drops the
-            // honest exchange (scenario_group_receipt_control_row MM-6).
-            // Deferring the answer until the hint arrives would need the
-            // challenger to retry. The real fix is to make the proof
-            // unreadable to anyone but the asker (encrypt the payload to its
-            // long-term key), which is a wire-format change and needs a
-            // review pass -- see the tracker entry.
+            // `challenger_key` below is still whatever the friend put in the
+            // packet -- it has to be, because the asker's per-group key is
+            // exactly what we do not know yet (see the block comment for why
+            // gating on a prior hint breaks the honest flow). So a friend can
+            // still make us address one NGC private packet to ANY member it
+            // names. What that member gets is a box sealed to THIS friend's
+            // long-term key, which it cannot open, so naming someone else
+            // buys the friend nothing but our silence towards it. Bounded by
+            // the replay key and the budgets right here.
             if (answered_identity_challenges_.count(replay_key) > 0) return;
             if (!TakeIdentityBudgetLocked(identity_rate_by_friend_[friend_hex], now,
                                           &IdentityRateWindow::proofs_sent, kMaxProofsPerFriend) ||
@@ -6039,14 +6436,25 @@ void V2TIMManagerImpl::HandleGroupIdentityAnnouncement(uint32_t friend_number, c
             data + TOX_GROUP_CHAT_ID_SIZE, TOX_PUBLIC_KEY_SIZE);
         const Tox_Group_Peer_Number peer_id = ResolveGroupPeerIdForKey(group_number, challenger_key);
         if (peer_id == UINT32_MAX) return;
-        std::vector<uint8_t> proof(data + TOX_GROUP_CHAT_ID_SIZE + TOX_PUBLIC_KEY_SIZE,
-                                   data + TOX_GROUP_CHAT_ID_SIZE + TOX_PUBLIC_KEY_SIZE + kIdentityNonceSize);
-        proof.insert(proof.end(), friend_key, friend_key + TOX_PUBLIC_KEY_SIZE);
-        const std::vector<uint8_t> packet = WrapTim2ToxGroupPacket(
-            kTim2ToxGroupPacketIdentityProof, proof.data(), proof.size());
+        uint8_t self_group_key[TOX_PUBLIC_KEY_SIZE];
+        Tox_Err_Group_Self_Query err_self = TOX_ERR_GROUP_SELF_QUERY_OK;
+        if (!tox_group_self_get_public_key(tox, group_number, self_group_key, &err_self) ||
+            err_self != TOX_ERR_GROUP_SELF_QUERY_OK) {
+            return;
+        }
+        std::vector<uint8_t> packet;
+        if (!SealIdentityProof(tox, data, data + TOX_GROUP_CHAT_ID_SIZE, self_group_key,
+                               data + TOX_GROUP_CHAT_ID_SIZE + TOX_PUBLIC_KEY_SIZE, friend_key,
+                               &packet)) {
+            return;
+        }
         Tox_Err_Group_Send_Custom_Private_Packet err_send;
-        tox_group_send_custom_private_packet(tox, group_number, peer_id, true,
-                                             packet.data(), packet.size(), &err_send);
+        const bool sent = tox_group_send_custom_private_packet(tox, group_number, peer_id, true,
+                                                              packet.data(), packet.size(), &err_send);
+        if (sent && err_send == TOX_ERR_GROUP_SEND_CUSTOM_PRIVATE_PACKET_OK) {
+            std::lock_guard<std::mutex> lock(mutex_);
+            ++mm6_diag_.proofs_sent;
+        }
         return;
     }
     if (subtype != kIdentityHints || length == 0 || length % CRYPTO_SHA256_SIZE != 0) return;
@@ -6173,13 +6581,14 @@ void V2TIMManagerImpl::MatchGroupIdentityDigests(Tox_Group_Number group_number, 
 
 void V2TIMManagerImpl::HandleGroupIdentityProof(Tox_Group_Number group_number, Tox_Group_Peer_Number peer_id,
                                                 const uint8_t* data, size_t length) {
-    if (data == nullptr || length != kIdentityNonceSize + TOX_PUBLIC_KEY_SIZE) return;
+    // v2 only: the old plaintext proof is neither produced nor accepted.
+    if (data == nullptr || length != kIdentityProofPacketSize) return;
     Tox* tox = GetToxManager() ? GetToxManager()->getTox() : nullptr;
     if (!tox) return;
-    // It must name US as the one who asked (defeats relaying our nonce).
-    uint8_t self_key[TOX_PUBLIC_KEY_SIZE];
-    tox_self_get_public_key(tox, self_key);
-    if (memcmp(data + kIdentityNonceSize, self_key, TOX_PUBLIC_KEY_SIZE) != 0) return;
+    const Memory* mem = os_memory();
+    if (mem == nullptr) return;
+    // The toxcore-authenticated NGC envelope sender. Everything below is
+    // verified against THIS, not against anything the packet claims.
     uint8_t sender_key[TOX_PUBLIC_KEY_SIZE];
     Tox_Err_Group_Peer_Query err_peer;
     if (!GetToxManager()->getGroupPeerPublicKey(group_number, peer_id, sender_key, &err_peer) ||
@@ -6188,21 +6597,122 @@ void V2TIMManagerImpl::HandleGroupIdentityProof(Tox_Group_Number group_number, T
     }
     std::string sender_hex = ToxUtil::tox_bytes_to_hex(sender_key, TOX_PUBLIC_KEY_SIZE);
     std::transform(sender_hex.begin(), sender_hex.end(), sender_hex.begin(), ::tolower);
-    const std::string nonce_hex = ToxUtil::tox_bytes_to_hex(data, kIdentityNonceSize);
     const auto now = IdentityClock::now();
-    std::lock_guard<std::mutex> lock(mutex_);
-    const auto it = pending_identity_challenges_.find(nonce_hex);
-    if (it == pending_identity_challenges_.end()) return;
-    if (now - it->second.sent_at > kIdentityChallengeTtl) {
-        pending_identity_challenges_.erase(it);
+    // METER FIRST, by the toxcore-authenticated sender, BEFORE anything this
+    // packet could make us spend: the payload hex recording, the four state
+    // queries, the secret-key copy and the pending-challenge scan all used to
+    // happen for free for any member, challenged or not, and the only budget
+    // was global so one hostile member could exhaust it and starve every
+    // honest proof in the window (codex 2026-09-24). The global crypto cap
+    // below still bounds the box opens.
+    // Fixed-size packet (checked at entry), so this is bounded work: recorded
+    // for EVERY proof that arrives, including the ones the gate below drops —
+    // the "was the payload really opaque?" diagnostic has to see exactly the
+    // packets nobody challenged for.
+    const std::string proof_payload_hex = ToxUtil::tox_bytes_to_hex(data, length);
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        ++mm6_diag_.proofs_in;
+        mm6_diag_.last_proof_payload_hex = proof_payload_hex;
+        PruneIdentityStateLocked(now, false);
+        // A sender we never challenged cannot be answering anything: drop it
+        // WITHOUT reserving one of the kMaxProofVerifySenders windows. Metering
+        // first meant 1024 group identities could fill that table with one
+        // bogus proof each and get the next honest member's proof refused for
+        // the whole window (codex 2026-09-26). This scan touches no crypto and
+        // no secret, and the pending table is itself capped.
+        if (!HasPendingChallengeForSenderLocked(group_number, sender_hex, now)) {
+            ++mm6_diag_.proofs_rejected;
+            return;
+        }
+        if (!TakeGroupSenderProofBudgetLocked(sender_hex, now)) {
+            ++mm6_diag_.proofs_rejected;
+            return;
+        }
+    }
+    // What we put in the challenge for this group, re-derived: the proof must
+    // echo both, or it answers some challenge we never sent.
+    uint8_t chat_id[TOX_GROUP_CHAT_ID_SIZE];
+    uint8_t self_group_key[TOX_PUBLIC_KEY_SIZE];
+    uint8_t self_key[TOX_PUBLIC_KEY_SIZE];
+    Tox_Err_Group_State_Query err_chat = TOX_ERR_GROUP_STATE_QUERY_OK;
+    Tox_Err_Group_Self_Query err_self = TOX_ERR_GROUP_SELF_QUERY_OK;
+    if (!tox_group_get_chat_id(tox, group_number, chat_id, &err_chat) ||
+        !tox_group_self_get_public_key(tox, group_number, self_group_key, &err_self)) {
         return;
     }
-    // Consume the entry ONLY on an exact group/key/nonce match: anyone else
-    // who learned the nonce (e.g. the friend a challenge went to, when it is
-    // not the key's owner) must not be able to cancel it. A non-matching
-    // proof leaves it to be answered or to expire.
-    if (it->second.group_number != group_number || LowerHex(it->second.member_key) != sender_hex) return;
-    const std::string friend_hex = it->second.friend_hex;
+    tox_self_get_public_key(tox, self_key);
+    // Pulled before the lock: no tox call happens while mutex_ is held below.
+    const SelfSecretKey self_secret(tox);
+    // The digest the hint side indexes this member under; used to spot askers
+    // that stopped claiming it.
+    const std::string sender_digest = GroupIdentityDigestHex(chat_id, sender_key);
+    std::lock_guard<std::mutex> lock(mutex_);
+    // Askers that no longer claim this member cannot answer; they only occupy
+    // scan slots an honest claimant needs.
+    DropStaleChallengesForMemberLocked(group_number, sender_hex, sender_digest);
+    // Candidate askers come from OUR pending challenges for exactly this
+    // (group, authenticated sender) -- never from the packet, because the
+    // responder's long-term key is the very thing being proven. The ISSUING
+    // side caps unexpired challenges per (group, member) at
+    // kMaxClaimantsPerDigest, so the bound below can no longer truncate a
+    // legitimate set: it used to take the first kMaxClaimantsPerDigest in
+    // unordered_map order out of a larger set, and an honest ninth claimant's
+    // valid proof was then rejected with no retry (codex 2026-09-24).
+    std::vector<std::pair<std::string, std::string>> candidates;  // nonce hex, friend hex
+    for (const auto& [nonce_hex, pending] : pending_identity_challenges_) {
+        if (pending.group_number != group_number || now - pending.sent_at > kIdentityChallengeTtl ||
+            LowerHex(pending.member_key) != sender_hex) {
+            continue;
+        }
+        candidates.emplace_back(nonce_hex, pending.friend_hex);
+        if (candidates.size() >= kMaxClaimantsPerDigest) break;
+    }
+    if (candidates.empty()) {
+        ++mm6_diag_.proofs_rejected;
+        return;
+    }
+    if (!TakeIdentityBudgetLocked(identity_rate_global_, now, &IdentityRateWindow::proof_verifies,
+                                  kMaxProofVerifiesGlobal)) {
+        ++mm6_diag_.proofs_rejected;
+        return;
+    }
+    std::string friend_hex;
+    uint8_t plain[kIdentityProofPlainSize];
+    for (const auto& [nonce_hex, candidate_friend] : candidates) {
+        uint8_t friend_key[TOX_PUBLIC_KEY_SIZE];
+        if (!ToxUtil::tox_hex_to_bytes(candidate_friend.c_str(), candidate_friend.size(), friend_key,
+                                       TOX_PUBLIC_KEY_SIZE)) {
+            continue;
+        }
+        const int32_t opened = decrypt_data(mem, friend_key, self_secret.get(), data,
+                                            data + CRYPTO_NONCE_SIZE,
+                                            length - CRYPTO_NONCE_SIZE, plain);
+        if (opened != static_cast<int32_t>(kIdentityProofPlainSize)) continue;
+        // Authorship is settled (only this friend's long-term key could have
+        // sealed it); now every transcript field must be the one we asked
+        // about. Any mismatch means a box from some other exchange.
+        uint8_t nonce_bytes[kIdentityNonceSize];
+        const bool bound =
+            memcmp(plain, kIdentityProofDomain, kIdentityProofDomainSize) == 0 &&
+            memcmp(plain + kIdentityProofOffChatId, chat_id, TOX_GROUP_CHAT_ID_SIZE) == 0 &&
+            memcmp(plain + kIdentityProofOffAskerGroupKey, self_group_key, TOX_PUBLIC_KEY_SIZE) == 0 &&
+            memcmp(plain + kIdentityProofOffResponderGroupKey, sender_key, TOX_PUBLIC_KEY_SIZE) == 0 &&
+            memcmp(plain + kIdentityProofOffAskerLongTermKey, self_key, TOX_PUBLIC_KEY_SIZE) == 0;
+        memcpy(nonce_bytes, plain + kIdentityProofOffNonce, kIdentityNonceSize);
+        crypto_memzero(plain, sizeof(plain));
+        if (!bound) continue;
+        if (LowerHex(ToxUtil::tox_bytes_to_hex(nonce_bytes, kIdentityNonceSize)) != LowerHex(nonce_hex)) {
+            continue;
+        }
+        friend_hex = candidate_friend;
+        break;
+    }
+    if (friend_hex.empty()) {
+        ++mm6_diag_.proofs_rejected;
+        return;
+    }
+    ++mm6_diag_.proofs_accepted;
     if (member_key_to_friend_.count(sender_hex) == 0 && member_key_to_friend_.size() >= kMaxProvenMembers) {
         auto oldest = member_key_to_friend_.begin();
         for (auto p = member_key_to_friend_.begin(); p != member_key_to_friend_.end(); ++p) {
@@ -6226,6 +6736,80 @@ std::string V2TIMManagerImpl::FriendForGroupMemberKey(const std::string& member_
     const auto it = member_key_to_friend_.find(key);
     return it == member_key_to_friend_.end() ? std::string() : it->second.friend_hex;
 }
+
+std::string V2TIMManagerImpl::Mm6DiagJson() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::ostringstream out;
+    out << "{\"proofsSent\":" << mm6_diag_.proofs_sent
+        << ",\"proofsIn\":" << mm6_diag_.proofs_in
+        << ",\"proofsAccepted\":" << mm6_diag_.proofs_accepted
+        << ",\"proofsRejected\":" << mm6_diag_.proofs_rejected
+        << ",\"lastProofPayloadHex\":\"" << mm6_diag_.last_proof_payload_hex << "\""
+        // Group receipts arriving on the same NGC private channel: what the
+        // per-sender meter, the replay filter and the forward saw. Nested so the
+        // proof keys above keep their exact names (auto_tests read them).
+        << ",\"groupReceipts\":{\"in\":" << mm6_diag_.group_receipts_in
+        << ",\"refused\":" << mm6_diag_.group_receipts_refused
+        << ",\"replayed\":" << mm6_diag_.group_receipts_replayed
+        << ",\"forwarded\":" << mm6_diag_.group_receipts_forwarded
+        << ",\"perSenderLimit\":" << kMaxGroupReceiptsPerSender << "}}";
+    return out.str();
+}
+
+#ifdef TIM2TOX_ENABLE_TEST_HOOKS
+// TEST-ONLY primitive, compiled in only with -DTIM2TOX_ENABLE_TEST_HOOKS=ON
+// (OFF by default). The guard belongs HERE and not only on the C wrapper in
+// ffi/tim2tox_ffi.cpp: this method is part of libtim2tox.a, and with only the
+// wrapper gated its mangled symbol stayed exported from a shipped library on
+// Linux, so the attack primitive remained callable even though the C entry
+// point was gone (codex 2026-09-26). CMake defines the macro for the tim2tox
+// target as well as tim2tox_ffi, so an ON build has both halves.
+int V2TIMManagerImpl::Mm6SendCraftedChallenge(const V2TIMString& groupID, const std::string& friend_key_hex,
+                                              const std::string& claimed_member_key_hex) {
+    if (groupID.Empty() || friend_key_hex.size() != static_cast<size_t>(TOX_PUBLIC_KEY_SIZE * 2) ||
+        claimed_member_key_hex.size() != static_cast<size_t>(TOX_PUBLIC_KEY_SIZE * 2)) {
+        return 0;
+    }
+    Tox_Group_Number group_number = UINT32_MAX;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        const auto it = group_id_to_group_number_.find(groupID);
+        if (it == group_id_to_group_number_.end()) return 0;
+        group_number = it->second;
+    }
+    if (IsConferenceMapKey(group_number)) return 0;
+    // FFI (harness) entry point: pinned across chat-id, friend lookup and send.
+    const ToxSessionGuard session = AcquireToxSession();
+    Tox* tox = session.tox();
+    if (!tox) return 0;
+    uint8_t chat_id[TOX_GROUP_CHAT_ID_SIZE];
+    Tox_Err_Group_State_Query err_chat = TOX_ERR_GROUP_STATE_QUERY_OK;
+    if (!tox_group_get_chat_id(tox, group_number, chat_id, &err_chat)) return 0;
+    uint8_t friend_key[TOX_PUBLIC_KEY_SIZE];
+    uint8_t claimed_key[TOX_PUBLIC_KEY_SIZE];
+    if (!ToxUtil::tox_hex_to_bytes(friend_key_hex.c_str(), friend_key_hex.size(), friend_key,
+                                   TOX_PUBLIC_KEY_SIZE) ||
+        !ToxUtil::tox_hex_to_bytes(claimed_member_key_hex.c_str(), claimed_member_key_hex.size(),
+                                   claimed_key, TOX_PUBLIC_KEY_SIZE)) {
+        return 0;
+    }
+    TOX_ERR_FRIEND_BY_PUBLIC_KEY err_by_key;
+    const uint32_t friend_number = tox_friend_by_public_key(tox, friend_key, &err_by_key);
+    if (friend_number == UINT32_MAX) return 0;
+    const Random* rng = os_random();
+    if (rng == nullptr) return 0;
+    uint8_t nonce[kIdentityNonceSize];
+    random_bytes(rng, nonce, sizeof(nonce));
+    // Deliberately NOT registered in pending_identity_challenges_: this is the
+    // hostile shape, where the asker never intends to consume an answer.
+    std::string body(1, static_cast<char>(kIdentityChallenge));
+    body.append(reinterpret_cast<const char*>(chat_id), TOX_GROUP_CHAT_ID_SIZE);
+    body.append(reinterpret_cast<const char*>(claimed_key), TOX_PUBLIC_KEY_SIZE);
+    body.append(reinterpret_cast<const char*>(nonce), kIdentityNonceSize);
+    SendFriendIdentityFrame(tox, friend_number, body);
+    return 1;
+}
+#endif  // TIM2TOX_ENABLE_TEST_HOOKS
 
 std::string V2TIMManagerImpl::ResolveSharedGroupName(const std::string& group_id) {
     auto* group_manager = static_cast<V2TIMGroupManagerImpl*>(GetGroupManager());
@@ -6823,6 +7407,32 @@ void V2TIMManagerImpl::HandleGroupCustomPrivatePacket(
     V2TIMString group_id;
     {
         std::lock_guard<std::mutex> lock(mutex_);
+        // METER FIRST, by the toxcore-authenticated sender, before ANYTHING this
+        // packet can make us spend from here on: a replay-cache slot, the Dart
+        // event, and the two history scans the reader/receiver tally does per
+        // event. The replay filter below only ever stopped the SAME receipt
+        // twice — distinct msgIDs from one member were unbounded, and the group
+        // leg now sends a burst of them on every chat open, so "one member, many
+        // ids" is the shape to bound. Same meter-first ordering as
+        // HandleGroupIdentityProof.
+        //
+        // It sits AFTER the envelope query and the payload/envelope match, not
+        // before them, for two reasons: the budget is charged to the
+        // AUTHENTICATED sender, and that identity is exactly what the peer-key
+        // query produces (keying on anything the packet claims would let one
+        // member burn another member's window); and those two gates are the
+        // cheap, crypto-free, allocation-free checks that keep a member sending
+        // garbage from reserving one of the bounded table's windows at all —
+        // HandleGroupIdentityProof's own lesson, that a bounded table must not
+        // reserve a window for a sender that has nothing pending.
+        const auto meter_now = IdentityClock::now();
+        ++mm6_diag_.group_receipts_in;
+        PruneIdentityStateLocked(meter_now, false);
+        if (!TakeGroupSenderReceiptBudgetLocked(sender_lower, meter_now)) {
+            ++mm6_diag_.group_receipts_refused;
+            V2TIM_LOG(kWarning, "[HandleGroupCustomPrivatePacket] refused receipt: sender over budget");
+            return;
+        }
         const auto group_it = group_number_to_group_id_.find(group_number);
         if (group_it == group_number_to_group_id_.end()) return;
         group_id = group_it->second;
@@ -6830,17 +7440,22 @@ void V2TIMManagerImpl::HandleGroupCustomPrivatePacket(
         // is forwarded once per kSeenGroupReceiptTtl. Every copy used to cost
         // Dart an event, a history rewrite and a UI refresh. (Dart's handler
         // is idempotent too, for anything that slips past a bounded cache.)
-        const auto now = IdentityClock::now();
-        PruneIdentityStateLocked(now, false);
+        // Reuses the meter's clock read and its prune above — one of each per
+        // packet, not two.
+        const auto now = meter_now;
         std::string replay_key = std::string(group_id.CString()) + "|" + sender_lower + "|" +
                                  receipt.receipt_type + "|" + receipt.msg_id;
-        if (seen_group_receipts_.count(replay_key) > 0) return;
+        if (seen_group_receipts_.count(replay_key) > 0) {
+            ++mm6_diag_.group_receipts_replayed;
+            return;
+        }
         while (seen_group_receipts_.size() >= kMaxSeenGroupReceipts && !seen_group_receipt_order_.empty()) {
             seen_group_receipts_.erase(seen_group_receipt_order_.front().second);
             seen_group_receipt_order_.pop_front();
         }
         seen_group_receipts_.emplace(replay_key, now);
         seen_group_receipt_order_.emplace_back(now, std::move(replay_key));
+        ++mm6_diag_.group_receipts_forwarded;
     }
     // Hand it to Dart on the group ACTION control line, where receipts have
     // always been consumed (and never rendered); the envelope sender is the
@@ -6864,11 +7479,21 @@ int V2TIMManagerImpl::SendGroupReceipt(const V2TIMString& groupID, const std::st
         group_number = it->second;
     }
     if (IsConferenceMapKey(group_number)) return -2;
-    ToxManager* tox_manager = GetToxManager();
-    Tox* tox = tox_manager ? tox_manager->getTox() : nullptr;
+    // Pinned for the WHOLE sequence below (peer lookup, self-key query, send):
+    // this runs on the FFI caller's thread, where a concurrent UnInitSDK used
+    // to be able to tox_kill() the instance between two of these calls.
+    const ToxSessionGuard session = AcquireToxSession();
+    Tox* tox = session.tox();
     if (!tox) return 0;
     const Tox_Group_Peer_Number peer_id = ResolveGroupPeerIdForKey(group_number, author_key_hex);
-    if (peer_id == UINT32_MAX) return 0;
+    // -3, distinct from the generic 0: the group is ours and the request is
+    // well formed, the AUTHOR is simply not a live NGC peer right now (offline,
+    // not yet re-synced, or gone). Dart parks the receipt for that author and
+    // re-sends it when the author is a resolvable peer again; a plain failure
+    // would be dropped forever, because the row is flagged read locally the
+    // same moment and never scanned again. Callers that only know the legacy
+    // codes still see "not 1, not -2" and behave exactly as before.
+    if (peer_id == UINT32_MAX) return -3;
     // The payload keeps the legacy receipt schema (type/msgID/receiptType/
     // sender) so every toxee version consumes it, but "sender" is our
     // PER-GROUP key: the long-term key it used to carry deanonymized every
@@ -8751,13 +9376,19 @@ static_assert(TOX_CONFERENCE_ID_SIZE == TOX_GROUP_CHAT_ID_SIZE,
 
 bool V2TIMManagerImpl::GetLiveGroupIdentity(Tox_Group_Number group_number,
                                             uint8_t out_id[TOX_GROUP_CHAT_ID_SIZE]) {
-    if (group_number == UINT32_MAX || !out_id || !tox_manager_) return false;
+    if (group_number == UINT32_MAX || !out_id) return false;
+    // Reached from HandleGroupSelfJoin, which the create/join/invite paths call
+    // from the FFI caller's thread (no IterateReentryScope, so UnInitSDK does
+    // not defer): reading through tox_manager_ raced the teardown that nulls it
+    // and frees the manager.
+    const ToxSessionGuard session = AcquireToxSession();
+    if (!session) return false;
     if (IsConferenceMapKey(group_number)) {
         // getConferenceId strips the tag itself.
-        return tox_manager_->getConferenceId(group_number, out_id);
+        return session.manager()->getConferenceId(group_number, out_id);
     }
     Tox_Err_Group_State_Query err = TOX_ERR_GROUP_STATE_QUERY_OK;
-    return tox_manager_->getGroupChatId(group_number, out_id, &err) &&
+    return session.manager()->getGroupChatId(group_number, out_id, &err) &&
            err == TOX_ERR_GROUP_STATE_QUERY_OK;
 }
 
@@ -9535,8 +10166,10 @@ V2TIMString V2TIMManagerImpl::StorePendingInvite(const V2TIMString& inviteID, Pe
 }
 
 bool V2TIMManagerImpl::RestorePendingGroupInvite(const PendingGroupInviteInfo& invite) {
-    if (invite.id.empty() || invite.cookie.empty() || !tox_manager_) return false;
-    Tox* tox = tox_manager_->getTox();
+    if (invite.id.empty() || invite.cookie.empty()) return false;
+    // Runs on the restore path and from the FFI surface: pinned.
+    const ToxSessionGuard session = AcquireToxSession();
+    Tox* tox = session.tox();
     if (!tox) return false;
     uint8_t inviter_pubkey[TOX_PUBLIC_KEY_SIZE];
     if (!ToxUtil::tox_hex_to_bytes(invite.inviter_userID.c_str(), invite.inviter_userID.size(),
@@ -9816,8 +10449,20 @@ void V2TIMManagerImpl::HandleGroupSelfJoin(Tox_Group_Number group_number) {
     int64_t this_instance_id = GetInstanceIdFromManager(this);
     static_cast<void>(0);
     static_cast<void>(0);
-    V2TIM_LOG(kInfo, "HandleGroupSelfJoin: ENTRY - group_number=%u, this=%p, current_instance_id=%lld, this_instance_id=%lld", 
+    V2TIM_LOG(kInfo, "HandleGroupSelfJoin: ENTRY - group_number=%u, this=%p, current_instance_id=%lld, this_instance_id=%lld",
               group_number, (void*)this, (long long)current_instance_id, (long long)this_instance_id);
+    // Pinned here rather than at the callers. Most invocations arrive from a
+    // tox callback, where teardown defers itself — but CreateGroup (both the
+    // V2TIMGroupManagerImpl one and the impl one), JoinGroup and the invite
+    // paths call this MANUALLY from the FFI caller's thread, outside any
+    // IterateReentryScope, so nothing defers UnInitSDK there and the raw
+    // GetToxManager()->... uses below were a use-after-free (codex
+    // 2026-09-24). Taking the pin in the handler makes every call site safe.
+    const ToxSessionGuard session = AcquireToxSession();
+    if (!session) {
+        V2TIM_LOG(kWarning, "HandleGroupSelfJoin: no live Tox session; ignoring key=%u", group_number);
+        return;
+    }
     V2TIMString groupID;
     bool found_in_mapping = false;
     {
@@ -9850,7 +10495,7 @@ void V2TIMManagerImpl::HandleGroupSelfJoin(Tox_Group_Number group_number) {
     } else if (found_in_mapping) {
         uint8_t chat_id[TOX_GROUP_CHAT_ID_SIZE];
         Tox_Err_Group_State_Query err_chat_id;
-        if (GetToxManager()->getGroupChatId(group_number, chat_id, &err_chat_id) &&
+        if (session.manager()->getGroupChatId(group_number, chat_id, &err_chat_id) &&
             err_chat_id == TOX_ERR_GROUP_STATE_QUERY_OK) {
             std::ostringstream oss;
             for (size_t i = 0; i < TOX_GROUP_CHAT_ID_SIZE; ++i) {
@@ -9959,7 +10604,7 @@ void V2TIMManagerImpl::HandleGroupSelfJoin(Tox_Group_Number group_number) {
                                     V2TIM_LOG(kInfo, "HandleGroupSelfJoin: Using stored inviter userID: {}", pending_inviter_userID);
                                 } else {
                                     // Fallback: get inviter's public key from friend_number
-                                    Tox* tox = GetToxManager()->getTox();
+                                    Tox* tox = session.tox();
                                     if (tox) {
                                         uint8_t inviter_pubkey[TOX_PUBLIC_KEY_SIZE];
                                         if (tox_friend_get_public_key(tox, pending_friend_number, inviter_pubkey, nullptr)) {
@@ -9973,7 +10618,7 @@ void V2TIMManagerImpl::HandleGroupSelfJoin(Tox_Group_Number group_number) {
                                 // Build member list (contains self)
                                 V2TIMGroupMemberInfoVector memberList;
                                 V2TIMGroupMemberInfo selfMember;
-                                Tox* tox = GetToxManager()->getTox();
+                                Tox* tox = session.tox();
                                 if (tox) {
                                     uint8_t self_pubkey[TOX_PUBLIC_KEY_SIZE];
                                     tox_self_get_public_key(tox, self_pubkey);
@@ -10317,13 +10962,18 @@ ToxAVManager* V2TIMManagerImpl::GetToxAVManager() {
 #endif
 
 void V2TIMManagerImpl::RejoinKnownGroups() {
-    // Check if manager is still valid
-    if (!tox_manager_) {
+    // Runs on the rejoin background task and from InitSDK/connection changes,
+    // i.e. never inside a tox callback that would defer teardown: pin the
+    // session for the whole restore pass instead of re-reading tox_manager_
+    // (which UnInitSDK can null between any two of the calls below).
+    const ToxSessionGuard session = AcquireToxSession();
+    ToxManager* tox_manager = session.manager();
+    if (!tox_manager) {
         static_cast<void>(0);
         static_cast<void>(0);
         return;
     }
-    
+
     // R-07: Get known groups from Core metadata
     std::vector<std::string> known_groups_list = GetKnownGroupIDs();
     if (known_groups_list.empty()) {
@@ -10337,7 +10987,7 @@ void V2TIMManagerImpl::RejoinKnownGroups() {
     // First, restore conferences from savedata (they are automatically restored by Tox)
     Tox* tox = nullptr;
     try {
-        tox = tox_manager_->getTox();
+        tox = session.tox();
     } catch (const std::exception& e) {
         static_cast<void>(0);
         static_cast<void>(0);
@@ -10415,7 +11065,7 @@ void V2TIMManagerImpl::RejoinKnownGroups() {
 
                                 Tox_Err_Conference_By_Id lookup_error;
                                 const Tox_Conference_Number conf_num =
-                                    tox_manager_->getConferenceById(
+                                    tox_manager->getConferenceById(
                                         conference_id, &lookup_error);
                                 if (lookup_error !=
                                         TOX_ERR_CONFERENCE_BY_ID_OK ||
@@ -10444,7 +11094,7 @@ void V2TIMManagerImpl::RejoinKnownGroups() {
                                 if (is_av_conference) {
                                     // Legacy group AV takes no toxcore lock (see
                                     // ToxAVManager::lockToxIterate); this runs on the rejoin thread.
-                                    auto av_iterate_lock = GetToxManager()->lockIterate();
+                                    auto av_iterate_lock = tox_manager->lockIterate();
                                     av_restore_failed =
                                         !toxav_groupchat_av_enabled(tox, conf_num) &&
                                         toxav_groupchat_enable_av(tox, conf_num, HandleAVConferenceAudio, this) != 0;
@@ -10559,7 +11209,7 @@ void V2TIMManagerImpl::RejoinKnownGroups() {
                                         if (is_av_conference) {
                                             // Legacy group AV takes no toxcore lock (see
                                             // ToxAVManager::lockToxIterate); this runs on the rejoin thread.
-                                            auto av_iterate_lock = GetToxManager()->lockIterate();
+                                            auto av_iterate_lock = tox_manager->lockIterate();
                                             av_restore_failed =
                                                 !toxav_groupchat_av_enabled(tox, conf_num) &&
                                                 toxav_groupchat_enable_av(tox, conf_num, HandleAVConferenceAudio, this) != 0;
@@ -10702,8 +11352,10 @@ void V2TIMManagerImpl::RejoinKnownGroups() {
                 continue;
             }
             
-            // Check if tox_manager_ is still valid before calling joinGroup
-            if (!tox_manager_) {
+            // The session may have ended while the loop was running; the pinned
+            // manager stays valid, but joining for a session that is over would
+            // map this profile's groups onto the next one's numbers.
+            if (session.Expired()) {
                 static_cast<void>(0);
                 static_cast<void>(0);
                 break;
@@ -10712,7 +11364,7 @@ void V2TIMManagerImpl::RejoinKnownGroups() {
             // Before attempting to join, check if the group already exists in Tox (restored from savedata).
             // tox_group_join() on an already-existing group returns an unreliable group_number (often 0),
             // which causes all groups to get mapped to the same number. Use getGroupByChatId first.
-            Tox_Group_Number existing_group_number = tox_manager_->getGroupByChatId(chat_id);
+            Tox_Group_Number existing_group_number = tox_manager->getGroupByChatId(chat_id);
             if (existing_group_number != UINT32_MAX) {
                 // Group already exists in Tox - just record the mapping, no need to join
                 rejoin_successes++;
@@ -10728,7 +11380,7 @@ void V2TIMManagerImpl::RejoinKnownGroups() {
 
             // Group not found in Tox - attempt to join using chat_id
             // Get self name for joining
-            std::string self_name = tox_manager_->getName();
+            std::string self_name = tox_manager->getName();
             if (self_name.empty()) {
                 self_name = "User";
             }
@@ -10736,7 +11388,7 @@ void V2TIMManagerImpl::RejoinKnownGroups() {
             // Attempt to rejoin group using chat_id
             rejoin_attempts++;
             Tox_Err_Group_Join err_join;
-            Tox_Group_Number group_number = tox_manager_->joinGroup(
+            Tox_Group_Number group_number = tox_manager->joinGroup(
                 chat_id,
                 reinterpret_cast<const uint8_t*>(self_name.c_str()), self_name.length(),
                 nullptr, 0, // No password
@@ -10844,8 +11496,8 @@ void V2TIMManagerImpl::RejoinKnownGroups() {
                 if (!endptr || *endptr != '\0' || v > 255) { ok = false; break; }
                 chat_id_bin[i] = static_cast<uint8_t>(v);
             }
-            if (!ok || !tox_manager_) continue;
-            Tox_Group_Number actual = tox_manager_->getGroupByChatId(chat_id_bin);
+            if (!ok || session.Expired()) continue;
+            Tox_Group_Number actual = tox_manager->getGroupByChatId(chat_id_bin);
             if (actual == UINT32_MAX) continue;
             V2TIMString groupID(lr.c_str());
             {

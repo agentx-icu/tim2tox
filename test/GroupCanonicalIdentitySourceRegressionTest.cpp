@@ -151,10 +151,15 @@ TEST(GroupCanonicalIdentitySourceRegressionTest,
               std::string::npos);
     EXPECT_NE(self_join.find("SetGroupChatIdInStorage(groupID.CString(), chat_id_hex)"),
               std::string::npos);
-    EXPECT_NE(
-        self_join.find(
-            "HandleGroupSelfJoin: refusing to publish temporary group alias"),
-        std::string::npos);
+    // A self-join that still holds only the per-invite `tox_inv_...` alias is
+    // PROMOTED to a stable id and then published. Refusing to publish (what
+    // this test asserted until the alias reached Dart-side invisibility) left
+    // the invitee's whole group surface missing, so the assertion now pins the
+    // promotion instead.
+    EXPECT_NE(self_join.find("PromoteTemporaryInviteGroupID(groupID, group_number)"),
+              std::string::npos);
+    EXPECT_NE(self_join.find("if (IsTemporaryInviteGroupID(groupID))"),
+              std::string::npos);
     EXPECT_NE(self_join.find("DartNotifyGroupJoin(groupID.CString(), "
                              "GetInstanceIdFromManager(this), GetSessionEpoch())"),
               std::string::npos);

@@ -289,19 +289,22 @@ void V2TIMFriendshipManagerImpl::NotifyBlackListDeleted(const V2TIMStringVector&
 
 
 // --- Public API Implementations (Placeholders) ---
-void V2TIMFriendshipManagerImpl::GetFriendList(V2TIMValueCallback<V2TIMFriendInfoVector>* callback) { 
-    ToxManager* tox_manager = GetToxManager();
-    if (!tox_manager) {
-        // Teardown or default instance: avoid noisy stdout; still report via callback
-        if (callback) callback->OnError(ERR_SDK_NOT_INITIALIZED, "ToxManager not initialized");
-        return;
-    }
-    Tox* tox = tox_manager->getTox();
-    
-    if (!tox) {
+void V2TIMFriendshipManagerImpl::GetFriendList(V2TIMValueCallback<V2TIMFriendInfoVector>* callback) {
+    // Pinned for the WHOLE enumeration: the friend-list size, the list itself
+    // and the per-friend key/name/status reads are ~8 tox_*() calls off one
+    // handle, and a concurrent UnInitSDK could tox_kill() the instance between
+    // any two of them. None of this runs inside tox_iterate, so teardown does
+    // not defer here (the CreateGroup shape).
+    const auto session = manager_impl_ ? manager_impl_->AcquireToxSession()
+                                       : V2TIMManagerImpl::ToxSessionGuard();
+    if (!session) {
+        // Teardown or default instance: avoid noisy stdout; still report via
+        // callback. One check replaces the old two: an empty guard means
+        // exactly "no ToxManager, or no live Tox".
         if (callback) callback->OnError(ERR_SDK_NOT_INITIALIZED, "Tox not initialized");
         return;
     }
+    Tox* const tox = session.tox();
     
     V2TIMFriendInfoVector friendInfoVector;
     size_t friendCount = tox_self_get_friend_list_size(tox);
@@ -357,17 +360,24 @@ void V2TIMFriendshipManagerImpl::GetFriendList(V2TIMValueCallback<V2TIMFriendInf
 
 void V2TIMFriendshipManagerImpl::GetFriendsInfo(const V2TIMStringVector& userIDList, V2TIMValueCallback<V2TIMFriendInfoResultVector>* callback) { 
     V2TIM_LOG(kInfo, "GetFriendsInfo called");
-     ToxManager* tox_manager = GetToxManager();
-    if (!tox_manager) {
+    // Pinned for the WHOLE lookup: the friend-number resolution and the
+    // key/name reads that follow are a sequence a concurrent UnInitSDK could
+    // tox_kill() the instance in the middle of, and none of it runs inside
+    // tox_iterate, so teardown does not defer here.
+    const auto session = manager_impl_ ? manager_impl_->AcquireToxSession()
+                                       : V2TIMManagerImpl::ToxSessionGuard();
+    // DELIBERATE error-code change (codex 2026-09-26): the "manager exists but
+    // Tox is null" case used to fall into ReportNotImplemented, i.e.
+    // ERR_SDK_INTERFACE_NOT_SUPPORT / "Feature not supported in Tox wrapper".
+    // GetFriendsInfo IS supported; the SDK was simply not initialized, which is
+    // what every sibling in this file reports, so the two old branches collapse
+    // into one honest ERR_SDK_NOT_INITIALIZED.
+    if (!session) {
         if (callback) callback->OnError(ERR_SDK_NOT_INITIALIZED, "ToxManager not initialized");
         return;
     }
-    Tox* tox = tox_manager->getTox();
-    if (!tox) {
-        ReportNotImplemented(callback); // Or specific error
-        return;
-    }
-    
+    Tox* const tox = session.tox();
+
     // CRITICAL: Copy userIDList immediately to avoid lifetime issues
     // Extract C-strings first and store them in std::string to avoid
     // accessing potentially invalid impl_ pointers from V2TIMString objects
@@ -491,17 +501,18 @@ void V2TIMFriendshipManagerImpl::SearchFriends(const V2TIMFriendSearchParam& sea
         return;
     }
     
-    ToxManager* tox_manager = GetToxManager();
-    if (!tox_manager) {
-        if (callback) callback->OnError(ERR_SDK_NOT_INITIALIZED, "ToxManager not initialized");
+    // Pinned for the WHOLE search: the friend-list walk and the per-friend
+    // key/name reads are ~8 tox_*() calls off one handle, and a concurrent
+    // UnInitSDK could tox_kill() the instance between any two of them. None of
+    // this runs inside tox_iterate, so teardown does not defer here.
+    const auto session = manager_impl_ ? manager_impl_->AcquireToxSession()
+                                       : V2TIMManagerImpl::ToxSessionGuard();
+    if (!session) {
+        V2TIM_LOG(kError, "SearchFriends: no live Tox session");
+        if (callback) callback->OnError(ERR_SDK_NOT_INITIALIZED, "Tox not initialized");
         return;
     }
-    Tox* tox = tox_manager->getTox();
-    if (!tox) {
-        V2TIM_LOG(kError, "SearchFriends: tox is null");
-        callback->OnError(ERR_SDK_NOT_INITIALIZED, "Tox not initialized");
-        return;
-    }
+    Tox* const tox = session.tox();
     
     V2TIMFriendInfoResultVector resultList;
     
@@ -624,17 +635,23 @@ void V2TIMFriendshipManagerImpl::AddFriend(const V2TIMFriendAddApplication& appl
     V2TIM_LOG(kInfo, "AddFriend ENTRY - userID length={}, userID={}, addWording length={}, addWording={}",
               application.userID.Length(), application.userID.CString(), application.addWording.Length(), application.addWording.CString());
 
-    ToxManager* tox_manager = GetToxManager();
-    if (!tox_manager) {
+    // Pinned for the WHOLE add: getAddress(), the connection-status read and
+    // tox_friend_add are a sequence a concurrent UnInitSDK could tox_kill() the
+    // instance in the middle of, and none of it runs inside tox_iterate, so
+    // teardown does not defer here.
+    const auto session = manager_impl_ ? manager_impl_->AcquireToxSession()
+                                       : V2TIMManagerImpl::ToxSessionGuard();
+    if (!session) {
         V2TIM_LOG(kError, "[AddFriend] ToxManager not initialized");
         if (callback) callback->OnError(ERR_SDK_NOT_INITIALIZED, "ToxManager not initialized");
         return;
     }
-    
+    ToxManager* const tox_manager = session.manager();
+
     std::string current_address = tox_manager->getAddress();
     V2TIM_LOG(kInfo, "[AddFriend] Current node address (full): {}, Target userID (full): {}", current_address, application.userID.CString());
-    
-    Tox* tox = tox_manager->getTox();
+
+    Tox* const tox = session.tox();
     V2TIMFriendOperationResult result; // Declare outside if
     // Normalize userID to 64-char public key for consistent identification
     std::string normalized_uid(application.userID.CString());
@@ -737,17 +754,45 @@ void V2TIMFriendshipManagerImpl::AddFriend(const V2TIMFriendAddApplication& appl
         }
         friendInfo.userID = V2TIMString(user_id_for_notify.c_str());
         addedFriends.PushBack(friendInfo);
-        NotifyFriendListAdded(addedFriends);
 
-        // Save Tox profile to disk so the new friend persists
-        if (manager_impl_) {
-            manager_impl_->SaveToxProfile();
-        }
+        // A logout landed mid-add: the pin kept the instance valid, but this
+        // friend belongs to a session that is over, so nothing session-scoped
+        // may be published for it (listeners, the profile save and the
+        // conversation cache all belong to the account that just left; the
+        // cache would be rebuilt for the NEXT one). This does NOT make the add
+        // a failure — tox_friend_add succeeded and UnInitSDK's own save
+        // quiesces against the pin this call holds, so the request is in the
+        // profile it writes. Answering OnError here would invite a retry that
+        // sends a duplicate request (CreateGroup's rule, codex 2026-09-26).
+        if (session.Expired()) {
+            V2TIM_LOG(kWarning, "[AddFriend] the session ended during the add; the friend request "
+                                "was sent and is reported as sent, but nothing was published for "
+                                "this session");
+        } else {
+            NotifyFriendListAdded(addedFriends);
 
-        // Refresh conversation cache so the new friend's conversation appears
-        if (manager_impl_) {
-            V2TIMConversationManager* cm = manager_impl_->GetConversationManager();
-            if (cm) static_cast<V2TIMConversationManagerImpl*>(cm)->RefreshCache();
+            // RE-CHECKED after the notification, not once at the top: the
+            // listeners above run SYNCHRONOUSLY on this thread and one of them
+            // may log out — and log back in — inside the callback. The pin does
+            // not stop that (a save excludes its own thread's pin from the
+            // drain), so a single check before the notification would let the
+            // save and the cache refresh below land on the NEXT session
+            // (codex 2026-09-26).
+            if (session.Expired()) {
+                V2TIM_LOG(kWarning, "[AddFriend] a listener ended the session during the "
+                                    "notification; skipping the profile save and the cache refresh");
+            } else {
+                // Save Tox profile to disk so the new friend persists
+                if (manager_impl_) {
+                    manager_impl_->SaveToxProfile();
+                }
+
+                // Refresh conversation cache so the new friend's conversation appears
+                if (manager_impl_) {
+                    V2TIMConversationManager* cm = manager_impl_->GetConversationManager();
+                    if (cm) static_cast<V2TIMConversationManagerImpl*>(cm)->RefreshCache();
+                }
+            }
         }
     } else {
         // Map Tox error to V2TIM error code/info
@@ -778,18 +823,20 @@ void V2TIMFriendshipManagerImpl::AddFriend(const V2TIMFriendAddApplication& appl
 void V2TIMFriendshipManagerImpl::DeleteFromFriendList(const V2TIMStringVector& userIDList, V2TIMFriendType deleteType, V2TIMValueCallback<V2TIMFriendOperationResultVector>* callback) { 
     V2TIM_LOG(kInfo, "DeleteFromFriendList called with %zu user(s)", userIDList.Size());
     
-    // Check if Tox is initialized (more reliable than IsRunning check)
-    ToxManager* tox_manager = GetToxManager();
-    if (!tox_manager) {
-        if (callback) callback->OnError(ERR_SDK_NOT_INITIALIZED, "ToxManager not initialized");
-        return;
-    }
-    Tox* tox = tox_manager->getTox();
-    if (!tox) {
+    // Check if Tox is initialized (more reliable than IsRunning check).
+    // Pinned for the WHOLE delete: the friend-number lookup and
+    // tox_friend_delete are a sequence per user, repeated over the list, and a
+    // concurrent UnInitSDK could tox_kill() the instance between any two of
+    // them. None of this runs inside tox_iterate, so teardown does not defer
+    // here.
+    const auto session = manager_impl_ ? manager_impl_->AcquireToxSession()
+                                       : V2TIMManagerImpl::ToxSessionGuard();
+    if (!session) {
         V2TIM_LOG(kError, "DeleteFromFriendList: Tox instance is null, cannot delete friends");
         if (callback) callback->OnError(ERR_SDK_NOT_INITIALIZED, "Tox not initialized");
         return;
     }
+    Tox* const tox = session.tox();
     V2TIM_LOG(kInfo, "DeleteFromFriendList: Tox instance is valid, proceeding with deletion");
     
     // CRITICAL: Copy userIDList immediately to avoid lifetime issues
@@ -857,7 +904,11 @@ void V2TIMFriendshipManagerImpl::DeleteFromFriendList(const V2TIMStringVector& u
                     // later friend may reuse the number: forget it was sent our
                     // group identity hints, and drop every hint, challenge and
                     // proven NGC member mapping it left behind (MM-6).
-                    if (manager_impl_) {
+                    // Not on a session that ended under us: the identity state
+                    // lives on the long-lived V2TIMManagerImpl, so purging by
+                    // friend number after a logout+login would drop the NEXT
+                    // account's entries (codex 2026-09-26).
+                    if (manager_impl_ && !session.Expired()) {
                         manager_impl_->PurgeFriendIdentityState(
                             friend_num, ToxUtil::tox_bytes_to_hex(pubkey, TOX_PUBLIC_KEY_SIZE));
                     }
@@ -897,22 +948,44 @@ void V2TIMFriendshipManagerImpl::DeleteFromFriendList(const V2TIMStringVector& u
             deletedUserIDs.PushBack(results[i].userID);
         }
     }
-    if (deletedUserIDs.Size() > 0) {
+    if (deletedUserIDs.Size() > 0 && session.Expired()) {
+        // A logout landed mid-delete. The deletions happened in Tox and
+        // UnInitSDK's own save quiesces against the pin this call holds, so
+        // they are in the profile it writes; but the listeners, the profile
+        // save and the conversation cache all belong to the session that just
+        // ended, and the cache would be rebuilt for the NEXT account. Publish
+        // nothing — and still report the delete as done below, because it is
+        // (CreateGroup's rule, codex 2026-09-26).
+        V2TIM_LOG(kWarning, "DeleteFromFriendList: the session ended during the delete; the "
+                            "friends were removed and are reported as removed, but nothing was "
+                            "published for this session");
+    } else if (deletedUserIDs.Size() > 0) {
         V2TIM_LOG(kInfo, "DeleteFromFriendList: Notifying listeners about %zu deleted friend(s)", deletedUserIDs.Size());
         NotifyFriendListDeleted(deletedUserIDs);
 
-        // Save Tox profile to disk immediately so the deletion persists
-        if (manager_impl_) {
-            manager_impl_->SaveToxProfile();
-        }
+        // RE-CHECKED after the notification, not once above it: the listeners
+        // run SYNCHRONOUSLY on this thread and one of them may log out — and
+        // log back in — inside the callback, which the pin does not prevent (a
+        // save excludes its own thread's pin from the drain). A single earlier
+        // check would let the save and the cache refresh below land on the NEXT
+        // session (codex 2026-09-26).
+        if (session.Expired()) {
+            V2TIM_LOG(kWarning, "DeleteFromFriendList: a listener ended the session during the "
+                                "notification; skipping the profile save and the cache refresh");
+        } else {
+            // Save Tox profile to disk immediately so the deletion persists
+            if (manager_impl_) {
+                manager_impl_->SaveToxProfile();
+            }
 
-        // Refresh conversation cache (without NotifyNewConversations) so deleted friends'
-        // conversations are removed from cache. We must NOT call RefreshCache() because it
-        // calls NotifyNewConversations() which fires OnNewConversation — Dart treats that as
-        // "add if not present" and would re-add the just-deleted conversation.
-        if (manager_impl_) {
-            V2TIMConversationManager* cm = manager_impl_->GetConversationManager();
-            if (cm) static_cast<V2TIMConversationManagerImpl*>(cm)->RefreshConversationCacheOnly();
+            // Refresh conversation cache (without NotifyNewConversations) so deleted friends'
+            // conversations are removed from cache. We must NOT call RefreshCache() because it
+            // calls NotifyNewConversations() which fires OnNewConversation — Dart treats that as
+            // "add if not present" and would re-add the just-deleted conversation.
+            if (manager_impl_) {
+                V2TIMConversationManager* cm = manager_impl_->GetConversationManager();
+                if (cm) static_cast<V2TIMConversationManagerImpl*>(cm)->RefreshConversationCacheOnly();
+            }
         }
     } else {
         V2TIM_LOG(kWarning, "DeleteFromFriendList: No friends were successfully deleted");

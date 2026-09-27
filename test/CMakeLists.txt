@@ -133,6 +133,15 @@ target_compile_definitions(control_path_source_regression_test PRIVATE
     TIM2TOX_ROOT_CMAKE_PATH="${CMAKE_SOURCE_DIR}/CMakeLists.txt"
     TIM2TOX_SOURCE_CMAKE_PATH="${CMAKE_SOURCE_DIR}/source/CMakeLists.txt"
     TIM2TOX_FFI_CMAKE_PATH="${CMAKE_SOURCE_DIR}/ffi/CMakeLists.txt")
+add_executable(tox_session_pin_test ToxSessionPinTest.cpp)
+target_compile_definitions(tox_session_pin_test PRIVATE
+    TIM2TOX_MANAGER_SOURCE_PATH="${CMAKE_SOURCE_DIR}/source/V2TIMManagerImpl.cpp"
+    TIM2TOX_MANAGER_HEADER_PATH="${CMAKE_SOURCE_DIR}/source/V2TIMManagerImpl.h"
+    TIM2TOX_FFI_SOURCE_PATH="${CMAKE_SOURCE_DIR}/ffi/tim2tox_ffi.cpp"
+    TIM2TOX_GROUP_MANAGER_SOURCE_PATH="${CMAKE_SOURCE_DIR}/source/V2TIMGroupManagerImpl.cpp"
+    TIM2TOX_FRIENDSHIP_MANAGER_SOURCE_PATH="${CMAKE_SOURCE_DIR}/source/V2TIMFriendshipManagerImpl.cpp"
+    TIM2TOX_CONVERSATION_MANAGER_SOURCE_PATH="${CMAKE_SOURCE_DIR}/source/V2TIMConversationManagerImpl.cpp"
+    TIM2TOX_TOX_MANAGER_SOURCE_PATH="${CMAKE_SOURCE_DIR}/source/ToxManager.cpp")
 add_executable(native_log_privacy_source_regression_test
     NativeLogPrivacySourceRegressionTest.cpp)
 target_compile_definitions(native_log_privacy_source_regression_test PRIVATE
@@ -209,6 +218,11 @@ target_link_libraries(control_path_source_regression_test PRIVATE
 target_link_libraries(native_log_privacy_source_regression_test PRIVATE
     ${TIM2TOX_GTEST_MAIN_TARGET})
 find_package(Threads REQUIRED)
+target_link_libraries(tox_session_pin_test PRIVATE
+    tim2tox
+    toxcore_static
+    Threads::Threads
+    ${TIM2TOX_GTEST_MAIN_TARGET})
 target_link_libraries(dart_send_message_contract_test PRIVATE
     ${TIM2TOX_GTEST_MAIN_TARGET}
     Threads::Threads)
@@ -247,3 +261,4 @@ add_test(NAME control_path_source_regression_test
     COMMAND control_path_source_regression_test)
 add_test(NAME native_log_privacy_source_regression_test
     COMMAND native_log_privacy_source_regression_test)
+add_test(NAME tox_session_pin_test COMMAND tox_session_pin_test)

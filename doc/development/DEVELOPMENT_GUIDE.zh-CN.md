@@ -261,6 +261,14 @@ make -j$(nproc)
 - `USE_IPV6`: 启用 IPv6 支持（默认：ON）
 - `ENABLE_STATIC`: 构建静态库（默认：ON）
 - `ENABLE_SHARED`: 构建动态库（默认：OFF）
+- `TIM2TOX_ENABLE_TEST_HOOKS`: 是否把仅供 `auto_tests/` 使用的 FFI 钩子编入
+  `libtim2tox_ffi`（默认：OFF）。目前只有
+  `tim2tox_ffi_mm6_send_crafted_challenge`：它伪造正常 API 无法构造的那一种
+  MM-6 身份挑战（成员冒称另一名成员的群内密钥），供场景用例验证应答对被冒称
+  的成员不可读。`build_ffi.sh` 会打开它，因为那正是 `auto_tests/` 所用的库；
+  应用与 CI 构建必须保持 OFF——在发布库里该符号只是一个攻击原语。符号缺失时
+  Dart 侧访问器 `Tim2ToxFfi.mm6SendCraftedChallengeNative` 返回 `null`，对应
+  场景会跳过。
 
 日志级别选项：
 

@@ -374,14 +374,14 @@ TEST(ControlPathSourceRegressionTest,
             "int64_t id = (instance_id == 0) ? GetCurrentInstanceId() : instance_id;"),
         std::string::npos);
     EXPECT_NE(poll_text.find("IsInstanceInited(id)"), std::string::npos);
+    // The resolved id AND the session epoch are passed through: the epoch is
+    // what lets the listener drop records a previous session of the same
+    // instance id left queued.
     EXPECT_NE(
         poll_text.find(
-            "return G.simple_listener.poll_text(id, buffer, buffer_len);"),
+            "return G.simple_listener.poll_text(id, session_epoch, buffer, buffer_len);"),
         std::string::npos);
-    EXPECT_EQ(
-        poll_text.find(
-            "return G.simple_listener.poll_text(instance_id, buffer, buffer_len);"),
-        std::string::npos);
+    EXPECT_EQ(poll_text.find("poll_text(instance_id,"), std::string::npos);
 }
 
 TEST(ControlPathSourceRegressionTest,
@@ -389,13 +389,16 @@ TEST(ControlPathSourceRegressionTest,
     const std::string ffi_source = ReadSource(TIM2TOX_FFI_SOURCE_PATH);
     const std::string listener = SourceSection(
         ffi_source,
-        "int poll_text(int64_t instance_id, char* buf, int len) {",
+        "int poll_text(int64_t instance_id, int64_t session_epoch, char* buf, int len) {",
         "int poll_custom(int64_t instance_id, unsigned char* buf, int len) {");
 
     EXPECT_NE(listener.find("payload may legally contain newlines"),
               std::string::npos);
-    EXPECT_NE(listener.find("text_q_.pop();"), std::string::npos);
-    EXPECT_NE(listener.find("CopyPayloadOrReturnRequiredCapacity(s, buf, len)"),
+    // One record leaves the queue per dequeue. It is no longer a std::queue:
+    // events for other instances must keep their arrival order, so the match
+    // is removed by index instead of popped from the front.
+    EXPECT_NE(listener.find("remove_locked(i);"), std::string::npos);
+    EXPECT_NE(listener.find("CopyPayloadOrReturnRequiredCapacity(event.line, buf, len)"),
               std::string::npos);
     EXPECT_NE(listener.find("if (n < 0) return n;"), std::string::npos);
 }

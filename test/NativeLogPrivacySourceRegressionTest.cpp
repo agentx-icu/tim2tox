@@ -289,8 +289,14 @@ bool IsExactPath(const std::filesystem::path& actual, const std::filesystem::pat
 
 bool IsExactApprovedLoggerSink(const std::filesystem::path& file, std::string_view line_text,
                                std::string_view token) {
-    return IsExactPath(file, TIM2TOX_LOG_SOURCE_PATH) && token == "std::cout" &&
-           Trim(line_text) == "std::cout << full_message;";
+    if (!IsExactPath(file, TIM2TOX_LOG_SOURCE_PATH) || token != "std::cout") return false;
+    const std::string text = Trim(line_text);
+    // Two exact forms, both the logger's own console sink and neither of them
+    // adding anything to what is printed. The flush form exists because the
+    // real-UI harness redirects stdout to a file (full buffering) and always
+    // kills the app rather than letting it exit, so an unflushed line is lost.
+    return text == "std::cout << full_message;" ||
+           text == "std::cout << full_message << std::flush;";
 }
 
 bool FindCallEnd(std::string_view stripped, size_t open_parenthesis, size_t* close_parenthesis) {
@@ -819,6 +825,12 @@ INSTANTIATE_TEST_SUITE_P(
 TEST(NativeLogPrivacyAllowlistTest, AllowsOnlyExactLoggerSinkStatement) {
     EXPECT_TRUE(
         FindOutputBypassesInSource(TIM2TOX_LOG_SOURCE_PATH, "std::cout << full_message;").empty());
+    EXPECT_TRUE(FindOutputBypassesInSource(TIM2TOX_LOG_SOURCE_PATH,
+                                           "std::cout << full_message << std::flush;")
+                    .empty());
+    EXPECT_FALSE(FindOutputBypassesInSource(TIM2TOX_LOG_SOURCE_PATH,
+                                            "std::cout << full_message << extra;")
+                     .empty());
     EXPECT_FALSE(
         FindOutputBypassesInSource(TIM2TOX_LOG_SOURCE_PATH, "std::cout << prefix << full_message;")
             .empty());
