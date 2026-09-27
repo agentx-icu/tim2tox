@@ -127,6 +127,8 @@ typedef _mm6_send_crafted_challenge_c = ffi.Int32 Function(
     ffi.Pointer<pkgffi.Utf8>,
     ffi.Pointer<pkgffi.Utf8>,
     ffi.Pointer<pkgffi.Utf8>);
+typedef _mm6_set_group_receipt_budgets_c = ffi.Int32 Function(
+    ffi.Int64, ffi.Int32, ffi.Int32);
 typedef _send_c2c_custom_c = ffi.Int32 Function(
     ffi.Pointer<pkgffi.Utf8>, ffi.Pointer<ffi.Uint8>, ffi.Int32);
 typedef _send_c2c_control_c = ffi.Int32 Function(
@@ -1488,6 +1490,41 @@ class Tim2ToxFfi {
       }
     }
     return _mm6SendCraftedChallengeNative;
+  }
+
+  int Function(int, int, int)? _mm6SetGroupReceiptBudgetsNative;
+  bool _mm6SetGroupReceiptBudgetsLookedUp = false;
+
+  /// TEST-ONLY seam: set this instance's INBOUND group-receipt budgets
+  /// (`perSenderLimit`, `globalLimit`); either value `<= 0` restores that
+  /// budget's compiled-in default. Returns 1 applied, 0 no such instance.
+  ///
+  /// The native caps are sized for honest traffic (2048 per sender per minute,
+  /// 16384 shared), so the refusal path cannot be driven by out-sending them:
+  /// 2048+ sends do not fit in the 60s window they must land inside. Lowering
+  /// the cap first is the only honest way to test it. The caps are read where
+  /// the budget is charged, so set them BEFORE the traffic, and read
+  /// `groupReceipts.perSenderLimit` / `.globalLimit` back from
+  /// [getMm6DiagNative] to confirm. Windows are not reset: a cap below what the
+  /// current window already spent refuses the very next receipt.
+  ///
+  /// **Null when the loaded library does not export it** — the same
+  /// `-DTIM2TOX_ENABLE_TEST_HOOKS=ON` gate as
+  /// [mm6SendCraftedChallengeNative]; app and packaging builds must not carry
+  /// it. Callers treat null as "not available in this build".
+  int Function(int, int, int)? get mm6SetGroupReceiptBudgetsNative {
+    if (!_mm6SetGroupReceiptBudgetsLookedUp) {
+      _mm6SetGroupReceiptBudgetsLookedUp = true;
+      try {
+        _mm6SetGroupReceiptBudgetsNative = _lib.lookupFunction<
+            _mm6_set_group_receipt_budgets_c, int Function(int, int, int)>(
+            'tim2tox_ffi_mm6_set_group_receipt_budgets');
+      } catch (_) {
+        // dart:ffi throws ArgumentError when the symbol is absent.
+        _mm6SetGroupReceiptBudgetsNative = null;
+      }
+    }
+    return _mm6SetGroupReceiptBudgetsNative;
   }
 
   /// The group's shared name (NGC name / conference title); returns bytes

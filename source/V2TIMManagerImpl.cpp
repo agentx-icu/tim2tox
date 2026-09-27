@@ -5866,6 +5866,15 @@ constexpr size_t kMaxGroupReceiptSenders = 1024;
 // bounded to its own 2048 before it can spend from the shared pool, so one
 // flooder can take at most 1/8 of it rather than all of it.
 constexpr uint32_t kMaxGroupReceiptsGlobal = 16384;
+// The two caps above are what SHIPS. `override_value` is the test-only seam
+// (V2TIMManagerImpl::Mm6SetGroupReceiptBudgets, compiled in only with the test
+// hooks): 0 means "the derived default", and it is read HERE, at the point the
+// budget is charged, so a scenario can lower the cap before any traffic starts
+// and watch the refusal happen -- out-sending the real 2048/16384 inside one
+// 60s window is not something a test harness can do honestly.
+uint32_t EffectiveReceiptCap(uint32_t override_value, uint32_t built_in) {
+    return override_value != 0 ? override_value : built_in;
+}
 // Answering side replay cache.
 constexpr size_t kMaxAnsweredChallenges = 1024;
 constexpr auto kAnsweredChallengeTtl = std::chrono::minutes(10);
@@ -6174,8 +6183,9 @@ bool V2TIMManagerImpl::TakeGroupSenderReceiptBudgetLocked(const std::string& sen
         if (group_receipt_rate_by_sender_.size() >= kMaxGroupReceiptSenders) return false;
         it = group_receipt_rate_by_sender_.emplace(sender_hex, IdentityRateWindow{}).first;
     }
-    return TakeIdentityBudgetLocked(it->second, now, &IdentityRateWindow::receipts_in,
-                                    kMaxGroupReceiptsPerSender);
+    return TakeIdentityBudgetLocked(
+        it->second, now, &IdentityRateWindow::receipts_in,
+        EffectiveReceiptCap(group_receipt_per_sender_limit_override_, kMaxGroupReceiptsPerSender));
 }
 
 void V2TIMManagerImpl::DropStaleChallengesForMemberLocked(Tox_Group_Number group_number,
@@ -6762,8 +6772,16 @@ std::string V2TIMManagerImpl::Mm6DiagJson() {
         << ",\"replayed\":" << mm6_diag_.group_receipts_replayed
         << ",\"forwarded\":" << mm6_diag_.group_receipts_forwarded
         << ",\"refusedGlobal\":" << mm6_diag_.group_receipts_refused_global
-        << ",\"perSenderLimit\":" << kMaxGroupReceiptsPerSender
-        << ",\"globalLimit\":" << kMaxGroupReceiptsGlobal << "}}";
+        // The EFFECTIVE caps, i.e. what the charge sites will actually enforce.
+        // Normally the compiled-in defaults; under the test-only budget seam
+        // whatever it was set to, so a scenario can read back the cap it asked
+        // for and, afterwards, that the default is restored.
+        << ",\"perSenderLimit\":"
+        << EffectiveReceiptCap(group_receipt_per_sender_limit_override_,
+                               kMaxGroupReceiptsPerSender)
+        << ",\"globalLimit\":"
+        << EffectiveReceiptCap(group_receipt_global_limit_override_, kMaxGroupReceiptsGlobal)
+        << "}}";
     return out.str();
 }
 
@@ -6819,6 +6837,21 @@ int V2TIMManagerImpl::Mm6SendCraftedChallenge(const V2TIMString& groupID, const 
     body.append(reinterpret_cast<const char*>(nonce), kIdentityNonceSize);
     SendFriendIdentityFrame(tox, friend_number, body);
     return 1;
+}
+
+// TEST-ONLY seam for the inbound group-receipt budgets, inside the SAME guarded
+// region as the primitive above (one region per file is what the pin test keys
+// on, and what keeps the definition from surviving in libtim2tox.a while the C
+// wrapper is gone). It writes nothing but the two override fields; the caps
+// themselves stay as derived, and <= 0 restores the default. The charge sites
+// read the overrides through EffectiveReceiptCap, so a test must set the budget
+// BEFORE the traffic it means to have refused.
+void V2TIMManagerImpl::Mm6SetGroupReceiptBudgets(int32_t per_sender_limit, int32_t global_limit) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    group_receipt_per_sender_limit_override_ =
+        per_sender_limit > 0 ? static_cast<uint32_t>(per_sender_limit) : 0;
+    group_receipt_global_limit_override_ =
+        global_limit > 0 ? static_cast<uint32_t>(global_limit) : 0;
 }
 #endif  // TIM2TOX_ENABLE_TEST_HOOKS
 
@@ -7446,9 +7479,9 @@ void V2TIMManagerImpl::HandleGroupCustomPrivatePacket(
         }
         // The shared ceiling, after the per-sender one (see
         // kMaxGroupReceiptsGlobal for why that order).
-        if (!TakeIdentityBudgetLocked(group_receipt_rate_global_, meter_now,
-                                     &IdentityRateWindow::receipts_in,
-                                     kMaxGroupReceiptsGlobal)) {
+        if (!TakeIdentityBudgetLocked(
+                group_receipt_rate_global_, meter_now, &IdentityRateWindow::receipts_in,
+                EffectiveReceiptCap(group_receipt_global_limit_override_, kMaxGroupReceiptsGlobal))) {
             ++mm6_diag_.group_receipts_refused_global;
             V2TIM_LOG(kWarning,
                       "[HandleGroupCustomPrivatePacket] refused receipt: global receipt budget spent");

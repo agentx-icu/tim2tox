@@ -37,6 +37,39 @@ class MessageHistoryPersistence {
   String? _historyDirectory;
   final LoggerService? _logger;
 
+  /// Writes this store could not land, for a host that wants to TELL the user
+  /// rather than leave it in the log.
+  ///
+  /// Why this exists: every failure here used to end at `_logger.logError`, so a
+  /// device that cannot write history (full disk, a revoked sandbox path, an
+  /// unwritable account directory) looked exactly like one that had nothing to
+  /// save — the app kept accepting messages and quietly lost them on restart.
+  /// Nothing downstream consumed [HistoryFlushException] either. A broadcast
+  /// stream keeps the host optional: with no listener the events are dropped and
+  /// the log stays the fallback.
+  ///
+  /// [HistoryWriteFailure.willRetry] separates "this one attempt failed, a retry
+  /// is armed" from "we have given up on this conversation", which is the only
+  /// distinction a user-facing message can be built on.
+  /// Subscribe again after a [dispose] + [openSession] cycle (an account
+  /// switch): the sink is closed with the store and re-made here on demand, so
+  /// a subscription does not silently outlive the session it was taken in.
+  Stream<HistoryWriteFailure> get writeFailures {
+    if (_writeFailures.isClosed) {
+      _writeFailures =
+          StreamController<HistoryWriteFailure>.broadcast(sync: false);
+    }
+    return _writeFailures.stream;
+  }
+
+  StreamController<HistoryWriteFailure> _writeFailures =
+      StreamController<HistoryWriteFailure>.broadcast(sync: false);
+
+  void _reportWriteFailure(HistoryWriteFailure failure) {
+    if (_writeFailures.isClosed) return;
+    _writeFailures.add(failure);
+  }
+
   /// Replaces `getApplicationSupportDirectory()` as the parent of the default
   /// (non-injected) history directory. For tests and hosts without
   /// path_provider; has no effect when [historyDirectory] is injected.
@@ -541,6 +574,13 @@ class MessageHistoryPersistence {
         '(unrenamed) so those rows stay reachable and a later merge retries '
         'them',
       );
+      _reportWriteFailure(HistoryWriteFailure(
+        conversationId: p.basename(from.path),
+        stage: HistoryWriteStage.merge,
+        error: StateError('$failed of ${merged + failed} file(s) unmerged'),
+        // The source is left in place on purpose, so the next merge retries.
+        willRetry: true,
+      ));
       return false;
     }
     // Nothing was there (a directory that only ever held its own marker):
@@ -1014,6 +1054,15 @@ class MessageHistoryPersistence {
       'written to the outgoing session\'s directory; they are held in memory '
       'and re-written if that identity is opened again',
     );
+    for (final id in rows.keys) {
+      _reportWriteFailure(HistoryWriteFailure(
+        conversationId: id,
+        stage: HistoryWriteStage.heldForOwner,
+        error: StateError('held for the outgoing identity'),
+        // Held, not abandoned: reopening that identity re-writes them.
+        willRetry: true,
+      ));
+    }
   }
 
   /// Conversations whose only copy of some rows is [_heldRowsByOwner]'s, for
@@ -1910,7 +1959,15 @@ class MessageHistoryPersistence {
       error,
       stack,
     );
-    if (_disposed || attempt > _maxSaveRetries) return;
+    final givingUp = _disposed || attempt > _maxSaveRetries;
+    _reportWriteFailure(HistoryWriteFailure(
+      conversationId: normalizedId,
+      stage: HistoryWriteStage.mainFile,
+      error: error,
+      attempt: attempt,
+      willRetry: !givingUp,
+    ));
+    if (givingUp) return;
     if (_saveRetryTimers.containsKey(normalizedId)) return;
     _saveRetryTimers[normalizedId] =
         Timer(_saveRetryBaseDelay * (1 << (attempt - 1)), () {
@@ -3094,6 +3151,11 @@ class MessageHistoryPersistence {
           failures.putIfAbsent(
               id,
               () => StateError('still dirty after $rounds flush rounds'));
+          _reportWriteFailure(HistoryWriteFailure(
+            conversationId: id,
+            stage: HistoryWriteStage.flush,
+            error: StateError('still dirty after $rounds flush rounds'),
+          ));
         }
       }
     }
@@ -3160,8 +3222,18 @@ class MessageHistoryPersistence {
         '[MessageHistoryPersistence] dispose: $unarchived row(s) queued for '
         'the archive were never written',
       );
+      _reportWriteFailure(HistoryWriteFailure(
+        conversationId: _pendingArchive.keys.join(', '),
+        stage: HistoryWriteStage.archive,
+        error: StateError('$unarchived archive row(s) never written'),
+      ));
     }
     _resetSessionState();
+    // Closed LAST, so the failures reported above still reach a listener. This
+    // store can be reopened by openSession(), and the getter re-makes the sink
+    // when that happens — a host re-subscribes at the same point it re-wires
+    // everything else for the new session.
+    await _writeFailures.close();
   }
 
   /// Drop every piece of session state and invalidate in-flight work.
@@ -4203,6 +4275,60 @@ class DefaultHistoryDirectoryStatus {
 /// [MessageHistoryPersistence.flushPendingSaves] could not write every
 /// conversation. Their rows are still in memory and a retry is armed; the
 /// flush reports it instead of returning as if everything were durable.
+/// Where a write failed. Named stages rather than a free-text label so a host
+/// can decide what is worth telling the user about: a failed main-file write
+/// risks the message itself, while a failed merge only delays rows that are
+/// still on disk somewhere else.
+enum HistoryWriteStage {
+  /// The conversation's own file — the rows are in memory and nowhere else.
+  mainFile,
+
+  /// The overflow archive. The rows left the in-memory window, so a failure
+  /// here is the one that loses the oldest messages first.
+  archive,
+
+  /// A flush that could not land everything it owed ([HistoryFlushException]).
+  flush,
+
+  /// An owner change could not write what it owed, so the rows are being HELD
+  /// for that identity instead of dropped.
+  heldForOwner,
+
+  /// A migration/adoption merge left a source file unmerged. Nothing is lost —
+  /// the source directory is deliberately not renamed aside — but those rows are
+  /// not in the directory the app reads until it is retried.
+  merge,
+}
+
+/// One write this store could not land. See
+/// [MessageHistoryPersistence.writeFailures].
+class HistoryWriteFailure {
+  const HistoryWriteFailure({
+    required this.conversationId,
+    required this.stage,
+    required this.error,
+    this.attempt = 1,
+    this.willRetry = false,
+  });
+
+  /// Normalized conversation id, or the file/directory name for a [stage] that
+  /// is not per-conversation.
+  final String conversationId;
+  final HistoryWriteStage stage;
+  final Object error;
+
+  /// Consecutive failures for this conversation, 1 on the first.
+  final int attempt;
+
+  /// Whether the store has armed another attempt of its own. False means it has
+  /// stopped trying: the rows survive only in memory, until the process ends.
+  final bool willRetry;
+
+  @override
+  String toString() => 'HistoryWriteFailure($stage, $conversationId, '
+      'attempt $attempt, willRetry: $willRetry): $error';
+}
+
 class HistoryFlushException implements Exception {
   HistoryFlushException(this.errors);
 

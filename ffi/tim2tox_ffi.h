@@ -391,6 +391,25 @@ int tim2tox_ffi_get_mm6_diag(int64_t instance_id, char* out, int out_len);
 int tim2tox_ffi_mm6_send_crafted_challenge(int64_t instance_id, const char* group_id,
                                            const char* friend_key_hex,
                                            const char* claimed_member_key_hex);
+
+// TEST-ONLY, same gate and same region as the hook above: set THIS instance's
+// inbound group-receipt budgets — `per_sender_limit` replaces
+// kMaxGroupReceiptsPerSender and `global_limit` replaces
+// kMaxGroupReceiptsGlobal for the metering of receipts this instance RECEIVES.
+// Either value <= 0 restores that budget's compiled-in default. The limits are
+// read where the budget is charged, so call this BEFORE the traffic that is
+// meant to be refused; tim2tox_ffi_get_mm6_diag reports the effective caps as
+// groupReceipts.perSenderLimit / .globalLimit. The windows themselves are not
+// reset — lowering a cap below what the current 60s window already spent means
+// the next receipt is refused.
+// Returns 1 applied, 0 no such instance.
+//
+// Not shippable: the real caps are sized for honest traffic, so an entry point
+// that shrinks them is a self-inflicted denial of service. It exists so
+// scenario_group_receipt_control_row_test can drive the refusal path, which
+// 2048+ sends inside one wall-clock minute cannot do reliably.
+int tim2tox_ffi_mm6_set_group_receipt_budgets(int64_t instance_id, int32_t per_sender_limit,
+                                             int32_t global_limit);
 #endif  // TIM2TOX_ENABLE_TEST_HOOKS
 
 // Send a group message receipt ("received"/"read") privately to the message's

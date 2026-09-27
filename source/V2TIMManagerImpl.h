@@ -274,6 +274,20 @@ public:
     // grants an attacker nothing it could not already send by hand.
     int Mm6SendCraftedChallenge(const V2TIMString& groupID, const std::string& friend_key_hex,
                                 const std::string& claimed_member_key_hex);
+    // TEST-ONLY seam, gated with the crafted challenge above (same single
+    // region, so the pin test's "exactly one guarded region" still holds):
+    // lower -- or restore -- THIS instance's inbound group-receipt budgets so a
+    // scenario can drive the REFUSAL path instead of describing it. Driving the
+    // real 2048-per-sender window means 2048+ native sends inside 60 wall-clock
+    // seconds, which the harness cannot do without the window rolling over
+    // mid-flood.
+    //
+    // A value <= 0 restores the compiled-in default. kMaxGroupReceiptsPerSender
+    // and kMaxGroupReceiptsGlobal are NOT touched -- the overrides below are
+    // read at the charge sites, so a test must set them BEFORE the traffic
+    // starts. Gated because a shipping library must not carry a way to shrink
+    // its own flood budget: that is a denial-of-service primitive, not a knob.
+    void Mm6SetGroupReceiptBudgets(int32_t per_sender_limit, int32_t global_limit);
 #endif  // TIM2TOX_ENABLE_TEST_HOOKS
     // NGC name / conference title (or a real cached name); "" if unknown.
     std::string ResolveSharedGroupName(const std::string& group_id);
@@ -714,6 +728,18 @@ private:
     // table is: a receipt flood must not spend the proofs' global budget
     // (kMaxGroupReceiptsGlobal explains the ordering and the size).
     IdentityRateWindow group_receipt_rate_global_;
+    // Effective-cap overrides for the two budgets above: 0 = "use the
+    // compiled-in default" (EffectiveReceiptCap in V2TIMManagerImpl.cpp reads
+    // them where the budget is charged). Plain, ALWAYS-present members on
+    // purpose, even though only the test hook can write them: the charge sites
+    // must compile to the same code in every build, and gating the fields would
+    // need a second guarded region in three files, which is exactly the shape
+    // the crafted-challenge pin test forbids. With
+    // Mm6SetGroupReceiptBudgets compiled out there is no way to move them off
+    // 0, so a shipping library carries two forever-zero uint32_ts and the
+    // built-in caps.
+    uint32_t group_receipt_per_sender_limit_override_ = 0;
+    uint32_t group_receipt_global_limit_override_ = 0;
     // MM-6 observability (guarded by mutex_). Counters plus the last proof
     // payload we received, verbatim: the auto_tests use it to assert that what
     // a named-but-uninvolved member receives is a box, not a readable proof.
