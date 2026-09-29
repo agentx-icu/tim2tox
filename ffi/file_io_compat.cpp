@@ -1,7 +1,10 @@
 #include "file_io_compat.h"
 
 #include <algorithm>
+#include <cerrno>
+#include <filesystem>
 #include <limits>
+#include <system_error>
 #include <sys/stat.h>
 
 #ifdef _WIN32
@@ -216,6 +219,54 @@ std::string ComposeStorageBasename(const std::string& prefix,
     const size_t budget = std::min(max_bytes, kMaxFilenameBytes);
     if (prefix.size() >= budget) return prefix.substr(0, budget);
     return prefix + TruncateUtf8Filename(filename, budget - prefix.size());
+}
+
+bool HasRoomForReceive(uint64_t available, uint64_t size, uint64_t reserve) {
+    if (size > std::numeric_limits<uint64_t>::max() - reserve) return false;
+    return available >= size + reserve;
+}
+
+bool IsNoSpaceErrno(int err) {
+#ifdef EDQUOT
+    if (err == EDQUOT) return true;
+#endif
+    return err == ENOSPC;
+}
+
+const char* ClassifyWriteErrno(int err) {
+    return IsNoSpaceErrno(err) ? "no_space" : "io";
+}
+
+std::string ReceiveMarkerPath(const std::string& data_path) {
+    const std::string::size_type slash = data_path.find_last_of("/\\");
+    const std::string::size_type base =
+        slash == std::string::npos ? 0 : slash + 1;
+    return data_path.substr(0, base) + "." + data_path.substr(base) +
+           kReceiveMarkerSuffix;
+}
+
+std::string DataNameForMarker(const std::string& name) {
+    const std::string suffix(kReceiveMarkerSuffix);
+    if (name.size() <= suffix.size() + 1 || name[0] != '.' ||
+        name.compare(name.size() - suffix.size(), suffix.size(), suffix) != 0) {
+        return {};
+    }
+    return name.substr(1, name.size() - suffix.size() - 1);
+}
+
+bool AvailableBytes(const std::string& dir, uint64_t* available) {
+    if (available == nullptr || dir.empty()) return false;
+#ifdef _WIN32
+    const std::filesystem::path path(std::u8string(
+        reinterpret_cast<const char8_t*>(dir.data()), dir.size()));
+#else
+    const std::filesystem::path path(dir);
+#endif
+    std::error_code ec;
+    const std::filesystem::space_info info = std::filesystem::space(path, ec);
+    if (ec) return false;
+    *available = static_cast<uint64_t>(info.available);
+    return true;
 }
 
 }

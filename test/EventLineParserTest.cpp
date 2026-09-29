@@ -17,6 +17,10 @@ TEST(EventLineParserTest, ParsesAllRoutedEventPrefixes) {
     EXPECT_EQ(tim2tox::event_line::ParseInstanceIdFromLine(
                   "avatar_request:73:user:1:2:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"),
               73);
+    // Checklist M5: a native receive failure is routed to its instance.
+    EXPECT_EQ(tim2tox::event_line::ParseInstanceIdFromLine(
+                  "file_recv_failed:7:user:3:no_space"),
+              7);
 }
 
 TEST(EventLineParserTest, ParsesIdAfterTheCompletePrefixDelimiter) {

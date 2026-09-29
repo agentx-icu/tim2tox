@@ -35,6 +35,13 @@ void main() {
     );
   });
 
+  test('maps the low-storage refusal (checklist M5)', () {
+    expect(
+      Tim2ToxFfi.fileControlErrorMessage(-7),
+      'Not enough storage to receive this file.',
+    );
+  });
+
   test('prepares receive file before native resume and retains rollback', () {
     final source = _tim2ToxFile('../ffi/tim2tox_ffi.cpp').readAsStringSync();
     final start = source.indexOf('int tim2tox_ffi_file_control(');

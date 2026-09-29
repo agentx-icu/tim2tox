@@ -564,6 +564,7 @@ class Tim2ToxFfi {
         -4 => 'File control failed.',
         -5 => 'Local receive file could not be opened.',
         -6 => 'Avatar exceeds the 10 MiB receive limit.',
+        -7 => 'Not enough storage to receive this file.',
         _ => null,
       };
 
