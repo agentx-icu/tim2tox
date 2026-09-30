@@ -3357,6 +3357,10 @@ class FfiChatService {
   /// The native default-instance session epoch captured at [init]; a later
   /// quarantine is authorized ONLY for this epoch.
   int _sessionEpoch = 0;
+  /// The native session epoch (`tim2tox_ffi_get_session_epoch(0)`) of the
+  /// init THIS service performed. [rekeyLiveProfilePassphrase] hands it back so
+  /// the native side refuses to re-key any other session's profile.
+  int _profileSessionEpoch = 0;
 
   /// The Dart-side session state [init] opens before any native work.
   void _beginSession() {
@@ -3463,6 +3467,11 @@ class FfiChatService {
       _sessionEpoch = _ffi.defaultEpoch();
     } on Object catch (_) {
       _sessionEpoch = 0; // older native lib
+    }
+    try {
+      _profileSessionEpoch = _ffi.getSessionEpoch(0);
+    } on Object catch (_) {
+      _profileSessionEpoch = 0; // older native lib
     }
     await _applyFileRecvDirectory();
     // register callback mode (preferred)
@@ -3919,12 +3928,19 @@ class FfiChatService {
   /// Returns true ONLY when the re-keyed profile reached disk. False means
   /// there is no live session, the write failed, or the native library predates
   /// the export -- in every one of those cases the file on disk still carries
-  /// the PREVIOUS passphrase, and the caller must not report success to the
-  /// user or drop the old password.
+  /// the PREVIOUS passphrase, the live session keeps it too (a failed re-key is
+  /// rolled back before any other save can run), and the caller must not
+  /// report success to the user or drop the old password.
+  ///
+  /// Bound to the native session this service's [init] opened: a re-key that
+  /// would land on a different session (an account switch in flight) is
+  /// refused natively and reports false.
   bool rekeyLiveProfilePassphrase(String? passphrase) =>
       _withPassphraseBuffer(passphrase, (buf, len) {
         try {
-          return _ffi.rekeyLiveProfilePassphrase(buf, len) == 1;
+          return _ffi.rekeyLiveProfilePassphrase(
+                  buf, len, _profileSessionEpoch) ==
+              1;
         } catch (e) {
           _logger?.logWarning(
               '[FfiChatService] rekeyLiveProfilePassphrase unavailable: $e');

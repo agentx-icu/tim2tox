@@ -219,11 +219,16 @@ int tim2tox_ffi_get_profile_passphrase_state(void);
 // deliberately does NOT do this: the live instance may still be a previous,
 // quarantined account, and re-keying it would make its final save write that
 // account's profile under the new account's password (or in plaintext).
-// Only call this when the live session is the account the passphrase belongs to.
+// session_epoch binds the call to ONE session: pass the value
+// tim2tox_ffi_get_session_epoch(0) returned right after the init that opened
+// this account. A different live session (an account switch racing this call)
+// is refused, so another account's profile is never re-keyed.
 // Returns 1 only when the re-keyed profile actually reached disk; 0 when there
-// is no live session OR the write failed -- in which case the file on disk
-// still carries the PREVIOUS passphrase and the host must retry.
-int tim2tox_ffi_rekey_live_profile_passphrase(const uint8_t* passphrase, size_t passphrase_len);
+// is no live session, the epoch does not match, OR the write failed -- in which
+// case the previous passphrase is back in force on the session, the file on
+// disk is unchanged, and the host may keep the previous password (or retry).
+int tim2tox_ffi_rekey_live_profile_passphrase(const uint8_t* passphrase, size_t passphrase_len,
+                                              int64_t session_epoch);
 
 // Get friend list as newline-separated lines:
 // "<userID>\t<nickName>\t<online>\n"

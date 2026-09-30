@@ -45,7 +45,7 @@ typedef _set_profile_passphrase_c = ffi.Int32 Function(
     ffi.Pointer<ffi.Uint8>, ffi.Size);
 typedef _get_profile_passphrase_state_c = ffi.Int32 Function();
 typedef _rekey_live_profile_passphrase_c = ffi.Int32 Function(
-    ffi.Pointer<ffi.Uint8>, ffi.Size);
+    ffi.Pointer<ffi.Uint8>, ffi.Size, ffi.Int64);
 typedef _get_friend_list_c = ffi.Int32 Function(
     ffi.Pointer<ffi.Int8>, ffi.Int32);
 typedef _set_self_info_c = ffi.Int32 Function(
@@ -683,10 +683,10 @@ class Tim2ToxFfi {
   /// Applies the staged passphrase to the RUNNING session and persists it.
   /// See `tim2tox_ffi_rekey_live_profile_passphrase` for why this is separate
   /// from [setProfilePassphrase].
-  late final int Function(ffi.Pointer<ffi.Uint8>, int)
+  late final int Function(ffi.Pointer<ffi.Uint8>, int, int)
       rekeyLiveProfilePassphrase = _lib.lookupFunction<
               _rekey_live_profile_passphrase_c,
-              int Function(ffi.Pointer<ffi.Uint8>, int)>(
+              int Function(ffi.Pointer<ffi.Uint8>, int, int)>(
           'tim2tox_ffi_rekey_live_profile_passphrase');
   late final int Function(ffi.Pointer<ffi.Int8>, int) getFriendList =
       _lib.lookupFunction<

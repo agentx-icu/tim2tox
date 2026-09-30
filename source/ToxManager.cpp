@@ -2016,6 +2016,10 @@ void ToxManager::setProfilePassphrase(const uint8_t* passphrase, size_t length) 
     // here until that save has finished makes "re-key, then save" atomic from
     // the caller's point of view.
     std::lock_guard<std::mutex> save_lock(save_mutex_);
+    setProfilePassphraseLocked(passphrase, length);
+}
+
+void ToxManager::setProfilePassphraseLocked(const uint8_t* passphrase, size_t length) {
     std::lock_guard<std::mutex> lock(mutex_);
     // Wipe the old secret before the vector reallocates/shrinks away from it.
     if (!profile_passphrase_.empty()) {
@@ -2033,6 +2037,38 @@ void ToxManager::setProfilePassphrase(const uint8_t* passphrase, size_t length) 
 bool ToxManager::hasProfilePassphrase() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return !profile_passphrase_.empty();
+}
+
+bool ToxManager::lastLoadWasEncrypted() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return last_load_was_encrypted_;
+}
+
+bool ToxManager::rekeyAndSave(const std::string& path, const uint8_t* passphrase,
+                              size_t length) {
+    if (isIterateOwner()) {
+        V2TIM_LOG(kError,
+                  "[ToxManager] rekeyAndSave: called from inside a tox callback; refused");
+        return false;
+    }
+    // Held across set + write + (on failure) restore: nothing else can save
+    // in between, so no autosave ever writes the new key unless this write
+    // itself succeeded.
+    std::lock_guard<std::mutex> save_lock(save_mutex_);
+    std::vector<uint8_t> previous;
+    ScopedSecretWipe wipe_previous(previous);
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        previous = profile_passphrase_;
+    }
+    setProfilePassphraseLocked(passphrase, length);
+    if (saveLocked(path, /*final_save=*/false)) return true;
+    setProfilePassphraseLocked(previous.empty() ? nullptr : previous.data(), previous.size());
+    V2TIM_LOG(kError,
+              "[ToxManager] rekeyAndSave: the re-keyed profile did not reach {}; the previous "
+              "passphrase is back in force and the file is unchanged",
+              path);
+    return false;
 }
 
 bool ToxManager::saveTo(const std::string& path, bool* queued, bool final_save) const {
@@ -2090,6 +2126,10 @@ bool ToxManager::saveTo(const std::string& path, bool* queued, bool final_save) 
     // that snapshotted the OLDER passphrase renames last, silently downgrading
     // the file (to the previous password, or to plaintext) after a re-key.
     std::lock_guard<std::mutex> save_lock(save_mutex_);
+    return saveLocked(path, final_save);
+}
+
+bool ToxManager::saveLocked(const std::string& path, bool final_save) const {
     try {
         auto data = getSaveData(final_save ? kFinalSaveQuiesceAttempts : 2);
         if (data.empty()) return false;
@@ -2246,6 +2286,10 @@ ToxManager::LoadOutcome ToxManager::loadFromEx(const std::string& path) {
     // recovery, and an out-of-memory or a transient tox_new failure is not a
     // reason to make someone's account look lost.
     bool source_was_encrypted = false;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        last_load_was_encrypted_ = false;
+    }
     try {
         std::ifstream file(path, std::ios::binary | std::ios::ate);
         if (!file) return LoadOutcome::kUnreadable;
@@ -2338,7 +2382,11 @@ ToxManager::LoadOutcome ToxManager::loadFromEx(const std::string& path) {
 
         // 初始化 Tox（若存档损坏会抛异常，此处捕获并返回 kCorrupt）
         initialize(&options, data.data(), data.size());
-        if (getTox() != nullptr) return LoadOutcome::kOk;
+        if (getTox() != nullptr) {
+            std::lock_guard<std::mutex> lock(mutex_);
+            last_load_was_encrypted_ = source_was_encrypted;
+            return LoadOutcome::kOk;
+        }
         return source_was_encrypted ? LoadOutcome::kEncryptedLoadFailed
                                     : LoadOutcome::kCorrupt;
     } catch (const std::exception&) {

@@ -88,6 +88,16 @@ target_compile_definitions(file_transfer_security_source_regression_test PRIVATE
     TIM2TOX_MANAGER_SOURCE_PATH="${CMAKE_SOURCE_DIR}/source/ToxManager.cpp")
 add_executable(tim2tox_control_packet_test Tim2ToxControlPacketTest.cpp)
 add_executable(tox_profile_encryption_at_rest_test ToxProfileEncryptionAtRestTest.cpp)
+# Drives InitSDK/UnInitSDK through the FFI entry points, so it needs the FFI
+# library (configure the test tree with -DBUILD_FFI=ON to get it).
+if(BUILD_FFI)
+    add_executable(init_sdk_profile_at_rest_test InitSdkProfileAtRestTest.cpp)
+    target_include_directories(init_sdk_profile_at_rest_test PRIVATE ${CMAKE_SOURCE_DIR}/ffi)
+    target_link_libraries(init_sdk_profile_at_rest_test PRIVATE
+        tim2tox_ffi
+        ${TIM2TOX_GTEST_MAIN_TARGET})
+    gtest_discover_tests(init_sdk_profile_at_rest_test)
+endif()
 add_executable(qtox_message_fragmenter_test QToxMessageFragmenterTest.cpp)
 add_executable(qtox_transport_source_regression_test
     QToxTransportSourceRegressionTest.cpp)

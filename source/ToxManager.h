@@ -213,6 +213,21 @@ public:
     void setProfilePassphrase(const uint8_t* passphrase, size_t length);
     bool hasProfilePassphrase() const;
 
+    // Re-key the LIVE session and write the profile under the new passphrase
+    // as ONE step, under save_mutex_: no other save can slip in between, and
+    // if the write fails the previous passphrase is put back BEFORE the mutex
+    // is released. So the session never keeps a key that has not reached the
+    // file — a host that takes "false" as "keep the old password" stays
+    // consistent with what is on disk, which a separate set-then-save could
+    // not promise (the autosave between the two would write the new key).
+    // Refused (false) from inside a tox callback: it cannot defer like
+    // saveTo(), because the caller needs the answer now.
+    bool rekeyAndSave(const std::string& path, const uint8_t* passphrase, size_t length);
+
+    // Whether the profile the last successful loadFromEx() opened was an
+    // encrypted container (false for plaintext, or before any load).
+    bool lastLoadWasEncrypted() const;
+
     // Why loadFrom() is not enough: the caller must be able to tell "the blob
     // is garbage" (safe to rename aside and mint a new identity) from "the blob
     // is a perfectly good ENCRYPTED profile we simply cannot open right now"
@@ -556,6 +571,12 @@ private:
     // mutex_. Zeroed before it is overwritten or cleared so the old secret does
     // not linger in freed heap. See setProfilePassphrase().
     std::vector<uint8_t> profile_passphrase_;
+    bool last_load_was_encrypted_{false};  // guarded by mutex_
+    // The body of saveTo() once the in-callback deferral is settled; the
+    // caller holds save_mutex_.
+    bool saveLocked(const std::string& path, bool final_save) const;
+    // setProfilePassphrase() for a caller that already holds save_mutex_.
+    void setProfilePassphraseLocked(const uint8_t* passphrase, size_t length);
     // Serializes whole saveTo() calls with each other AND with a passphrase
     // change, so a save that snapshotted the old passphrase can never rename
     // its file over the output of a later, correctly-keyed save.

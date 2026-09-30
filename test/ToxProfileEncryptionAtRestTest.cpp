@@ -22,6 +22,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <string>
@@ -59,6 +60,17 @@ void WriteAll(const std::string& path, const std::vector<uint8_t>& data) {
             static_cast<std::streamsize>(data.size()));
 }
 
+// The tests create real Tox instances. TCP-only mode keeps them off UDP
+// sockets, which a sandboxed CI runner may refuse to bind; persistence does
+// not depend on the transport.
+void ForceTcpOnly() {
+#ifdef _WIN32
+    _putenv_s("TOX_FORCE_TCP_ONLY", "1");
+#else
+    setenv("TOX_FORCE_TCP_ONLY", "1", 1);
+#endif
+}
+
 std::vector<uint8_t> AsBytes(const char* s) {
     const uint8_t* p = reinterpret_cast<const uint8_t*>(s);
     return std::vector<uint8_t>(p, p + std::char_traits<char>::length(s));
@@ -67,6 +79,7 @@ std::vector<uint8_t> AsBytes(const char* s) {
 class ToxProfileEncryptionAtRest : public ::testing::Test {
 protected:
     void SetUp() override {
+        ForceTcpOnly();
         dir_ = std::filesystem::temp_directory_path() /
                ("tim2tox_f5_" + std::to_string(::testing::UnitTest::GetInstance()
                                                    ->random_seed()) +
@@ -336,6 +349,115 @@ TEST_F(ToxProfileEncryptionAtRest, ClearingThePassphraseRestoresPlaintextSaves) 
     EXPECT_FALSE(m.hasProfilePassphrase());
     ASSERT_TRUE(m.saveTo(path_));
     EXPECT_FALSE(tox_is_data_encrypted(ReadAll(path_).data()));
+}
+
+// rekeyAndSave is the one-step re-key: on success the file is readable with
+// the NEW passphrase only, and the manager keeps that passphrase for later
+// autosaves.
+TEST_F(ToxProfileEncryptionAtRest, RekeyAndSaveSwitchesThePassphraseInOneStep) {
+    std::string address;
+    const auto first = AsBytes(kPassphrase);
+    const auto second = AsBytes(kWrongPassphrase);
+    {
+        ToxManager m;
+        MakeIdentity(m);
+        m.setProfilePassphrase(first.data(), first.size());
+        ASSERT_TRUE(m.saveTo(path_));
+        ASSERT_TRUE(m.rekeyAndSave(path_, second.data(), second.size()));
+        EXPECT_TRUE(m.hasProfilePassphrase());
+        address = m.getAddress();
+        // A later autosave keeps writing under the new key.
+        ASSERT_TRUE(m.saveTo(path_));
+    }
+
+    ToxManager stale;
+    stale.setProfilePassphrase(first.data(), first.size());
+    EXPECT_EQ(stale.loadFromEx(path_), ToxManager::LoadOutcome::kBadPassphrase);
+
+    ToxManager fresh;
+    fresh.setProfilePassphrase(second.data(), second.size());
+    EXPECT_EQ(fresh.loadFromEx(path_), ToxManager::LoadOutcome::kOk);
+    EXPECT_EQ(fresh.getAddress(), address);
+}
+
+// The failure half of the contract (codex finding P1): when the re-keyed
+// profile cannot reach disk, the previous passphrase stays in force -- a
+// later autosave must NOT silently write the new key that the host's
+// verifier never recorded -- and the file on disk is untouched.
+TEST_F(ToxProfileEncryptionAtRest, RekeyThatCannotReachDiskKeepsThePreviousPassphrase) {
+    const auto first = AsBytes(kPassphrase);
+    const auto second = AsBytes(kWrongPassphrase);
+    ToxManager m;
+    MakeIdentity(m);
+    m.setProfilePassphrase(first.data(), first.size());
+    ASSERT_TRUE(m.saveTo(path_));
+    const auto before = ReadAll(path_);
+    ASSERT_FALSE(before.empty());
+
+    // A destination whose directory does not exist cannot be written.
+    const std::string unwritable = (dir_ / "missing" / "tox_profile.tox").string();
+    EXPECT_FALSE(m.rekeyAndSave(unwritable, second.data(), second.size()));
+    EXPECT_FALSE(std::filesystem::exists(unwritable));
+    EXPECT_EQ(ReadAll(path_), before);
+    EXPECT_TRUE(m.hasProfilePassphrase());
+
+    // The next ordinary save still uses the FIRST passphrase.
+    ASSERT_TRUE(m.saveTo(path_));
+    ToxManager with_first;
+    with_first.setProfilePassphrase(first.data(), first.size());
+    EXPECT_EQ(with_first.loadFromEx(path_), ToxManager::LoadOutcome::kOk);
+    ToxManager with_second;
+    with_second.setProfilePassphrase(second.data(), second.size());
+    EXPECT_EQ(with_second.loadFromEx(path_), ToxManager::LoadOutcome::kBadPassphrase);
+}
+
+// Re-keying to "no passphrase" through the same call ends in a plaintext file,
+// which is the password-removal flow.
+TEST_F(ToxProfileEncryptionAtRest, RekeyAndSaveToNoPassphraseWritesPlaintext) {
+    ToxManager m;
+    MakeIdentity(m);
+    const auto passphrase = AsBytes(kPassphrase);
+    m.setProfilePassphrase(passphrase.data(), passphrase.size());
+    ASSERT_TRUE(m.saveTo(path_));
+    ASSERT_TRUE(tox_is_data_encrypted(ReadAll(path_).data()));
+
+    ASSERT_TRUE(m.rekeyAndSave(path_, nullptr, 0));
+    EXPECT_FALSE(m.hasProfilePassphrase());
+    EXPECT_FALSE(tox_is_data_encrypted(ReadAll(path_).data()));
+}
+
+// lastLoadWasEncrypted() is what lets InitSDK tell "opened a plaintext profile
+// with a passphrase staged -- upgrade it now" from "opened ciphertext -- the
+// file is already right". It reflects the most recent load only.
+TEST_F(ToxProfileEncryptionAtRest, LastLoadWasEncryptedReflectsTheMostRecentLoad) {
+    const auto passphrase = AsBytes(kPassphrase);
+    const std::string plain_path = (dir_ / "plain.tox").string();
+    {
+        ToxManager m;
+        MakeIdentity(m);
+        ASSERT_TRUE(m.saveTo(plain_path));
+        m.setProfilePassphrase(passphrase.data(), passphrase.size());
+        ASSERT_TRUE(m.saveTo(path_));
+    }
+
+    // A plaintext file opened with a passphrase staged: the InitSDK
+    // "upgrade it now" case.
+    ToxManager plain_reader;
+    EXPECT_FALSE(plain_reader.lastLoadWasEncrypted());
+    plain_reader.setProfilePassphrase(passphrase.data(), passphrase.size());
+    ASSERT_EQ(plain_reader.loadFromEx(plain_path), ToxManager::LoadOutcome::kOk);
+    EXPECT_FALSE(plain_reader.lastLoadWasEncrypted());
+
+    ToxManager cipher_reader;
+    cipher_reader.setProfilePassphrase(passphrase.data(), passphrase.size());
+    ASSERT_EQ(cipher_reader.loadFromEx(path_), ToxManager::LoadOutcome::kOk);
+    EXPECT_TRUE(cipher_reader.lastLoadWasEncrypted());
+
+    // The flag is reset at the start of every load, so a later load that does
+    // not succeed (a manager already holding a Tox instance refuses a second
+    // one) does not leave a stale "true" behind.
+    EXPECT_NE(cipher_reader.loadFromEx(plain_path), ToxManager::LoadOutcome::kOk);
+    EXPECT_FALSE(cipher_reader.lastLoadWasEncrypted());
 }
 
 }  // namespace

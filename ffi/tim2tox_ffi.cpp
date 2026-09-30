@@ -2411,6 +2411,11 @@ int tim2tox_ffi_get_self_tox_id(char* buffer, int buffer_len) {
 }
 
 void tim2tox_ffi_uninit(void) {
+    // Serialised with tim2tox_ffi_init_with_path: two overlapping uninits
+    // could both pass the inited check, and the slower one would then tear
+    // down (and zero the session epoch of) a session the next init had
+    // already published.
+    std::lock_guard<std::mutex> lifecycle(g_default_lifecycle_mutex);
     V2TIMManagerImpl* manager_impl = GetCurrentInstance();
     if (!manager_impl) return;
     int64_t instance_id = GetInstanceIdFromManager(manager_impl);
@@ -2454,25 +2459,23 @@ int tim2tox_ffi_get_profile_passphrase_state(void) {
     return manager_impl->HasProfilePassphrase() ? 1 : 0;
 }
 
-int tim2tox_ffi_rekey_live_profile_passphrase(const uint8_t* passphrase, size_t passphrase_len) {
-    // Requires a LIVE session on the default instance. Gated on
-    // IsCurrentInstanceInited() precisely because it is the dangerous one: it
-    // must never reach a quarantined predecessor account's manager.
-    if (!IsCurrentInstanceInited()) return 0;
+int tim2tox_ffi_rekey_live_profile_passphrase(const uint8_t* passphrase, size_t passphrase_len,
+                                              int64_t session_epoch) {
+    // The dangerous one: it must never reach a quarantined predecessor
+    // account's manager, nor the NEXT account's if a switch is in flight. The
+    // binding is the session epoch the host captured after ITS init
+    // (tim2tox_ffi_get_session_epoch(0)); the manager checks it against the
+    // live session atomically with taking that session's manager and path.
     V2TIMManagerImpl* manager_impl = GetCurrentInstance();
     if (!manager_impl) return 0;
     const bool has_pass = (passphrase && passphrase_len > 0);
-    if (!manager_impl->ReKeyLiveProfilePassphrase(has_pass ? passphrase : nullptr,
-                                                  has_pass ? passphrase_len : 0)) {
-        return 0;
-    }
-    // The file on disk still carries the OLD passphrase until something saves,
-    // so report success only when the re-keyed bytes actually reached disk.
-    // Returning 1 on a failed write would tell the host the profile is
-    // protected by the new password when it is still protected by the old one
-    // -- or, when the new passphrase is empty, still encrypted rather than
-    // plaintext.
-    return manager_impl->PersistToxProfile() ? 1 : 0;
+    // Re-key and persist are one step in the manager: 1 only when the re-keyed
+    // bytes reached disk; on 0 the previous passphrase is back in force and the
+    // file is unchanged, so the host may safely keep the old password.
+    return manager_impl->ReKeyLiveProfilePassphrase(has_pass ? passphrase : nullptr,
+                                                    has_pass ? passphrase_len : 0, session_epoch)
+               ? 1
+               : 0;
 }
 
 void tim2tox_ffi_set_callback(tim2tox_event_cb cb, void* user_data) {
