@@ -41,6 +41,11 @@ typedef _get_login_user_c = ffi.Int32 Function(
     ffi.Pointer<ffi.Int8>, ffi.Int32);
 typedef _uninit_c = ffi.Void Function();
 typedef _save_tox_profile_c = ffi.Void Function();
+typedef _set_profile_passphrase_c = ffi.Int32 Function(
+    ffi.Pointer<ffi.Uint8>, ffi.Size);
+typedef _get_profile_passphrase_state_c = ffi.Int32 Function();
+typedef _rekey_live_profile_passphrase_c = ffi.Int32 Function(
+    ffi.Pointer<ffi.Uint8>, ffi.Size, ffi.Int64);
 typedef _get_friend_list_c = ffi.Int32 Function(
     ffi.Pointer<ffi.Int8>, ffi.Int32);
 typedef _set_self_info_c = ffi.Int32 Function(
@@ -661,6 +666,28 @@ class Tim2ToxFfi {
   late final void Function() saveToxProfile =
       _lib.lookupFunction<_save_tox_profile_c, void Function()>(
           'tim2tox_ffi_save_tox_profile');
+
+  /// Sets (or, with a null/empty buffer, clears) the passphrase used to encrypt
+  /// the tox savedata every time it is persisted. See
+  /// `tim2tox_ffi_set_profile_passphrase` in tim2tox_ffi.h for the contract.
+  late final int Function(ffi.Pointer<ffi.Uint8>, int) setProfilePassphrase =
+      _lib.lookupFunction<_set_profile_passphrase_c,
+          int Function(ffi.Pointer<ffi.Uint8>,
+              int)>('tim2tox_ffi_set_profile_passphrase');
+
+  /// 1 when a savedata passphrase is set, 0 when not, -1 on error.
+  late final int Function() getProfilePassphraseState =
+      _lib.lookupFunction<_get_profile_passphrase_state_c,
+          int Function()>('tim2tox_ffi_get_profile_passphrase_state');
+
+  /// Applies the staged passphrase to the RUNNING session and persists it.
+  /// See `tim2tox_ffi_rekey_live_profile_passphrase` for why this is separate
+  /// from [setProfilePassphrase].
+  late final int Function(ffi.Pointer<ffi.Uint8>, int, int)
+      rekeyLiveProfilePassphrase = _lib.lookupFunction<
+              _rekey_live_profile_passphrase_c,
+              int Function(ffi.Pointer<ffi.Uint8>, int, int)>(
+          'tim2tox_ffi_rekey_live_profile_passphrase');
   late final int Function(ffi.Pointer<ffi.Int8>, int) getFriendList =
       _lib.lookupFunction<
           _get_friend_list_c,

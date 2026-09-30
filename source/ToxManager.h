@@ -200,6 +200,61 @@ public:
     static constexpr std::chrono::seconds kSaveQuiesceTimeout{5};
     bool loadFrom(const std::string& path);
 
+    // ---- Savedata encryption at the persistence boundary --------------------
+    // When a passphrase is set, EVERY saveTo() writes a toxcore encrypted save
+    // (tox_pass_encrypt, the same "toxEsave" container the Dart-side
+    // AccountExportService already produces) and loadFrom() transparently
+    // decrypts it. The file is then never plaintext at rest, not even while a
+    // session is live, so an OS kill of a backgrounded app cannot leave the
+    // secret key, friend list and nospam readable on disk.
+    //
+    // Empty passphrase (the default) == the historical behaviour: plaintext
+    // savedata, byte-identical to before. This is opt-in per session.
+    void setProfilePassphrase(const uint8_t* passphrase, size_t length);
+    bool hasProfilePassphrase() const;
+
+    // Re-key the LIVE session and write the profile under the new passphrase
+    // as ONE step, under save_mutex_: no other save can slip in between, and
+    // if the write fails the previous passphrase is put back BEFORE the mutex
+    // is released. So the session never keeps a key that has not reached the
+    // file — a host that takes "false" as "keep the old password" stays
+    // consistent with what is on disk, which a separate set-then-save could
+    // not promise (the autosave between the two would write the new key).
+    // Refused (false) from inside a tox callback: it cannot defer like
+    // saveTo(), because the caller needs the answer now.
+    bool rekeyAndSave(const std::string& path, const uint8_t* passphrase, size_t length);
+
+    // Whether the profile the last successful loadFromEx() opened was an
+    // encrypted container (false for plaintext, or before any load).
+    bool lastLoadWasEncrypted() const;
+
+    // Why loadFrom() is not enough: the caller must be able to tell "the blob
+    // is garbage" (safe to rename aside and mint a new identity) from "the blob
+    // is a perfectly good ENCRYPTED profile we simply cannot open right now"
+    // (must be left exactly where it is — renaming it away and creating a new
+    // identity is indistinguishable from data loss to the user).
+    enum class LoadOutcome {
+        kOk = 0,
+        kUnreadable,        // missing / empty / unreadable file
+        kCorrupt,           // plaintext blob that toxcore refused
+        kNeedsPassphrase,   // encrypted, and no passphrase is set
+        kBadPassphrase,     // encrypted, and the passphrase does not open it
+        // The file is (or may be) an encrypted profile and something OTHER than
+        // a wrong passphrase went wrong: an allocation failure, a header we
+        // could not even read, or toxcore rejecting the decrypted blob.
+        // Grouped with the two above rather than with kCorrupt: an operational
+        // failure is never a licence to rename someone's account aside.
+        kEncryptedLoadFailed,
+    };
+
+    /** True for every outcome that means "the file on disk must be left alone". */
+    static bool LoadOutcomeMustPreserveFile(LoadOutcome outcome) {
+        return outcome == LoadOutcome::kNeedsPassphrase ||
+               outcome == LoadOutcome::kBadPassphrase ||
+               outcome == LoadOutcome::kEncryptedLoadFailed;
+    }
+    LoadOutcome loadFromEx(const std::string& path);
+
     // 基本功能接口
     // 用户信息相关
     bool setName(const std::string& name);
@@ -512,6 +567,21 @@ private:
     bool tcp_relay_server_allowed_{true};  // see setTcpRelayServerAllowed
     uint16_t udp_start_port_{0};  // see setUdpPortRange
     uint16_t udp_end_port_{0};
+    // Savedata passphrase; empty => plaintext savedata (legacy). Guarded by
+    // mutex_. Zeroed before it is overwritten or cleared so the old secret does
+    // not linger in freed heap. See setProfilePassphrase().
+    std::vector<uint8_t> profile_passphrase_;
+    bool last_load_was_encrypted_{false};  // guarded by mutex_
+    // The body of saveTo() once the in-callback deferral is settled; the
+    // caller holds save_mutex_.
+    bool saveLocked(const std::string& path, bool final_save) const;
+    // setProfilePassphrase() for a caller that already holds save_mutex_.
+    void setProfilePassphraseLocked(const uint8_t* passphrase, size_t length);
+    // Serializes whole saveTo() calls with each other AND with a passphrase
+    // change, so a save that snapshotted the old passphrase can never rename
+    // its file over the output of a later, correctly-keyed save.
+    // LOCK ORDER: save_mutex_ before mutex_. Nothing takes them the other way.
+    mutable std::mutex save_mutex_;
 
     // 回调存储
     SelfConnectionStatusCallback self_connection_status_cb_;

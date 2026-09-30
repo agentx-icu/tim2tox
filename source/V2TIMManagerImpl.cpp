@@ -687,9 +687,50 @@ size_t V2TIMManagerImpl::DebugSDKListenerCountForTest() {
 }
 
 // SDK initialization and shutdown
+namespace {
+// Zeroes a byte buffer on every scope exit, including the exception path.
+class ScopedSecretWipe {
+public:
+    explicit ScopedSecretWipe(std::vector<uint8_t>& buf) : buf_(buf) {}
+    ~ScopedSecretWipe() {
+        volatile uint8_t* p = buf_.data();
+        for (size_t i = 0; i < buf_.size(); ++i) p[i] = 0;
+    }
+    ScopedSecretWipe(const ScopedSecretWipe&) = delete;
+    ScopedSecretWipe& operator=(const ScopedSecretWipe&) = delete;
+
+private:
+    std::vector<uint8_t>& buf_;
+};
+}  // namespace
+
 bool V2TIMManagerImpl::InitSDK(uint32_t sdkAppID, const V2TIMSDKConfig& config) {
     int64_t this_instance_id = GetInstanceIdFromManager(this);
+
+    // CONSUME the staged passphrase up front, so EVERY return below -- success,
+    // no-op, or any early failure (a data dir we cannot create, a profile we
+    // cannot open, a tox_new that throws) -- leaves the staging slot empty.
+    // Doing this per-return has already been wrong twice; doing it once here is
+    // the only version that stays correct when someone adds a new early exit.
+    //
+    // Single use is the safety property: a staged value belongs to exactly one
+    // init attempt on this manager. If it survived, the NEXT account opened on
+    // this instance would silently be keyed with the PREVIOUS account's
+    // password -- or, worse, the previous account's profile would be re-saved
+    // under the new one's. A host that stages and then abandons the init must
+    // call ClearStagedProfilePassphrase().
+    std::vector<uint8_t> staged_passphrase;
+    ScopedSecretWipe wipe_staged(staged_passphrase);
+    {
+        std::lock_guard<std::mutex> lock(profile_passphrase_mutex_);
+        staged_passphrase.swap(profile_passphrase_);
+        profile_passphrase_.clear();
+        profile_passphrase_.shrink_to_fit();
+    }
+
     if (tox_manager_) {
+        // No-op init onto an already-running session: the staged value is
+        // already consumed above, which is all this branch needs.
         return true;
     }
     // An UnInitSDK that ran ON the event thread could not join it (see there);
@@ -738,6 +779,28 @@ bool V2TIMManagerImpl::InitSDK(uint32_t sdkAppID, const V2TIMSDKConfig& config) 
     V2TIM_LOG(kInfo, "[InitSDK] Created ToxAVManager={} for this={} (instance_id={})",
               (void*)toxav_manager_.get(), (void*)this, (long long)this_instance_id);
 #endif
+    // Declared here, ahead of every failure exit below, so the teardown can
+    // free it whichever step fails; created in Step 6.
+    Tox_Options* tox_options = nullptr;
+    // Tears a half-built session down. InitSDK short-circuits with
+    // `if (tox_manager_) return true;` at its top, so leaving these alive
+    // would make the NEXT init (e.g. the retry after the user types the right
+    // password) report success without ever loading the profile or starting
+    // the event thread. Unpublished under tox_manager_mutex_ like UnInitSDK.
+    auto abandon_half_built_session = [&]() {
+        if (tox_options) tox_options_free(tox_options);
+        running_.store(false, std::memory_order_release);
+#ifdef BUILD_TOXAV
+        toxav_manager_.reset();
+#endif
+        std::shared_ptr<ToxManager> dead;
+        {
+            std::lock_guard<std::mutex> manager_lock(tox_manager_mutex_);
+            save_path_.clear();
+            dead.swap(tox_manager_);
+        }
+    };
+
     V2TIM_LOG(kInfo, "[InitSDK] Step 1: Computing save path...");
     // Compute save path using config.initPath if provided; otherwise platform default
     std::filesystem::path save_dir = config.initPath.Empty()
@@ -748,13 +811,17 @@ bool V2TIMManagerImpl::InitSDK(uint32_t sdkAppID, const V2TIMSDKConfig& config) 
     std::string mkdir_err;
     if (!tim2tox::path::EnsureDirectoryExists(save_dir, &mkdir_err)) {
         V2TIM_LOG(kError, "[InitSDK] Failed to create data dir: {}", mkdir_err);
+        abandon_half_built_session();
         return false;
     }
 
     int64_t instance_id = GetInstanceIdFromManager(this);
     std::string save_path = tim2tox::path::BuildProfilePath(save_dir, instance_id).string();
     V2TIM_LOG(kInfo, "[InitSDK] Save path: {}", save_path);
-    save_path_ = save_path;
+    {
+        std::lock_guard<std::mutex> manager_lock(tox_manager_mutex_);
+        save_path_ = save_path;
+    }
 
     V2TIM_LOG(kInfo, "[InitSDK] Step 4: Checking for saved profile...");
     bool loaded = false;
@@ -794,7 +861,10 @@ bool V2TIMManagerImpl::InitSDK(uint32_t sdkAppID, const V2TIMSDKConfig& config) 
                     "[InitSDK] Reload fallback: instance-id-keyed profile missing; loading sibling {}",
                     fallback.string());
                 save_path = fallback.string();
-                save_path_ = save_path;
+                {
+                    std::lock_guard<std::mutex> manager_lock(tox_manager_mutex_);
+                    save_path_ = save_path;
+                }
                 std::ifstream f2(save_path, std::ios::binary);
                 loaded = f2.good();
             }
@@ -813,7 +883,6 @@ bool V2TIMManagerImpl::InitSDK(uint32_t sdkAppID, const V2TIMSDKConfig& config) 
               has_options ? "true" : "false", local_discovery, ipv6);
 
     V2TIM_LOG(kInfo, "[InitSDK] Step 6: Creating Tox_Options...");
-    Tox_Options* tox_options = nullptr;
     Tox_Err_Options_New opt_err;
     V2TIM_LOG(kInfo, "[InitSDK] About to call tox_options_new...");
     tox_options = tox_options_new(&opt_err);
@@ -862,10 +931,60 @@ bool V2TIMManagerImpl::InitSDK(uint32_t sdkAppID, const V2TIMSDKConfig& config) 
         }
     );
     
+    // Hand the session passphrase (if any) to the manager BEFORE the first load
+    // or save, so an encrypted profile can be opened and every subsequent
+    // persist writes ciphertext. Empty => plaintext savedata, exactly as before.
+    // Hand the consumed passphrase to this session's manager, BEFORE the first
+    // load or save. Empty => plaintext savedata, exactly as before.
+    if (!staged_passphrase.empty()) {
+        tox_manager_->setProfilePassphrase(staged_passphrase.data(),
+                                           staged_passphrase.size());
+    }
+
     if (loaded) {
         V2TIM_LOG(kInfo, "[InitSDK] Profile exists, loading from {}", save_path);
-        if (!tox_manager_->loadFrom(save_path)) {
-            V2TIM_LOG(kWarning, "[InitSDK] Profile load failed (encrypted or corrupted), creating new profile and backing up old file");
+        const ToxManager::LoadOutcome outcome = tox_manager_->loadFromEx(save_path);
+        // An ENCRYPTED profile we cannot open is not a corrupt profile. The
+        // bytes are intact and the user's account is recoverable with the right
+        // passphrase, so renaming the file aside and minting a brand-new
+        // identity here would be indistinguishable from losing their account.
+        // Fail the init instead and leave the file exactly where it is; the
+        // caller surfaces this as a startup failure the user can act on.
+        if (ToxManager::LoadOutcomeMustPreserveFile(outcome)) {
+            V2TIM_LOG(kError,
+                      "[InitSDK] Profile is encrypted and could not be opened ({}); "
+                      "refusing to replace it — init fails and the file is preserved",
+                      outcome == ToxManager::LoadOutcome::kNeedsPassphrase
+                          ? "no passphrase set"
+                          : (outcome == ToxManager::LoadOutcome::kBadPassphrase
+                                 ? "passphrase rejected"
+                                 : "load failed for another reason"));
+            abandon_half_built_session();
+            return false;
+        }
+        if (outcome == ToxManager::LoadOutcome::kOk && !staged_passphrase.empty() &&
+            !tox_manager_->lastLoadWasEncrypted()) {
+            // A PLAINTEXT profile opened under a passphrase: a legacy install, or
+            // one an OS kill left decrypted. Encrypt it now, not at the first
+            // autosave — a kill before then would leave the plaintext in place,
+            // which is the very gap this exists to close. If that write fails
+            // the session must not run on a plaintext profile it promised to
+            // encrypt: the init fails and the file is left exactly as it was
+            // (the profile is valid; the next attempt retries the write).
+            if (tox_manager_->saveTo(save_path)) {
+                V2TIM_LOG(kInfo, "[InitSDK] plaintext profile re-written encrypted at {}", save_path);
+            } else {
+                V2TIM_LOG(kError,
+                          "[InitSDK] plaintext profile could NOT be re-written encrypted at {}; "
+                          "refusing to run the session on a plaintext profile: init fails "
+                          "and the file is unchanged",
+                          save_path);
+                abandon_half_built_session();
+                return false;
+            }
+        }
+        if (outcome != ToxManager::LoadOutcome::kOk) {
+            V2TIM_LOG(kWarning, "[InitSDK] Profile load failed (corrupted), creating new profile and backing up old file");
             std::string backup_path = save_path + ".corrupted";
             if (std::rename(save_path.c_str(), backup_path.c_str()) == 0) {
                 V2TIM_LOG(kInfo, "[InitSDK] Backed up unloadable profile to {}", backup_path);
@@ -877,7 +996,7 @@ bool V2TIMManagerImpl::InitSDK(uint32_t sdkAppID, const V2TIMSDKConfig& config) 
                 tox_manager_->saveTo(save_path);
             } catch (const std::runtime_error& e) {
                 V2TIM_LOG(kError, "InitSDK: Tox initialization failed - {}", e.what());
-                if (tox_options) tox_options_free(tox_options);
+                abandon_half_built_session();
                 return false;
             }
         }
@@ -887,7 +1006,7 @@ bool V2TIMManagerImpl::InitSDK(uint32_t sdkAppID, const V2TIMSDKConfig& config) 
             tox_manager_->saveTo(save_path);
         } catch (const std::runtime_error& e) {
             V2TIM_LOG(kError, "InitSDK: Tox initialization failed - {}", e.what());
-            if (tox_options) tox_options_free(tox_options);
+            abandon_half_built_session();
             return false;
         }
     }
@@ -903,6 +1022,7 @@ bool V2TIMManagerImpl::InitSDK(uint32_t sdkAppID, const V2TIMSDKConfig& config) 
     Tox* tox = tox_manager_->getTox();
     if (!tox) {
         V2TIM_LOG(kError, "InitSDK: tox is null");
+        abandon_half_built_session();
         return false;
     }
 
@@ -2160,7 +2280,11 @@ void V2TIMManagerImpl::UnInitSDK() {
     }
     // Now that event thread has exited, it's safe to shutdown ToxManager
     // Persist tox profile on shutdown using path from InitSDK
-    std::string save_path = save_path_;
+    std::string save_path;
+    {
+        std::lock_guard<std::mutex> manager_lock(tox_manager_mutex_);
+        save_path = save_path_;
+    }
     if (save_path.empty()) {
         std::filesystem::path save_dir = tim2tox::path::GetDefaultDataDir();
         std::string mkdir_err;
@@ -2202,7 +2326,10 @@ void V2TIMManagerImpl::UnInitSDK() {
     } catch (...) {
         // Ignore exceptions during shutdown
     }
-    save_path_.clear();
+    {
+        std::lock_guard<std::mutex> manager_lock(tox_manager_mutex_);
+        save_path_.clear();
+    }
     ResetGroupSessionState();
     // Sent/received invites address this profile's friend numbers.
     if (signaling_manager_) signaling_manager_->ResetSessionState();
@@ -2213,6 +2340,11 @@ void V2TIMManagerImpl::UnInitSDK() {
     // the next session of this instance id.
     DiscardDurableCallbacksForInstance(GetInstanceIdFromManager(this));
     session_epoch_.store(0, std::memory_order_release);
+    // NOTE: the staged passphrase is deliberately NOT cleared here. InitSDK
+    // consumes it (single use), and an uninit can be triggered by the NEXT
+    // account's init detaching a quarantined predecessor -- clearing here would
+    // wipe the value that init is about to need. Nothing survives either way:
+    // after a successful init the staged slot is already empty.
 }
 
 // The default instance is a process singleton that is never destroyed, so an
@@ -2272,12 +2404,92 @@ void V2TIMManagerImpl::ResetGroupSessionState() {
     ForgetCrossInstanceGroupIdentities(GetInstanceIdFromManager(this));
 }
 
-void V2TIMManagerImpl::SaveToxProfile() {
-    if (!tox_manager_) {
-        V2TIM_LOG(kWarning, "[SaveToxProfile] tox_manager_ is null, skipping");
-        return;
+void V2TIMManagerImpl::SetProfilePassphrase(const uint8_t* passphrase, size_t length) {
+    std::lock_guard<std::mutex> lock(profile_passphrase_mutex_);
+    if (!profile_passphrase_.empty()) {
+        volatile uint8_t* p = profile_passphrase_.data();
+        for (size_t i = 0; i < profile_passphrase_.size(); ++i) p[i] = 0;
     }
-    std::string save_path = save_path_;
+    if (!passphrase || length == 0) {
+        profile_passphrase_.clear();
+        profile_passphrase_.shrink_to_fit();
+    } else {
+        profile_passphrase_.assign(passphrase, passphrase + length);
+    }
+    // DELIBERATELY does not touch a live ToxManager. A previous account's
+    // instance can still be alive here (dispose() quarantines rather than stops
+    // it when a background task outlived the drain window); pushing the NEXT
+    // account's passphrase into it would make its final save -- triggered when
+    // the next init detaches it -- write account A's profile under account B's
+    // password, or in plaintext if B has none. Re-keying a live session is a
+    // separate, explicit call.
+}
+
+bool V2TIMManagerImpl::ReKeyLiveProfilePassphrase(const uint8_t* passphrase, size_t length,
+                                                  int64_t expected_session_epoch) {
+    // Not under profile_passphrase_mutex_: that guards the STAGED slot, which a
+    // live re-key never touches. Manager, path and epoch come from ONE snapshot
+    // under tox_manager_mutex_, so an account switch racing this call cannot
+    // hand it the next account's manager: that session has a different epoch.
+    const LiveProfileSession session = SnapshotLiveProfileSession();
+    if (!session.manager || session.save_path.empty()) {
+        V2TIM_LOG(kWarning, "[ReKeyLiveProfilePassphrase] no live session; refused");
+        return false;
+    }
+    if (expected_session_epoch <= 0 || session.epoch != expected_session_epoch) {
+        V2TIM_LOG(kError,
+                  "[ReKeyLiveProfilePassphrase] session epoch mismatch (live={} expected={}); "
+                  "refused so another account's profile is never re-keyed",
+                  (long long)session.epoch, (long long)expected_session_epoch);
+        return false;
+    }
+    const bool has_pass = passphrase && length > 0;
+    const bool ok = session.manager->rekeyAndSave(session.save_path,
+                                                  has_pass ? passphrase : nullptr,
+                                                  has_pass ? length : 0);
+    const char* mode = has_pass ? "passphrase set" : "passphrase cleared";
+    if (ok) {
+        V2TIM_LOG(kInfo, "[ReKeyLiveProfilePassphrase] re-keyed profile reached disk ({})", mode);
+    } else {
+        V2TIM_LOG(kError, "[ReKeyLiveProfilePassphrase] re-key FAILED; previous passphrase kept ({})",
+                  mode);
+    }
+    return ok;
+}
+
+V2TIMManagerImpl::LiveProfileSession V2TIMManagerImpl::SnapshotLiveProfileSession() const {
+    std::lock_guard<std::mutex> lock(tox_manager_mutex_);
+    return LiveProfileSession{tox_manager_, save_path_,
+                              session_epoch_.load(std::memory_order_acquire)};
+}
+
+bool V2TIMManagerImpl::HasProfilePassphrase() const {
+    std::lock_guard<std::mutex> lock(profile_passphrase_mutex_);
+    return !profile_passphrase_.empty();
+}
+
+void V2TIMManagerImpl::ClearStagedProfilePassphrase() {
+    std::lock_guard<std::mutex> lock(profile_passphrase_mutex_);
+    if (!profile_passphrase_.empty()) {
+        volatile uint8_t* p = profile_passphrase_.data();
+        for (size_t i = 0; i < profile_passphrase_.size(); ++i) p[i] = 0;
+    }
+    profile_passphrase_.clear();
+    profile_passphrase_.shrink_to_fit();
+}
+
+void V2TIMManagerImpl::SaveToxProfile() {
+    (void)PersistToxProfile();
+}
+
+bool V2TIMManagerImpl::PersistToxProfile() {
+    const LiveProfileSession session = SnapshotLiveProfileSession();
+    const std::shared_ptr<ToxManager>& manager = session.manager;
+    if (!manager) {
+        V2TIM_LOG(kWarning, "[SaveToxProfile] tox_manager_ is null, skipping");
+        return false;
+    }
+    std::string save_path = session.save_path;
     if (save_path.empty()) {
         std::filesystem::path save_dir = tim2tox::path::GetDefaultDataDir();
         std::string mkdir_err;
@@ -2285,16 +2497,21 @@ void V2TIMManagerImpl::SaveToxProfile() {
         save_path = tim2tox::path::BuildProfilePath(save_dir, GetInstanceIdFromManager(this)).string();
     }
     bool queued = false;
-    if (!tox_manager_->saveTo(save_path, &queued)) {
-        V2TIM_LOG(kError, "[SaveToxProfile] Failed to save tox profile to {}", save_path);
-    } else if (queued) {
-        // Reached from inside a tox callback: the write runs when the iterate
-        // returns and logs its own result. Saying "saved" here would claim a
-        // durability this call does not have.
-        V2TIM_LOG(kInfo, "[SaveToxProfile] Queued tox profile save to {}", save_path);
-    } else {
+    if (manager->saveTo(save_path, &queued)) {
+        if (queued) {
+            // Reached from inside a tox callback: the write runs when the
+            // iterate returns and logs its own result. Neither "saved" nor
+            // "failed" is true yet, so a caller that needs the bytes on disk
+            // (a re-key, see ReKeyLiveProfilePassphrase) gets false and must
+            // not report success; SaveToxProfile itself discards the result.
+            V2TIM_LOG(kInfo, "[SaveToxProfile] Queued tox profile save to {}", save_path);
+            return false;
+        }
         V2TIM_LOG(kInfo, "[SaveToxProfile] Saved tox profile to {}", save_path);
+        return true;
     }
+    V2TIM_LOG(kError, "[SaveToxProfile] Failed to save tox profile to {}", save_path);
+    return false;
 }
 
 // SDK Information

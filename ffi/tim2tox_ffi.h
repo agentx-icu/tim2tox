@@ -190,6 +190,46 @@ void tim2tox_ffi_uninit(void);
 // Save tox profile to disk (same path as init). Call periodically or on app pause to reduce data loss on crash.
 void tim2tox_ffi_save_tox_profile(void);
 
+// Set (or clear) the passphrase used to encrypt the tox savedata AT THE
+// PERSISTENCE BOUNDARY, so tox_profile.tox is never plaintext at rest -- not
+// even while a session is live. The container is toxcore's own encrypted save
+// ("toxEsave" magic, tox_pass_encrypt), identical to what
+// tim2tox_ffi_pass_encrypt produces, so the on-disk format is unchanged and an
+// older build still opens a profile written by a newer one.
+//
+// Call BEFORE tim2tox_ffi_init/_with_path so the first load and first save
+// already use it. It only STAGES the value: it never touches an already-running
+// session (see tim2tox_ffi_rekey_live_profile_passphrase for that). The staged
+// value is SINGLE USE -- init consumes and zeroes it -- so the host must set it
+// again before every init. That is deliberate: a value that survived would key
+// whichever account happened to be opened next.
+//
+// passphrase == NULL or passphrase_len == 0 clears it => plaintext savedata,
+// byte-identical to the legacy behaviour. Buffer is copied; the caller keeps
+// ownership and should zero it afterwards.
+//
+// Returns 1 on success, 0 if there is no manager instance.
+int tim2tox_ffi_set_profile_passphrase(const uint8_t* passphrase, size_t passphrase_len);
+
+// 1 when a savedata passphrase is currently staged, 0 when not, -1 on error.
+int tim2tox_ffi_get_profile_passphrase_state(void);
+
+// Apply the staged passphrase to the RUNNING session and immediately persist,
+// for a mid-session password change. tim2tox_ffi_set_profile_passphrase
+// deliberately does NOT do this: the live instance may still be a previous,
+// quarantined account, and re-keying it would make its final save write that
+// account's profile under the new account's password (or in plaintext).
+// session_epoch binds the call to ONE session: pass the value
+// tim2tox_ffi_get_session_epoch(0) returned right after the init that opened
+// this account. A different live session (an account switch racing this call)
+// is refused, so another account's profile is never re-keyed.
+// Returns 1 only when the re-keyed profile actually reached disk; 0 when there
+// is no live session, the epoch does not match, OR the write failed -- in which
+// case the previous passphrase is back in force on the session, the file on
+// disk is unchanged, and the host may keep the previous password (or retry).
+int tim2tox_ffi_rekey_live_profile_passphrase(const uint8_t* passphrase, size_t passphrase_len,
+                                              int64_t session_epoch);
+
 // Get friend list as newline-separated lines:
 // "<userID>\t<nickName>\t<online>\n"
 // nickName may be empty; online is 0 or 1.

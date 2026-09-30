@@ -411,6 +411,60 @@ public:
 
     // Save Tox profile to disk (call after friend list changes to persist state)
     void SaveToxProfile();
+
+    /** SaveToxProfile, but reports whether the bytes actually reached disk
+     *  (a save deferred to the end of a tox callback counts as not yet). */
+    bool PersistToxProfile();
+
+    /**
+     * Set the passphrase used to encrypt the tox savedata at the persistence
+     * boundary, so `tox_profile.tox` is never plaintext at rest -- not even
+     * while a session is live, which is what an OS kill of a backgrounded
+     * mobile app exposes today.
+     *
+     * MUST be called BEFORE InitSDK(): InitSDK pushes it into the ToxManager it
+     * creates, ahead of the first load/save. Calling it afterwards also updates
+     * the live ToxManager (so a mid-session password change can re-key the next
+     * autosave), but the profile already on disk keeps the OLD passphrase until
+     * the next save.
+     *
+     * Empty/null => plaintext savedata, byte-identical to the legacy behaviour.
+     */
+    void SetProfilePassphrase(const uint8_t* passphrase, size_t length);
+
+    /**
+     * Push a passphrase into the CURRENTLY RUNNING session, for a
+     * mid-session password change. Separate from SetProfilePassphrase() on
+     * purpose: that one must never touch a live manager, because the live one
+     * may still belong to a previous, quarantined account (see the comment on
+     * the implementation). Only call this when the live session is known to be
+     * the same account the passphrase belongs to.
+     *
+     * Re-keys and PERSISTS as one step (ToxManager::rekeyAndSave): the file on
+     * disk carries the new passphrase when this returns true. When it returns
+     * false — no live session, or the write failed — the previous passphrase
+     * is back in force on the session and the file is unchanged, so a host
+     * that keeps the old password on failure stays consistent with the disk.
+     *
+     * Takes the passphrase explicitly rather than reading the staged slot:
+     * the staged value is single-use and already consumed by InitSDK.
+     *
+     * Bound to ONE session: expected_session_epoch is the GetSessionEpoch()
+     * value the host captured right after the init that opened this account.
+     * Manager, save path and epoch are read as one snapshot, so an account
+     * switch racing this call (A uninited, B inited meanwhile) is refused
+     * instead of re-keying B's profile with A's password.
+     */
+    bool ReKeyLiveProfilePassphrase(const uint8_t* passphrase, size_t length,
+                                    int64_t expected_session_epoch);
+
+    /** True when a savedata passphrase is staged (diagnostics / test assertions). */
+    bool HasProfilePassphrase() const;
+
+    /** Drop and zero the staged passphrase, for a host that stages one and then
+     *  abandons the init. InitSDK consumes it on the success path, so this is
+     *  only needed to abort. */
+    void ClearStagedProfilePassphrase();
     
     // Upper bound for how long RunOnEventThread will block waiting for the event
     // thread to start queued work. If the task is still pending at timeout it is
@@ -557,8 +611,29 @@ private:
         std::string group_name;         // From the invite packet (NGC only; empty for conferences)
         int64_t received_ms{0};         // Wall clock when the invite arrived
     };
-    // Tox profile path used in InitSDK; UnInitSDK and SaveToxProfile use this instead of recomputing
+    // Tox profile path used in InitSDK; UnInitSDK and SaveToxProfile use this
+    // instead of recomputing. Written and read under tox_manager_mutex_ so it
+    // is always paired with the manager it belongs to.
     std::string save_path_;
+    // One consistent view of the live session for the save paths: the
+    // ToxManager (or null), the profile path it was loaded from, and the
+    // session epoch. Taken under tox_manager_mutex_; the shared_ptr keeps the
+    // manager alive across the call even if UnInitSDK swaps it out meanwhile,
+    // and no Tox pin is taken (a save quiesces pins, see
+    // ToxManager::getSaveData). session_epoch_ is stored before the manager is
+    // published and zeroed only after it is unpublished, so a non-null manager
+    // and the epoch in one snapshot belong to the same session.
+    struct LiveProfileSession {
+        std::shared_ptr<ToxManager> manager;
+        std::string save_path;
+        int64_t epoch{0};
+    };
+    LiveProfileSession SnapshotLiveProfileSession() const;
+    // Savedata passphrase staged before InitSDK; empty => plaintext savedata.
+    // SINGLE USE: InitSDK consumes and zeroes it, so it can never key a later,
+    // different account. See SetProfilePassphrase().
+    std::vector<uint8_t> profile_passphrase_;
+    mutable std::mutex profile_passphrase_mutex_;
 
     // ToxManager instance (owned by this V2TIMManagerImpl instance).
     // shared_ptr so AcquireToxSession() can pin it across a call sequence:

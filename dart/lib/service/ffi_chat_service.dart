@@ -3357,6 +3357,10 @@ class FfiChatService {
   /// The native default-instance session epoch captured at [init]; a later
   /// quarantine is authorized ONLY for this epoch.
   int _sessionEpoch = 0;
+  /// The native session epoch (`tim2tox_ffi_get_session_epoch(0)`) of the
+  /// init THIS service performed. [rekeyLiveProfilePassphrase] hands it back so
+  /// the native side refuses to re-key any other session's profile.
+  int _profileSessionEpoch = 0;
 
   /// The Dart-side session state [init] opens before any native work.
   void _beginSession() {
@@ -3463,6 +3467,11 @@ class FfiChatService {
       _sessionEpoch = _ffi.defaultEpoch();
     } on Object catch (_) {
       _sessionEpoch = 0; // older native lib
+    }
+    try {
+      _profileSessionEpoch = _ffi.getSessionEpoch(0);
+    } on Object catch (_) {
+      _profileSessionEpoch = 0; // older native lib
     }
     await _applyFileRecvDirectory();
     // register callback mode (preferred)
@@ -3838,6 +3847,116 @@ class FfiChatService {
         resultInfo: resultInfo,
         dispatched: true,
       ));
+    }
+  }
+
+  /// Sets the passphrase the native layer uses to encrypt the tox savedata
+  /// EVERY time it is persisted, so `tox_profile.tox` is never plaintext at
+  /// rest -- not even while this session is live.
+  ///
+  /// Must be called BEFORE [init]. It only STAGES the value: it never touches
+  /// an already-running session, because that session may still belong to a
+  /// previous, QUARANTINED account, and re-keying it would make its final save
+  /// write that account's profile under this account's password (or in
+  /// plaintext). Use [rekeyLiveProfilePassphrase] for a mid-session change.
+  ///
+  /// The staged value is SINGLE USE -- [init] consumes and zeroes it -- so it
+  /// must be set again before every [init]. A value that survived would key
+  /// whichever account happened to be opened next.
+  ///
+  /// A null or empty [passphrase] clears it, restoring plaintext savedata.
+  ///
+  /// The on-disk container is toxcore's own encrypted save ("toxEsave" magic),
+  /// which is exactly what the host's at-rest encryption already writes, so the
+  /// file format does not change and an older host build can still open it.
+  ///
+  /// Returns true when the native layer accepted the value. Returns false (and
+  /// logs) when the native library predates this export -- callers MUST treat
+  /// that as "the profile will be plaintext" and not assume protection.
+  bool setProfilePassphrase(String? passphrase) =>
+      _withPassphraseBuffer(passphrase, (buf, len) {
+        try {
+          return _ffi.setProfilePassphrase(buf, len) == 1;
+        } catch (e) {
+          _logger?.logWarning(
+              '[FfiChatService] setProfilePassphrase unavailable in this '
+              'native library: $e');
+          return false;
+        }
+      });
+
+  /// Encodes [passphrase] into native memory, runs [body] on it, and zeroes
+  /// EVERY intermediate copy on the way out -- the native buffer and the
+  /// encoder's own output. `utf8.encode` already returns a Uint8List, so it is
+  /// used directly rather than copied again.
+  ///
+  /// The source String stays in the Dart heap until GC and cannot be zeroed;
+  /// closing that would need a byte-array password API all the way up the
+  /// stack, which is a host-side change.
+  bool _withPassphraseBuffer(
+      String? passphrase, bool Function(ffi.Pointer<ffi.Uint8>, int) body) {
+    final Uint8List? bytes = (passphrase == null || passphrase.isEmpty)
+        ? null
+        : utf8.encode(passphrase);
+    ffi.Pointer<ffi.Uint8> buf = ffi.nullptr;
+    try {
+      if (bytes != null) {
+        buf = pkgffi.malloc<ffi.Uint8>(bytes.length);
+        buf.asTypedList(bytes.length).setAll(0, bytes);
+      }
+      return body(buf, bytes?.length ?? 0);
+    } finally {
+      if (buf != ffi.nullptr) {
+        final view = buf.asTypedList(bytes!.length);
+        for (var i = 0; i < view.length; i++) {
+          view[i] = 0;
+        }
+        pkgffi.malloc.free(buf);
+      }
+      if (bytes != null) {
+        for (var i = 0; i < bytes.length; i++) {
+          bytes[i] = 0;
+        }
+      }
+    }
+  }
+
+  /// Applies [passphrase] to the RUNNING session and forces a save, so the file
+  /// on disk stops carrying the old one. Use this for a mid-session password
+  /// change; a null/empty value re-keys back to plaintext.
+  ///
+  /// Returns true ONLY when the re-keyed profile reached disk. False means
+  /// there is no live session, the write failed, or the native library predates
+  /// the export -- in every one of those cases the file on disk still carries
+  /// the PREVIOUS passphrase, the live session keeps it too (a failed re-key is
+  /// rolled back before any other save can run), and the caller must not
+  /// report success to the user or drop the old password.
+  ///
+  /// Bound to the native session this service's [init] opened: a re-key that
+  /// would land on a different session (an account switch in flight) is
+  /// refused natively and reports false.
+  bool rekeyLiveProfilePassphrase(String? passphrase) =>
+      _withPassphraseBuffer(passphrase, (buf, len) {
+        try {
+          return _ffi.rekeyLiveProfilePassphrase(
+                  buf, len, _profileSessionEpoch) ==
+              1;
+        } catch (e) {
+          _logger?.logWarning(
+              '[FfiChatService] rekeyLiveProfilePassphrase unavailable: $e');
+          return false;
+        }
+      });
+
+  /// Whether the native layer currently holds a savedata passphrase.
+  /// Returns null when the native library predates the export.
+  bool? profilePassphraseIsSet() {
+    try {
+      final rc = _ffi.getProfilePassphraseState();
+      if (rc < 0) return null;
+      return rc == 1;
+    } catch (_) {
+      return null;
     }
   }
 
