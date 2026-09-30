@@ -19,9 +19,14 @@
 #include <memory>
 #include <mutex>
 #include <condition_variable>
+#include <cerrno>
+#include <filesystem>
+#include <set>
+#include <system_error>
 #include <limits>
 #include "ToxManager.h"
 #include "ToxUtil.h"
+#include "Nat64Synthesis.h"
 #include "V2TIMManagerImpl.h"
 #include "V2TIMMessageManagerImpl.h"
 #include "V2TIMLog.h"
@@ -859,6 +864,98 @@ static std::shared_ptr<SendContext> FindSendContext(int64_t instance_id,
                                                     : context_it->second;
 }
 
+// Closes an unfinished receive, deletes its data file and its
+// ".<name>.t2t-receiving" marker, and forgets the context (checklist M5: a failed or
+// cancelled receive must not leave a partial file filling the disk). Returns
+// false when there was no such receive. Must be called WITHOUT G.send_mtx.
+static bool DiscardReceive(int64_t instance_id, uint64_t key,
+                           std::string* sender_hex_out = nullptr,
+                           uint32_t* kind_out = nullptr) {
+    std::string path;
+    {
+        std::lock_guard<std::mutex> lock(G.send_mtx);
+        auto instance_it = G.recv_files.find(instance_id);
+        if (instance_it == G.recv_files.end()) return false;
+        auto it = instance_it->second.find(key);
+        if (it == instance_it->second.end()) return false;
+        if (it->second.fp) fclose(it->second.fp);
+        path = it->second.path;
+        if (sender_hex_out) *sender_hex_out = it->second.sender_hex;
+        if (kind_out) *kind_out = it->second.kind;
+        instance_it->second.erase(it);
+    }
+    tim2tox::file_io::RemoveUtf8(path);
+    tim2tox::file_io::RemoveUtf8(tim2tox::file_io::ReceiveMarkerPath(path));
+    return true;
+}
+
+// Reports a receive that failed locally to Dart. Routed by instance id
+// (event_line_parser kRoutedPrefixes). Format:
+//   file_recv_failed:<instance_id>:<sender_hex>:<file_number>:<reason>
+// reason: "no_space" (ENOSPC / EDQUOT) or "io".
+static void EnqueueReceiveFailed(int64_t instance_id, const std::string& sender_hex,
+                                 uint32_t file_number, const char* reason) {
+    std::string line = "file_recv_failed:" + std::to_string(instance_id) + ":" +
+                       sender_hex + ":" + std::to_string(file_number) + ":" + reason;
+    G.simple_listener.enqueue_text_line(line);
+}
+
+// A receive that cannot continue locally (write failure): drop it (close,
+// delete data + marker), ask the peer to stop sending (best effort — toxcore
+// may fail to send the control packet; nothing more is written either way
+// because the context is gone), and tell Dart why.
+static void FailReceive(Tox* tox, int64_t instance_id, uint64_t key,
+                        uint32_t friend_number, uint32_t file_number,
+                        const char* reason) {
+    std::string sender_hex;
+    if (!DiscardReceive(instance_id, key, &sender_hex)) return;
+    TOX_ERR_FILE_CONTROL cancel_err = TOX_ERR_FILE_CONTROL_OK;
+    if (tox == nullptr ||
+        !tox_file_control(tox, friend_number, file_number,
+                          TOX_FILE_CONTROL_CANCEL, &cancel_err)) {
+        V2TIM_LOG(kWarning,
+                  "[ffi] file_receive: type=file status=cancel_failed count={}",
+                  static_cast<int>(cancel_err));
+    }
+    EnqueueReceiveFailed(instance_id, sender_hex, file_number, reason);
+}
+
+// Startup cleanup of receives that were never finalized (checklist M5): a
+// ".<data>.t2t-receiving" marker still on disk means the app died (or the transfer
+// failed) before the data file was completed AND handed over to Dart, whose
+// history row was pending and is dropped at startup — so the data file is
+// unreachable. Only this directory is scanned (non-recursive), only files
+// whose sidecar marker exists are touched, and live receives are skipped.
+static void SweepUnfinishedReceives(const std::string& dir) {
+    std::set<std::string> active;
+    {
+        std::lock_guard<std::mutex> lock(G.send_mtx);
+        for (const auto& instance : G.recv_files) {
+            for (const auto& entry : instance.second) active.insert(entry.second.path);
+        }
+    }
+    std::error_code ec;
+    const std::filesystem::path root(dir);
+    int swept = 0;
+    for (auto it = std::filesystem::directory_iterator(root, ec);
+         !ec && it != std::filesystem::directory_iterator(); it.increment(ec)) {
+        std::error_code type_ec;
+        if (!it->is_regular_file(type_ec) || type_ec) continue;
+        const auto u8name = it->path().filename().u8string();
+        const std::string name(u8name.begin(), u8name.end());
+        const std::string data_name = tim2tox::file_io::DataNameForMarker(name);
+        if (data_name.empty()) continue;
+        const std::string data_path = dir + "/" + data_name;
+        if (active.count(data_path) != 0) continue;
+        tim2tox::file_io::RemoveUtf8(data_path);
+        tim2tox::file_io::RemoveUtf8(dir + "/" + name);
+        ++swept;
+    }
+    if (swept > 0) {
+        V2TIM_LOG(kInfo, "[ffi] set_file_recv_dir: type=file status=swept_unfinished count={}", swept);
+    }
+}
+
 static void EraseSendContext(int64_t instance_id, uint64_t key) {
     std::lock_guard<std::mutex> lock(G.send_mtx);
     const auto instance_it = G.send_files.find(instance_id);
@@ -978,6 +1075,9 @@ static void RegisterToxManagerFileCallbacks(V2TIMManagerImpl* manager_impl) {
             G.simple_listener.enqueue_text_line_for_instance(instance_id, line);
             if (control == TOX_FILE_CONTROL_CANCEL) {
                 EraseSendContext(instance_id, key);
+                // A peer-cancelled RECEIVE: close it and delete the partial
+                // data + marker right away (checklist M5).
+                DiscardReceive(instance_id, key);
             }
             if (previous_file_control_callback) {
                 previous_file_control_callback(friend_number, file_number,
@@ -1185,6 +1285,8 @@ static void RegisterToxManagerFileCallbacks(V2TIMManagerImpl* manager_impl) {
         if (length == 0) {
             uint64_t final_size = 0;
             bool io_failed = false;
+            bool close_ok = true;
+            int close_errno = 0;
             {
                 std::lock_guard<std::mutex> lk(G.send_mtx);
                 auto instance_it = G.recv_files.find(instance_id);
@@ -1195,15 +1297,24 @@ static void RegisterToxManagerFileCallbacks(V2TIMManagerImpl* manager_impl) {
                         io_failed = it->second.io_failed;
                     }
                 }
-                if (fp) { fflush(fp); fclose(fp); }
+                if (fp) {
+                    // A deferred write error (ENOSPC) can surface only here.
+                    errno = 0;
+                    if (fflush(fp) != 0) { close_ok = false; close_errno = errno; }
+                    errno = 0;
+                    if (fclose(fp) != 0 && close_ok) { close_ok = false; close_errno = errno; }
+                }
                 if (instance_it != G.recv_files.end()) instance_it->second.erase(key);
             }
-            if (io_failed ||
+            if (io_failed || !close_ok ||
                 !tim2tox::file_io::HasExactFileSize(full, final_size)) {
                 tim2tox::file_io::RemoveUtf8(full);
+                tim2tox::file_io::RemoveUtf8(tim2tox::file_io::ReceiveMarkerPath(full));
+                const char* reason = close_ok ? "io" : tim2tox::file_io::ClassifyWriteErrno(close_errno);
                 V2TIM_LOG(kError,
-                          "[ffi] file_receive: type={} status=incomplete count={}",
-                          file_kind, (unsigned long long)final_size);
+                          "[ffi] file_receive: type={} status=incomplete reason={} count={}",
+                          file_kind, reason, (unsigned long long)final_size);
+                EnqueueReceiveFailed(instance_id, sender_hex, file_number, reason);
                 return;
             }
             /* Send final progress_recv (100%) so Dart progress listener gets transferComplete */
@@ -1260,16 +1371,31 @@ static void RegisterToxManagerFileCallbacks(V2TIMManagerImpl* manager_impl) {
                       file_kind, length);
             return;
         }
+        errno = 0;
         size_t written = tim2tox::file_io::WriteAt64(
             fp, position, data, length);
-        if (written != length) {
-            mark_io_failed();
-            V2TIM_LOG(kError,
-                      "[ffi] file_receive: type={} status=partial_write count={}",
-                      file_kind, written);
+        int write_errno = errno;
+        bool write_ok = written == length;
+        if (write_ok) {
+            // stdio buffers: ENOSPC usually surfaces at the flush, and an
+            // ignored flush error used to let a transfer "succeed" with a
+            // zero-filled hole. Either failure ends the receive now.
+            errno = 0;
+            if (fflush(fp) != 0) {
+                write_ok = false;
+                write_errno = errno;
+            }
         }
-        if (written == 0) return;
-        fflush(fp);
+        if (!write_ok) {
+            const char* reason = tim2tox::file_io::ClassifyWriteErrno(write_errno);
+            V2TIM_LOG(kError,
+                      "[ffi] file_receive: type={} status=write_failed reason={} count={}",
+                      file_kind, reason, written);
+            // Cancel + delete partial data + tell Dart, instead of silently
+            // swallowing every remaining chunk of the file (checklist M5).
+            FailReceive(tox, instance_id, key, friend_number, file_number, reason);
+            return;
+        }
         uint64_t received_end = 0;
         if (!tim2tox::file_io::CheckedEndPosition(position, written,
                                                   &received_end)) {
@@ -3646,22 +3772,41 @@ int tim2tox_ffi_add_bootstrap_node(int64_t instance_id, const char* host, int po
     // Add bootstrap node
     // Reference: c-toxcore's tox_node_bootstrap only calls tox_bootstrap
     // We also add TCP relay for better connectivity
-    Tox_Err_Bootstrap bootstrap_err;
-    bool bootstrap_ok = tox_bootstrap(tox, host, (uint16_t)port, key_bin, &bootstrap_err);
-    if (!bootstrap_ok || bootstrap_err != TOX_ERR_BOOTSTRAP_OK) {
-        V2TIM_LOG(kError, "[ffi] add_bootstrap_node: tox_bootstrap failed with error {}", bootstrap_err);
-        // Continue anyway, as TCP relay might still work
+    //
+    // IPv6-only / NAT64 (checklist N3): an IPv4 literal is expanded to its
+    // NAT64-synthesized IPv6 address(es) FIRST, then the literal itself; on
+    // any other network the candidate list is just {host}. toxcore keeps only
+    // the first onion-bootstrap / TCP-relay address per public key, hence the
+    // order. Success if ANY candidate bootstrapped. See source/Nat64Synthesis.h.
+    const std::vector<std::string> candidates =
+        tim2tox::nat64::BootstrapHostCandidates(host);
+    bool bootstrap_ok = false;
+    Tox_Err_Bootstrap bootstrap_err = TOX_ERR_BOOTSTRAP_BAD_HOST;
+    for (size_t i = 0; i < candidates.size(); ++i) {
+        const char* candidate = candidates[i].c_str();
+        Tox_Err_Bootstrap candidate_err;
+        const bool candidate_ok =
+            tox_bootstrap(tox, candidate, (uint16_t)port, key_bin, &candidate_err);
+        if (candidate_ok && candidate_err == TOX_ERR_BOOTSTRAP_OK) {
+            bootstrap_ok = true;
+            bootstrap_err = TOX_ERR_BOOTSTRAP_OK;
+        } else {
+            if (!bootstrap_ok) bootstrap_err = candidate_err;
+            V2TIM_LOG(kError, "[ffi] add_bootstrap_node: tox_bootstrap failed with error {} (candidate {} of {})",
+                      candidate_err, i + 1, candidates.size());
+            // Continue anyway, as TCP relay might still work
+        }
+
+        // Add TCP relay on same port (helps with connectivity)
+        Tox_Err_Bootstrap relay_err;
+        tox_add_tcp_relay(tox, candidate, (uint16_t)port, key_bin, &relay_err);
+        // Try common alternate ports
+        tox_add_tcp_relay(tox, candidate, 443, key_bin, nullptr);
+        tox_add_tcp_relay(tox, candidate, 3389, key_bin, nullptr);
     }
-    
-    // Add TCP relay on same port (helps with connectivity)
-    Tox_Err_Bootstrap relay_err;
-    tox_add_tcp_relay(tox, host, (uint16_t)port, key_bin, &relay_err);
-    // Try common alternate ports
-    tox_add_tcp_relay(tox, host, 443, key_bin, nullptr);
-    tox_add_tcp_relay(tox, host, 3389, key_bin, nullptr);
-    
-    V2TIM_LOG(kInfo, "[Bootstrap] add_bootstrap_node instance_id={} host={} port={} bootstrap_ok={} err={} (0=OK)",
-            (long long)instance_id, host, port, bootstrap_ok ? 1 : 0, bootstrap_err);
+
+    V2TIM_LOG(kInfo, "[Bootstrap] add_bootstrap_node instance_id={} host={} port={} candidates={} bootstrap_ok={} err={} (0=OK)",
+            (long long)instance_id, host, port, candidates.size(), bootstrap_ok ? 1 : 0, bootstrap_err);
 
     return bootstrap_ok ? 1 : 0;
 }
@@ -3749,11 +3894,13 @@ int tim2tox_ffi_file_control(int64_t instance_id, const char* user_id, uint32_t 
         }
         if (it->second.fp == nullptr) {
             opened_path = it->second.path;
+            std::string space_dir = G.file_recv_dir;
             const std::string::size_type last_slash =
                 opened_path.find_last_of("/\\");
             if (last_slash != std::string::npos) {
                 const std::string parent_dir = opened_path.substr(0, last_slash);
                 if (!parent_dir.empty()) {
+                    space_dir = parent_dir;
                     const int mkdir_result =
                         tim2tox_mkdir(parent_dir.c_str(), 0755);
                     if (mkdir_result != 0 && errno != EEXIST) {
@@ -3762,10 +3909,55 @@ int tim2tox_ffi_file_control(int64_t instance_id, const char* user_id, uint32_t 
                     }
                 }
             }
+            // Checklist M5 (low storage). Regular files only: avatar receives
+            // are small (<= 10 MiB, checked above) and owned by the avatar flow.
+            const bool track_receive = it->second.kind != TOX_FILE_KIND_AVATAR;
+            uint64_t available = 0;
+            if (track_receive && it->second.size != UINT64_MAX &&
+                tim2tox::file_io::AvailableBytes(space_dir, &available) &&
+                !tim2tox::file_io::HasRoomForReceive(
+                    available, it->second.size,
+                    tim2tox::file_io::kReceiveReserveBytes)) {
+                // Refuse BEFORE accepting: nothing is opened, the offer stays
+                // pending, and Dart can tell the user to free space.
+                V2TIM_LOG(kWarning,
+                          "[ffi] file_control: type=file status=insufficient_space count={}",
+                          (unsigned long long)it->second.size);
+                return -7;
+            }
+            const std::string marker_path =
+                tim2tox::file_io::ReceiveMarkerPath(opened_path);
+            if (track_receive) {
+                // "Not finalized yet" sidecar: removed by Dart once the file is
+                // finalized, by native on failure / cancel; a leftover one is
+                // swept at the next set_file_recv_dir.
+                errno = 0;
+                FILE* marker = tim2tox::file_io::OpenUtf8(marker_path, "wb");
+                int marker_errno = errno;
+                bool marker_ok = marker != nullptr;
+                if (marker_ok) {
+                    errno = 0;
+                    if (fclose(marker) != 0) {
+                        marker_ok = false;
+                        marker_errno = errno;
+                    }
+                }
+                if (!marker_ok) {
+                    V2TIM_LOG(kError,
+                              "[ffi] file_control: type=file status=marker_failed count=0");
+                    tim2tox::file_io::RemoveUtf8(marker_path);
+                    if (tim2tox::file_io::IsNoSpaceErrno(marker_errno)) return -7;
+                    return -5;
+                }
+            }
+            errno = 0;
             opened_file = tim2tox::file_io::OpenUtf8(opened_path, "wb");
             if (opened_file == nullptr) {
+                const int open_errno = errno;
                 V2TIM_LOG(kError,
                           "[ffi] file_control: type=file status=open_failed count=0");
+                if (track_receive) tim2tox::file_io::RemoveUtf8(marker_path);
+                if (tim2tox::file_io::IsNoSpaceErrno(open_errno)) return -7;
                 return -5;
             }
             it->second.fp = opened_file;
@@ -3792,6 +3984,8 @@ int tim2tox_ffi_file_control(int64_t instance_id, const char* user_id, uint32_t 
                     if (tim2tox::file_io::HasExactFileSize(opened_path, 0)) {
                         tim2tox::file_io::RemoveUtf8(opened_path);
                     }
+                    tim2tox::file_io::RemoveUtf8(
+                        tim2tox::file_io::ReceiveMarkerPath(opened_path));
                 }
             }
         }
@@ -3815,8 +4009,10 @@ int tim2tox_ffi_file_control(int64_t instance_id, const char* user_id, uint32_t 
                     if (it->second.fp) {
                         fclose(it->second.fp);
                     }
-                    // Remove file if it exists
+                    // Remove file (and its unfinished-receive marker) if it exists
                     tim2tox::file_io::RemoveUtf8(it->second.path);
+                    tim2tox::file_io::RemoveUtf8(
+                        tim2tox::file_io::ReceiveMarkerPath(it->second.path));
                     instance_it->second.erase(it);
                 }
             }
@@ -3835,6 +4031,7 @@ int tim2tox_ffi_set_file_recv_dir(const char* dir_path) {
         return 0;
     }
     V2TIM_LOG(kInfo, "[ffi] set_file_recv_dir: configured path_length={}", G.file_recv_dir.size());
+    SweepUnfinishedReceives(G.file_recv_dir);
     return 1;
 }
 
@@ -5556,9 +5753,23 @@ int tim2tox_ffi_dht_send_nodes_request(const char* public_key, const char* ip, u
         target_public_key_bin[i] = (uint8_t)strtoul(hex_byte, nullptr, 16);
     }
     
-    // Call tox_dht_send_nodes_request
-    Tox_Err_Dht_Send_Nodes_Request error;
-    bool success = tox_dht_send_nodes_request(tox, public_key_bin, ip, port, target_public_key_bin, &error);
+    // Call tox_dht_send_nodes_request - on every NAT64 candidate of an IPv4
+    // literal first, then on `ip` itself (checklist N3, source/Nat64Synthesis.h),
+    // so the bootstrap probe tries the same reachable address the live session
+    // bootstraps. Success if any send succeeded; otherwise the LAST refusal is
+    // reported, which on a network without NAT64 is exactly the single call
+    // this used to make.
+    Tox_Err_Dht_Send_Nodes_Request error = TOX_ERR_DHT_SEND_NODES_REQUEST_BAD_IP;
+    bool success = false;
+    for (const std::string& candidate : tim2tox::nat64::BootstrapHostCandidates(ip)) {
+        Tox_Err_Dht_Send_Nodes_Request candidate_error;
+        if (tox_dht_send_nodes_request(tox, public_key_bin, candidate.c_str(), port,
+                                       target_public_key_bin, &candidate_error)) {
+            success = true;
+        } else {
+            error = candidate_error;
+        }
+    }
     
     if (!success) {
         V2TIM_LOG(kError, "[ffi] dht_send_nodes_request: tox_dht_send_nodes_request failed with error {}",

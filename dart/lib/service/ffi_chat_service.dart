@@ -23,6 +23,7 @@ import '../utils/message_history_persistence.dart';
 import '../utils/offline_message_queue_persistence.dart';
 import 'polling_event_ownership.dart';
 import 'file_receive_cleanup.dart';
+import 'file_receive_failure.dart';
 import 'scratch_file_manager.dart';
 import 'package:tencent_cloud_chat_sdk/native_im/bindings/native_library_manager.dart';
 import 'package:tencent_cloud_chat_sdk/native_im/adapter/tim_message_manager.dart';
@@ -1721,6 +1722,13 @@ class FfiChatService {
         String fileName,
         int? instanceId,
       })> get fileRequests => _fileRequestCtrl.stream;
+
+  /// Incoming files that failed locally — storage full, write / finalize
+  /// errors (checklist M5) — for the app to tell the user about.
+  final _fileReceiveFailureCtrl =
+      StreamController<FileReceiveFailure>.broadcast();
+  Stream<FileReceiveFailure> get fileReceiveFailures =>
+      _fileReceiveFailureCtrl.stream;
 
   // IRC callbacks
   final _ircConnectionStatusCtrl = StreamController<
@@ -4990,6 +4998,14 @@ class FfiChatService {
                   _logger?.log(
                       '[FfiChatService] file_done: rejected malformed event without logging fields');
                 }
+              } else if (s.startsWith('file_recv_failed:')) {
+                // Checklist M5: native gave up on a receive (disk full / I/O
+                // error), already cancelled it and deleted the partial file.
+                final failed = parseFileRecvFailedEvent(s);
+                if (failed != null && _ownsEventInstance(failed.instanceId)) {
+                  _handleNativeReceiveFailure(failed.uid, failed.fileNumber,
+                      failed.instanceId, failed.reason);
+                }
               } else if (s.startsWith('file_canceled:') ||
                   s.startsWith('file_cancel:') ||
                   s.startsWith('file_paused:') ||
@@ -5455,30 +5471,43 @@ class FfiChatService {
         if (kind == 'image') {
           _logger?.log(
               '[FfiChatService] _handleFileDone: Moving image to avatars directory');
+          final imageFileNumber = actualFileNumber;
+          final imageMsgID = foundMsgID;
           finalPathFuture = _getAvatarsDir().then((avatarsDirPath) async {
             final actualFileName = fileName ?? p.basename(path);
             final ext = p.extension(actualFileName);
             final baseName = p.basenameWithoutExtension(actualFileName);
-            final destPath = p.join(avatarsDirPath,
-                '${baseName}_${DateTime.now().millisecondsSinceEpoch}$ext');
-            // Verify source file exists before copying
+            final stamp = DateTime.now().millisecondsSinceEpoch;
+            final destName = '${baseName}_$stamp$ext';
+            // Verify source file exists before moving
             final sourceFile = File(path);
             if (!await sourceFile.exists()) {
               // Source file already moved/deleted, check if destPath exists
-              final destFile = File(destPath);
+              final destFile = File(p.join(avatarsDirPath, destName));
               if (await destFile.exists()) {
-                return destPath; // File already moved
+                return destFile.path; // File already moved
               }
               // File doesn't exist, return original path
               return path;
             }
-            await sourceFile.copy(destPath);
-            if (_isTransientSourcePath(path)) {
-              try {
-                await sourceFile.delete();
-              } catch (e) {}
+            try {
+              // Checklist M5: rename when possible (no second copy on a
+              // nearly full disk), staged copy otherwise, collision-safe.
+              return await finalizeReceivedFile(
+                source: path,
+                destDir: avatarsDirPath,
+                fileName: destName,
+                uniqueTag: '${imageMsgID ?? stamp}',
+                moveSource: _isTransientSourcePath(path),
+              );
+            } catch (e, st) {
+              _logger?.logError(
+                  '[FfiChatService] _handleFileDone: finalizing received image failed',
+                  e.runtimeType,
+                  st);
+              _onFinalizeFailed(uid, imageFileNumber, imageMsgID, path, e);
+              return '';
             }
-            return destPath;
           });
         } else {
           // Non-image files: move to Downloads directory (respects settings page configuration)
@@ -5561,23 +5590,34 @@ class FfiChatService {
             } else {
               return path;
             }
-          }).catchError((e) {
+          }).catchError((Object e) {
             // P1-4: same rationale as the null branch above — bail out and
             // mark the transfer failed instead of pretending the source
             // path is a final destination.
             _logger?.logError(
                 '[FfiChatService] _handleFileDone: Error moving file to Downloads',
-                e,
+                e.runtimeType,
                 StackTrace.current);
-            _markFileTransferFailed(uid, actualFileNumber, foundMsgID);
+            _onFinalizeFailed(uid, actualFileNumber, foundMsgID, path, e);
             return '';
           });
         }
 
         // Update message with final path
+        final markerFileNumber = actualFileNumber;
+        final markerMsgID = foundMsgID;
         unawaited(finalPathFuture.then((finalPath) async {
           _logger?.log(
               '[FfiChatService] _handleFileDone: Processing final file pathLength=${finalPath.length}');
+          if (finalPath.isNotEmpty) {
+            // Checklist M5: the completed file has been finalized (moved out
+            // of file_recv, or deliberately kept there): it is no longer an
+            // unfinished receive, so the native marker goes now — a leftover
+            // marker would make the next session delete a file history may
+            // reference.
+            await _releaseReceiveMarker(
+                path, uid, markerFileNumber, markerMsgID);
+          }
           // P1-4: empty string is the sentinel _moveFileToDownloads uses to
           // signal that we already marked the transfer failed. Don't go on
           // to write history with an empty path.
@@ -8176,11 +8216,22 @@ class FfiChatService {
       throw Exception('File transfer not found for msgID: $msgID');
     }
 
-    await acceptFileTransfer(
-      peerId,
-      fileNumber,
-      instanceId: transferInfo.$3,
-    );
+    try {
+      await acceptFileTransfer(
+        peerId,
+        fileNumber,
+        instanceId: transferInfo.$3,
+      );
+    } on FileControlException catch (e) {
+      // Checklist M5: refused because the file cannot fit. Tell the user and
+      // keep the offer pending (no native cancel) so they can free space and
+      // tap download again.
+      final reason = e.receiveFailureReason;
+      if (reason != null) {
+        _emitReceiveFailure(peerId, fileNumber, reason, msgID: msgID);
+      }
+      rethrow;
+    }
   }
 
   /// Clear C2C chat history for a user
@@ -8861,7 +8912,17 @@ class FfiChatService {
 
   String _detectKind(String path) {
     final p = path.toLowerCase();
-    const img = ['.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp', '.heic'];
+    // .heif is the other extension HEIF stills use (e.g. macOS exports).
+    const img = [
+      '.png',
+      '.jpg',
+      '.jpeg',
+      '.gif',
+      '.webp',
+      '.bmp',
+      '.heic',
+      '.heif',
+    ];
     // P2-1: previously missed common Windows/legacy mobile container
     // formats; UIKit was rendering these as generic file attachments.
     const vid = [
@@ -11278,6 +11339,12 @@ class FfiChatService {
       error,
       stackTrace,
     );
+    final reason =
+        error is FileControlException ? error.receiveFailureReason : null;
+    if (reason != null) {
+      // Checklist M5: emitted before the cleanup drops the tracking entry.
+      _emitReceiveFailure(uid, fileNumber, reason);
+    }
     await runFileAcceptFailureCleanup(
       hasPendingRow: hasPendingRow,
       markPendingFailed: () => _markFileTransferFailed(uid, fileNumber, null),
@@ -11307,7 +11374,7 @@ class FfiChatService {
     if (result <= 0) {
       final message = Tim2ToxFfi.fileControlErrorMessage(result) ??
           'Failed to accept file transfer (code $result).';
-      throw Exception(message);
+      throw FileControlException(result, message);
     }
   }
 
@@ -11362,7 +11429,7 @@ class FfiChatService {
     if (result <= 0) {
       final message = Tim2ToxFfi.fileControlErrorMessage(result) ??
           'Failed to resume file transfer (code $result).';
-      throw Exception(message);
+      throw FileControlException(result, message);
     }
   }
 
@@ -11952,62 +12019,58 @@ class FfiChatService {
   }
 
   // Move regular file to Downloads directory (except images which stay in avatars)
+  /// Moves a completed receive into the Downloads directory (settings
+  /// configurable). Returns the final path, the source path when there is no
+  /// Downloads directory, or null when the source is gone. THROWS when the
+  /// move fails (checklist M5: the caller reports why — e.g. storage full —
+  /// and cleans up); a partial copy is never left under the real name.
   Future<String?> _moveFileToDownloads(
       String sourcePath, String fileName) async {
-    try {
-      final sourceFile = File(sourcePath);
-      if (!await sourceFile.exists()) {
-        _logger?.log(
-            '[FfiChatService] _moveFileToDownloads: source does not exist basename=${p.basename(sourcePath)}');
-        return null;
-      }
-      final downloadsDir = await _getDownloadsDirectory();
-      if (downloadsDir == null) {
-        _logger?.log(
-            '[FfiChatService] _moveFileToDownloads: downloadsDir is null, returning source path');
-        return sourcePath; // Return original path if Downloads not available
-      }
-      // Use original file name or extract from path
-      final actualFileName = fileName ?? p.basename(sourcePath);
-      final destPath = p.join(downloadsDir, actualFileName);
-      // If file already exists, add a number suffix
-      String finalPath = destPath;
-      int counter = 1;
-      while (await File(finalPath).exists()) {
-        final nameWithoutExt = p.basenameWithoutExtension(actualFileName);
-        final ext = p.extension(actualFileName);
-        final dir = p.dirname(finalPath);
-        finalPath = p.join(dir, '${nameWithoutExt}_$counter$ext');
-        counter++;
-      }
+    final sourceFile = File(sourcePath);
+    if (!await sourceFile.exists()) {
       _logger?.log(
-          '[FfiChatService] _moveFileToDownloads: copying basename=${p.basename(finalPath)}');
-      await sourceFile.copy(finalPath);
-      // Delete source file if it's in a temporary location
-      if (_isTransientSourcePath(sourcePath)) {
-        try {
-          await sourceFile.delete();
-        } catch (e) {
-          _logger?.log(
-              '[FfiChatService] _moveFileToDownloads: failed to delete source file type=${e.runtimeType}');
-        }
-      }
-      final exists = await File(finalPath).exists();
-      _logger?.log(
-          '[FfiChatService] _moveFileToDownloads: copy done, destination exists: $exists');
-      return finalPath;
-    } catch (e, stackTrace) {
-      // P1-4: previously returned [sourcePath] on failure, which let the
-      // caller persist the temp `receiving_*` path into history as if the
-      // file had landed in Downloads. The UI then surfaced a non-existent
-      // file. Return null so the caller can mark the transfer failed
-      // instead.
-      _logger?.logError(
-          '[FfiChatService] _moveFileToDownloads: copy failed type=${e.runtimeType}',
-          e.runtimeType,
-          stackTrace);
+          '[FfiChatService] _moveFileToDownloads: source does not exist basename=${p.basename(sourcePath)}');
       return null;
     }
+    final downloadsDir = await _getDownloadsDirectory();
+    if (downloadsDir == null) {
+      _logger?.log(
+          '[FfiChatService] _moveFileToDownloads: downloadsDir is null, returning source path');
+      return sourcePath; // Return original path if Downloads not available
+    }
+    final finalPath = await finalizeReceivedFile(
+      source: sourcePath,
+      destDir: downloadsDir,
+      fileName: fileName,
+      uniqueTag: '${DateTime.now().microsecondsSinceEpoch}',
+      moveSource: _isTransientSourcePath(sourcePath),
+    );
+    _logger?.log(
+        '[FfiChatService] _moveFileToDownloads: finalized basename=${p.basename(finalPath)}');
+    return finalPath;
+  }
+
+  /// Finalizing a completed receive failed: fail the row, tell the user why
+  /// (storage full or not), and drop the unfinalized source + marker.
+  void _onFinalizeFailed(String uid, int? fileNumber, String? msgID,
+      String nativePath, Object error) {
+    if (fileNumber != null) {
+      _emitReceiveFailure(
+          uid,
+          fileNumber,
+          isNoSpaceError(error)
+              ? FileReceiveFailureReason.noSpace
+              : FileReceiveFailureReason.io,
+          msgID: msgID);
+    }
+    // Decided BEFORE the tracking entry is cleared: afterwards a newer
+    // receive reusing this (peer, file number) could no longer be seen.
+    final pathReused = _nativePathReused(uid, fileNumber, msgID);
+    // If a newer receive already reuses (peer, file number), fail THIS row by
+    // msgID only: clearing by file number would drop the newer transfer's
+    // tracking, and its path must not be touched.
+    _markFileTransferFailed(uid, pathReused ? null : fileNumber, msgID);
+    if (!pathReused) unawaited(_discardUnfinalizedReceive(nativePath));
   }
 
   // Public method to update avatar (called from profile page)
@@ -12498,6 +12561,102 @@ class FfiChatService {
     }
   }
 
+  /// Publishes a [FileReceiveFailure] for the tracked receive
+  /// ([uid], [fileNumber]); reads the tracking entry, so call it BEFORE
+  /// `_markFileTransferFailed` clears it.
+  void _emitReceiveFailure(
+      String uid, int fileNumber, FileReceiveFailureReason reason,
+      {String? msgID}) {
+    final normalizedUid = uid.length > 64 ? _normalizeFriendId(uid) : uid;
+    var progress = _fileReceiveProgress[(normalizedUid, fileNumber)] ??
+        _fileReceiveProgress[(uid, fileNumber)];
+    // A newer receive may already reuse the file number: never describe this
+    // failure with its name.
+    if (msgID != null && progress != null && progress.msgID != msgID) {
+      progress = null;
+    }
+    if (_fileReceiveFailureCtrl.isClosed) return;
+    _fileReceiveFailureCtrl.add(FileReceiveFailure(
+      peerId: normalizedUid,
+      reason: reason,
+      fileName: progress?.fileName,
+      fileSize: progress?.total,
+      msgID: msgID ?? progress?.msgID,
+    ));
+  }
+
+  /// A `file_recv_failed:` event: native already cancelled the transfer and
+  /// deleted the partial file + marker, so this only fails the row and tells
+  /// the user. Deliberately NOT `_handleFileControl`: that schedules a delayed
+  /// delete of the transfer's path, which could hit a newer transfer that
+  /// reuses the same deterministic path.
+  void _handleNativeReceiveFailure(String uid, int fileNumber, int instanceId,
+      FileReceiveFailureReason reason) {
+    final normalizedUid = uid.length > 64 ? _normalizeFriendId(uid) : uid;
+    final progress = _fileReceiveProgress[(normalizedUid, fileNumber)] ??
+        _fileReceiveProgress[(uid, fileNumber)];
+    final msgID = progress?.msgID ??
+        _fileNumberToMsgID[(normalizedUid, fileNumber)] ??
+        _fileNumberToMsgID[(uid, fileNumber)];
+    if (msgID == null) {
+      // Not a tracked chat file (e.g. an avatar transfer): nothing to show.
+      _logger?.log(
+          '[FfiChatService] file_recv_failed: status=untracked reason=${reason.name}');
+      return;
+    }
+    final trackedInstance = _fileTransferInstanceByMsgID[msgID];
+    if (trackedInstance != null && trackedInstance != instanceId) {
+      _logger?.log(
+          '[FfiChatService] file_recv_failed: status=instance_mismatch reason=${reason.name}');
+      return;
+    }
+    _emitReceiveFailure(uid, fileNumber, reason, msgID: msgID);
+    _markFileTransferFailed(uid, fileNumber, msgID);
+    _logger?.log(
+        '[FfiChatService] file_recv_failed: status=failed reason=${reason.name}');
+  }
+
+  /// Deletes the native "not finalized" marker of a received file (checklist
+  /// M5), once the file has been finalized. A leftover marker makes the next
+  /// session delete the data file at [nativePath].
+  Future<void> _releaseReceiveMarker(
+      String nativePath, String uid, int? fileNumber, String? msgID) async {
+    if (_nativePathReused(uid, fileNumber, msgID)) return;
+    try {
+      final marker = File(receiveMarkerPathFor(nativePath));
+      if (await marker.exists()) await marker.delete();
+    } catch (_) {}
+  }
+
+  /// The native storage path embeds the friend and the Tox file number, which
+  /// toxcore reuses once a transfer ends. If a NEWER receive already occupies
+  /// ([uid], [fileNumber]) — tracked under another msgID — the path (data file
+  /// and marker) now belongs to it and must not be touched by the older one.
+  bool _nativePathReused(String uid, int? fileNumber, String? msgID) {
+    if (fileNumber == null || msgID == null) return false;
+    final normalizedUid = uid.length > 64 ? _normalizeFriendId(uid) : uid;
+    for (final key in [(normalizedUid, fileNumber), (uid, fileNumber)]) {
+      final tracked = _fileReceiveProgress[key]?.msgID ?? _fileNumberToMsgID[key];
+      if (tracked != null && tracked != msgID) return true;
+    }
+    return false;
+  }
+
+  /// Finalization failed: the row is failed and references nothing, so the
+  /// source (still in file_recv) and its marker are dropped now. The caller
+  /// has already checked that no newer receive reuses that path.
+  Future<void> _discardUnfinalizedReceive(String nativePath) async {
+    if (!_isTransientSourcePath(nativePath)) return;
+    try {
+      final f = File(nativePath);
+      if (await f.exists()) await f.delete();
+    } catch (_) {}
+    try {
+      final marker = File(receiveMarkerPathFor(nativePath));
+      if (await marker.exists()) await marker.delete();
+    } catch (_) {}
+  }
+
   /// Handle live peer-initiated file_control events (cancel, pause, resume)
   /// and Dart-side synthesized timeouts.
   ///
@@ -12949,6 +13108,7 @@ class FfiChatService {
     await _connectionStatus.close();
     await _progressCtrl.close();
     await _fileRequestCtrl.close();
+    await _fileReceiveFailureCtrl.close();
     await _reactionCtrl.close();
     await _receiptEventsCtrl.close();
     await _avatarUpdatedCtrl.close();

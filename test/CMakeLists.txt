@@ -134,6 +134,9 @@ target_compile_definitions(control_path_source_regression_test PRIVATE
     TIM2TOX_SOURCE_CMAKE_PATH="${CMAKE_SOURCE_DIR}/source/CMakeLists.txt"
     TIM2TOX_COMPAT_LISTENERS_PATH="${CMAKE_SOURCE_DIR}/ffi/dart_compat_listeners.cpp"
     TIM2TOX_FFI_CMAKE_PATH="${CMAKE_SOURCE_DIR}/ffi/CMakeLists.txt")
+add_executable(nat64_synthesis_test Nat64SynthesisTest.cpp)
+target_compile_definitions(nat64_synthesis_test PRIVATE
+    TIM2TOX_FFI_SOURCE_PATH="${CMAKE_SOURCE_DIR}/ffi/tim2tox_ffi.cpp")
 add_executable(tox_session_pin_test ToxSessionPinTest.cpp)
 target_compile_definitions(tox_session_pin_test PRIVATE
     TIM2TOX_MANAGER_SOURCE_PATH="${CMAKE_SOURCE_DIR}/source/V2TIMManagerImpl.cpp"
@@ -218,6 +221,8 @@ target_link_libraries(control_path_source_regression_test PRIVATE
     ${TIM2TOX_GTEST_MAIN_TARGET})
 target_link_libraries(native_log_privacy_source_regression_test PRIVATE
     ${TIM2TOX_GTEST_MAIN_TARGET})
+target_link_libraries(nat64_synthesis_test PRIVATE
+    ${TIM2TOX_GTEST_MAIN_TARGET})
 find_package(Threads REQUIRED)
 target_link_libraries(tox_session_pin_test PRIVATE
     tim2tox
@@ -263,3 +268,4 @@ add_test(NAME control_path_source_regression_test
 add_test(NAME native_log_privacy_source_regression_test
     COMMAND native_log_privacy_source_regression_test)
 add_test(NAME tox_session_pin_test COMMAND tox_session_pin_test)
+add_test(NAME nat64_synthesis_test COMMAND nat64_synthesis_test)

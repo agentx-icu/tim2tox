@@ -9,6 +9,9 @@
 #include <limits>
 #include <memory>
 #include <string>
+#include <cerrno>
+#include <cstdlib>
+#include <vector>
 
 namespace {
 
@@ -292,3 +295,86 @@ TEST(FileIoCompatTest, LeavesShortStorageBasenameUnchanged) {
 }
 
 }
+
+// ---- Checklist M5: receiving under low storage -----------------------------
+
+TEST(FileIoCompatTest, HasRoomForReceiveKeepsTheReserveAndNeverOverflows) {
+    using tim2tox::file_io::HasRoomForReceive;
+    EXPECT_TRUE(HasRoomForReceive(100, 60, 40));
+    EXPECT_FALSE(HasRoomForReceive(100, 61, 40));
+    EXPECT_TRUE(HasRoomForReceive(100, 0, 0));
+    EXPECT_FALSE(HasRoomForReceive(std::numeric_limits<uint64_t>::max(),
+                                   std::numeric_limits<uint64_t>::max(), 1));
+    EXPECT_FALSE(HasRoomForReceive(0, 1, 0));
+}
+
+TEST(FileIoCompatTest, ClassifyWriteErrnoSeparatesFullDisksFromOtherErrors) {
+    using tim2tox::file_io::ClassifyWriteErrno;
+    EXPECT_STREQ(ClassifyWriteErrno(ENOSPC), "no_space");
+#ifdef EDQUOT
+    EXPECT_STREQ(ClassifyWriteErrno(EDQUOT), "no_space");
+#endif
+    EXPECT_STREQ(ClassifyWriteErrno(EIO), "io");
+    EXPECT_STREQ(ClassifyWriteErrno(0), "io");
+}
+
+TEST(FileIoCompatTest, ReceiveMarkerNamesRoundTrip) {
+    using tim2tox::file_io::DataNameForMarker;
+    using tim2tox::file_io::ReceiveMarkerPath;
+    EXPECT_EQ(ReceiveMarkerPath("/r/abc_1_2_photo.jpg"), "/r/.abc_1_2_photo.jpg.t2t-receiving");
+    EXPECT_EQ(ReceiveMarkerPath("C:\\r\\abc_1_2_a.txt"), "C:\\r\\.abc_1_2_a.txt.t2t-receiving");
+    EXPECT_EQ(DataNameForMarker(".abc_1_2_photo.jpg.t2t-receiving"), "abc_1_2_photo.jpg");
+    EXPECT_EQ(DataNameForMarker("abc_1_2_photo.jpg"), "");
+    EXPECT_EQ(DataNameForMarker(".t2t-receiving"), "");
+    // A RECEIVED file whose own name ends in the suffix is never a marker:
+    // storage basenames start with the sender key, never with '.'.
+    EXPECT_EQ(DataNameForMarker("abc_1_2_notes.t2t-receiving"), "");
+    EXPECT_EQ(DataNameForMarker("x.t2t-receiving.jpg"), "");
+}
+
+TEST(FileIoCompatTest, AvailableBytesReportsTheTempVolume) {
+    uint64_t available = 0;
+    const auto temp = std::filesystem::temp_directory_path().u8string();
+    const std::string dir(temp.begin(), temp.end());
+    EXPECT_TRUE(tim2tox::file_io::AvailableBytes(dir, &available));
+    EXPECT_GT(available, 0u);
+    EXPECT_FALSE(tim2tox::file_io::AvailableBytes("", &available));
+    EXPECT_FALSE(tim2tox::file_io::AvailableBytes(dir, nullptr));
+}
+
+#ifndef _WIN32
+// Opt-in real low-storage run (checklist M5): point TIM2TOX_ENOSPC_DIR at a
+// tiny volume (e.g. `hdiutil create -size 5m -fs HFS+ -volname t2tfull` +
+// attach on macOS) and the test fills it through the SAME write + flush
+// sequence the receive callback uses, asserting the failure is classified as
+// no_space. Skipped when the variable is unset.
+TEST(FileIoCompatTest, RealFullVolumeIsClassifiedAsNoSpace) {
+    const char* dir = std::getenv("TIM2TOX_ENOSPC_DIR");
+    if (dir == nullptr || *dir == '\0') GTEST_SKIP() << "TIM2TOX_ENOSPC_DIR not set";
+    const std::string path = std::string(dir) + "/fill.bin";
+    FILE* fp = tim2tox::file_io::OpenUtf8(path, "wb");
+    ASSERT_NE(fp, nullptr);
+    std::vector<uint8_t> chunk(1371, 0xAB);
+    uint64_t position = 0;
+    const char* reason = nullptr;
+    for (int i = 0; i < 1000000 && reason == nullptr; ++i) {
+        errno = 0;
+        const size_t written = tim2tox::file_io::WriteAt64(fp, position, chunk.data(), chunk.size());
+        int err = errno;
+        bool ok = written == chunk.size();
+        if (ok) {
+            errno = 0;
+            if (std::fflush(fp) != 0) {
+                ok = false;
+                err = errno;
+            }
+        }
+        if (!ok) reason = tim2tox::file_io::ClassifyWriteErrno(err);
+        position += written;
+    }
+    std::fclose(fp);
+    tim2tox::file_io::RemoveUtf8(path);
+    ASSERT_NE(reason, nullptr) << "the volume never filled up";
+    EXPECT_STREQ(reason, "no_space");
+}
+#endif

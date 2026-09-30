@@ -7,11 +7,12 @@
 namespace tim2tox::event_line {
 namespace {
 
-constexpr std::array<std::string_view, 4> kRoutedPrefixes = {
+constexpr std::array<std::string_view, 5> kRoutedPrefixes = {
     "progress_recv:",
     "file_done:",
     "file_request:",
     "avatar_request:",
+    "file_recv_failed:",
 };
 
 }
