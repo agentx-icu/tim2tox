@@ -45,6 +45,10 @@ void main() {
     expect(e.isInsufficientStorage, isTrue);
     expect(e.toString(), 'Exception: Not enough storage to receive this file.');
     expect(const FileControlException(-5, 'x').isInsufficientStorage, isFalse);
+    expect(e.receiveFailureReason, FileReceiveFailureReason.noSpace);
+    expect(const FileControlException(-5, 'x').receiveFailureReason,
+        FileReceiveFailureReason.io);
+    expect(const FileControlException(-3, 'x').receiveFailureReason, isNull);
   });
 
   test('isNoSpaceError recognises a full disk only', () {

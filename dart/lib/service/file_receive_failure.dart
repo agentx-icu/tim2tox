@@ -51,7 +51,20 @@ class FileControlException implements Exception {
   /// Not enough storage for the incoming file (native code -7).
   static const int insufficientStorage = -7;
 
+  /// Local receive file could not be created (native code -5).
+  static const int localOpenFailed = -5;
+
   bool get isInsufficientStorage => code == insufficientStorage;
+
+  /// The user-facing reason when this accept failure is a LOCAL storage
+  /// problem (-7 full, -5 could not create the file); null for protocol /
+  /// peer errors (unknown transfer, friend gone, ...), which are not the
+  /// user's storage to fix.
+  FileReceiveFailureReason? get receiveFailureReason => switch (code) {
+        insufficientStorage => FileReceiveFailureReason.noSpace,
+        localOpenFailed => FileReceiveFailureReason.io,
+        _ => null,
+      };
 
   @override
   String toString() => 'Exception: $message';

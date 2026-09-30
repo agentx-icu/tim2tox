@@ -7692,9 +7692,9 @@ class FfiChatService {
       // Checklist M5: refused because the file cannot fit. Tell the user and
       // keep the offer pending (no native cancel) so they can free space and
       // tap download again.
-      if (e.isInsufficientStorage) {
-        _emitReceiveFailure(peerId, fileNumber, FileReceiveFailureReason.noSpace,
-            msgID: msgID);
+      final reason = e.receiveFailureReason;
+      if (reason != null) {
+        _emitReceiveFailure(peerId, fileNumber, reason, msgID: msgID);
       }
       rethrow;
     }
@@ -10521,9 +10521,11 @@ class FfiChatService {
       error,
       stackTrace,
     );
-    if (error is FileControlException && error.isInsufficientStorage) {
+    final reason =
+        error is FileControlException ? error.receiveFailureReason : null;
+    if (reason != null) {
       // Checklist M5: emitted before the cleanup drops the tracking entry.
-      _emitReceiveFailure(uid, fileNumber, FileReceiveFailureReason.noSpace);
+      _emitReceiveFailure(uid, fileNumber, reason);
     }
     await runFileAcceptFailureCleanup(
       hasPendingRow: hasPendingRow,
