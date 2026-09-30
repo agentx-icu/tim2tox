@@ -18,6 +18,13 @@ case "$OSTYPE" in
 esac
 LIB_FILE="$FFI_BUILD_DIR/${LIB_PREFIX}tim2tox_ffi.${LIB_EXT}"
 
+# This is the library auto_tests/ runs against, so the test-only FFI hooks
+# (tim2tox_ffi_mm6_send_crafted_challenge) are compiled in here. They are OFF in
+# CMake by default and every app/CI build configures its own build tree without
+# them; export TIM2TOX_ENABLE_TEST_HOOKS=OFF to get a hook-free library from
+# this script too.
+TEST_HOOKS="${TIM2TOX_ENABLE_TEST_HOOKS:-ON}"
+
 # Colors for output
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -37,8 +44,16 @@ else
     # Get library modification time
     LIB_TIME=$(stat -f "%m" "$LIB_FILE" 2>/dev/null || stat -c "%Y" "$LIB_FILE" 2>/dev/null)
     
-    # Check FFI source files
-    for file in "$FFI_SOURCE_DIR"/*.cpp "$FFI_SOURCE_DIR"/*.h "$FFI_SOURCE_DIR"/*.hpp; do
+    # Check FFI source files, the CORE sources and the ROOT CMakeLists.
+    #
+    # source/ and the root CMakeLists.txt were missing here, and that is not a
+    # cosmetic gap: the option that gates the MM-6 crafted-challenge primitive
+    # lives in the root CMakeLists and the primitive itself in source/, so a
+    # change to either left an existing library looking current and a stale one
+    # — still carrying the primitive — got reused (codex 2026-09-27).
+    for file in "$FFI_SOURCE_DIR"/*.cpp "$FFI_SOURCE_DIR"/*.h "$FFI_SOURCE_DIR"/*.hpp \
+                "$SCRIPT_DIR/source"/*.cpp "$SCRIPT_DIR/source"/*.h \
+                "$SCRIPT_DIR/CMakeLists.txt"; do
         if [[ -f "$file" ]]; then
             FILE_TIME=$(stat -f "%m" "$file" 2>/dev/null || stat -c "%Y" "$file" 2>/dev/null)
             if [[ $FILE_TIME -gt $LIB_TIME ]]; then
@@ -63,6 +78,14 @@ else
         echo -e "${YELLOW}Build directory not configured. Rebuilding...${NC}"
         NEEDS_BUILD=true
     fi
+
+    # The cached test-hook setting must match what we want, or the library we
+    # keep would silently export (or lack) tim2tox_ffi_mm6_send_crafted_challenge.
+    if [[ -f "$BUILD_DIR/CMakeCache.txt" ]] && \
+       ! grep -q "TIM2TOX_ENABLE_TEST_HOOKS:BOOL=$TEST_HOOKS" "$BUILD_DIR/CMakeCache.txt" 2>/dev/null; then
+        echo -e "${YELLOW}Test-hook setting differs from TIM2TOX_ENABLE_TEST_HOOKS=$TEST_HOOKS. Rebuilding...${NC}"
+        NEEDS_BUILD=true
+    fi
 fi
 
 if [[ "$NEEDS_BUILD" == "true" ]]; then
@@ -85,7 +108,8 @@ if [[ "$NEEDS_BUILD" == "true" ]]; then
     if [[ ! -f "CMakeCache.txt" ]] || ! grep -q "BUILD_TOXAV:BOOL=ON" "CMakeCache.txt" 2>/dev/null || \
        ! grep -q "MUST_BUILD_TOXAV:BOOL=ON" "CMakeCache.txt" 2>/dev/null || \
        ! grep -q "DHT_BOOTSTRAP:BOOL=ON" "CMakeCache.txt" 2>/dev/null || \
-       ! grep -q "BOOTSTRAP_DAEMON:BOOL=ON" "CMakeCache.txt" 2>/dev/null; then
+       ! grep -q "BOOTSTRAP_DAEMON:BOOL=ON" "CMakeCache.txt" 2>/dev/null || \
+       ! grep -q "TIM2TOX_ENABLE_TEST_HOOKS:BOOL=$TEST_HOOKS" "CMakeCache.txt" 2>/dev/null; then
         if [[ ! -f "CMakeCache.txt" ]]; then
             echo -e "${BLUE}Configuring CMake...${NC}"
         else
@@ -112,7 +136,8 @@ if [[ "$NEEDS_BUILD" == "true" ]]; then
             -DINFO=ON \
             -DTRACE=OFF \
             -DDEBUG=OFF \
-            -DBUILD_FFI=ON
+            -DBUILD_FFI=ON \
+            -DTIM2TOX_ENABLE_TEST_HOOKS="$TEST_HOOKS"
     fi
     
     # Build only the FFI library

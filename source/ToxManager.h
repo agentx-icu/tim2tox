@@ -58,7 +58,13 @@ public:
     static bool Defer(std::function<void()> fn);
 };
 
-class ToxManager {
+// enable_shared_from_this: a save deferred out of a tox callback has to hold the
+// manager alive while it runs, and the weak alive-token alone cannot do that —
+// it can be locked just as another thread's teardown starts destroying the
+// object (codex 2026-09-26). Production always owns a ToxManager through
+// V2TIMManagerImpl's shared_ptr; a test that owns one by unique_ptr gets an
+// empty weak_from_this() and the token fallback.
+class ToxManager : public std::enable_shared_from_this<ToxManager> {
 public:
     // 删除拷贝构造函数和赋值运算符
     ToxManager(const ToxManager&) = delete;
@@ -154,13 +160,43 @@ public:
     // between the two — a conference/NGC join, a friend add, a self-name
     // change — then makes toxcore write MORE bytes than the buffer we sized:
     // a heap overflow (codex 2026-09-24). So instead of toxcore's lock we
-    // quiesce OUR mutators: iterate_mutex_ stops tox_iterate, and the pin gate
-    // below stops every acquireTox() operation. When they do not drain in
-    // kSaveQuiesceTimeout the save is REFUSED (returns {}) rather than risking
-    // the overflow; the previously written profile stays valid and the next
-    // save retries.
-    std::vector<uint8_t> getSaveData() const;
-    bool saveTo(const std::string& path) const;
+    // quiesce OUR mutators: the pin gate below stops every acquireTox()
+    // operation and iterate_mutex_ stops tox_iterate -- IN THAT ORDER, because
+    // callers legitimately hold a pin and then wait for iterate_mutex_ (the
+    // poll loop did it every round), and a saver holding the iterate lock while
+    // waiting for those pins deadlocks against them until the timeout
+    // (codex 2026-09-26). When they still do not drain the save is REFUSED
+    // (returns {}) rather than risking the overflow; the previously written
+    // profile stays valid and saveTo() returns false so the caller retries.
+    //
+    // The ordering rule this implies, for anything added later: NEVER take
+    // iterate_mutex_ and then wait for a pin. Taking a pin and then
+    // iterate_mutex_ is fine and is what callers do.
+    // `attempts` quiesce rounds of kSaveQuiesceTimeout each. The teardown save
+    // passes more: it is the one save an in-flight operation MUST be allowed to
+    // land in (a group created moments earlier is only durable because this
+    // save waits for that operation's pin), and there is no later save to retry
+    // (codex 2026-09-26).
+    // Refuse every future pin. Call before the final save: after it, an
+    // operation that had not been admitted yet fails cleanly (as "not
+    // initialized", which is what it is) instead of running into a session whose
+    // profile has already been written. Irreversible for this ToxManager.
+    void closeAdmission();
+    std::vector<uint8_t> getSaveData(int attempts = 2) const;
+    // Returns false when the profile was NOT written. Called from inside a tox
+    // callback it instead DEFERS the save to the end of the iterate (the quiesce
+    // cannot run there, see the implementation): it then returns true and sets
+    // *queued, so a caller that reports the outcome can say "queued" rather than
+    // claim a write that has not happened yet. The deferred attempt logs its own
+    // result.
+    bool saveTo(const std::string& path, bool* queued = nullptr,
+                bool final_save = false) const;
+    // Quiesce rounds the teardown save gets. Deliberately modest: the native
+    // uninit is synchronous on the Dart isolate, so this budget is time the app
+    // looks frozen at logout on mobile (codex 2026-09-26). Three rounds cover a
+    // slow in-flight operation; beyond that the admission gate in acquireTox is
+    // what keeps a late operation out, not a longer wait.
+    static constexpr int kFinalSaveQuiesceAttempts = 3;
     static constexpr std::chrono::seconds kSaveQuiesceTimeout{5};
     bool loadFrom(const std::string& path);
 
@@ -445,6 +481,12 @@ private:
         std::unordered_map<std::thread::id, int> depth;
         bool quiescing = false;
         std::thread::id quiescing_owner{};
+        // Set once, by closeAdmission(), when the session is going away: no new
+        // pin is handed out after it, so the final save's snapshot is the last
+        // word. Without it an operation could be admitted between that save's
+        // quiesce and shutdown() and do work nothing would ever persist
+        // (codex 2026-09-26).
+        bool closed = false;
     };
     std::shared_ptr<PinState> pin_state_ = std::make_shared<PinState>();
     // RAII: blocks new pins from other threads, waits (bounded) for the live
@@ -456,11 +498,16 @@ private:
         SaveQuiesce(const SaveQuiesce&) = delete;
         SaveQuiesce& operator=(const SaveQuiesce&) = delete;
         bool drained() const { return drained_; }
+        // See ToxManager::getSaveData: re-confirm after tox_iterate is stopped.
+        bool rewait();
 
     private:
         std::shared_ptr<PinState> state_;
         bool drained_ = false;
     };
+    // getSaveData()'s critical section, split out so the retry above reads as
+    // one statement. Requires the quiesce AND iterate_mutex_.
+    std::vector<uint8_t> readSaveDataQuiesced() const;
     std::atomic<bool> is_shutting_down_{false};  // Flag to prevent double cleanup; atomic for lock-free read in iterate()
     bool tcp_relay_server_allowed_{true};  // see setTcpRelayServerAllowed
     uint16_t udp_start_port_{0};  // see setUdpPortRange

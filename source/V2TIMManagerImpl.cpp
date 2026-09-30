@@ -2185,7 +2185,18 @@ void V2TIMManagerImpl::UnInitSDK() {
             tox_manager.swap(tox_manager_);
         }
         if (tox_manager) {
-            tox_manager->saveTo(save_path);
+            // Admission first: from here no NEW operation is handed a pin, so
+            // the save below is the last word on this session. Operations
+            // already admitted keep their pins and the save waits for them.
+            tox_manager->closeAdmission();
+            // final_save: the LAST chance for anything still in flight to reach
+            // the profile — a CreateGroup that overlapped this logout is only
+            // durable because this save waits for its pin (codex 2026-09-26).
+            if (!tox_manager->saveTo(save_path, nullptr, /*final_save=*/true)) {
+                V2TIM_LOG(kError,
+                          "[UnInitSDK] the final profile save FAILED; work from this session "
+                          "may not be on disk");
+            }
             tox_manager->shutdown();
         }
     } catch (...) {
@@ -2242,7 +2253,9 @@ void V2TIMManagerImpl::ResetGroupSessionState() {
         answered_identity_challenge_order_.clear();
         identity_rate_by_friend_.clear();
         identity_rate_by_group_sender_.clear();
+        group_receipt_rate_by_sender_.clear();
         identity_rate_global_ = IdentityRateWindow{};
+        group_receipt_rate_global_ = IdentityRateWindow{};
         identity_last_prune_ = IdentityClock::time_point{};
         seen_group_receipts_.clear();
         seen_group_receipt_order_.clear();
@@ -2271,10 +2284,16 @@ void V2TIMManagerImpl::SaveToxProfile() {
         (void)tim2tox::path::EnsureDirectoryExists(save_dir, &mkdir_err);
         save_path = tim2tox::path::BuildProfilePath(save_dir, GetInstanceIdFromManager(this)).string();
     }
-    if (tox_manager_->saveTo(save_path)) {
-        V2TIM_LOG(kInfo, "[SaveToxProfile] Saved tox profile to {}", save_path);
-    } else {
+    bool queued = false;
+    if (!tox_manager_->saveTo(save_path, &queued)) {
         V2TIM_LOG(kError, "[SaveToxProfile] Failed to save tox profile to {}", save_path);
+    } else if (queued) {
+        // Reached from inside a tox callback: the write runs when the iterate
+        // returns and logs its own result. Saying "saved" here would claim a
+        // durability this call does not have.
+        V2TIM_LOG(kInfo, "[SaveToxProfile] Queued tox profile save to {}", save_path);
+    } else {
+        V2TIM_LOG(kInfo, "[SaveToxProfile] Saved tox profile to {}", save_path);
     }
 }
 
@@ -5807,6 +5826,55 @@ constexpr uint32_t kMaxProofVerifiesPerSender = 32;
 // not each be able to open a window. Entries expire with kIdentityRateWindow
 // and are pruned, so a full table clears within a minute.
 constexpr size_t kMaxProofVerifySenders = 1024;
+// DERIVATION of the per-minute ceiling for inbound group receipts, per
+// kIdentityRateWindow and per authenticated sender.
+//
+// Derived against the CURRENT senders, all of which are bounded now that
+// Tim2ToxSdkPlatform.markGroupMessageAsRead claims each row and skips the ones
+// already read (it used to re-send the whole loaded window on every chat open,
+// which is what justified the old 4096):
+//   * a FIRST open of a long-unread group: markGroupMessageAsRead can emit one
+//     receipt per unread row we authored, bounded by
+//     MessageHistoryPersistence._maxMessagesInMemory = 1000 — but only once,
+//     because it claims. A repeat open costs only the genuinely new rows.
+//   * FfiChatService._sendGroupReadReceiptsOnView adds <=50 per open, claimed.
+//   * one 'received' per message of ours the member ingests: a very chatty
+//     author at ~2 messages/second is ~120 in the window.
+//   * the offline flush, bounded at _maxPendingGroupReadReceiptsPerAuthor = 200.
+// 1000 + 50 + 120 + 200 = 1370 honest worst case; 2048 keeps ~1.5x headroom.
+// The cap's job is bounding "one member, unbounded invented msgIDs", not
+// policing honest volume: the per-receipt work here is a hash lookup and a
+// bounded key. Per-sender keys are NGC per-group keys, so the same person in
+// several groups gets one window per group, not one shared window.
+constexpr uint32_t kMaxGroupReceiptsPerSender = 2048;
+// Bound on the RECEIPT sender table. Its own cap, and its own table
+// (group_receipt_rate_by_sender_), so a receipt flood cannot fill the table the
+// MM-6 proof budget lives in and starve the proofs — see the header.
+constexpr size_t kMaxGroupReceiptSenders = 1024;
+// ...and a GLOBAL ceiling across every sender, because the per-sender cap alone
+// multiplies: 1024 windows x 2048 is over two million forwards in a window, and
+// the replay cache EVICTS rather than caps, so invented msgIDs keep reaching
+// Dart and each one costs two history scans (codex 2026-09-27).
+//
+// Sized for the author's side of a large group, which is where receipts
+// converge: one 'received' per member per message of ours (a 100-member group
+// where we posted 30 messages in the window is ~3000), plus a read burst when
+// those members open the chat (~99 x 50 = ~4950) — call the honest worst case
+// ~8000. 16384 is ~2x that and cuts the absolute worst case by ~128x.
+//
+// Charged AFTER the per-sender budget on purpose: a single sender must first be
+// bounded to its own 2048 before it can spend from the shared pool, so one
+// flooder can take at most 1/8 of it rather than all of it.
+constexpr uint32_t kMaxGroupReceiptsGlobal = 16384;
+// The two caps above are what SHIPS. `override_value` is the test-only seam
+// (V2TIMManagerImpl::Mm6SetGroupReceiptBudgets, compiled in only with the test
+// hooks): 0 means "the derived default", and it is read HERE, at the point the
+// budget is charged, so a scenario can lower the cap before any traffic starts
+// and watch the refusal happen -- out-sending the real 2048/16384 inside one
+// 60s window is not something a test harness can do honestly.
+uint32_t EffectiveReceiptCap(uint32_t override_value, uint32_t built_in) {
+    return override_value != 0 ? override_value : built_in;
+}
 // Answering side replay cache.
 constexpr size_t kMaxAnsweredChallenges = 1024;
 constexpr auto kAnsweredChallengeTtl = std::chrono::minutes(10);
@@ -6063,6 +6131,24 @@ bool V2TIMManagerImpl::TakeIdentityBudgetLocked(IdentityRateWindow& window, Iden
     return true;
 }
 
+bool V2TIMManagerImpl::HasPendingChallengeForSenderLocked(Tox_Group_Number group_number,
+                                                          const std::string& sender_hex,
+                                                          IdentityClock::time_point now) const {
+    // Allocation-free: this runs for every valid-size proof packet, before any
+    // budget applies, so it must not build a lowercased copy per entry. Both
+    // sides are lowercase by construction (see the insert in
+    // IssueIdentityChallenges and the caller). The scan is bounded by
+    // kMaxPendingIdentityChallenges.
+    for (const auto& [nonce_hex, pending] : pending_identity_challenges_) {
+        (void)nonce_hex;
+        if (pending.group_number == group_number && now - pending.sent_at <= kIdentityChallengeTtl &&
+            pending.member_key == sender_hex) {
+            return true;
+        }
+    }
+    return false;
+}
+
 bool V2TIMManagerImpl::TakeGroupSenderProofBudgetLocked(const std::string& sender_hex,
                                                         IdentityClock::time_point now) {
     auto it = identity_rate_by_group_sender_.find(sender_hex);
@@ -6077,6 +6163,29 @@ bool V2TIMManagerImpl::TakeGroupSenderProofBudgetLocked(const std::string& sende
     }
     return TakeIdentityBudgetLocked(it->second, now, &IdentityRateWindow::proof_verifies,
                                     kMaxProofVerifiesPerSender);
+}
+
+bool V2TIMManagerImpl::TakeGroupSenderReceiptBudgetLocked(const std::string& sender_hex,
+                                                          IdentityClock::time_point now) {
+    // Its OWN table with its OWN cap, not the proof table (codex 2026-09-26):
+    // sharing one meant 1024 distinct member keys each sending one structurally
+    // valid receipt with an invented msgID could fill it and refuse both the
+    // next honest reader's receipt AND a challenged member's MM-6 proof, i.e.
+    // receipts could starve the identity work. Same fail-closed reasoning as the
+    // proof side above: a full table refuses rather than growing, and it drains
+    // within kIdentityRateWindow (pruned in PruneIdentityStateLocked). The
+    // caller must have applied its cheap structural gates FIRST, so a member
+    // sending garbage cannot reserve one of these windows at all — the lesson
+    // HandleGroupIdentityProof records (a bounded table must not reserve a
+    // window for a sender that has nothing pending).
+    auto it = group_receipt_rate_by_sender_.find(sender_hex);
+    if (it == group_receipt_rate_by_sender_.end()) {
+        if (group_receipt_rate_by_sender_.size() >= kMaxGroupReceiptSenders) return false;
+        it = group_receipt_rate_by_sender_.emplace(sender_hex, IdentityRateWindow{}).first;
+    }
+    return TakeIdentityBudgetLocked(
+        it->second, now, &IdentityRateWindow::receipts_in,
+        EffectiveReceiptCap(group_receipt_per_sender_limit_override_, kMaxGroupReceiptsPerSender));
 }
 
 void V2TIMManagerImpl::DropStaleChallengesForMemberLocked(Tox_Group_Number group_number,
@@ -6132,6 +6241,13 @@ void V2TIMManagerImpl::PruneIdentityStateLocked(IdentityClock::time_point now, b
     for (auto it = identity_rate_by_group_sender_.begin(); it != identity_rate_by_group_sender_.end();) {
         it = now - it->second.window_start >= kIdentityRateWindow
                  ? identity_rate_by_group_sender_.erase(it)
+                 : std::next(it);
+    }
+    // The receipt meter's own table. Same rule; separate table so neither budget
+    // can fill the other's (see TakeGroupSenderReceiptBudgetLocked).
+    for (auto it = group_receipt_rate_by_sender_.begin(); it != group_receipt_rate_by_sender_.end();) {
+        it = now - it->second.window_start >= kIdentityRateWindow
+                 ? group_receipt_rate_by_sender_.erase(it)
                  : std::next(it);
     }
 }
@@ -6267,8 +6383,12 @@ void V2TIMManagerImpl::IssueIdentityChallenges(Tox* tox, const std::vector<Pendi
                 }
                 pending_identity_challenges_.erase(oldest);
             }
+            // member_key is stored LOWERCASE here, once, so the per-packet gate
+            // in HandleGroupIdentityProof can compare it without allocating for
+            // every entry it scans (codex 2026-09-26).
             pending_identity_challenges_[ToxUtil::tox_bytes_to_hex(nonce, kIdentityNonceSize)] =
-                PendingIdentityChallenge{candidate.friend_hex, candidate.group_number, candidate.member_key, now};
+                PendingIdentityChallenge{candidate.friend_hex, candidate.group_number,
+                                        LowerHex(candidate.member_key), now};
         }
         std::string body(1, static_cast<char>(kIdentityChallenge));
         body.append(prefix_it->second);
@@ -6504,10 +6624,26 @@ void V2TIMManagerImpl::HandleGroupIdentityProof(Tox_Group_Number group_number, T
     // was global so one hostile member could exhaust it and starve every
     // honest proof in the window (codex 2026-09-24). The global crypto cap
     // below still bounds the box opens.
+    // Fixed-size packet (checked at entry), so this is bounded work: recorded
+    // for EVERY proof that arrives, including the ones the gate below drops —
+    // the "was the payload really opaque?" diagnostic has to see exactly the
+    // packets nobody challenged for.
+    const std::string proof_payload_hex = ToxUtil::tox_bytes_to_hex(data, length);
     {
         std::lock_guard<std::mutex> lock(mutex_);
         ++mm6_diag_.proofs_in;
+        mm6_diag_.last_proof_payload_hex = proof_payload_hex;
         PruneIdentityStateLocked(now, false);
+        // A sender we never challenged cannot be answering anything: drop it
+        // WITHOUT reserving one of the kMaxProofVerifySenders windows. Metering
+        // first meant 1024 group identities could fill that table with one
+        // bogus proof each and get the next honest member's proof refused for
+        // the whole window (codex 2026-09-26). This scan touches no crypto and
+        // no secret, and the pending table is itself capped.
+        if (!HasPendingChallengeForSenderLocked(group_number, sender_hex, now)) {
+            ++mm6_diag_.proofs_rejected;
+            return;
+        }
         if (!TakeGroupSenderProofBudgetLocked(sender_hex, now)) {
             ++mm6_diag_.proofs_rejected;
             return;
@@ -6531,7 +6667,6 @@ void V2TIMManagerImpl::HandleGroupIdentityProof(Tox_Group_Number group_number, T
     // that stopped claiming it.
     const std::string sender_digest = GroupIdentityDigestHex(chat_id, sender_key);
     std::lock_guard<std::mutex> lock(mutex_);
-    mm6_diag_.last_proof_payload_hex = ToxUtil::tox_bytes_to_hex(data, length);
     // Askers that no longer claim this member cannot answer; they only occupy
     // scan slots an honest claimant needs.
     DropStaleChallengesForMemberLocked(group_number, sender_hex, sender_digest);
@@ -6628,10 +6763,36 @@ std::string V2TIMManagerImpl::Mm6DiagJson() {
         << ",\"proofsIn\":" << mm6_diag_.proofs_in
         << ",\"proofsAccepted\":" << mm6_diag_.proofs_accepted
         << ",\"proofsRejected\":" << mm6_diag_.proofs_rejected
-        << ",\"lastProofPayloadHex\":\"" << mm6_diag_.last_proof_payload_hex << "\"}";
+        << ",\"lastProofPayloadHex\":\"" << mm6_diag_.last_proof_payload_hex << "\""
+        // Group receipts arriving on the same NGC private channel: what the
+        // per-sender meter, the replay filter and the forward saw. Nested so the
+        // proof keys above keep their exact names (auto_tests read them).
+        << ",\"groupReceipts\":{\"in\":" << mm6_diag_.group_receipts_in
+        << ",\"refused\":" << mm6_diag_.group_receipts_refused
+        << ",\"replayed\":" << mm6_diag_.group_receipts_replayed
+        << ",\"forwarded\":" << mm6_diag_.group_receipts_forwarded
+        << ",\"refusedGlobal\":" << mm6_diag_.group_receipts_refused_global
+        // The EFFECTIVE caps, i.e. what the charge sites will actually enforce.
+        // Normally the compiled-in defaults; under the test-only budget seam
+        // whatever it was set to, so a scenario can read back the cap it asked
+        // for and, afterwards, that the default is restored.
+        << ",\"perSenderLimit\":"
+        << EffectiveReceiptCap(group_receipt_per_sender_limit_override_,
+                               kMaxGroupReceiptsPerSender)
+        << ",\"globalLimit\":"
+        << EffectiveReceiptCap(group_receipt_global_limit_override_, kMaxGroupReceiptsGlobal)
+        << "}}";
     return out.str();
 }
 
+#ifdef TIM2TOX_ENABLE_TEST_HOOKS
+// TEST-ONLY primitive, compiled in only with -DTIM2TOX_ENABLE_TEST_HOOKS=ON
+// (OFF by default). The guard belongs HERE and not only on the C wrapper in
+// ffi/tim2tox_ffi.cpp: this method is part of libtim2tox.a, and with only the
+// wrapper gated its mangled symbol stayed exported from a shipped library on
+// Linux, so the attack primitive remained callable even though the C entry
+// point was gone (codex 2026-09-26). CMake defines the macro for the tim2tox
+// target as well as tim2tox_ffi, so an ON build has both halves.
 int V2TIMManagerImpl::Mm6SendCraftedChallenge(const V2TIMString& groupID, const std::string& friend_key_hex,
                                               const std::string& claimed_member_key_hex) {
     if (groupID.Empty() || friend_key_hex.size() != static_cast<size_t>(TOX_PUBLIC_KEY_SIZE * 2) ||
@@ -6677,6 +6838,22 @@ int V2TIMManagerImpl::Mm6SendCraftedChallenge(const V2TIMString& groupID, const 
     SendFriendIdentityFrame(tox, friend_number, body);
     return 1;
 }
+
+// TEST-ONLY seam for the inbound group-receipt budgets, inside the SAME guarded
+// region as the primitive above (one region per file is what the pin test keys
+// on, and what keeps the definition from surviving in libtim2tox.a while the C
+// wrapper is gone). It writes nothing but the two override fields; the caps
+// themselves stay as derived, and <= 0 restores the default. The charge sites
+// read the overrides through EffectiveReceiptCap, so a test must set the budget
+// BEFORE the traffic it means to have refused.
+void V2TIMManagerImpl::Mm6SetGroupReceiptBudgets(int32_t per_sender_limit, int32_t global_limit) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    group_receipt_per_sender_limit_override_ =
+        per_sender_limit > 0 ? static_cast<uint32_t>(per_sender_limit) : 0;
+    group_receipt_global_limit_override_ =
+        global_limit > 0 ? static_cast<uint32_t>(global_limit) : 0;
+}
+#endif  // TIM2TOX_ENABLE_TEST_HOOKS
 
 std::string V2TIMManagerImpl::ResolveSharedGroupName(const std::string& group_id) {
     auto* group_manager = static_cast<V2TIMGroupManagerImpl*>(GetGroupManager());
@@ -7274,6 +7451,42 @@ void V2TIMManagerImpl::HandleGroupCustomPrivatePacket(
     V2TIMString group_id;
     {
         std::lock_guard<std::mutex> lock(mutex_);
+        // METER FIRST, by the toxcore-authenticated sender, before ANYTHING this
+        // packet can make us spend from here on: a replay-cache slot, the Dart
+        // event, and the two history scans the reader/receiver tally does per
+        // event. The replay filter below only ever stopped the SAME receipt
+        // twice — distinct msgIDs from one member were unbounded, and the group
+        // leg now sends a burst of them on every chat open, so "one member, many
+        // ids" is the shape to bound. Same meter-first ordering as
+        // HandleGroupIdentityProof.
+        //
+        // It sits AFTER the envelope query and the payload/envelope match, not
+        // before them, for two reasons: the budget is charged to the
+        // AUTHENTICATED sender, and that identity is exactly what the peer-key
+        // query produces (keying on anything the packet claims would let one
+        // member burn another member's window); and those two gates are the
+        // cheap, crypto-free, allocation-free checks that keep a member sending
+        // garbage from reserving one of the bounded table's windows at all —
+        // HandleGroupIdentityProof's own lesson, that a bounded table must not
+        // reserve a window for a sender that has nothing pending.
+        const auto meter_now = IdentityClock::now();
+        ++mm6_diag_.group_receipts_in;
+        PruneIdentityStateLocked(meter_now, false);
+        if (!TakeGroupSenderReceiptBudgetLocked(sender_lower, meter_now)) {
+            ++mm6_diag_.group_receipts_refused;
+            V2TIM_LOG(kWarning, "[HandleGroupCustomPrivatePacket] refused receipt: sender over budget");
+            return;
+        }
+        // The shared ceiling, after the per-sender one (see
+        // kMaxGroupReceiptsGlobal for why that order).
+        if (!TakeIdentityBudgetLocked(
+                group_receipt_rate_global_, meter_now, &IdentityRateWindow::receipts_in,
+                EffectiveReceiptCap(group_receipt_global_limit_override_, kMaxGroupReceiptsGlobal))) {
+            ++mm6_diag_.group_receipts_refused_global;
+            V2TIM_LOG(kWarning,
+                      "[HandleGroupCustomPrivatePacket] refused receipt: global receipt budget spent");
+            return;
+        }
         const auto group_it = group_number_to_group_id_.find(group_number);
         if (group_it == group_number_to_group_id_.end()) return;
         group_id = group_it->second;
@@ -7281,17 +7494,22 @@ void V2TIMManagerImpl::HandleGroupCustomPrivatePacket(
         // is forwarded once per kSeenGroupReceiptTtl. Every copy used to cost
         // Dart an event, a history rewrite and a UI refresh. (Dart's handler
         // is idempotent too, for anything that slips past a bounded cache.)
-        const auto now = IdentityClock::now();
-        PruneIdentityStateLocked(now, false);
+        // Reuses the meter's clock read and its prune above — one of each per
+        // packet, not two.
+        const auto now = meter_now;
         std::string replay_key = std::string(group_id.CString()) + "|" + sender_lower + "|" +
                                  receipt.receipt_type + "|" + receipt.msg_id;
-        if (seen_group_receipts_.count(replay_key) > 0) return;
+        if (seen_group_receipts_.count(replay_key) > 0) {
+            ++mm6_diag_.group_receipts_replayed;
+            return;
+        }
         while (seen_group_receipts_.size() >= kMaxSeenGroupReceipts && !seen_group_receipt_order_.empty()) {
             seen_group_receipts_.erase(seen_group_receipt_order_.front().second);
             seen_group_receipt_order_.pop_front();
         }
         seen_group_receipts_.emplace(replay_key, now);
         seen_group_receipt_order_.emplace_back(now, std::move(replay_key));
+        ++mm6_diag_.group_receipts_forwarded;
     }
     // Hand it to Dart on the group ACTION control line, where receipts have
     // always been consumed (and never rendered); the envelope sender is the
@@ -7322,7 +7540,14 @@ int V2TIMManagerImpl::SendGroupReceipt(const V2TIMString& groupID, const std::st
     Tox* tox = session.tox();
     if (!tox) return 0;
     const Tox_Group_Peer_Number peer_id = ResolveGroupPeerIdForKey(group_number, author_key_hex);
-    if (peer_id == UINT32_MAX) return 0;
+    // -3, distinct from the generic 0: the group is ours and the request is
+    // well formed, the AUTHOR is simply not a live NGC peer right now (offline,
+    // not yet re-synced, or gone). Dart parks the receipt for that author and
+    // re-sends it when the author is a resolvable peer again; a plain failure
+    // would be dropped forever, because the row is flagged read locally the
+    // same moment and never scanned again. Callers that only know the legacy
+    // codes still see "not 1, not -2" and behave exactly as before.
+    if (peer_id == UINT32_MAX) return -3;
     // The payload keeps the legacy receipt schema (type/msgID/receiptType/
     // sender) so every toxee version consumes it, but "sender" is our
     // PER-GROUP key: the long-term key it used to carry deanonymized every

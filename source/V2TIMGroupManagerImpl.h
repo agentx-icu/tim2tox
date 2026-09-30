@@ -41,7 +41,14 @@ public:
 
     // Best-known display name for a group: cached when real, live NGC name
     // otherwise. See the definition for why the cache alone is not enough.
-    std::string ResolveGroupName(const std::string& groupID);
+    //
+    // `pinned_tox` is the caller's already-PINNED Tox handle when it holds a
+    // session pin, and nullptr when it does not (then this function pins for
+    // itself). SearchGroups calls this twice per matched group, so a wide search
+    // used to take two pins per hit; passing one hoisted pin down makes the
+    // whole result set read from a single session as well as being cheaper.
+    std::string ResolveGroupName(const std::string& groupID,
+                                 Tox* pinned_tox = nullptr);
     void InitGroupAttributes(const V2TIMString& groupID,
                             const V2TIMGroupAttributeMap& attributes,
                             V2TIMCallback* callback) override;

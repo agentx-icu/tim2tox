@@ -852,10 +852,22 @@ public:
         for (size_t i = 0; i < receipt_list.Size(); ++i) {
             if (i != 0) receipts << ",";
             const V2TIMMessageReceipt& receipt = receipt_list[i];
+            // A GROUP receipt must say so, or it loses the only thing that
+            // identifies its conversation: the SDK reads groupID out of
+            // msg_receipt_conv_id and ONLY when conv_type is
+            // kTIMConv_Group (2) — see v2_tim_message_receipt.dart's
+            // fromJson. Emitting 1 for everything put the group id nowhere
+            // and left userID (empty for a group receipt) in its place.
+            // Latent until now, because only the C2C delivery receipt
+            // reached this callback (codex 2026-09-26).
+            const char* group_id = receipt.groupID.CString();
+            const bool is_group = group_id != nullptr && group_id[0] != '\0';
             receipts << "{"
-                     << "\"msg_receipt_conv_type\":1,"
+                     << "\"msg_receipt_conv_type\":" << (is_group ? 2 : 1) << ","
                      << "\"msg_receipt_conv_id\":\""
-                     << EscapeJsonString(receipt.userID.CString()) << "\","
+                     << EscapeJsonString(is_group ? group_id
+                                                  : receipt.userID.CString())
+                     << "\","
                      << "\"msg_receipt_time_stamp\":" << receipt.timestamp << ","
                      << "\"msg_receipt_msg_id\":\""
                      << EscapeJsonString(receipt.msgID.CString()) << "\","

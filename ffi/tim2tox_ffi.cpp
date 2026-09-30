@@ -3136,6 +3136,14 @@ int tim2tox_ffi_get_mm6_diag(int64_t instance_id, char* out, int out_len) {
     return n;
 }
 
+#ifdef TIM2TOX_ENABLE_TEST_HOOKS
+// TEST-ONLY hook, gated behind -DTIM2TOX_ENABLE_TEST_HOOKS=ON (OFF by default;
+// only `build_ffi.sh`, which builds the library the auto_tests run against,
+// turns it on). It forges the one MM-6 identity-challenge shape the honest API
+// cannot produce — a member claiming ANOTHER member's per-group key — so
+// scenario_group_receipt_control_row_test can prove the answer comes back as an
+// unreadable box to the member it names. In a shipping library it would be
+// purely an attack primitive, which is why it is not compiled by default.
 int tim2tox_ffi_mm6_send_crafted_challenge(int64_t instance_id, const char* group_id,
                                            const char* friend_key_hex,
                                            const char* claimed_member_key_hex) {
@@ -3145,6 +3153,23 @@ int tim2tox_ffi_mm6_send_crafted_challenge(int64_t instance_id, const char* grou
     if (!manager || !manager->GetToxManager()) return 0;
     return manager->Mm6SendCraftedChallenge(group_id, friend_key_hex, claimed_member_key_hex);
 }
+
+// TEST-ONLY, in the SAME guarded region as the hook above (one region per file:
+// that is what the pin test checks, and what keeps the C++ half from surviving
+// in libtim2tox.a after the C half is compiled out). Lowers or restores this
+// instance's inbound group-receipt budgets so the auto_tests can drive the
+// refusal path the caps exist for; <= 0 restores a default. Never in a shipping
+// library — shrinking the flood budget of the library that enforces it is a
+// denial-of-service knob, not an observability one.
+int tim2tox_ffi_mm6_set_group_receipt_budgets(int64_t instance_id, int32_t per_sender_limit,
+                                             int32_t global_limit) {
+    if (instance_id == 0) instance_id = GetCurrentInstanceId();
+    V2TIMManagerImpl* manager = GetInstanceFromId(instance_id);
+    if (!manager) return 0;
+    manager->Mm6SetGroupReceiptBudgets(per_sender_limit, global_limit);
+    return 1;
+}
+#endif  // TIM2TOX_ENABLE_TEST_HOOKS
 
 int tim2tox_ffi_set_retired_group_id_max(int64_t instance_id, uint64_t max_id) {
     if (instance_id == 0) instance_id = GetCurrentInstanceId();
@@ -3501,6 +3526,14 @@ int tim2tox_ffi_delete_avatar(int64_t instance_id, const char* user_id) {
                   "[ffi] file_send: type=avatar_delete status=send_failed count=0");
         return -7;
     }
+    // Same post-send check as the other two senders: a logout that landed
+    // during tox_file_send queued the deletion on an instance that will never
+    // iterate again, so it must not be reported as sent (codex 2026-09-26).
+    if (peer.session_ended()) {
+        V2TIM_LOG(kError,
+                  "[ffi] file_send: type=avatar_delete status=session_ended count=0");
+        return -1;
+    }
     V2TIM_LOG(kInfo,
               "[ffi] file_send: type=avatar_delete status=sent count=0");
     return 1;
@@ -3511,13 +3544,27 @@ int tim2tox_ffi_iterate_current_instance(int count) {
     V2TIMManagerImpl* manager_impl = GetCurrentInstance();
     if (!manager_impl) return 0;
     for (int i = 0; i < count; ++i) {
-        // Re-pinned every round: a callback may UnInitSDK, which runs (and
-        // drops the ToxManager) when that iterate returns. The pin makes the
-        // iterate itself safe even if that happens mid-round; re-taking it is
-        // what stops the NEXT round from driving a dead session.
-        const auto session = manager_impl->AcquireToxSession();
-        if (!session) return i > 0 ? 1 : 0;
-        session.manager()->iterate(0);
+        // Re-taken every round: a callback may UnInitSDK, which runs (and drops
+        // the ToxManager) when that iterate returns, so the NEXT round must not
+        // drive a dead session.
+        //
+        // The Tox PIN is released before the iterate, deliberately. It bought
+        // nothing — ToxManager::iterate() holds iterate_mutex_ across
+        // tox_iterate() and re-checks tox_ under mutex_, which is what makes
+        // the iterate safe — and holding it across the iterate put this loop on
+        // the one forbidden lock order (pin, then wait for iterate_mutex_)
+        // against a saver, so every profile save that overlapped a poll round
+        // was skipped (codex 2026-09-26). The ToxManager itself stays alive
+        // through the call: the guard's shared_ptr keeps it, and a teardown
+        // reached from a callback is deferred to the end of the iterate.
+        std::shared_ptr<ToxManager> manager;
+        {
+            const auto session = manager_impl->AcquireToxSession();
+            if (!session) return i > 0 ? 1 : 0;
+            manager = session.manager_shared();
+        }
+        if (!manager) return i > 0 ? 1 : 0;
+        manager->iterate(0);
     }
     return 1;
 }
@@ -3607,8 +3654,17 @@ int tim2tox_ffi_iterate_all_instances(int count) {
     if (copy.empty()) return 0;
     for (int round = 0; round < count; ++round) {
         for (V2TIMManagerImpl* manager : copy) {
-            const auto session = manager->AcquireToxSession();
-            if (session) session.manager()->iterate(0);
+            // Same rule as tim2tox_ffi_iterate_current_instance: keep the
+            // ToxManager, drop the Tox pin BEFORE the iterate, or a profile
+            // save that overlaps this loop waits out its whole quiesce and is
+            // skipped (codex 2026-09-26).
+            std::shared_ptr<ToxManager> tox_manager;
+            {
+                const auto session = manager->AcquireToxSession();
+                if (!session) continue;
+                tox_manager = session.manager_shared();
+            }
+            if (tox_manager) tox_manager->iterate(0);
         }
     }
     return static_cast<int>(copy.size());

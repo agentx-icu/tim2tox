@@ -25,6 +25,9 @@
 #ifndef TIM2TOX_ROOT_CMAKE_PATH
 #error "TIM2TOX_ROOT_CMAKE_PATH must point to CMakeLists.txt"
 #endif
+#ifndef TIM2TOX_COMPAT_LISTENERS_PATH
+#error "TIM2TOX_COMPAT_LISTENERS_PATH is required"
+#endif
 #ifndef TIM2TOX_SOURCE_CMAKE_PATH
 #error "TIM2TOX_SOURCE_CMAKE_PATH must point to source/CMakeLists.txt"
 #endif
@@ -277,6 +280,30 @@ TEST(ControlPathSourceRegressionTest,
     EXPECT_LT(group_callback, group_catch);
 }
 
+// A GROUP read receipt reaching the binary-replacement path must carry its group
+// id. The SDK takes groupID out of msg_receipt_conv_id and ONLY when conv_type is
+// kTIMConv_Group (2); this emitter hardcoded 1 and always sent userID, which is
+// empty for a group receipt, so the conversation identity was simply dropped.
+// Latent while only the C2C delivery receipt used this callback.
+TEST(ControlPathSourceRegressionTest, ReadReceiptCallbackCarriesTheGroupId) {
+    const std::string listeners =
+        ReadSource(TIM2TOX_COMPAT_LISTENERS_PATH);
+    const std::string receipts = SourceSection(
+        listeners, "void OnRecvMessageReadReceipts(", "fields[\"json_msg_read_receipt_array\"]");
+    ASSERT_FALSE(receipts.empty());
+    EXPECT_EQ(receipts.find("\\\"msg_receipt_conv_type\\\":1,"), std::string::npos)
+        << "the conversation type must not be hardcoded to C2C";
+    EXPECT_NE(receipts.find("receipt.groupID"), std::string::npos)
+        << "the receipt's groupID must be consulted";
+    EXPECT_NE(receipts.find("is_group ? 2 : 1"), std::string::npos)
+        << "a group receipt must be emitted as kTIMConv_Group (2)";
+    // ...and the id that travels with it must be the group's, not the empty
+    // userID a group receipt carries. (Asserted on the emitted expression, not
+    // on the field name, which also appears in the comment above it.)
+    EXPECT_NE(receipts.find("is_group ? group_id"), std::string::npos)
+        << "the conversation id must follow the conversation type";
+}
+
 TEST(ControlPathSourceRegressionTest,
      DeliveryReceiptCallbacksAreIsolatedAndPreserveReceiptSemantics) {
     const std::string manager = ReadSource(TIM2TOX_MANAGER_SOURCE_PATH);
@@ -374,14 +401,14 @@ TEST(ControlPathSourceRegressionTest,
             "int64_t id = (instance_id == 0) ? GetCurrentInstanceId() : instance_id;"),
         std::string::npos);
     EXPECT_NE(poll_text.find("IsInstanceInited(id)"), std::string::npos);
+    // The resolved id AND the session epoch are passed through: the epoch is
+    // what lets the listener drop records a previous session of the same
+    // instance id left queued.
     EXPECT_NE(
         poll_text.find(
-            "return G.simple_listener.poll_text(id, buffer, buffer_len);"),
+            "return G.simple_listener.poll_text(id, session_epoch, buffer, buffer_len);"),
         std::string::npos);
-    EXPECT_EQ(
-        poll_text.find(
-            "return G.simple_listener.poll_text(instance_id, buffer, buffer_len);"),
-        std::string::npos);
+    EXPECT_EQ(poll_text.find("poll_text(instance_id,"), std::string::npos);
 }
 
 TEST(ControlPathSourceRegressionTest,
@@ -389,13 +416,16 @@ TEST(ControlPathSourceRegressionTest,
     const std::string ffi_source = ReadSource(TIM2TOX_FFI_SOURCE_PATH);
     const std::string listener = SourceSection(
         ffi_source,
-        "int poll_text(int64_t instance_id, char* buf, int len) {",
+        "int poll_text(int64_t instance_id, int64_t session_epoch, char* buf, int len) {",
         "int poll_custom(int64_t instance_id, unsigned char* buf, int len) {");
 
     EXPECT_NE(listener.find("payload may legally contain newlines"),
               std::string::npos);
-    EXPECT_NE(listener.find("text_q_.pop();"), std::string::npos);
-    EXPECT_NE(listener.find("CopyPayloadOrReturnRequiredCapacity(s, buf, len)"),
+    // One record leaves the queue per dequeue. It is no longer a std::queue:
+    // events for other instances must keep their arrival order, so the match
+    // is removed by index instead of popped from the front.
+    EXPECT_NE(listener.find("remove_locked(i);"), std::string::npos);
+    EXPECT_NE(listener.find("CopyPayloadOrReturnRequiredCapacity(event.line, buf, len)"),
               std::string::npos);
     EXPECT_NE(listener.find("if (n < 0) return n;"), std::string::npos);
 }

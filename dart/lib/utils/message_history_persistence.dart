@@ -8,6 +8,8 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:math';
+import 'package:crypto/crypto.dart';
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 import '../interfaces/logger_service.dart';
@@ -35,6 +37,39 @@ class MessageHistoryPersistence {
   /// through [_getHistoryDirectory].
   String? _historyDirectory;
   final LoggerService? _logger;
+
+  /// Writes this store could not land, for a host that wants to TELL the user
+  /// rather than leave it in the log.
+  ///
+  /// Why this exists: every failure here used to end at `_logger.logError`, so a
+  /// device that cannot write history (full disk, a revoked sandbox path, an
+  /// unwritable account directory) looked exactly like one that had nothing to
+  /// save — the app kept accepting messages and quietly lost them on restart.
+  /// Nothing downstream consumed [HistoryFlushException] either. A broadcast
+  /// stream keeps the host optional: with no listener the events are dropped and
+  /// the log stays the fallback.
+  ///
+  /// [HistoryWriteFailure.willRetry] separates "this one attempt failed, a retry
+  /// is armed" from "we have given up on this conversation", which is the only
+  /// distinction a user-facing message can be built on.
+  /// Subscribe again after a [dispose] + [openSession] cycle (an account
+  /// switch): the sink is closed with the store and re-made here on demand, so
+  /// a subscription does not silently outlive the session it was taken in.
+  Stream<HistoryWriteFailure> get writeFailures {
+    if (_writeFailures.isClosed) {
+      _writeFailures =
+          StreamController<HistoryWriteFailure>.broadcast(sync: false);
+    }
+    return _writeFailures.stream;
+  }
+
+  StreamController<HistoryWriteFailure> _writeFailures =
+      StreamController<HistoryWriteFailure>.broadcast(sync: false);
+
+  void _reportWriteFailure(HistoryWriteFailure failure) {
+    if (_writeFailures.isClosed) return;
+    _writeFailures.add(failure);
+  }
 
   /// Replaces `getApplicationSupportDirectory()` as the parent of the default
   /// (non-injected) history directory. For tests and hosts without
@@ -383,6 +418,18 @@ class MessageHistoryPersistence {
       );
     }
     if (_historyDirectory != null && _historyDirectory!.isNotEmpty) return null;
+    // Adoption merges THE DIRECTORY THIS SESSION IS USING into the base and
+    // marks the base for [ownerKey]. If those are two different identities,
+    // that mixes one account's rows into the other's (codex 2026-09-26): the
+    // session's own directory is the only one it may hand over. A store with
+    // no owner yet is free to adopt on behalf of the identity it is told.
+    final sessionOwner = _ownerKey;
+    if (sessionOwner != null && sessionOwner != owner) {
+      throw StateError(
+        'adoptDefaultHistoryDirectory: this store is bound to another '
+        'identity; open a session for the adopting owner first',
+      );
+    }
     final basePath = await _defaultBasePath();
     final marker = File(p.join(basePath, _ownerMarkerName));
     final state = await _readOwnerMarker(marker);
@@ -411,9 +458,17 @@ class MessageHistoryPersistence {
 
     final from = (await _getHistoryDirectory()).path;
     await Directory(basePath).create(recursive: true);
-    if (p.canonicalize(from) != p.canonicalize(basePath)) {
-      await _mergeHistoryDirectory(
-          from: Directory(from), into: Directory(basePath));
+    if (p.canonicalize(from) != p.canonicalize(basePath) &&
+        !await _mergeHistoryDirectory(
+            from: Directory(from), into: Directory(basePath))) {
+      // The marker is NOT written: with rows still only in the isolated
+      // directory, claiming the base would leave them unreachable (this
+      // session keeps routing to the isolated directory, so nothing is lost —
+      // the caller can retry once the unreadable file is dealt with).
+      throw StateError(
+        'adoptDefaultHistoryDirectory: not every history file could be merged '
+        'into the default directory; nothing was adopted',
+      );
     }
     // Last: a crash before this leaves the rows merged into an unmarked
     // directory, which is exactly the state adoption started from — so
@@ -427,36 +482,183 @@ class MessageHistoryPersistence {
 
   /// Merge every history file of [from] into [into], then rename [from] aside.
   /// Nothing is deleted.
-  Future<void> _mergeHistoryDirectory({
+  /// Returns true when EVERY file of [from] was merged (and [from] was then
+  /// renamed aside). False when at least one file could not be read or
+  /// written: [from] is then left exactly where it is, unrenamed, so its rows
+  /// stay reachable and the next rebind / adoption merges them again. Renaming
+  /// it aside on a partial merge is what hid rows before (codex 2026-09-26).
+  Future<bool> _mergeHistoryDirectory({
     required Directory from,
     required Directory into,
   }) async {
-    if (!await from.exists()) return;
+    if (!await from.exists()) return true;
     var merged = 0;
+    var failed = 0;
+    final alreadyMerged = await _readMergedManifest(from, into);
     await for (final entity in from.list(followLinks: false)) {
       if (entity is! File) continue;
       final name = p.basename(entity.path);
-      if (name == _ownerMarkerName || name.endsWith('.tmp')) continue;
+      if (name == _ownerMarkerName ||
+          name == _mergedManifestName ||
+          name == _dirIdName ||
+          name.endsWith('.tmp') ||
+          name.contains('.corrupt-')) {
+        continue;
+      }
+      // Already transferred by an earlier, partially failed pass INTO THIS
+      // destination, and both sides unchanged since. Replaying it could copy
+      // back a row the user deleted in between; the file itself STAYS where it
+      // is, because this directory may still be the one the app reads
+      // (codex 2026-09-26). A source the session has written since is merged
+      // again -- the manifest records its size and mtime exactly so a filename
+      // cannot vouch for content that has moved on.
+      //
+      // The DESTINATION is checked too: it may have been deleted or replaced
+      // since, and skipping on the source's word alone then retired a source
+      // whose rows were no longer anywhere (codex 2026-09-28).
+      final prior = alreadyMerged[name];
       final dest = File(p.join(into.path, name));
+      if (await _isUnchangedSinceTransfer(entity, prior) &&
+          await _destinationStillHoldsTransfer(dest, prior)) {
+        continue;
+      }
       try {
-        if (!await dest.exists()) {
-          await entity.copy(dest.path);
+        var transferred = true;
+        final before = await _transferStampOf(entity);
+        final destExisted = await dest.exists();
+        // Is the destination file NOTHING BUT this merge's own earlier copy?
+        // That is the question a filename cannot answer, and not answering it
+        // was the residue: a changed source had to be UNIONED with the
+        // destination, because the destination might have gained rows of its
+        // own (a rebind that could not rename the source aside leaves both
+        // live) and losing those is worse. Union, though, resurrects a row
+        // deleted between the two attempts -- it is still in the copy attempt
+        // one left behind. The in-memory tombstones cover that only while the
+        // process lives; across a restart the deletion exists solely as a row
+        // missing from the source, and the merge put it back.
+        //
+        // So the manifest records WHO wrote the destination file (`created`)
+        // and a DIGEST of the bytes we left in it. When both say the
+        // destination is exactly our own copy, untouched since, the source may
+        // REPLACE its rows: nothing of the destination's own can be lost,
+        // because it has none. Anything else keeps the conservative union.
+        //
+        // A digest and not size+mtime: mtime has millisecond resolution here, so
+        // a same-size write in the same millisecond passed, and the next merge
+        // then dropped that writer's rows (codex 2026-09-28). The digest is of
+        // what we WROTE, never of what we read back afterwards -- reading back
+        // would certify another writer's bytes as our own.
+        //
+        // TWO LIMITS, both accepted on purpose (codex 2026-09-28):
+        //   * the check and the replacement are not atomic. A writer that adds
+        //     a row between them loses it. Adoption is a single-process,
+        //     user-initiated flow and this session is the only writer, so the
+        //     guarantee comes from the caller, not from a lock here.
+        //   * a session that keeps writing during EVERY attempt can keep
+        //     adoption from finishing, because each attempt then counts a
+        //     changed file as failed. That is recoverable (the next quiet moment
+        //     succeeds) and it is the safe direction: the alternative retired a
+        //     directory whose newest rows were only inside it.
+        final destIsOurCopy = prior != null &&
+            prior['created'] == true &&
+            (!destExisted || await _destinationStillHoldsTransfer(dest, prior));
+        var destRowsAreOurs = destIsOurCopy;
+        String? destDigest;
+        if (!destExisted) {
+          destDigest = await _copyOntoDestination(entity, dest);
+          destRowsAreOurs = true;
         } else if (name.endsWith('.archive.jsonl')) {
-          await _appendArchiveLines(entity, dest);
+          if (destIsOurCopy) {
+            // Nothing but our own earlier copy, so the source is simply the
+            // newer version of it. Replacing carries a REWRITE as well as
+            // growth: `removeArchivedMessages` rewrites the file, and an
+            // append-only merge would have kept the removed lines.
+            destDigest = await _copyOntoDestination(entity, dest);
+          } else {
+            // A destination with lines of its own can only be appended to, and
+            // only with the lines it does not already have. See
+            // [_appendMissingArchiveLines] for why neither "append it all" nor
+            // "append what it grew by" is safe.
+            // The digest it returns is computed from what it read and wrote,
+            // so no read-back is needed here either.
+            destDigest = await _appendMissingArchiveLines(entity, dest);
+          }
         } else if (name.endsWith('.json')) {
-          await _mergeHistoryFiles(entity, dest);
+          final result = await _mergeHistoryFiles(entity, dest,
+              destRowsAreOurs: destIsOurCopy);
+          if (!result.ok) {
+            failed++;
+            continue;
+          }
+          destRowsAreOurs = result.destHoldsOnlyOurs;
+          // Null when it decided the destination did not need rewriting, in
+          // which case the digest recorded for it still describes it.
+          destDigest = result.destDigest ?? _stringOrNull(prior?['destDigest']);
+        } else {
+          // A `.json.bak` whose destination already exists adds nothing: the
+          // destination's own backup is the newer safety net.
+          transferred = false;
         }
-        // A `.json.bak` whose destination already exists adds nothing: the
-        // destination's own backup is the newer safety net.
         merged++;
+        // Record it as transferred as soon as its rows are in the destination,
+        // so a retry after a LATER file fails does not merge it twice. The
+        // manifest is rewritten atomically per file; a crash between the write
+        // and the manifest costs one replayed file, whose rows dedupe by
+        // identity.
+        //
+        // The stamp is the one taken BEFORE the transfer, and only when the file
+        // still matches it afterwards: stamping after the read would certify
+        // bytes that were never transferred if the session wrote to the source
+        // meanwhile (codex 2026-09-26).
+        final after = await _transferStampOf(entity);
+        if (!_stampsMatch(before, after)) {
+          // NOT just a warning: the file is counted as FAILED, so the source
+          // directory is left in place and merged again. Warning alone let the
+          // directory be retired with those newly written rows only inside it
+          // (codex 2026-09-28).
+          failed++;
+          merged--;
+          _logger?.logWarning(
+            '[MessageHistoryPersistence] $name changed while it was being '
+            'merged; it is not recorded as transferred and the source '
+            'directory is kept so a later merge retries it',
+          );
+        } else if (transferred) {
+          alreadyMerged[name] = <String, Object?>{
+            ...before,
+            // Once a foreign destination has been merged into, this can never
+            // become true again: the two sides' rows are mixed and nothing can
+            // unmix them.
+            'created': destRowsAreOurs,
+            if (destDigest != null) 'destDigest': destDigest,
+          };
+          await _writeMergedManifest(from, into, alreadyMerged);
+        }
       } catch (e, st) {
+        failed++;
         _logger?.logError(
             '[MessageHistoryPersistence] adopting $name failed', e, st);
       }
     }
+    if (failed > 0) {
+      _logger?.logWarning(
+        '[MessageHistoryPersistence] $failed of ${merged + failed} file(s) '
+        'could not be merged out of ${from.path}; it is left in place '
+        '(unrenamed) so those rows stay reachable and a later merge retries '
+        'them',
+      );
+      _reportWriteFailure(HistoryWriteFailure(
+        conversationId: p.basename(from.path),
+        stage: HistoryWriteStage.merge,
+        error: StateError('$failed of ${merged + failed} file(s) unmerged'),
+        // The source is left in place on purpose, so the next merge retries.
+        willRetry: true,
+      ));
+      return false;
+    }
     // Nothing was there (a directory that only ever held its own marker):
     // leave it alone rather than scatter empty `.adopted` directories.
-    if (merged == 0) return;
+    if (merged == 0) return true;
     var aside = '${from.path}.adopted';
     if (await Directory(aside).exists() || await File(aside).exists()) {
       aside = '${from.path}.adopted-${DateTime.now().millisecondsSinceEpoch}';
@@ -472,6 +674,246 @@ class MessageHistoryPersistence {
       _logger?.logError(
           '[MessageHistoryPersistence] rename aside failed', e, st);
     }
+    return true;
+  }
+
+  /// Names the files of a source directory whose rows are already in the
+  /// destination, so a merge that resumes after a partial failure does not
+  /// transfer them twice.
+  ///
+  /// A MANIFEST rather than renaming the files: the source directory may still
+  /// be the one this session reads (an aborted adoption leaves it bound), and
+  /// renaming its history files aside hid them (codex 2026-09-26).
+  static const String _mergedManifestName = '.tim2tox_merged';
+
+  /// `{into: <canonical destination>, files: {name: {size, mtimeMs}}}`. The
+  /// destination is part of it because a manifest written while merging into
+  /// account B says nothing about a later merge into account C, and skipping
+  /// files on its word left C without those rows (codex 2026-09-26).
+  /// Identifies the destination DIRECTORY, not its path: a directory renamed
+  /// aside and recreated at the same path is a different destination, and
+  /// honouring a manifest written for the old one activated the new one without
+  /// the skipped files (codex 2026-09-26). Created on first use.
+  static const String _dirIdName = '.tim2tox_dir_id';
+
+  Future<String?> _directoryId(Directory dir, {required bool create}) async {
+    final file = File(p.join(dir.path, _dirIdName));
+    try {
+      if (await file.exists()) {
+        final value = (await file.readAsString()).trim();
+        if (value.isNotEmpty) return value;
+      }
+      if (!create) return null;
+      final value = '${DateTime.now().microsecondsSinceEpoch}'
+          '-${Random().nextInt(1 << 32).toRadixString(16)}';
+      final temp = File('${file.path}.tmp');
+      final raf = await temp.open(mode: FileMode.write);
+      try {
+        await raf.writeString(value);
+        await raf.flush();
+      } finally {
+        await raf.close();
+      }
+      await _renameWithRetry(temp, file.path);
+      return value;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  Future<Map<String, Map<String, Object?>>> _readMergedManifest(
+      Directory from, Directory into) async {
+    final file = File(p.join(from.path, _mergedManifestName));
+    try {
+      if (!await file.exists()) return {};
+      final decoded = jsonDecode(await file.readAsString());
+      if (decoded is! Map<String, dynamic>) return {};
+      final recordedInto = decoded['into'];
+      if (recordedInto is! String ||
+          p.canonicalize(recordedInto) != p.canonicalize(into.path)) {
+        return {};
+      }
+      // Same path, different directory: nothing recorded applies.
+      final recordedId = decoded['intoId'];
+      final currentId = await _directoryId(into, create: false);
+      if (recordedId is! String || currentId == null || recordedId != currentId) {
+        return {};
+      }
+      final files = decoded['files'];
+      if (files is! Map<String, dynamic>) return {};
+      final out = <String, Map<String, Object?>>{};
+      for (final entry in files.entries) {
+        final value = entry.value;
+        if (value is Map<String, dynamic>) out[entry.key] = value;
+      }
+      return out;
+    } catch (_) {
+      // An unreadable manifest only costs a replay, which dedupes.
+      return {};
+    }
+  }
+
+  String? _stringOrNull(Object? value) =>
+      value is String && value.isNotEmpty ? value : null;
+
+  /// Hex sha256 of [bytes]. Used to recognise a file as the one this merge
+  /// wrote or read, which size and a millisecond mtime cannot do: two different
+  /// writes of the same length inside one millisecond are indistinguishable to
+  /// them, and an mtime can be restored outright (codex 2026-09-28).
+  String _digestOfBytes(List<int> bytes) => sha256.convert(bytes).toString();
+
+  /// Hex sha256 of a stream, hashed incrementally so a large archive is never
+  /// held in memory (codex 2026-09-28).
+  Future<String> _digestOfStream(Stream<List<int>> chunks) async {
+    final collector = _DigestCollector();
+    final hasher = sha256.startChunkedConversion(collector);
+    await for (final chunk in chunks) {
+      hasher.add(chunk);
+    }
+    hasher.close();
+    return collector.value.toString();
+  }
+
+  Future<String?> _digestOfFile(File file) async {
+    try {
+      return await _digestOfStream(file.openRead());
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// Whether [dest] still holds what an earlier pass recorded in [prior].
+  ///
+  /// False when it has gone, or when its bytes are no longer the ones that pass
+  /// left: skipping a source because IT had not changed, without looking at the
+  /// destination, retired a source whose rows were no longer in either place
+  /// (codex 2026-09-28). The digest is checked for a destination this merge
+  /// merged INTO as well as one it created — there a mismatch does not mean
+  /// "not ours", only "cannot vouch for it any more", and the answer to that is
+  /// the same: merge it again, which is always safe.
+  Future<bool> _destinationStillHoldsTransfer(
+      File dest, Map<String, Object?>? prior) async {
+    if (prior == null) return false;
+    if (!await dest.exists()) return false;
+    final digest = _stringOrNull(prior['destDigest']);
+    // No digest on record -- an older manifest, or a pass whose digest could not
+    // be computed -- says nothing about this file, and "says nothing" must read
+    // as "merge it again" rather than as "still fine" (codex 2026-09-28).
+    if (digest == null) return false;
+    return await _digestOfFile(dest) == digest;
+  }
+
+  /// Copy [from] onto [dest] atomically and return the digest of what was
+  /// written.
+  ///
+  /// Each chunk is awaited into a [RandomAccessFile] rather than queued on an
+  /// [IOSink]: `add` returns immediately and buffers, so a slow destination let
+  /// the queue grow with the file and the "streamed, so memory is bounded"
+  /// claim was not true (codex 2026-09-28).
+  ///
+  /// The digest is of what was WRITTEN, not of a read-back: a read-back would
+  /// hash whatever another writer had put there in the meantime and record it as
+  /// this merge's own, which is the provenance the replace path relies on.
+  Future<String> _copyOntoDestination(File from, File dest) async {
+    final temp = File('${dest.path}.tmp');
+    final raf = await temp.open(mode: FileMode.write);
+    final collector = _DigestCollector();
+    final hasher = sha256.startChunkedConversion(collector);
+    try {
+      await for (final chunk in from.openRead()) {
+        await raf.writeFrom(chunk);
+        hasher.add(chunk);
+      }
+      hasher.close();
+      await raf.flush();
+    } finally {
+      await raf.close();
+    }
+    await _renameWithRetry(temp, dest.path);
+    return collector.value.toString();
+  }
+
+  /// Identifies a SOURCE file for the manifest: a digest, plus size and mtime
+  /// for a human reading the manifest.
+  ///
+  /// ONLY the digest decides anything. Size and a millisecond mtime certified a
+  /// file that had been rewritten to the same length inside that millisecond --
+  /// or one whose mtime was simply restored -- and the source directory was then
+  /// retired with rows that had never been transferred (codex 2026-09-28).
+  Future<Map<String, Object?>> _transferStampOf(File file) async {
+    try {
+      final stat = await file.stat();
+      final digest = await _digestOfFile(file);
+      return <String, Object?>{
+        'size': stat.size,
+        'mtimeMs': stat.modified.millisecondsSinceEpoch,
+        if (digest != null) 'digest': digest,
+      };
+    } catch (_) {
+      return <String, Object?>{};
+    }
+  }
+
+  /// Whether two stamps describe the same bytes.
+  ///
+  /// A stamp with NO digest never matches. That is the conservative direction:
+  /// a digest can be missing because the file could not be read, or because an
+  /// older build wrote the manifest, and falling back to size and mtime there
+  /// reinstated exactly the aliasing this replaced (codex 2026-09-28). The cost
+  /// of saying "no" is one more merge, whose rows dedupe by identity; the cost
+  /// of a wrong "yes" is a retired directory whose rows are nowhere.
+  bool _stampsMatch(Map<String, Object?> a, Map<String, Object?> b) {
+    final da = _stringOrNull(a['digest']);
+    return da != null && da == _stringOrNull(b['digest']);
+  }
+
+  /// Whether [file] is byte-for-byte the file a previous pass transferred. A
+  /// stamp that is missing, empty or digest-less means "not established", i.e.
+  /// merge it again.
+  Future<bool> _isUnchangedSinceTransfer(
+      File file, Map<String, Object?>? stamp) async {
+    if (stamp == null) return false;
+    final recorded = _stringOrNull(stamp['digest']);
+    if (recorded == null) return false;
+    return await _digestOfFile(file) == recorded;
+  }
+
+  Future<void> _writeMergedManifest(Directory from, Directory into,
+      Map<String, Map<String, Object?>> files) async {
+    final target = p.join(from.path, _mergedManifestName);
+    final temp = File('$target.tmp');
+    try {
+      final intoId = await _directoryId(into, create: true);
+      if (intoId == null) {
+        // Without it the reader cannot tell this destination from a replacement
+        // at the same path, so it would ignore the manifest anyway. Not writing
+        // one keeps the conservative behaviour (replay, which dedupes) instead
+        // of leaving a file that looks authoritative (codex 2026-09-26).
+        _logger?.logWarning(
+          '[MessageHistoryPersistence] could not identify ${into.path}; no '
+          'merged-file manifest is kept, so a resumed merge re-merges',
+        );
+        return;
+      }
+      final raf = await temp.open(mode: FileMode.write);
+      try {
+        await raf.writeString(jsonEncode(<String, Object?>{
+          'into': into.path,
+          'intoId': intoId,
+          'files': files,
+        }));
+        await raf.flush();
+      } finally {
+        await raf.close();
+      }
+      await _renameWithRetry(temp, target);
+    } catch (e, st) {
+      _logger?.logError(
+          '[MessageHistoryPersistence] recording the merged-file manifest in '
+          '${from.path} failed; those files may be merged again',
+          e,
+          st);
+    }
   }
 
   /// Row-level merge of one conversation file into another.
@@ -480,7 +922,40 @@ class MessageHistoryPersistence {
   /// so a message present in both files stays ONE row and keeps every id
   /// either copy carried. Stored `filePath` values round-trip verbatim: both
   /// files were written by this device, so no placeholder rewriting applies.
-  Future<void> _mergeHistoryFiles(File from, File into) async {
+  /// `ok` is false when neither side could be decoded — the caller must then
+  /// leave the source file where it is.
+  ///
+  /// [destRowsAreOurs] says the destination file holds nothing but this merge's
+  /// own earlier copy of [from] (the caller establishes that from the manifest,
+  /// not from the file name). Its rows are then DROPPED rather than unioned in,
+  /// so a row deleted from the source between two attempts stays deleted
+  /// instead of coming back from the copy attempt one left behind. It is only
+  /// ever true when the destination has nothing of its own to lose; the read
+  /// barrier is still taken from both sides.
+  ///
+  /// `destHoldsOnlyOurs` reports whether that was still true when the write
+  /// happened, which is what the caller records in the manifest. It is NOT the
+  /// same as the argument: the recovery path below rebuilds the destination out
+  /// of its own backup, and those rows were never ours to drop — recording them
+  /// as ours would let a third attempt drop them.
+  ///
+  /// `destDigest` is the digest of the bytes written to [into], for the caller
+  /// to record, or null when nothing was written (the digest already on record
+  /// then still describes the file). It is computed from what was written and
+  /// never from a read-back, which would hash another writer's bytes and
+  /// certify them as this merge's own.
+  Future<({bool ok, bool destHoldsOnlyOurs, String? destDigest})>
+      _mergeHistoryFiles(File from, File into,
+          {bool destRowsAreOurs = false}) async {
+    // Rows this session has deleted must not come back through the merge: the
+    // destination copy made by an earlier, partially failed pass still holds
+    // them, and dedupe would keep it (codex 2026-09-26).
+    final conversationKey =
+        ConversationIdUtils.normalize(p.basenameWithoutExtension(into.path));
+    final tombstones = _recentlyDeleted[conversationKey];
+    bool isTombstoned(ChatMessage m) =>
+        tombstones != null &&
+        identitiesOf(m).any((id) => tombstones.containsKey(id));
     List<ChatMessage> rowsOf(dynamic decoded) {
       final raw = decoded is Map<String, dynamic> ? decoded['messages'] : decoded;
       if (raw is! List) return const <ChatMessage>[];
@@ -495,78 +970,211 @@ class MessageHistoryPersistence {
       return out;
     }
 
-    dynamic decodedInto;
-    List<ChatMessage> target;
+    var mustWrite = false;
+    // Defeasible: the recovery path below rebuilds the destination out of its
+    // own backup, whose rows this merge never transferred, so they may not be
+    // dropped however sure the manifest was about the primary.
+    var dropDestRows = destRowsAreOurs;
+    dynamic decodedFrom;
     List<ChatMessage> source;
     try {
-      decodedInto = jsonDecode(await into.readAsString());
-      target = rowsOf(decodedInto);
-      source = rowsOf(jsonDecode(await from.readAsString()));
+      decodedFrom = jsonDecode(await from.readAsString());
+      source = rowsOf(decodedFrom);
     } catch (e, st) {
-      // Leave the destination exactly as it is: a merge that cannot read both
-      // sides must not rewrite either.
+      // Nothing can be done with a source we cannot read. It stays where it is
+      // (the caller does not retire it and does not rename the directory
+      // aside), so it remains recoverable.
       _logger?.logError(
-        '[MessageHistoryPersistence] merging ${p.basename(from.path)} into the '
-        'adopted directory failed; the destination is unchanged',
+        '[MessageHistoryPersistence] reading ${p.basename(from.path)} to merge '
+        'it failed; it is left in place',
         e,
         st,
       );
-      return;
+      return (ok: false, destHoldsOnlyOurs: false, destDigest: null);
     }
-    if (source.isEmpty) return;
 
-    final merged = _dedupeByIdentity(<ChatMessage>[...target, ...source]);
+    dynamic decodedInto;
+    List<ChatMessage> target;
+    try {
+      decodedInto = jsonDecode(await into.readAsString());
+      target = rowsOf(decodedInto);
+    } catch (e, st) {
+      // A DESTINATION we cannot decode must not make readable source rows
+      // unreachable (codex 2026-09-26): it is renamed aside — never deleted —
+      // and its own BACKUP is consulted first, because that backup is where
+      // its rows and its read barrier still are (a plain replacement then let
+      // the next save overwrite the backup and lose them).
+      final aside = '${into.path}.corrupt-'
+          '${DateTime.now().millisecondsSinceEpoch}';
+      _logger?.logError(
+        '[MessageHistoryPersistence] the destination ${p.basename(into.path)} '
+        'could not be decoded; it is moved to ${p.basename(aside)} and its '
+        'backup, if any, is merged with the incoming file',
+        e,
+        st,
+      );
+      try {
+        final backup = File('${into.path}.bak');
+        dynamic decodedBackup;
+        if (await backup.exists()) {
+          try {
+            decodedBackup = jsonDecode(await backup.readAsString());
+          } catch (_) {
+            decodedBackup = null;
+          }
+        }
+        await into.rename(aside);
+        if (decodedBackup == null) {
+          // Nothing recoverable: the source file takes the slot, atomically.
+          // The slot becomes exactly the source, so it IS only ours.
+          final digest = await _copyOntoDestination(from, into);
+          return (ok: true, destHoldsOnlyOurs: true, destDigest: digest);
+        }
+        decodedInto = decodedBackup;
+        target = rowsOf(decodedBackup);
+        dropDestRows = false;
+        // The primary is GONE now, so the write below is no longer optional:
+        // returning early would leave the conversation with no main file at all
+        // (codex 2026-09-26).
+        mustWrite = true;
+      } catch (e2, st2) {
+        _logger?.logError(
+            '[MessageHistoryPersistence] replacing the undecodable '
+            '${p.basename(into.path)} failed', e2, st2);
+        return (ok: false, destHoldsOnlyOurs: false, destDigest: null);
+      }
+    }
+    final merged = List<ChatMessage>.from(_dedupeByIdentity(<ChatMessage>[
+      if (!dropDestRows) ...target,
+      ...source,
+    ]))
+      ..removeWhere(isTombstoned);
     sortChatMessagesChronologically(merged);
     final conversationId = (decodedInto is Map<String, dynamic>
             ? decodedInto['conversationId'] as String?
             : null) ??
         ConversationIdUtils.normalize(p.basenameWithoutExtension(into.path));
-    final lastView = (decodedInto is Map<String, dynamic>
-            ? decodedInto['lastViewTimestamp'] as int?
-            : null) ??
-        0;
+    // The LATER of the two read barriers: the same conversation may have been
+    // read more recently through the source directory, and keeping only the
+    // destination's value re-marked already-read messages unread
+    // (codex 2026-09-26).
+    int? readBarrierOf(dynamic decoded) =>
+        decoded is Map<String, dynamic> ? decoded['lastViewTimestamp'] as int? : null;
+    final intoBarrier = readBarrierOf(decodedInto) ?? 0;
+    final fromBarrier = readBarrierOf(decodedFrom) ?? 0;
+    final lastView = intoBarrier > fromBarrier ? intoBarrier : fromBarrier;
+    // Nothing to carry: a source with no rows and no later read barrier does not
+    // justify rewriting the destination. (The barrier alone does: skipping it
+    // here left already-read messages unread, codex 2026-09-26.) `mustWrite`
+    // wins: the primary may already have been moved aside.
+    // Dropping the destination's rows is itself the change to write, even when
+    // the source has nothing left to carry: an emptied source means the user
+    // deleted the last row, and returning here would leave our own earlier copy
+    // of it standing.
+    final replacingOurOwnCopy = dropDestRows && target.isNotEmpty;
+    if (!mustWrite &&
+        !replacingOurOwnCopy &&
+        source.isEmpty &&
+        fromBarrier <= intoBarrier) {
+      // Nothing written, so the caller keeps whatever digest is on record.
+      return (ok: true, destHoldsOnlyOurs: dropDestRows, destDigest: null);
+    }
     final jsonString = jsonEncode({
       'conversationId': conversationId,
       'version': _historyFormatVersion,
       'lastViewTimestamp': lastView,
       'messages': merged.map((m) => m.toJson()).toList(),
     });
+    final bytes = utf8.encode(jsonString);
     final temp = File('${into.path}.tmp');
     final raf = await temp.open(mode: FileMode.write);
     try {
-      await raf.writeString(jsonString);
+      await raf.writeFrom(bytes);
       await raf.flush();
     } finally {
       await raf.close();
     }
     await _renameWithRetry(temp, into.path);
+    return (
+      ok: true,
+      destHoldsOnlyOurs: dropDestRows,
+      destDigest: _digestOfBytes(bytes),
+    );
   }
 
-  /// Append one archive file's lines to another's. Append-only by
-  /// construction, so concatenation is the merge.
-  Future<void> _appendArchiveLines(File from, File into) async {
-    final lines = await from.readAsString();
-    if (lines.trim().isEmpty) return;
-    var needsNewline = false;
-    final destLength = await into.length();
-    if (destLength > 0) {
-      final probe = await into.open();
-      try {
-        await probe.setPosition(destLength - 1);
-        final last = await probe.read(1);
-        needsNewline = last.isNotEmpty && last[0] != 0x0A;
-      } finally {
-        await probe.close();
-      }
+  /// Append the lines of [from] that [into] does not already have, and return
+  /// the digest [into] then holds.
+  ///
+  /// Archives are append-only in normal operation, so the first merge of one
+  /// into a destination that already has lines is a concatenation. A RETRY is
+  /// not, and neither obvious rule is safe:
+  ///
+  ///   * appending the whole file again duplicates every line the first pass
+  ///     contributed;
+  ///   * appending only what the file GREW by transfers nothing at all when
+  ///     `removeArchivedMessages` has rewritten it to the same byte length,
+  ///     and cannot know whether the bytes before that offset are still the
+  ///     ones that were transferred (codex 2026-09-28).
+  ///
+  /// Comparing lines needs no bookkeeping and is right for growth, rewrite and
+  /// equal-length rewrite alike. Two identical lines ARE the same archived row,
+  /// so collapsing them is what loading the archive would do anyway.
+  ///
+  /// Both files are streamed and only a DIGEST per destination line is held, so
+  /// an archive that has grown far past the main file's window does not have to
+  /// fit in memory twice. The returned digest is computed from the bytes READ
+  /// and then the bytes WRITTEN, so it describes what this pass put there --
+  /// not a read-back, which would certify a concurrent writer's bytes as this
+  /// pass's own result (codex 2026-09-28).
+  ///
+  /// A side that is not valid UTF-8 throws, and the caller counts that as a
+  /// failed file, which is better than silently transferring replacement
+  /// characters.
+  Future<String> _appendMissingArchiveLines(File from, File into) async {
+    final collector = _DigestCollector();
+    final hasher = sha256.startChunkedConversion(collector);
+    final seen = <String>{};
+    var lastByte = -1;
+
+    await for (final line in into
+        .openRead()
+        .map((chunk) {
+          hasher.add(chunk);
+          if (chunk.isNotEmpty) lastByte = chunk.last;
+          return chunk;
+        })
+        .transform(utf8.decoder)
+        .transform(const LineSplitter())) {
+      if (line.trim().isEmpty) continue;
+      seen.add(_digestOfBytes(utf8.encode(line)));
     }
-    final sink = into.openWrite(mode: FileMode.append);
+    // A destination whose last line was never terminated must not have the first
+    // appended line run into it.
+    var pending = lastByte >= 0 && lastByte != 0x0A ? '\n' : '';
+
+    RandomAccessFile? raf;
     try {
-      if (needsNewline) sink.write('\n');
-      sink.write(lines.endsWith('\n') ? lines : '$lines\n');
-      await sink.flush();
+      await for (final line in from
+          .openRead()
+          .transform(utf8.decoder)
+          .transform(const LineSplitter())) {
+        if (line.trim().isEmpty) continue;
+        // Added as we go, so a line the SOURCE repeats is not appended twice.
+        if (!seen.add(_digestOfBytes(utf8.encode(line)))) continue;
+        raf ??= await into.open(mode: FileMode.append);
+        final bytes = utf8.encode('$pending$line\n');
+        pending = '';
+        // Awaited per chunk rather than queued on an IOSink, so memory stays
+        // bounded however large the archive is (codex 2026-09-28).
+        await raf.writeFrom(bytes);
+        hasher.add(bytes);
+      }
+      await raf?.flush();
     } finally {
-      await sink.close();
+      await raf?.close();
     }
+    hasher.close();
+    return collector.value.toString();
   }
 
   /// Start (or restart) a session on this store.
@@ -620,33 +1228,258 @@ class MessageHistoryPersistence {
     _resetSessionState();
     _ownerKey = nextOwner;
     _forgetResolvedDefaultDirectory();
+    _restoreHeldRows(nextOwner);
+  }
+
+  /// Rows an owner change could not write to the OUTGOING owner's directory,
+  /// held until that identity comes back.
+  ///
+  /// They must not be carried into the next session (they would be written
+  /// into another account's files), and dropping them loses a message the user
+  /// sent — a full disk or one unwritable conversation during an account
+  /// switch was enough (codex 2026-09-26). So they stay here, keyed by the
+  /// owner they belong to, and [_applyNewOwner] puts them back when that owner
+  /// is opened again — including the common `null -> owner -> null` shape.
+  ///
+  /// In-memory only, and bounded: an app that never returns to that identity
+  /// loses them at exit exactly as before.
+  final Map<String?, _HeldRows> _heldRowsByOwner = {};
+  static const int _maxHeldOwners = 8;
+
+  /// Hold what [flushPendingSaves] could not land for [owner].
+  void _holdUnflushedRows(String? owner, Iterable<String> conversationIds) {
+    if (owner == null) {
+      // An OWNERLESS session's rows cannot be held: `null` names no identity,
+      // so restoring them on the next ownerless session would serve one
+      // account's unwritten messages to the next account that logs in through
+      // the same pre-identity window (codex 2026-09-26). They stay lost, which
+      // is what the log says.
+      _logger?.logWarning(
+        '[MessageHistoryPersistence] the outgoing session had no identity, so '
+        'its unwritten rows cannot be attributed and are dropped',
+      );
+      return;
+    }
+    final rows = <String, List<ChatMessage>>{};
+    final lastView = <String, int>{};
+    final deleted = <String, Map<String, int>>{};
+    for (final id in conversationIds) {
+      final cached = _historyById[id];
+      if (cached != null && cached.isNotEmpty) {
+        rows[id] = List<ChatMessage>.from(cached);
+      }
+      final seen = _lastViewTimestampById[id];
+      if (seen != null) lastView[id] = seen;
+      // The tombstones of the SAME conversation: a delete whose write failed is
+      // undone by the next load merging the disk row back in, and dropping the
+      // sole row of a conversation leaves nothing else to hold (codex
+      // 2026-09-26).
+      final tombstones = _recentlyDeleted[id];
+      if (tombstones != null && tombstones.isNotEmpty) {
+        deleted[id] = Map<String, int>.from(tombstones);
+      }
+    }
+    if (rows.isEmpty && lastView.isEmpty && deleted.isEmpty) return;
+    final existing = _heldRowsByOwner.remove(owner);
+    if (existing != null) {
+      // Merge, so a second failed switch does not discard the first one's rows.
+      for (final entry in existing.rows.entries) {
+        rows.putIfAbsent(entry.key, () => entry.value);
+      }
+      for (final entry in existing.lastView.entries) {
+        lastView.putIfAbsent(entry.key, () => entry.value);
+      }
+      for (final entry in existing.deleted.entries) {
+        deleted.putIfAbsent(entry.key, () => entry.value);
+      }
+    }
+    _heldRowsByOwner[owner] =
+        _HeldRows(rows: rows, lastView: lastView, deleted: deleted);
+    while (_heldRowsByOwner.length > _maxHeldOwners) {
+      final oldest = _heldRowsByOwner.keys.first;
+      _heldRowsByOwner.remove(oldest);
+      _logger?.logWarning(
+        '[MessageHistoryPersistence] more than $_maxHeldOwners '
+        'identities hold unwritten rows; the oldest one\'s are dropped',
+      );
+    }
+    _logger?.logWarning(
+      '[MessageHistoryPersistence] ${rows.length} conversation(s) could not be '
+      'written to the outgoing session\'s directory; they are held in memory '
+      'and re-written if that identity is opened again',
+    );
+    for (final id in rows.keys) {
+      _reportWriteFailure(HistoryWriteFailure(
+        conversationId: id,
+        stage: HistoryWriteStage.heldForOwner,
+        error: StateError('held for the outgoing identity'),
+        // Held, not abandoned: reopening that identity re-writes them.
+        willRetry: true,
+      ));
+    }
+  }
+
+  /// Conversations whose only copy of some rows is [_heldRowsByOwner]'s, for
+  /// the owner this session is bound to. They are in the cache (the restore put
+  /// them there) but not necessarily on disk yet, so a listing built purely
+  /// from files would miss them.
+  Iterable<String> get _restoredConversationIds => _restoredForThisOwner;
+  final Set<String> _restoredForThisOwner = {};
+
+  /// Conversations whose restored TOMBSTONES still have to be applied to the
+  /// file. Drained by [flushPendingSaves] (and therefore by [dispose]) through
+  /// a load-then-save under the conversation lock, so the deletion becomes
+  /// durable without a blind write.
+  final Set<String> _tombstoneReconcile = {};
+
+  /// Whether every row [file] holds is named by [normalizedId]'s tombstones —
+  /// i.e. writing an empty list over it deletes nothing that should survive.
+  /// False when the file cannot be read or decoded, which is the case an empty
+  /// write must never be authorised from.
+  Future<bool> _holdsOnlyTombstonedRows(File file, String normalizedId) async {
+    final tombstones = _recentlyDeleted[normalizedId];
+    if (tombstones == null || tombstones.isEmpty) return false;
+    try {
+      final decoded = jsonDecode(await file.readAsString());
+      final raw = decoded is Map<String, dynamic> ? decoded['messages'] : decoded;
+      if (raw is! List) return false;
+      for (final row in raw) {
+        if (row is! Map<String, dynamic>) return false;
+        final ChatMessage message;
+        try {
+          message = ChatMessage.fromJson(row);
+        } catch (_) {
+          return false;
+        }
+        if (!identitiesOf(message).any(tombstones.containsKey)) return false;
+      }
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  Future<void> _drainTombstoneReconcile() async {
+    if (_tombstoneReconcile.isEmpty) return;
+    // Each id leaves the queue only once its write has landed: clearing the set
+    // upfront let a flush report success for a deletion that never reached the
+    // file, and dispose then dropped the tombstone with it (codex 2026-09-26).
+    for (final id in _tombstoneReconcile.toList(growable: false)) {
+      try {
+        // The load filters what [_recentlyDeleted] names, so what it installs is
+        // already the post-delete state. The CACHE is what gets saved, not the
+        // returned list: an ordinary save may have added a row between the two
+        // operations, and that row must not be written away.
+        await loadHistory(id);
+        final normalizedId = ConversationIdUtils.normalize(id);
+        var rows = _historyById[normalizedId];
+        if (rows == null) {
+          // The load installed nothing. That is the right state for a
+          // conversation whose every row was deleted, but a READ FAILURE looks
+          // exactly the same from here, and creating an empty entry would let
+          // saveHistory delete a file that still has rows (codex 2026-09-26).
+          // So the file decides.
+          final file = await _getHistoryFile(normalizedId);
+          if (!await file.exists()) {
+            // Nothing on disk: the deletion is already effective.
+            _tombstoneReconcile.remove(id);
+            continue;
+          }
+          if (!await _holdsOnlyTombstonedRows(file, normalizedId)) {
+            _logger?.logWarning(
+              '[MessageHistoryPersistence] a restored deletion for $id could '
+              'not be applied (the file could not be read as deleted-only); it '
+              'stays queued',
+            );
+            continue;
+          }
+          rows = _historyById.putIfAbsent(normalizedId, () => <ChatMessage>[]);
+        }
+        await saveHistory(normalizedId, rows);
+        _tombstoneReconcile.remove(id);
+      } catch (e, st) {
+        _logger?.logError(
+            '[MessageHistoryPersistence] applying a restored deletion for $id '
+            'failed; it stays queued',
+            e,
+            st);
+      }
+    }
+  }
+
+  /// Put back what a previous failed hand-over held for [owner], and re-arm
+  /// the write so the next flush (or dispose) tries again.
+  void _restoreHeldRows(String? owner) {
+    if (owner == null) return;
+    final held = _heldRowsByOwner.remove(owner);
+    if (held == null) return;
+    // Before the rows: a tombstone must be in place when the next load of that
+    // conversation merges the file, or the delete is undone.
+    for (final entry in held.deleted.entries) {
+      final into = _recentlyDeleted.putIfAbsent(entry.key, () => <String, int>{});
+      for (final tombstone in entry.value.entries) {
+        into.putIfAbsent(tombstone.key, () => tombstone.value);
+      }
+      // NOT an empty cached list: rows can survive on disk that the cache never
+      // held (an overflow row whose archive write failed), and writing `[]`
+      // over the file would delete them (codex 2026-09-26). The conversation is
+      // queued for reconciliation instead — load the file under the
+      // conversation lock, which applies these tombstones, then save that.
+      _tombstoneReconcile.add(entry.key);
+      _restoredForThisOwner.add(entry.key);
+    }
+    for (final entry in held.rows.entries) {
+      final existing = _historyById[entry.key];
+      _historyById[entry.key] = existing == null
+          ? entry.value
+          : _dedupeByIdentity(<ChatMessage>[...existing, ...entry.value]);
+      sortChatMessagesChronologically(_historyById[entry.key]!);
+      _dirtyAfterLoad.add(entry.key);
+      _restoredForThisOwner.add(entry.key);
+    }
+    for (final entry in held.lastView.entries) {
+      final existing = _lastViewTimestampById[entry.key];
+      if (existing == null || entry.value > existing) {
+        _lastViewTimestampById[entry.key] = entry.value;
+      }
+    }
+    _logger?.log(
+      '[MessageHistoryPersistence] ${held.rows.length} conversation(s) held '
+      'from an earlier failed session hand-over were restored for this owner',
+    );
   }
 
   /// Land everything owed to the directory the session is bound to now, then
   /// drop that session and adopt [nextOwner].
   Future<void> _handOverSession(String? nextOwner) async {
+    final outgoing = _ownerKey;
     try {
       await flushPendingSaves();
     } on HistoryFlushException catch (e, st) {
       // Carrying the rows across would be worse than losing them: they would
-      // be written under the NEXT identity, in that account's files. Say
-      // exactly what stayed in memory.
+      // be written under the NEXT identity, in that account's files. So they
+      // are QUARANTINED under the outgoing owner instead of dropped — a full
+      // disk during an account switch used to lose the message outright
+      // (codex 2026-09-26).
       _logger?.logError(
         '[MessageHistoryPersistence] openSession: '
         '${e.conversationIds.length} conversation(s) could not be written to '
-        'the outgoing session\'s directory; they are dropped rather than '
-        'carried into the next identity',
+        'the outgoing session\'s directory; they are held for that identity '
+        'rather than carried into the next one',
         e,
         st,
       );
+      _holdUnflushedRows(outgoing, e.conversationIds);
     } catch (e, st) {
       _logger?.logError(
         '[MessageHistoryPersistence] openSession: flushing the outgoing '
-        'session failed; its unwritten rows are dropped rather than carried '
-        'into the next identity',
+        'session failed; its unwritten rows are held for that identity rather '
+        'than carried into the next one',
         e,
         st,
       );
+      // No per-conversation detail: hold everything the session still has.
+      _holdUnflushedRows(outgoing, _historyById.keys.toList(growable: false));
     }
     _applyNewOwner(nextOwner);
   }
@@ -748,10 +1581,21 @@ class MessageHistoryPersistence {
       if (carryOver != null &&
           p.canonicalize(carryOver) != p.canonicalize(historyDirectory)) {
         await Directory(historyDirectory).create(recursive: true);
-        await _mergeHistoryDirectory(
+        if (!await _mergeHistoryDirectory(
           from: Directory(carryOver),
           into: Directory(historyDirectory),
-        );
+        )) {
+          // The rebind still happens — the per-account directory IS this
+          // account's storage from here on, and refusing would fail the login
+          // over one unreadable file. What did not merge stays in $carryOver,
+          // which is not renamed aside, so the next rebind of this account
+          // picks it up.
+          _logger?.logWarning(
+            '[MessageHistoryPersistence] part of $carryOver could not be '
+            'carried into $historyDirectory; those rows stay there and are '
+            'merged again on the next rebind of this account',
+          );
+        }
       }
     } catch (e, st) {
       // Not fatal: the rows stay where they are and the directory is named in
@@ -1369,7 +2213,15 @@ class MessageHistoryPersistence {
       error,
       stack,
     );
-    if (_disposed || attempt > _maxSaveRetries) return;
+    final givingUp = _disposed || attempt > _maxSaveRetries;
+    _reportWriteFailure(HistoryWriteFailure(
+      conversationId: normalizedId,
+      stage: HistoryWriteStage.mainFile,
+      error: error,
+      attempt: attempt,
+      willRetry: !givingUp,
+    ));
+    if (givingUp) return;
     if (_saveRetryTimers.containsKey(normalizedId)) return;
     _saveRetryTimers[normalizedId] =
         Timer(_saveRetryBaseDelay * (1 << (attempt - 1)), () {
@@ -1899,6 +2751,28 @@ class MessageHistoryPersistence {
       }
     } catch (e) {
       // Return whatever we've loaded so far
+    }
+
+    // Conversations restored from a previous failed hand-over ([_HeldRows]) are
+    // in the cache but not necessarily in a file yet, so a listing built from
+    // the directory alone would leave them out of the conversation list for the
+    // whole session (codex 2026-09-26).
+    for (final id in _restoredConversationIds) {
+      if (result.containsKey(id)) continue;
+      final cached = _historyById[id];
+      if (cached == null || cached.isEmpty) continue;
+      // Matched on the ROW's groupId, exactly as loadHistory does: the
+      // conversation id is normalized ('group_g1' -> 'g1') and comparing that
+      // against quitGroups let a quit group's rows through (codex 2026-09-26).
+      if (quitGroups != null) {
+        final groupId = cached.first.groupId;
+        if (groupId != null &&
+            groupId.isNotEmpty &&
+            quitGroups.contains(groupId)) {
+          continue;
+        }
+      }
+      result[id] = List<ChatMessage>.from(cached);
     }
 
     // M1: drain post-load normalization writes serially so we don't fan out
@@ -2468,6 +3342,9 @@ class MessageHistoryPersistence {
     // left armed, never cancelled here), and the flush then throws a
     // [HistoryFlushException] naming what is still only in memory, instead
     // of returning as if everything were durable.
+    // Restored deletions first: they turn into ordinary dirty writes, which
+    // the rounds below then flush.
+    await _drainTombstoneReconcile();
     final failures = <String, Object>{};
     // Set when the round cap below is reached with dirty work still arriving:
     // that is NOT "flushed", and callers that reset session state on the
@@ -2528,6 +3405,11 @@ class MessageHistoryPersistence {
           failures.putIfAbsent(
               id,
               () => StateError('still dirty after $rounds flush rounds'));
+          _reportWriteFailure(HistoryWriteFailure(
+            conversationId: id,
+            stage: HistoryWriteStage.flush,
+            error: StateError('still dirty after $rounds flush rounds'),
+          ));
         }
       }
     }
@@ -2594,8 +3476,18 @@ class MessageHistoryPersistence {
         '[MessageHistoryPersistence] dispose: $unarchived row(s) queued for '
         'the archive were never written',
       );
+      _reportWriteFailure(HistoryWriteFailure(
+        conversationId: _pendingArchive.keys.join(', '),
+        stage: HistoryWriteStage.archive,
+        error: StateError('$unarchived archive row(s) never written'),
+      ));
     }
     _resetSessionState();
+    // Closed LAST, so the failures reported above still reach a listener. This
+    // store can be reopened by openSession(), and the getter re-makes the sink
+    // when that happens — a host re-subscribes at the same point it re-wires
+    // everything else for the new session.
+    await _writeFailures.close();
   }
 
   /// Drop every piece of session state and invalidate in-flight work.
@@ -2624,6 +3516,8 @@ class MessageHistoryPersistence {
     _archiveCacheRows = null;
     _lastViewTimestampById.clear();
     _dirtyAfterLoad.clear();
+    _restoredForThisOwner.clear();
+    _tombstoneReconcile.clear();
   }
 
   /// Whether [msg] is identified by [id] — either its current primary
@@ -3554,6 +4448,17 @@ typedef _OpToken = ({int epoch, int gen});
 /// [exists] without an [owner] is the state an interrupted claim leaves: a
 /// marker is present but names nobody. See
 /// `MessageHistoryPersistence._writeOwnerMarker`.
+/// Rows held for an identity whose directory could not be written during an
+/// owner change. See [MessageHistoryPersistence._heldRowsByOwner].
+class _HeldRows {
+  _HeldRows({required this.rows, required this.lastView, required this.deleted});
+
+  final Map<String, List<ChatMessage>> rows;
+  final Map<String, int> lastView;
+  /// Tombstones owed with the rows: conversation id -> msgID -> delete seq.
+  final Map<String, Map<String, int>> deleted;
+}
+
 class _OwnerMarkerState {
   const _OwnerMarkerState._(this.owner, this.exists);
   const _OwnerMarkerState.missing() : this._(null, false);
@@ -3624,6 +4529,60 @@ class DefaultHistoryDirectoryStatus {
 /// [MessageHistoryPersistence.flushPendingSaves] could not write every
 /// conversation. Their rows are still in memory and a retry is armed; the
 /// flush reports it instead of returning as if everything were durable.
+/// Where a write failed. Named stages rather than a free-text label so a host
+/// can decide what is worth telling the user about: a failed main-file write
+/// risks the message itself, while a failed merge only delays rows that are
+/// still on disk somewhere else.
+enum HistoryWriteStage {
+  /// The conversation's own file — the rows are in memory and nowhere else.
+  mainFile,
+
+  /// The overflow archive. The rows left the in-memory window, so a failure
+  /// here is the one that loses the oldest messages first.
+  archive,
+
+  /// A flush that could not land everything it owed ([HistoryFlushException]).
+  flush,
+
+  /// An owner change could not write what it owed, so the rows are being HELD
+  /// for that identity instead of dropped.
+  heldForOwner,
+
+  /// A migration/adoption merge left a source file unmerged. Nothing is lost —
+  /// the source directory is deliberately not renamed aside — but those rows are
+  /// not in the directory the app reads until it is retried.
+  merge,
+}
+
+/// One write this store could not land. See
+/// [MessageHistoryPersistence.writeFailures].
+class HistoryWriteFailure {
+  const HistoryWriteFailure({
+    required this.conversationId,
+    required this.stage,
+    required this.error,
+    this.attempt = 1,
+    this.willRetry = false,
+  });
+
+  /// Normalized conversation id, or the file/directory name for a [stage] that
+  /// is not per-conversation.
+  final String conversationId;
+  final HistoryWriteStage stage;
+  final Object error;
+
+  /// Consecutive failures for this conversation, 1 on the first.
+  final int attempt;
+
+  /// Whether the store has armed another attempt of its own. False means it has
+  /// stopped trying: the rows survive only in memory, until the process ends.
+  final bool willRetry;
+
+  @override
+  String toString() => 'HistoryWriteFailure($stage, $conversationId, '
+      'attempt $attempt, willRetry: $willRetry): $error';
+}
+
 class HistoryFlushException implements Exception {
   HistoryFlushException(this.errors);
 
@@ -3636,4 +4595,14 @@ class HistoryFlushException implements Exception {
   String toString() =>
       'HistoryFlushException: ${errors.length} conversation(s) not written: '
       '${errors.entries.map((e) => '${e.key}: ${e.value}').join('; ')}';
+}
+
+class _DigestCollector implements Sink<Digest> {
+  late Digest value;
+
+  @override
+  void add(Digest data) => value = data;
+
+  @override
+  void close() {}
 }

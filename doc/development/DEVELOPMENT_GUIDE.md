@@ -259,6 +259,16 @@ Main build options:
 - `USE_IPV6`: Enable IPv6 support (default: ON)
 - `ENABLE_STATIC`: Build static library (default: ON)
 - `ENABLE_SHARED`: Build dynamic library (default: OFF)
+- `TIM2TOX_ENABLE_TEST_HOOKS`: Compile the auto_tests-only FFI hooks into
+  `libtim2tox_ffi` (default: OFF). Today that is exactly
+  `tim2tox_ffi_mm6_send_crafted_challenge`, which forges the one MM-6 identity
+  challenge the honest API cannot produce (a member claiming another member's
+  per-group key) so the scenario suite can prove the answer is unreadable by
+  the member it names. `build_ffi.sh` turns it ON because that is the library
+  `auto_tests/` runs against; app and CI builds must leave it OFF — in a
+  shipping library the symbol is only an attack primitive. When it is absent,
+  the Dart accessor `Tim2ToxFfi.mm6SendCraftedChallengeNative` returns `null`
+  and the scenario skips.
 
 Log level options:
 

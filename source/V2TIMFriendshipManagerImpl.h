@@ -69,8 +69,12 @@ public:
     void GetUserFollowInfo(const V2TIMStringVector& userIDList, V2TIMValueCallback<V2TIMFollowInfoVector>* callback) override;
     void CheckFollowType(const V2TIMStringVector& userIDList, V2TIMValueCallback<V2TIMFollowTypeCheckResultVector>* callback) override;
 
-    // --- Internal: get ToxManager from owner (R-06) ---
-    ToxManager* GetToxManager();
+    // NO GetToxManager() here on purpose. It handed out an UNPINNED raw
+    // ToxManager*, which is precisely how an operation ends up making a sequence
+    // of tox_*() calls that a concurrent UnInitSDK can tox_kill() halfway
+    // through. Its last two callers were converted to AcquireToxSession() and it
+    // was removed, so the footgun cannot be picked up again by accident: use
+    // manager_impl_->AcquireToxSession() and read through the guard.
 
     // --- Internal methods for V2TIMManagerImpl to call ---
     void NotifyFriendApplicationListAdded(const V2TIMFriendApplicationVector& applicationList);

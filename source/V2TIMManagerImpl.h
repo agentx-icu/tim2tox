@@ -107,7 +107,9 @@ public:
     // Deliver a "received"/"read" receipt for one group message to its AUTHOR
     // only (NGC custom private packet under the tim2tox group-packet header).
     // Returns 1 sent, -2 not possible on this kind of group (legacy
-    // conference: no private packets), 0 failure (author not reachable).
+    // conference: no private packets), -3 the author is not a live NGC peer
+    // right now (the caller may park the receipt and retry when it is), 0
+    // failure.
     int SendGroupReceipt(const V2TIMString& groupID, const std::string& author_key_hex,
                          const std::string& msg_id, const std::string& receipt_type);
     Tox_Group_Peer_Number ResolveGroupPeerIdForKey(Tox_Group_Number group_number, const std::string& receiver_hex);
@@ -255,6 +257,14 @@ public:
     // MM-6 observability: counters plus the last identity-proof payload we
     // received (hex), as a small JSON object. Read-only.
     std::string Mm6DiagJson();
+#ifdef TIM2TOX_ENABLE_TEST_HOOKS
+    // TEST-ONLY, and gated by the SAME macro as its C wrapper
+    // (tim2tox_ffi_mm6_send_crafted_challenge) on purpose: gating only the
+    // wrapper left this method compiled into libtim2tox.a, where on Linux its
+    // mangled symbol stays exported and the primitive remains callable from a
+    // shipped library (codex 2026-09-26). CMake defines the macro for BOTH the
+    // tim2tox and tim2tox_ffi targets, so the two halves can never disagree.
+    //
     // MM-6 harness hook: send `friend_key_hex` an identity challenge that
     // names `claimed_member_key_hex` as OUR per-group key in `groupID`. That
     // is the shape of the MM-6 abuse case -- naming a member key that is not
@@ -264,6 +274,21 @@ public:
     // grants an attacker nothing it could not already send by hand.
     int Mm6SendCraftedChallenge(const V2TIMString& groupID, const std::string& friend_key_hex,
                                 const std::string& claimed_member_key_hex);
+    // TEST-ONLY seam, gated with the crafted challenge above (same single
+    // region, so the pin test's "exactly one guarded region" still holds):
+    // lower -- or restore -- THIS instance's inbound group-receipt budgets so a
+    // scenario can drive the REFUSAL path instead of describing it. Driving the
+    // real 2048-per-sender window means 2048+ native sends inside 60 wall-clock
+    // seconds, which the harness cannot do without the window rolling over
+    // mid-flood.
+    //
+    // A value <= 0 restores the compiled-in default. kMaxGroupReceiptsPerSender
+    // and kMaxGroupReceiptsGlobal are NOT touched -- the overrides below are
+    // read at the charge sites, so a test must set them BEFORE the traffic
+    // starts. Gated because a shipping library must not carry a way to shrink
+    // its own flood budget: that is a denial-of-service primitive, not a knob.
+    void Mm6SetGroupReceiptBudgets(int32_t per_sender_limit, int32_t global_limit);
+#endif  // TIM2TOX_ENABLE_TEST_HOOKS
     // NGC name / conference title (or a real cached name); "" if unknown.
     std::string ResolveSharedGroupName(const std::string& group_id);
     
@@ -339,6 +364,11 @@ public:
         explicit operator bool() const { return tox_ != nullptr; }
         Tox* tox() const { return tox_.get(); }
         ToxManager* manager() const { return manager_.get(); }
+        // The manager WITHOUT the Tox pin. For the one caller that must keep
+        // the manager alive across a call that waits for iterate_mutex_ and
+        // therefore must not still hold a pin (see
+        // tim2tox_ffi_iterate_current_instance and ToxManager::getSaveData).
+        std::shared_ptr<ToxManager> manager_shared() const { return manager_; }
         int64_t epoch() const { return epoch_; }
         // True once the session this guard belongs to has ended. The pinned
         // pointers stay VALID (that is the point of the pin), but the work is
@@ -670,6 +700,11 @@ private:
         // sender is an NGC group peer, and its long-term key is precisely what
         // we do not know yet, so there is no friend to charge it to.
         uint32_t proof_verifies = 0;
+        // Received GROUP RECEIPTS, charged per authenticated NGC sender. The
+        // replay filter only stops the SAME receipt twice; distinct msgIDs from
+        // one member were unbounded, and each one costs a Dart event plus two
+        // history scans on the way to the tally.
+        uint32_t receipts_in = 0;
     };
     std::unordered_map<std::string, IdentityRateWindow> identity_rate_by_friend_;  // friend pk hex ->
     // Received-proof windows keyed by the AUTHENTICATED NGC group sender (lower
@@ -678,7 +713,33 @@ private:
     // cannot spend the global crypto window. Bounded by kMaxProofVerifySenders
     // and pruned with the rest of the identity state.
     std::unordered_map<std::string, IdentityRateWindow> identity_rate_by_group_sender_;
+    // Received-RECEIPT windows, keyed the same way but in a SEPARATE table on
+    // purpose (codex 2026-09-26): sharing the proof table let the two budgets
+    // evict each other. Across public groups, kMaxProofVerifySenders distinct
+    // member keys can each send one structurally valid receipt with an invented
+    // msgID, fill the table, and have it refuse both a new honest reader's
+    // receipt AND a challenged member's MM-6 proof until the entries expire —
+    // i.e. a receipt flood could starve the identity proofs the fill-up bound
+    // exists to protect. Separate tables, separate caps
+    // (kMaxGroupReceiptSenders); both pruned in PruneIdentityStateLocked.
+    std::unordered_map<std::string, IdentityRateWindow> group_receipt_rate_by_sender_;
     IdentityRateWindow identity_rate_global_;
+    // The receipt counterpart, kept separate for the same reason its per-sender
+    // table is: a receipt flood must not spend the proofs' global budget
+    // (kMaxGroupReceiptsGlobal explains the ordering and the size).
+    IdentityRateWindow group_receipt_rate_global_;
+    // Effective-cap overrides for the two budgets above: 0 = "use the
+    // compiled-in default" (EffectiveReceiptCap in V2TIMManagerImpl.cpp reads
+    // them where the budget is charged). Plain, ALWAYS-present members on
+    // purpose, even though only the test hook can write them: the charge sites
+    // must compile to the same code in every build, and gating the fields would
+    // need a second guarded region in three files, which is exactly the shape
+    // the crafted-challenge pin test forbids. With
+    // Mm6SetGroupReceiptBudgets compiled out there is no way to move them off
+    // 0, so a shipping library carries two forever-zero uint32_ts and the
+    // built-in caps.
+    uint32_t group_receipt_per_sender_limit_override_ = 0;
+    uint32_t group_receipt_global_limit_override_ = 0;
     // MM-6 observability (guarded by mutex_). Counters plus the last proof
     // payload we received, verbatim: the auto_tests use it to assert that what
     // a named-but-uninvolved member receives is a box, not a readable proof.
@@ -688,6 +749,19 @@ private:
         uint64_t proofs_accepted = 0;
         uint64_t proofs_rejected = 0;
         std::string last_proof_payload_hex;
+        // Group receipts arriving on the same private channel. `in` counts every
+        // structurally valid receipt from an authenticated member (i.e. every
+        // one that reached the per-sender meter), and the three below say what
+        // happened to it. Exported as the "groupReceipts" block of
+        // Mm6DiagJson so auto_tests can assert the budget from the outside.
+        uint64_t group_receipts_in = 0;
+        uint64_t group_receipts_refused = 0;
+        // Refused by the SHARED ceiling rather than by the sender's own window:
+        // told apart so "one flooder" and "everyone at once" are distinguishable
+        // in the diag.
+        uint64_t group_receipts_refused_global = 0;
+        uint64_t group_receipts_replayed = 0;
+        uint64_t group_receipts_forwarded = 0;
     };
     Mm6Diag mm6_diag_;
     IdentityClock::time_point identity_last_prune_{};
@@ -707,8 +781,21 @@ private:
     // One received-proof verification charged to this NGC sender. False = over
     // budget, or the sender table is full: drop the packet before spending
     // anything on it.
+    // Whether WE have an unexpired identity challenge outstanding for this
+    // (group, authenticated sender). Cheap, crypto-free, and the gate that
+    // keeps an unchallenged sender from consuming metering state at all.
+    bool HasPendingChallengeForSenderLocked(Tox_Group_Number group_number,
+                                           const std::string& sender_hex,
+                                           IdentityClock::time_point now) const;
     bool TakeGroupSenderProofBudgetLocked(const std::string& sender_hex,
                                           IdentityClock::time_point now);
+    // One received GROUP RECEIPT charged to this NGC sender. False = over
+    // budget, or the receipt sender table is full: drop the packet before it
+    // costs a replay-cache slot, a Dart event and two history scans. Metered in
+    // group_receipt_rate_by_sender_, NOT the proof table, so neither budget can
+    // evict the other.
+    bool TakeGroupSenderReceiptBudgetLocked(const std::string& sender_hex,
+                                            IdentityClock::time_point now);
     // Pending challenges for (group, member) whose asker no longer claims that
     // member's digest. They hold a slot the verifier scans and an honest
     // claimant needs; nothing will ever answer them.

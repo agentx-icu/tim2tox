@@ -251,14 +251,15 @@ TEST(AVConferenceLifecycleSourceRegressionTest,
     EXPECT_NE(quit_failure.find("return;"), std::string::npos);
     EXPECT_EQ(quit_failure.find("callback->OnSuccess"), std::string::npos);
 
-    EXPECT_NE(dismiss.find("if (!deleted)"), std::string::npos);
-    const std::string dismiss_failure = SourceSection(
-        dismiss,
-        "if (!deleted)",
-        "std::lock_guard<std::mutex> lock(member_mutex_);");
-    EXPECT_NE(dismiss_failure.find("callback->OnError"), std::string::npos);
-    EXPECT_NE(dismiss_failure.find("return;"), std::string::npos);
-    EXPECT_EQ(dismiss_failure.find("callback->OnSuccess"), std::string::npos);
+    // Dismiss no longer has a delete path of its own: Tox has no "dismiss", so
+    // the founder dismissing a group IS the founder leaving it, and the weaker
+    // copy this test used to check (no stored-identity recovery, no
+    // conversation removal) was replaced by delegation to QuitGroup. The
+    // fail-closed assertions above therefore cover both.
+    EXPECT_NE(dismiss.find("QuitGroup(groupID, callback);"), std::string::npos);
+    EXPECT_EQ(dismiss.find("tox_conference_delete"), std::string::npos);
+    EXPECT_EQ(dismiss.find("callback->OnSuccess"), std::string::npos)
+        << "dismiss must not report success independently of the quit path";
 
     EXPECT_NE(manager_quit.find("QuitGroupCallbackWrapper wrapper_callback"),
               std::string::npos);

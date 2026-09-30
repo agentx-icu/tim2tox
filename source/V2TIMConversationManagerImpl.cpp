@@ -257,16 +257,30 @@ void V2TIMConversationManagerImpl::GetConversationList(uint64_t nextSeq, uint32_
         if (callback) callback->OnError(ERR_SDK_NOT_INITIALIZED, "SDK not initialized");
         return;
     }
-    ToxManager* tox_manager = manager_impl->GetToxManager();
-    if (!tox_manager) {
+    // Pinned for the WHOLE call, and taken BEFORE cache_mutex_ for the reason
+    // spelled out in RefreshConversationCache: acquiring a pin can wait out a
+    // profile save's quiesce, and pinned publishers take cache_mutex_
+    // afterwards, so the reverse order closes a three-way cycle. The friend-count
+    // read below used to come off a raw ToxManager*/Tox* pair that a concurrent
+    // UnInitSDK could free between the fetch and the read. Reentrant for the
+    // nested RefreshConversationCache() acquire on this thread.
+    const auto session = manager_impl->AcquireToxSession();
+    // One check replaces the old two. DELIBERATE change, the same one
+    // GetFriendsInfo made in the previous batch: the old code refused only when
+    // the ToxManager was gone and, when the manager was alive but the Tox was
+    // not, quietly rebuilt (i.e. CLEARED) the cache and answered OnSuccess with
+    // whatever was left. An empty guard means exactly "no ToxManager, or no live
+    // Tox", and answering ERR_SDK_NOT_INITIALIZED leaves the caller's list alone
+    // instead of emptying it.
+    if (!session) {
         if (callback) callback->OnError(ERR_SDK_NOT_INITIALIZED, "ToxManager not initialized");
         return;
     }
-    Tox* tox = tox_manager->getTox();
+    Tox* const tox = session.tox();
     // Decide whether to refresh; must call RefreshConversationCache() WITHOUT holding cache_mutex_
     // (RefreshConversationCache locks cache_mutex_ internally — calling it under lock would deadlock).
     bool need_refresh = false;
-    if (tox) {
+    {
         size_t current_friend_count = tox_self_get_friend_list_size(tox);
         {
             std::lock_guard<std::mutex> lock(cache_mutex_);
@@ -277,10 +291,8 @@ void V2TIMConversationManagerImpl::GetConversationList(uint64_t nextSeq, uint32_
         if (need_refresh) {
             RefreshConversationCache();
         }
-    } else {
-        RefreshConversationCache();
     }
-    
+
     V2TIMConversationResult result;
     result.nextSeq = 0;
     result.isFinished = true;
@@ -305,7 +317,8 @@ void V2TIMConversationManagerImpl::GetConversationList(uint64_t nextSeq, uint32_
 }
 
 // 创建会话对象（好友）
-V2TIMConversation V2TIMConversationManagerImpl::CreateConversationFromFriend(uint32_t friend_number) {
+V2TIMConversation V2TIMConversationManagerImpl::CreateConversationFromFriend(Tox* tox,
+                                                                            uint32_t friend_number) {
     V2TIMConversation conv;
     std::string convID;
     
@@ -330,25 +343,14 @@ V2TIMConversation V2TIMConversationManagerImpl::CreateConversationFromFriend(uin
     conv.groupReadSequence = 0;
     
     uint8_t pubkey[TOX_PUBLIC_KEY_SIZE];
-    V2TIMManagerImpl* manager_impl = nullptr;
-    {
-        std::lock_guard<std::mutex> lock(manager_impl_mutex_);
-        manager_impl = manager_impl_;
-    }
-    if (!manager_impl) {
-        convID = "c2c_" + std::to_string(friend_number);
-        conv.userID = V2TIMString("");
-        conv.conversationID = V2TIMString(convID.c_str());
-        return conv;
-    }
-    ToxManager* tox_manager = manager_impl->GetToxManager();
-    if (!tox_manager) {
-        convID = "c2c_" + std::to_string(friend_number);
-        conv.userID = V2TIMString("");
-        conv.conversationID = V2TIMString(convID.c_str());
-        return conv;
-    }
-    Tox* tox = tox_manager->getTox();
+    // The handle comes from the CALLER's pin. This used to walk
+    // manager_impl_mutex_ -> GetToxManager() -> getTox() for one
+    // tox_friend_get_public_key, behind a caller that already held a pin over
+    // the friend-list read that produced `friend_number` — so the re-fetch could
+    // hand back a Tox the caller's own pin was keeping alive anyway, or, once the
+    // callers were pinned, a DIFFERENT session's instance. Three early-outs
+    // (no manager / no ToxManager / no Tox) collapse into this one: they all
+    // produced the same degraded row.
     if (!tox) {
         convID = "c2c_" + std::to_string(friend_number);
         conv.userID = V2TIMString("");
@@ -417,41 +419,52 @@ void V2TIMConversationManagerImpl::RefreshConversationCache() {
         deleted_snapshot = deleted_conversation_ids_;
     }
 
-    std::lock_guard<std::mutex> lock(cache_mutex_);
-    cached_conversations_.clear();
-
     V2TIMManagerImpl* manager_impl = dynamic_cast<V2TIMManagerImpl*>(SafeGetV2TIMManager());
     if (!manager_impl) {
         std::lock_guard<std::mutex> lock_mgr(manager_impl_mutex_);
         manager_impl = manager_impl_;
     }
-    if (!manager_impl) {
-        return;
+
+    // Pinned for the WHOLE rebuild: the friend-list size and the list read are
+    // a pair a concurrent UnInitSDK could tox_kill() the instance between, and
+    // this runs on whatever thread a friend event or a UI refresh came in on —
+    // not inside tox_iterate — so teardown does not defer here.
+    //
+    // TAKEN BEFORE cache_mutex_, and that order is load-bearing. Acquiring a pin
+    // can WAIT (a profile save quiesces the pins in ToxManager::getSaveData),
+    // and pinned operations legitimately take cache_mutex_ afterwards
+    // (AddFriend / DeleteFromFriendList publish through RefreshCache while
+    // holding their own pin). Taking cache_mutex_ first would give the two
+    // orders and a three-way cycle: this thread waits out the quiesce holding
+    // cache_mutex_, the save waits for the pin the publisher still holds, and
+    // the publisher waits for cache_mutex_. Pin first, so nobody ever waits for
+    // admission while holding the cache.
+    V2TIMManagerImpl::ToxSessionGuard session;
+    if (manager_impl && manager_impl->IsRunning()) {
+        // Neither catch returns early: the guard is simply left empty and the
+        // code below clears the cache and returns — which is exactly what the
+        // old `getTox()` catch blocks did, because the clear used to happen
+        // above them.
+        try {
+            session = manager_impl->AcquireToxSession();
+        } catch (const std::exception& e) {
+            V2TIM_LOG(kError, "[V2TIMConversationManagerImpl] RefreshConversationCache: Exception in AcquireToxSession(): {}", e.what());
+        } catch (...) {
+            V2TIM_LOG(kError, "[V2TIMConversationManagerImpl] RefreshConversationCache: Unknown exception in AcquireToxSession()");
+        }
     }
 
-    if (!manager_impl->IsRunning()) {
-        return;
-    }
+    std::lock_guard<std::mutex> lock(cache_mutex_);
+    cached_conversations_.clear();
 
-    ToxManager* tox_manager = manager_impl->GetToxManager();
-    if (!tox_manager) {
+    // No manager, not running, or no live session: nothing to rebuild from.
+    // This is a void refresh, so there is no callback to refuse through —
+    // leaving the cache cleared (as every one of these early returns did
+    // before) is correct: a logged-out account has no conversations.
+    if (!session) {
         return;
     }
-
-    Tox* tox = nullptr;
-    try {
-        tox = tox_manager->getTox();
-    } catch (const std::exception& e) {
-        V2TIM_LOG(kError, "[V2TIMConversationManagerImpl] RefreshConversationCache: Exception in getTox(): {}", e.what());
-        return;
-    } catch (...) {
-        V2TIM_LOG(kError, "[V2TIMConversationManagerImpl] RefreshConversationCache: Unknown exception in getTox()");
-        return;
-    }
-
-    if (!tox) {
-        return;
-    }
+    Tox* const tox = session.tox();
 
     const size_t friend_count = tox_self_get_friend_list_size(tox);
     std::vector<uint32_t> friends(friend_count);
@@ -461,7 +474,7 @@ void V2TIMConversationManagerImpl::RefreshConversationCache() {
     
     for (uint32_t friend_number : friends) {
         try {
-            V2TIMConversation conv = CreateConversationFromFriend(friend_number);
+            V2TIMConversation conv = CreateConversationFromFriend(tox, friend_number);
             std::string conv_id_str(conv.conversationID.CString());
             if (deleted_snapshot.count(conv_id_str) > 0) {
                 continue;
@@ -544,9 +557,24 @@ void V2TIMConversationManagerImpl::CreateConversationGroup(const V2TIMString &gr
 
 void V2TIMConversationManagerImpl::GetConversation(const V2TIMString& conversationID,
                                                    V2TIMValueCallback<V2TIMConversation>* callback) {
+    // Pinned for the WHOLE call, and taken BEFORE cache_mutex_ for the reason
+    // spelled out in RefreshConversationCache: acquiring a pin can wait out a
+    // save's quiesce, and pinned publishers take cache_mutex_ afterwards, so the
+    // reverse order closes a three-way cycle. The on-the-fly branch below needs
+    // the pin across a friend-list size + list + per-friend key sequence; the
+    // cache-hit path simply does not use it. Reentrant for the nested
+    // RefreshConversationCache() acquire on this thread.
+    V2TIMManagerImpl* manager_impl = nullptr;
+    {
+        std::lock_guard<std::mutex> lock_mgr(manager_impl_mutex_);
+        manager_impl = manager_impl_;
+    }
+    const auto session = manager_impl ? manager_impl->AcquireToxSession()
+                                      : V2TIMManagerImpl::ToxSessionGuard();
+
     // Refresh cache first to ensure it's up to date
     RefreshConversationCache();
-    
+
     std::lock_guard<std::mutex> lock(cache_mutex_);
     std::string conv_id = conversationID.CString();
     
@@ -575,25 +603,20 @@ void V2TIMConversationManagerImpl::GetConversation(const V2TIMString& conversati
                 pubkey[i] = (uint8_t)strtoul(hex_byte, nullptr, 16);
             }
             
-            V2TIMManagerImpl* manager_impl = nullptr;
-            {
-                std::lock_guard<std::mutex> lock(manager_impl_mutex_);
-                manager_impl = manager_impl_;
-            }
             if (!manager_impl) {
                 if (callback) callback->OnError(ERR_SDK_NOT_INITIALIZED, "SDK not initialized");
                 return;
             }
-            ToxManager* tox_manager = manager_impl->GetToxManager();
-            if (!tox_manager) {
-                if (callback) callback->OnError(ERR_SDK_NOT_INITIALIZED, "ToxManager not initialized");
-                return;
-            }
-            Tox* tox = tox_manager->getTox();
-            if (!tox) {
+            // The pin taken at the top of the function covers everything from
+            // here down: the friend-list size, the list read and the per-friend
+            // key reads are a sequence a concurrent UnInitSDK could tox_kill()
+            // the instance in the middle of, and none of it runs inside
+            // tox_iterate, so teardown does not defer here.
+            if (!session) {
                 if (callback) callback->OnError(ERR_SDK_NOT_INITIALIZED, "Tox instance not available");
                 return;
             }
+            Tox* const tox = session.tox();
             const size_t friend_count = tox_self_get_friend_list_size(tox);
             std::vector<uint32_t> friends(friend_count);
             tox_self_get_friend_list(tox, friends.data());
@@ -603,7 +626,7 @@ void V2TIMConversationManagerImpl::GetConversation(const V2TIMString& conversati
                 if (tox_friend_get_public_key(tox, friend_number, friend_pubkey, nullptr)) {
                     if (memcmp(pubkey, friend_pubkey, TOX_PUBLIC_KEY_SIZE) == 0) {
                         // Found friend, create conversation
-                        V2TIMConversation conv = CreateConversationFromFriend(friend_number);
+                        V2TIMConversation conv = CreateConversationFromFriend(tox, friend_number);
                         if (callback) callback->OnSuccess(conv);
                         return;
                     }

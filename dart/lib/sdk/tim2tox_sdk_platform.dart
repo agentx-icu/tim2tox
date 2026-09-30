@@ -2354,21 +2354,73 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
     });
   }
 
+  /// Member counts the PULL path has already fetched, so a live push can do the
+  /// same unread math without a fetch of its own.
+  ///
+  /// The push used to always report unreadCount as null, which is honest but
+  /// costs precision: the menu then reads "at least N members read" and "all
+  /// members read" waits for the next pull. Fetching a member list per receipt
+  /// is not an option — it is a full list query, and a burst in a large group
+  /// would hammer it — so the push reads what the pull left here and stays null
+  /// when nothing has. Cold cache therefore behaves exactly as before.
+  ///
+  /// Short TTL because membership moves: a join or leave inside the window can
+  /// leave unreadCount off until the next pull. readCount — the only thing the
+  /// tick depends on — never comes from here.
+  static const Duration _groupMemberCountTtl = Duration(seconds: 30);
+  static const int _maxCachedGroupMemberCounts = 64;
+  final Map<String, ({int count, DateTime at})> _groupMemberCounts = {};
+
+  void _rememberGroupMemberCount(String groupID, int count) {
+    if (groupID.isEmpty || count <= 0) return;
+    if (_groupMemberCounts.length >= _maxCachedGroupMemberCounts &&
+        !_groupMemberCounts.containsKey(groupID)) {
+      _groupMemberCounts.remove(_groupMemberCounts.keys.first);
+    }
+    _groupMemberCounts[groupID] = (count: count, at: DateTime.now());
+  }
+
+  /// The cached member count for [groupID], or null when there is none fresh.
+  int? _freshGroupMemberCount(String groupID) {
+    final hit = _groupMemberCounts[groupID];
+    if (hit == null) return null;
+    if (DateTime.now().difference(hit.at) > _groupMemberCountTtl) {
+      _groupMemberCounts.remove(groupID);
+      return null;
+    }
+    return hit.count;
+  }
+
   /// Live read-receipt pushes: FfiChatService tallies a READ from a peer and
   /// emits; UIKit's messageData.onReceiveMessageReadReceipts refreshes the
-  /// bubble label without waiting for a refetch. unreadCount is left null —
-  /// the pull path (getMessageReadReceipts) owns the member-count math.
+  /// bubble label without waiting for a refetch.
   void _setupReceiptListener() {
     _receiptEventsSubscription?.cancel();
     _receiptEventsSubscription = ffiService.receiptEvents.listen((event) {
       if (event.msgID.isEmpty) return;
+      // Exact only when BOTH halves are known: the tally must be exact (a row
+      // restored from disk reports a floor, see groupRowReadTally) and a member
+      // count must be fresh in the cache. Otherwise unknown, as before — never
+      // a number derived from a floor.
+      final groupID = event.groupID;
+      final total = (groupID == null || groupID.isEmpty)
+          ? null
+          : _freshGroupMemberCount(groupID);
+      final tallyExact = (groupID == null || groupID.isEmpty)
+          ? true
+          : ffiService
+              .groupRowReadTally(event.msgID, groupID: groupID)
+              .exactCount;
+      final int? unread = (total != null && tallyExact)
+          ? ((total - 1 - event.readCount) < 0 ? 0 : total - 1 - event.readCount)
+          : null;
       final receipt = V2TimMessageReceipt(
         userID: '',
         timestamp: DateTime.now().millisecondsSinceEpoch ~/ 1000,
         groupID: event.groupID,
         msgID: event.msgID,
         readCount: event.readCount,
-        unreadCount: null,
+        unreadCount: unread,
       );
       _notifyAdvancedMsgListeners((listener) {
         listener.onRecvMessageReadReceipts?.call([receipt]);
@@ -8215,10 +8267,23 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
       await ffiService.messageHistoryPersistence.loadHistory(groupID);
       final history = ffiService.getHistory(groupID);
       for (final msg in history) {
-        if (!msg.isSelf) {
-          await ffiService.markMessageAsRead(groupID, msg.msgID ?? '',
-              groupID: groupID);
-        }
+        if (msg.isSelf) continue;
+        // CLAIM + SKIP (codex): UIKit calls this on EVERY group chat open, and
+        // this walk used to re-send a READ receipt for every inbound row of the
+        // loaded window each time — up to `_maxMessagesInMemory` private
+        // packets per tap, per member, which is the load the native per-sender
+        // receipt budget had to be widened to absorb. A row that is already
+        // read has nothing to report, and a row this session already receipted
+        // (here, or through FfiChatService's on-view walk, which shares this
+        // bounded claim set) must not be paid for twice. The API contract is
+        // unchanged: marking read is idempotent, so the rows it skips are rows
+        // whose read state and receipt are already accounted for, and a
+        // receipt that never reached the wire is retried by the pending group
+        // queue, not by re-walking the window.
+        final rowId = msg.msgID ?? '';
+        if (rowId.isEmpty || msg.isRead) continue;
+        if (!ffiService.claimGroupReadReceiptForRow(groupID, msg)) continue;
+        await ffiService.markMessageAsRead(groupID, rowId, groupID: groupID);
       }
 
       return V2TimCallback(
@@ -8504,13 +8569,15 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
       };
       // Counts come from the live read-receipt tally (see
       // FfiChatService.getMessageReaders): in-memory, rebuilt from traffic,
-      // deliberately not persisted.
+      // never persisted by reader identity. A row whose readers were tallied
+      // in a PREVIOUS session falls back to the persisted read FACT on the row
+      // (FfiChatService.groupRowReadTally) — see below.
       final memberCountByGroup = <String, int>{};
       for (final msgID in ids) {
         final msg = byId[msgID];
         final gid = msg?.groupID;
         if (msg == null || gid == null || gid.isEmpty) continue;
-        var total = memberCountByGroup[gid] ?? -1;
+        var total = memberCountByGroup[gid] ?? _freshGroupMemberCount(gid) ?? -1;
         if (total < 0) {
           try {
             final res = await getGroupMemberList(
@@ -8526,11 +8593,26 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
             total = 0;
           }
           memberCountByGroup[gid] = total;
+          // Share it with the live push path, which cannot afford this fetch.
+          _rememberGroupMemberCount(gid, total);
         }
-        final readCount = ffiService.getMessageReaders(msgID).length;
+        // RESTART: the live tally starts empty every launch, so a message a
+        // member read in a previous session had no readers here and the group
+        // tick vanished on reload while the C2C one survived. The read FACT is
+        // persisted on the author's own row (isRead, flipped and saved by
+        // FfiChatService._handleReceipt exactly as for C2C), and the group tick
+        // renders nothing finer than "at least one member read it", so such a
+        // row reports the honest lower bound of 1 rather than a made up reader
+        // count. Reader identities are NOT persisted (per-group member keys
+        // rotate), so a restored row has no exact count to report — and never
+        // regains one this session, even once live receipts arrive again.
+        final tally = ffiService.groupRowReadTally(msgID, groupID: gid);
+        final readCount = tally.readCount;
         // Unknown membership (failed/empty lookup) -> unreadCount stays null
-        // rather than inventing a zero; readCount alone is still truthful.
-        final int? unread = total > 0
+        // rather than inventing a zero; readCount alone is still truthful. An
+        // inexact readCount is the same situation: unread stays UNKNOWN instead
+        // of being derived from a floor.
+        final int? unread = tally.exactCount && total > 0
             ? ((total - 1 - readCount) < 0 ? 0 : total - 1 - readCount)
             : null;
         receipts.add(

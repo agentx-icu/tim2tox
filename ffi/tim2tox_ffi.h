@@ -379,17 +379,45 @@ int tim2tox_ffi_get_mm6_diag(int64_t instance_id, char* out, int out_len);
 // MM-6 harness hook: send `friend_key_hex` an identity challenge naming
 // `claimed_member_key_hex` as our per-group key in `group_id`. The honest API
 // always names our OWN key there, so this is the only way to reproduce the
-// abuse case the encrypted proof (v2) defends against. It hands an attacker
-// nothing new — any Tox peer can send this frame — and exists so the
-// auto_tests can assert the named member receives only an unreadable box.
+// abuse case the encrypted proof (v2) defends against, and the auto_tests use
+// it to assert the named member receives only an unreadable box.
 // Returns 1 sent, 0 failure.
+//
+// TEST-ONLY: compiled in only with -DTIM2TOX_ENABLE_TEST_HOOKS=ON (OFF by
+// default; `build_ffi.sh` turns it on for the auto_tests build). Shipping
+// libraries must not carry it — inside the product it is nothing but an
+// attack primitive, so callers other than the auto_tests should not exist.
+#ifdef TIM2TOX_ENABLE_TEST_HOOKS
 int tim2tox_ffi_mm6_send_crafted_challenge(int64_t instance_id, const char* group_id,
                                            const char* friend_key_hex,
                                            const char* claimed_member_key_hex);
 
+// TEST-ONLY, same gate and same region as the hook above: set THIS instance's
+// inbound group-receipt budgets — `per_sender_limit` replaces
+// kMaxGroupReceiptsPerSender and `global_limit` replaces
+// kMaxGroupReceiptsGlobal for the metering of receipts this instance RECEIVES.
+// Either value <= 0 restores that budget's compiled-in default. The limits are
+// read where the budget is charged, so call this BEFORE the traffic that is
+// meant to be refused; tim2tox_ffi_get_mm6_diag reports the effective caps as
+// groupReceipts.perSenderLimit / .globalLimit. The windows themselves are not
+// reset — lowering a cap below what the current 60s window already spent means
+// the next receipt is refused.
+// Returns 1 applied, 0 no such instance.
+//
+// Not shippable: the real caps are sized for honest traffic, so an entry point
+// that shrinks them is a self-inflicted denial of service. It exists so
+// scenario_group_receipt_control_row_test can drive the refusal path, which
+// 2048+ sends inside one wall-clock minute cannot do reliably.
+int tim2tox_ffi_mm6_set_group_receipt_budgets(int64_t instance_id, int32_t per_sender_limit,
+                                             int32_t global_limit);
+#endif  // TIM2TOX_ENABLE_TEST_HOOKS
+
 // Send a group message receipt ("received"/"read") privately to the message's
 // author (their per-group public key). Returns 1 sent, -2 unsupported on this
-// group kind (legacy conference), 0 failure.
+// group kind (legacy conference), -3 the author is not a resolvable peer of this
+// group right now (the caller may park the receipt and retry when it is — a
+// READ receipt has no second chance of its own, unlike "received", which the
+// next inbound message re-fires), 0 failure.
 int tim2tox_ffi_send_group_receipt(int64_t instance_id, const char* group_id,
                                    const char* author_key_hex, const char* msg_id,
                                    const char* receipt_type);
