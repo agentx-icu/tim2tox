@@ -6100,7 +6100,11 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
           // soundDuration > 0 and the temp copy fails, the receiver would
           // silently get duration=0 — worse than failing the send, because
           // the user has no way to retry. We surface the failure.
-          bool durationEncodeRequested = soundDuration > 0;
+          // A note to self never travels, so there is no wire filename to
+          // encode — and the encoding copy is scratch that is deleted after
+          // a few minutes, which would orphan the persisted self row.
+          bool durationEncodeRequested = soundDuration > 0 &&
+              !(groupID.isEmpty && ffiService.isSelfPeer(receiver));
           bool durationEncodeFailed = false;
           Object? durationEncodeError;
           if (durationEncodeRequested) {

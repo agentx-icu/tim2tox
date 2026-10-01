@@ -916,7 +916,7 @@ class FfiChatService {
   /// Loads history for a conversation and tracks the in-flight work so
   /// disposal waits for it.
   Future<void> loadHistory(String id) {
-    return _trackHistoryLoad(id);
+    return _trackHistoryLoad(_canonicalSelfAware(id));
   }
 
   /// Deletes a path previously returned by a scratch write/copy operation.
@@ -1261,6 +1261,202 @@ class FfiChatService {
       return s;
     } finally {
       pkgffi.malloc.free(buf);
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // The SELF conversation ("note to self").
+  //
+  // A C2C conversation keyed by our OWN public key: everything sent to it is a
+  // local row only. toxcore cannot befriend its own key (Messenger.c
+  // `m_addfriend` -> FAERR_OWNKEY), so without these guards a self send would
+  // fall into the offline queue forever. Every C2C outbound chokepoint below
+  // (text, file, typing, control, reaction, receipts, file control, group
+  // invite queue, offline-queue drain) short-circuits on [isSelfPeer], so no
+  // byte addressed to self ever reaches native code; history, archive, unread
+  // and clear work unchanged under the canonical key [selfPublicKey].
+  // ---------------------------------------------------------------------------
+
+  /// Our own 64-hex public key exactly as native reports it (the history key
+  /// of the self conversation), or null before an identity is loaded.
+  /// NOT [selfId]: that is the login alias, not the Tox account.
+  String? get selfPublicKey {
+    final String? id;
+    try {
+      id = getSelfToxId();
+    } catch (_) {
+      // History reads consult this on every call; an identity that cannot be
+      // read (no native session / binding) must never break them.
+      return null;
+    }
+    if (id == null || id.length < 64) return null;
+    final key = normalizeToxId(id);
+    return _toxPublicKeyPattern.hasMatch(key) ? key : null;
+  }
+
+  /// Whether [peerId] addresses the self conversation: our public key in any
+  /// case, as a 76-hex address, or `c2c_`-prefixed.
+  bool isSelfPeer(String peerId) {
+    final self = selfPublicKey;
+    if (self == null) return false;
+    final key = ConversationIdUtils.normalize(peerId.trim());
+    return key.length == 64 && key.toUpperCase() == self.toUpperCase();
+  }
+
+  /// [id] mapped onto the canonical self key when it addresses self, else
+  /// returned unchanged — so every case/format alias reaches one history file.
+  String _canonicalSelfAware(String id) =>
+      isSelfPeer(id) ? selfPublicKey! : id;
+
+  /// The local-only row for a send to self: persisted and streamed exactly
+  /// like a delivered send, never handed to native code or the offline queue.
+  ChatMessage _appendSelfRow(ChatMessage msg) {
+    final key = selfPublicKey!;
+    _lastByPeer[key] = msg;
+    _appendHistory(key, msg);
+    _messages.add(msg);
+    // What an older build queued for self (it was "an offline friend":
+    // messages, group invites) is reconciled locally; nothing else triggers
+    // that because self never comes online. Swept once per session, and again
+    // whenever self messages are still queued.
+    if (!_selfLegacySwept ||
+        _offlineQueuePersistence.getPeerIds().any(isSelfPeer)) {
+      unawaited(_reconcileLegacySelfQueue());
+    }
+    return msg;
+  }
+
+  Future<void>? _selfQueueReconcile;
+  bool _selfLegacySwept = false;
+
+  /// Turns what an older build parked in the offline queue for self into
+  /// delivered local rows — no native call, no pacing, serialised.
+  ///
+  /// Crash-safe order: the reconciled history is saved durably BEFORE the
+  /// queue items are removed, so a crash in between leaves a queue item whose
+  /// row already exists (matched by msgID next time), never a lost note. Bound
+  /// to the identity and session it started on: an account switch or dispose
+  /// in between stops it before it writes anything.
+  Future<void> _reconcileLegacySelfQueue() =>
+      _selfQueueReconcile ??= _reconcileLegacySelfQueueOnce()
+          .whenComplete(() => _selfQueueReconcile = null);
+
+  Future<void> _reconcileLegacySelfQueueOnce() async {
+    final self = selfPublicKey;
+    if (self == null || _sessionClosed) return;
+    bool stillOurs() => !_sessionClosed && selfPublicKey == self;
+
+    await _dropQueuedSelfGroupInvites();
+    final aliases =
+        _offlineQueuePersistence.getPeerIds().where(isSelfPeer).toList();
+    if (aliases.isEmpty) {
+      _selfLegacySwept = stillOurs();
+      return;
+    }
+    await loadHistory(self);
+    if (!stillOurs()) return;
+
+    final reconciled = <(String, OfflineMessageItem)>[];
+    for (final alias in aliases) {
+      for (final item in List<OfflineMessageItem>.of(
+          _offlineQueuePersistence.getMessages(alias))) {
+        await _reconcileSelfItem(self, item);
+        if (!stillOurs()) return;
+        reconciled.add((alias, item));
+      }
+    }
+    final rows = _messageHistoryPersistence.getCachedList(self);
+    if (rows != null && rows.isNotEmpty) {
+      try {
+        await _messageHistoryPersistence.saveHistory(self, rows);
+      } catch (e, st) {
+        // Not durable: keep the queue items; the next self send retries.
+        _logger?.logError('[FfiChatService] self queue reconcile: history '
+            'save failed; queue kept', e, st);
+        return;
+      }
+    }
+    if (!stillOurs()) return;
+    for (final (alias, item) in reconciled) {
+      await _offlineQueuePersistence.removeItem(alias, item);
+    }
+    _selfLegacySwept = stillOurs();
+  }
+
+  /// One queued item for self -> its delivered row: flips the matching
+  /// pending row in place (msgID-first, see [_offlineRowMatchesItem]) or,
+  /// when the queue item outlived its row, recreates the row with the item's
+  /// own msgID, timestamp and file metadata.
+  Future<void> _reconcileSelfItem(String self, OfflineMessageItem item) async {
+    final isFile = item.kind == 'file' ||
+        (item.filePath != null && item.filePath!.isNotEmpty);
+    final itemMs = item.timestamp.millisecondsSinceEpoch;
+    final history = _messageHistoryPersistence.getCachedList(self);
+    if (history != null) {
+      for (var i = history.length - 1; i >= 0; i--) {
+        final row = history[i];
+        // Same content as well as identity: a legacy item without msgID is
+        // matched by timestamp, and two notes can share a millisecond.
+        final sameKind = isFile
+            ? row.filePath == item.filePath
+            : row.filePath == null &&
+                row.text == item.text &&
+                row.contentKind == item.contentKind;
+        if (row.isSelf && sameKind && _offlineRowMatchesItem(row, item, itemMs)) {
+          if (row.isPending) {
+            final delivered = row.copyWith(isPending: false);
+            history[i] = delivered;
+            _updateSelfPreview(self, delivered);
+            _messages.add(delivered);
+          }
+          return;
+        }
+      }
+    }
+    final itemMsgID = item.msgID;
+    final msgID = itemMsgID != null && itemMsgID.isNotEmpty
+        ? itemMsgID
+        : '${itemMs}_${_msgIDSequence++}_$_selfId';
+    final ChatMessage row;
+    if (isFile) {
+      final path = item.filePath!;
+      final file = File(path);
+      row = ChatMessage(
+        text: '',
+        fromUserId: _selfId,
+        isSelf: true,
+        timestamp: item.timestamp,
+        groupId: null,
+        filePath: path,
+        fileName: item.fileName ?? p.basename(path),
+        mediaKind: _detectKind(path),
+        fileSize: await file.exists() ? await file.length() : null,
+        isPending: false,
+        msgID: msgID,
+      );
+    } else {
+      row = ChatMessage(
+        text: item.text,
+        fromUserId: _selfId,
+        isSelf: true,
+        timestamp: item.timestamp,
+        groupId: null,
+        isPending: false,
+        msgID: msgID,
+        cloudCustomData: item.cloudCustomData,
+        contentKind: item.contentKind,
+      );
+    }
+    unawaited(_messageHistoryPersistence.appendHistory(self, row));
+    _updateSelfPreview(self, row);
+    _messages.add(row);
+  }
+
+  /// A reconciled OLD row must not replace a newer conversation preview.
+  void _updateSelfPreview(String self, ChatMessage row) {
+    final current = _lastByPeer[self];
+    if (current == null || !row.timestamp.isBefore(current.timestamp)) {
+      _lastByPeer[self] = row;
     }
   }
 
@@ -2087,6 +2283,7 @@ class FfiChatService {
   /// Awaitable so callers (the Platform `cleanConversationUnreadMessageCount`)
   /// can fire the conversation-list refresh only after the barrier is saved.
   Future<void> markConversationRead(String conversationId) async {
+    conversationId = _canonicalSelfAware(conversationId);
     final normalizedId = ConversationIdUtils.normalize(conversationId);
     if (normalizedId.isEmpty) return;
     // Zero the in-memory GROUP counter BEFORE the awaited barrier write below.
@@ -2130,6 +2327,7 @@ class FfiChatService {
   /// no wire receipt ever left the reader). Bounded to the most recent 50
   /// unread inbound rows; group ids never match the 64-hex gate.
   void _sendC2cReadReceiptsOnView(String normalizedId) {
+    if (isSelfPeer(normalizedId)) return; // self conversation: local-only
     if (normalizedId.length != 64 ||
         !RegExp(r'^[0-9A-Fa-f]{64}$').hasMatch(normalizedId) ||
         _knownGroups.contains(normalizedId)) {
@@ -2809,6 +3007,7 @@ class FfiChatService {
   /// ids are detected via the authoritative in-memory `_knownGroups` /
   /// `_quitGroups` sets (a quit group still isn't a C2C peer).
   int getUnreadOf(String peerId) {
+    peerId = _canonicalSelfAware(peerId);
     final norm = _unreadKey(peerId);
     if (_knownGroups.contains(norm) || _quitGroups.contains(norm)) {
       // Reader and writer now share [_unreadKey], so the normalized lookup is
@@ -3365,6 +3564,8 @@ class FfiChatService {
   /// The Dart-side session state [init] opens before any native work.
   void _beginSession() {
     _sessionClosed = false;
+    // A re-init may be another account: its legacy self state is unswept.
+    _selfLegacySwept = false;
     // A re-init after dispose: the session-scoped streams closed with the
     // previous session; a native callback of this one must find them open.
     _reopenSessionStreams();
@@ -6450,6 +6651,25 @@ class FfiChatService {
     cloudCustomData = _consumeArmedCloudCustomData(cloudCustomData);
     // Normalize friend ID to 64 characters (public key length)
     final normalizedPeerId = _normalizeFriendId(peerId);
+    if (isSelfPeer(peerId)) {
+      // Self conversation: a local row, delivered by definition. The armed
+      // read-receipt intent is consumed (and dropped) so it cannot leak onto
+      // the next real send.
+      _consumeArmedNeedReadReceipt();
+      return _appendSelfRow(ChatMessage(
+        text: text,
+        fromUserId: _selfId,
+        isSelf: true,
+        timestamp: DateTime.now(),
+        groupId: null,
+        isPending: false,
+        msgID: _usableClientMessageID(clientMessageID)
+            ? clientMessageID!
+            : '${DateTime.now().millisecondsSinceEpoch}_${_msgIDSequence++}_$_selfId',
+        cloudCustomData: cloudCustomData,
+        contentKind: outgoing.contentKind,
+      ));
+    }
     // Check if friend is online
     final friends = await getFriendList();
     final friend = friends.firstWhere((f) => f.userId == normalizedPeerId,
@@ -6549,6 +6769,7 @@ class FfiChatService {
       _sendGroupTextNativeChecked(peerId, payload);
       return;
     }
+    if (isSelfPeer(peerId)) return; // nobody on the wire to signal
     final normalizedPeerId = _normalizeFriendId(peerId);
     _sendC2cTextNativeChecked(normalizedPeerId, payload);
   }
@@ -8192,16 +8413,17 @@ class FfiChatService {
   /// [MessageHistoryPersistence.loadArchivedHistory]), oldest first. Same id
   /// normalization as [getHistory].
   Future<List<ChatMessage>> getArchivedHistory(String id) async {
-    return _messageHistoryPersistence
-        .loadArchivedHistory(ConversationIdUtils.normalize(id));
+    return _messageHistoryPersistence.loadArchivedHistory(
+        ConversationIdUtils.normalize(_canonicalSelfAware(id)));
   }
 
   Future<bool> hasArchivedHistory(String id) async {
-    return _messageHistoryPersistence
-        .hasArchivedHistory(ConversationIdUtils.normalize(id));
+    return _messageHistoryPersistence.hasArchivedHistory(
+        ConversationIdUtils.normalize(_canonicalSelfAware(id)));
   }
 
   List<ChatMessage> getHistory(String id) {
+    id = _canonicalSelfAware(id);
     // The persistence layer keys every conversation by
     // ConversationIdUtils.normalize (prefix stripped, then cut to 64), so
     // there is exactly one key per conversation and nothing to migrate here.
@@ -8358,6 +8580,7 @@ class FfiChatService {
   /// This deletes the persisted history file (JSON) but does NOT delete actual media files
   /// (images, videos, audio, documents) that may be referenced in the messages
   Future<void> clearC2CHistory(String userID) async {
+    userID = _canonicalSelfAware(userID);
     // Normalize friend ID to 64 characters (public key length)
     final normalizedUserID = _normalizeFriendId(userID);
 
@@ -9073,6 +9296,7 @@ class FfiChatService {
   }
 
   Future<void> sendTyping(String peerId, bool on) async {
+    if (isSelfPeer(peerId)) return; // self conversation: local-only
     // Normalize to 64 chars (public key) - FFI set_typing expects exactly 64 hex chars
     final normalizedPeerId = _normalizeFriendId(peerId);
     final p = normalizedPeerId.toNativeUtf8();
@@ -9995,6 +10219,9 @@ class FfiChatService {
 
   Future<void> queueGroupInviteForOfflineFriend(
       String groupId, String friendId) {
+    // Self is never a friend (toxcore refuses its own key), so an invite to
+    // self can never be delivered; queueing it would park it forever.
+    if (isSelfPeer(friendId)) return Future<void>.value();
     final entry = _offlineInviteEntry(groupId, _normalizeFriendId(friendId));
     return _withOfflineInviteQueueLock(() async {
       final prefs = _prefs;
@@ -10004,6 +10231,23 @@ class FfiChatService {
       if (entries.add(entry)) await prefs.setStringSet(key, entries);
     });
   }
+
+  /// Removes queued invites addressed to self (an older build could queue
+  /// them; they can never be delivered).
+  Future<void> _dropQueuedSelfGroupInvites() =>
+      _withOfflineInviteQueueLock(() async {
+        final prefs = _prefs;
+        if (prefs == null || _sessionClosed) return;
+        final key = _scopedKey(_kQueuedOfflineGroupInvites);
+        final entries = <String>{...await prefs.getStringSet(key)};
+        final kept = entries.where((entry) {
+          final tab = entry.indexOf('\t');
+          return tab <= 0 || !isSelfPeer(entry.substring(tab + 1));
+        }).toSet();
+        if (kept.length != entries.length) {
+          await prefs.setStringSet(key, kept);
+        }
+      });
 
   /// The queued invites ("groupId<TAB>normalizedFriendId"), for tests and
   /// diagnostics.
@@ -10028,6 +10272,7 @@ class FfiChatService {
   Future<void> _flushPendingGroupInvites(String friendId,
       {Future<bool> Function(String groupId)? inviteOverride}) {
     if (_sessionClosed) return Future<void>.value();
+    if (isSelfPeer(friendId)) return _dropQueuedSelfGroupInvites();
     final normalized = _normalizeFriendId(friendId);
     return _withOfflineInviteQueueLock(() async {
       final prefs = _prefs;
@@ -10352,6 +10597,9 @@ class FfiChatService {
       }
       return;
     }
+    // Single C2C receipt sink (on-view, explicit row-read, automatic
+    // 'received', restored flush): nothing goes to the self conversation.
+    if (isSelfPeer(peerId)) return;
     try {
       // C2C receipts echo a CONTENT-derived correlator instead of any id:
       // `bind:<sha256(text)>` in the (free-form) msgID field. The receiver
@@ -10860,6 +11108,7 @@ class FfiChatService {
       String peerId, String msgID, String reactionID, String action,
       {String? groupID}) async {
     if (groupID != null) return;
+    if (isSelfPeer(peerId)) return; // self conversation: local-only
     if (msgID.isEmpty || reactionID.isEmpty || _selfId.isEmpty) {
       throw ArgumentError('Reaction fields cannot be empty');
     }
@@ -11315,6 +11564,26 @@ class FfiChatService {
     final fileSize = await file.length();
     if (fileSize == 0) {
       throw Exception('File is empty');
+    }
+    if (isSelfPeer(peerId)) {
+      // Self conversation: no transfer. The row references [filePath] exactly
+      // like a delivered send does. The queue drain passes
+      // addToChatHistory:false (its pending row already exists) -> no row.
+      if (!addToChatHistory) return null;
+      return _appendSelfRow(ChatMessage(
+        text: '',
+        fromUserId: _selfId,
+        isSelf: true,
+        timestamp: DateTime.now(),
+        groupId: null,
+        filePath: filePath,
+        fileName: p.basename(filePath),
+        mediaKind: _detectKind(filePath),
+        fileSize: fileSize,
+        isPending: false,
+        msgID:
+            '${DateTime.now().millisecondsSinceEpoch}_${_msgIDSequence++}_$_selfId',
+      ));
     }
     // Check if friend is online
     final friends = await getFriendList();
@@ -12239,6 +12508,7 @@ class FfiChatService {
   }
 
   Future<void> _sendPendingMessages(String peerId) async {
+    if (isSelfPeer(peerId)) return _reconcileLegacySelfQueue();
     final normalizedPeerId = _normalizeFriendId(peerId);
 
     // Snapshot the items to drain. The persistence cache still holds them;
@@ -13035,6 +13305,12 @@ class FfiChatService {
 
     // 1. Stop new work.
     _draftDisposing = true;
+    final selfReconcile = _selfQueueReconcile;
+    if (selfReconcile != null) {
+      try {
+        await selfReconcile;
+      } catch (_) {}
+    }
     // The Tox instance behind the latched address is going away; a service
     // object that is re-init'ed after dispose must re-probe. See
     // [_selfToxIdCacheByInstance].
