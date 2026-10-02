@@ -160,6 +160,10 @@ Future<void> _persistFailedSend({
   );
 }
 
+/// V2TIM ERR_INVALID_PARAMETERS (include/V2TIMErrorCode.h), returned when a
+/// destructive call targets the self conversation.
+const int _kSelfUndeletableCode = 6017;
+
 /// Custom SDK Platform implementation that routes calls to tim2tox.
 ///
 /// TODO(tim2tox-refactor): this class is ~8000 lines (~70 @override methods
@@ -4781,6 +4785,15 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
   Future<V2TimCallback> deleteConversation({
     required String conversationID,
   }) async {
+    // The self conversation (the user's local notebook) is never deleted:
+    // refused before the deletion notification (which makes hosts suppress
+    // the row) and before any history or failed-row cleanup.
+    if (ffiService.isSelfPeer(conversationID)) {
+      return V2TimCallback(
+        code: _kSelfUndeletableCode,
+        desc: FfiChatService.selfConversationUndeletable,
+      );
+    }
     try {
       // 1) Notify listeners that the conversation was deleted. The host's
       //    conversation provider records this id in its "SDK-deleted" set, so
@@ -4831,6 +4844,15 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
       final results = <V2TimConversationOperationResult>[];
 
       for (final conversationID in conversationIDList) {
+        if (ffiService.isSelfPeer(conversationID)) {
+          // Per-id refusal; the rest of the batch proceeds.
+          results.add(V2TimConversationOperationResult(
+            conversationID: conversationID,
+            resultCode: _kSelfUndeletableCode,
+            resultInfo: FfiChatService.selfConversationUndeletable,
+          ));
+          continue;
+        }
         try {
           // Notify conversation listeners that conversation is being deleted
           _notifyConversationListeners((listener) {
@@ -8840,7 +8862,19 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
       // Delete friends via FfiChatService
       // Use deleteFriend instead of removeFriend to ensure local persistence cleanup
       final results = <V2TimFriendOperationResult>[];
+      final deleted = <String>[];
       for (final userID in userIDList) {
+        if (ffiService.isSelfPeer(userID)) {
+          // Never a friend; and deleteFriend's local cleanup would wipe the
+          // self conversation's notes.
+          results.add(V2TimFriendOperationResult(
+            userID: userID,
+            resultCode: _kSelfUndeletableCode,
+            resultInfo: FfiChatService.selfConversationUndeletable,
+          ));
+          continue;
+        }
+        deleted.add(userID);
         try {
           await ffiService.deleteFriend(userID);
           results.add(V2TimFriendOperationResult(
@@ -8856,10 +8890,12 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
         }
       }
 
-      // Notify listeners
-      _notifyFriendshipListeners((listener) {
-        listener.onFriendListDeleted?.call(userIDList);
-      });
+      // Notify listeners (a refused self id is not reported as deleted).
+      if (deleted.isNotEmpty) {
+        _notifyFriendshipListeners((listener) {
+          listener.onFriendListDeleted?.call(deleted);
+        });
+      }
 
       return V2TimValueCallback<List<V2TimFriendOperationResult>>(
         code: 0,
