@@ -1303,6 +1303,19 @@ class FfiChatService {
     return key.length == 64 && key.toUpperCase() == self.toUpperCase();
   }
 
+  /// Why a destructive operation refused the self conversation. The self
+  /// conversation is the user's local notebook: it is never a friend (toxcore
+  /// refuses the own key), so friend deletion cannot apply, and it is never
+  /// deleted — only its history can be cleared, explicitly.
+  static const String selfConversationUndeletable =
+      'the self conversation cannot be deleted';
+
+  void _refuseSelf(String peerId, String name) {
+    if (isSelfPeer(peerId)) {
+      throw ArgumentError.value(peerId, name, selfConversationUndeletable);
+    }
+  }
+
   /// [id] mapped onto the canonical self key when it addresses self, else
   /// returned unchanged — so every case/format alias reaches one history file.
   String _canonicalSelfAware(String id) =>
@@ -7411,6 +7424,7 @@ class FfiChatService {
   }
 
   Future<void> removeFriend(String userId) async {
+    _refuseSelf(userId, 'userId');
     // P0-A4: centralize on deleteFriend. Previously this method called the
     // FFI deleteFriend directly without writing the prefs side — the result
     // was a friend that disappeared from Tox but lingered in
@@ -8683,6 +8697,9 @@ class FfiChatService {
   /// Delete friend
   /// This is called by UIKit when user clicks "Delete" in profile page
   Future<void> deleteFriend(String userID) async {
+    // Before any local cleanup: that cleanup runs even when the native delete
+    // fails (as it always would for the own key) and would wipe the notes.
+    _refuseSelf(userID, 'userID');
     try {
       // Normalize userID to 64 characters (Tox public key length)
       final normalizedUserID = _normalizeFriendId(userID);

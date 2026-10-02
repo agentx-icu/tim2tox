@@ -70,14 +70,16 @@ class _CountingFfi extends Tim2ToxFfi {
       get sendText => (_, __) => _count('sendText');
 
   @override
-  int Function(ffi.Pointer<pkgffi.Utf8>, ffi.Pointer<pkgffi.Utf8>,
-      ffi.Pointer<ffi.Int8>, int) get sendTextEx =>
-      (_, __, ___, ____) => _count('sendTextEx');
+  int Function(
+      ffi.Pointer<pkgffi.Utf8>,
+      ffi.Pointer<pkgffi.Utf8>,
+      ffi.Pointer<ffi.Int8>,
+      int) get sendTextEx => (_, __, ___, ____) => _count('sendTextEx');
 
   @override
   int Function(ffi.Pointer<pkgffi.Utf8>, ffi.Pointer<pkgffi.Utf8>,
-      ffi.Pointer<ffi.Int8>, int) get sendC2CActionEx =>
-      (_, __, ___, ____) => _count('sendC2CActionEx');
+          ffi.Pointer<ffi.Int8>, int)
+      get sendC2CActionEx => (_, __, ___, ____) => _count('sendC2CActionEx');
 
   @override
   int Function(ffi.Pointer<pkgffi.Utf8>, ffi.Pointer<ffi.Uint8>, int, int)
@@ -93,8 +95,8 @@ class _CountingFfi extends Tim2ToxFfi {
       get sendFileNative => (_, __, ___) => _count('sendFileNative');
 
   @override
-  int Function(int, ffi.Pointer<pkgffi.Utf8>, int, int)
-      get fileControlNative => (_, __, ___, ____) => _count('fileControl');
+  int Function(int, ffi.Pointer<pkgffi.Utf8>, int, int) get fileControlNative =>
+      (_, __, ___, ____) => _count('fileControl');
 }
 
 /// A session whose identity cannot be read (no native binding behind it).
@@ -218,8 +220,7 @@ void main() {
       _selfToxId,
       'c2c_$_selfKey',
     ]) {
-      expect(service.getHistory(alias).map((m) => m.text),
-          ['lower', 'address'],
+      expect(service.getHistory(alias).map((m) => m.text), ['lower', 'address'],
           reason: alias);
     }
     expect(service.getConversationIds(), {_selfKey});
@@ -257,16 +258,14 @@ void main() {
     expect(row!.filePath, file.path);
     expect(row.fileSize, 4);
     expect(row.isPending, isFalse);
-    expect(
-        await service.sendFile(_selfKey, file.path, addToChatHistory: false),
+    expect(await service.sendFile(_selfKey, file.path, addToChatHistory: false),
         isNull);
     expect(service.getHistory(_selfKey), hasLength(1));
     expect(queue.getMessages(_selfKey), isEmpty);
     expect(ffiStub.calls, isEmpty);
   });
 
-  test('typing, control, reactions and receipts stay local',
-      () async {
+  test('typing, control, reactions and receipts stay local', () async {
     final row = await service.sendTextWithResult(_selfKey, 'x');
     await service.sendTyping(_selfKey, true);
     await service.sendControlSignal(_selfKey, '__revoke__:{}');
@@ -310,8 +309,7 @@ void main() {
         contentKind: ChatMessageContentKind.normal,
       );
 
-  test('a text an older build queued for self is reconciled locally',
-      () async {
+  test('a text an older build queued for self is reconciled locally', () async {
     final queuedAt = DateTime.now().subtract(const Duration(minutes: 5));
     await history.appendHistory(
         _selfKey,
@@ -324,7 +322,8 @@ void main() {
           isPending: true,
           msgID: 'legacy-1',
         ));
-    await queue.addMessage(_selfKey, queued('legacy-1', queuedAt, text: 'stuck'));
+    await queue.addMessage(
+        _selfKey, queued('legacy-1', queuedAt, text: 'stuck'));
 
     await service.retryPendingC2cMessages(_selfKey);
 
@@ -342,8 +341,10 @@ void main() {
       ..writeAsBytesSync([9, 9, 9]);
     final at = DateTime.now().subtract(const Duration(minutes: 3));
     await queue.addMessage(_selfKey, queued('q-text', at, text: 'orphan'));
-    await queue.addMessage(_selfKey,
-        queued('q-file', at.add(const Duration(seconds: 1)), filePath: file.path));
+    await queue.addMessage(
+        _selfKey,
+        queued('q-file', at.add(const Duration(seconds: 1)),
+            filePath: file.path));
 
     await service.retryPendingC2cMessages(_selfKey);
 
@@ -366,7 +367,8 @@ void main() {
 
   test('a new self send reconciles legacy items without losing the preview',
       () async {
-    await queue.addMessage(_selfKey,
+    await queue.addMessage(
+        _selfKey,
         queued('legacy-2', DateTime.now().subtract(const Duration(hours: 1)),
             text: 'old'));
     await service.sendTextWithResult(_selfKey, 'new');
@@ -374,8 +376,8 @@ void main() {
       await Future<void>.delayed(const Duration(milliseconds: 10));
     }
     expect(queue.getMessages(_selfKey), isEmpty);
-    expect(service.getHistory(_selfKey).map((m) => m.msgID),
-        contains('legacy-2'));
+    expect(
+        service.getHistory(_selfKey).map((m) => m.msgID), contains('legacy-2'));
     expect(service.lastMessages[_selfKey]?.text, 'new',
         reason: 'an older reconciled row must not replace the newest preview');
     expect(ffiStub.calls, isEmpty);
@@ -400,8 +402,7 @@ void main() {
         {'tox_2\t${'CD' * 32}'});
   });
 
-  test('msgID-less legacy notes sharing a millisecond are both kept',
-      () async {
+  test('msgID-less legacy notes sharing a millisecond are both kept', () async {
     final at = DateTime.now().subtract(const Duration(minutes: 2));
     await history.appendHistory(
         _selfKey,
@@ -477,8 +478,24 @@ void main() {
     expect(await settle(), isEmpty);
   });
 
-  test('a real friend still goes to the wire (guards are self-only)',
-      () async {
+  test('friend deletion refuses self and leaves the notes alone', () async {
+    await service.sendTextWithResult(_selfKey, 'keep me');
+    for (final alias in [_selfKey, _selfToxId, _selfKey.toLowerCase()]) {
+      await expectLater(
+        service.deleteFriend(alias),
+        throwsA(isA<ArgumentError>().having((e) => e.message, 'message',
+            FfiChatService.selfConversationUndeletable)),
+        reason: alias,
+      );
+      await expectLater(
+          service.removeFriend(alias), throwsA(isA<ArgumentError>()),
+          reason: alias);
+    }
+    expect(service.getHistory(_selfKey).map((m) => m.text), ['keep me']);
+    expect(ffiStub.calls, isEmpty);
+  });
+
+  test('a real friend still goes to the wire (guards are self-only)', () async {
     // Offline friend: queued (the stub reports no friends), not dropped.
     final row = await service.sendTextWithResult('CD' * 32, 'hello');
     expect(row.isPending, isTrue);
