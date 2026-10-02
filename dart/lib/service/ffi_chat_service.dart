@@ -4087,7 +4087,14 @@ class FfiChatService {
   /// Returns true when the native layer accepted the value. Returns false (and
   /// logs) when the native library predates this export -- callers MUST treat
   /// that as "the profile will be plaintext" and not assume protection.
-  bool setProfilePassphrase(String? passphrase) =>
+  ///
+  /// [passphrase] is the raw UTF-8 bytes. The host owns them: they are copied
+  /// into native memory for the duration of the call, that copy is zeroed, and
+  /// the host's buffer is left untouched so the host can keep (and later zero)
+  /// its own copy. This is the primary API; a host that only has a String
+  /// should still convert it ONCE at the UI edge and keep bytes from then on,
+  /// because a Dart String can never be zeroed.
+  bool setProfilePassphraseBytes(Uint8List? passphrase) =>
       _withPassphraseBuffer(passphrase, (buf, len) {
         try {
           return _ffi.setProfilePassphrase(buf, len) == 1;
@@ -4099,19 +4106,19 @@ class FfiChatService {
         }
       });
 
-  /// Encodes [passphrase] into native memory, runs [body] on it, and zeroes
-  /// EVERY intermediate copy on the way out -- the native buffer and the
-  /// encoder's own output. `utf8.encode` already returns a Uint8List, so it is
-  /// used directly rather than copied again.
-  ///
-  /// The source String stays in the Dart heap until GC and cannot be zeroed;
-  /// closing that would need a byte-array password API all the way up the
-  /// stack, which is a host-side change.
+  /// String convenience over [setProfilePassphraseBytes]. The encoded copy is
+  /// zeroed after the call; the String itself stays in the Dart heap until GC
+  /// and cannot be, so prefer the bytes API for anything the host retains.
+  bool setProfilePassphrase(String? passphrase) =>
+      _withEncodedPassphrase(passphrase, setProfilePassphraseBytes);
+
+  /// Copies [passphrase] into native memory, runs [body] on it, and zeroes the
+  /// native buffer before freeing it. The caller's bytes are NOT zeroed: they
+  /// belong to the caller, which decides when its copy dies. Null or empty
+  /// means "no passphrase" (a null pointer, length 0).
   bool _withPassphraseBuffer(
-      String? passphrase, bool Function(ffi.Pointer<ffi.Uint8>, int) body) {
-    final Uint8List? bytes = (passphrase == null || passphrase.isEmpty)
-        ? null
-        : utf8.encode(passphrase);
+      Uint8List? passphrase, bool Function(ffi.Pointer<ffi.Uint8>, int) body) {
+    final bytes = (passphrase == null || passphrase.isEmpty) ? null : passphrase;
     ffi.Pointer<ffi.Uint8> buf = ffi.nullptr;
     try {
       if (bytes != null) {
@@ -4121,17 +4128,23 @@ class FfiChatService {
       return body(buf, bytes?.length ?? 0);
     } finally {
       if (buf != ffi.nullptr) {
-        final view = buf.asTypedList(bytes!.length);
-        for (var i = 0; i < view.length; i++) {
-          view[i] = 0;
-        }
+        buf.asTypedList(bytes!.length).fillRange(0, bytes.length, 0);
         pkgffi.malloc.free(buf);
       }
-      if (bytes != null) {
-        for (var i = 0; i < bytes.length; i++) {
-          bytes[i] = 0;
-        }
-      }
+    }
+  }
+
+  /// Encodes [passphrase] for a bytes API and zeroes the encoding afterwards.
+  /// `utf8.encode` returns a fresh Uint8List, so no second copy is made.
+  static bool _withEncodedPassphrase(
+      String? passphrase, bool Function(Uint8List?) body) {
+    final Uint8List? bytes = (passphrase == null || passphrase.isEmpty)
+        ? null
+        : utf8.encode(passphrase);
+    try {
+      return body(bytes);
+    } finally {
+      bytes?.fillRange(0, bytes.length, 0);
     }
   }
 
@@ -4149,7 +4162,10 @@ class FfiChatService {
   /// Bound to the native session this service's [init] opened: a re-key that
   /// would land on a different session (an account switch in flight) is
   /// refused natively and reports false.
-  bool rekeyLiveProfilePassphrase(String? passphrase) =>
+  ///
+  /// Same byte-ownership contract as [setProfilePassphraseBytes]: the host's
+  /// buffer is copied, the copy is zeroed, the host's bytes are untouched.
+  bool rekeyLiveProfilePassphraseBytes(Uint8List? passphrase) =>
       _withPassphraseBuffer(passphrase, (buf, len) {
         try {
           return _ffi.rekeyLiveProfilePassphrase(
@@ -4161,6 +4177,11 @@ class FfiChatService {
           return false;
         }
       });
+
+  /// String convenience over [rekeyLiveProfilePassphraseBytes]; see
+  /// [setProfilePassphrase] for why the bytes API is preferred.
+  bool rekeyLiveProfilePassphrase(String? passphrase) =>
+      _withEncodedPassphrase(passphrase, rekeyLiveProfilePassphraseBytes);
 
   /// Whether the native layer currently holds a savedata passphrase.
   /// Returns null when the native library predates the export.
