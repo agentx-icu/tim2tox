@@ -344,4 +344,23 @@ void main() {
       expect(platformSource, isNot(contains(leak)), reason: leak);
     }
   });
+
+  test('incoming files off (limit 0) are refused before any row exists', () {
+    final source = File('lib/service/ffi_chat_service.dart').readAsStringSync();
+    final branch = source.substring(
+      source.indexOf("} else if (s.startsWith('file_request:')) {",
+          source.indexOf("} else if (s.startsWith('file_request:')) {") + 1),
+    );
+    final disabledCheck = branch.indexOf('_incomingFilesDisabled()');
+    final rowCreated = branch.indexOf('_fileReceiveProgress[(normalizedUid');
+    final autoAccept = branch.indexOf('getAutoDownloadSizeLimit()');
+    expect(disabledCheck, greaterThan(0));
+    expect(disabledCheck, lessThan(rowCreated));
+    expect(disabledCheck, lessThan(autoAccept));
+    expect(
+      source.contains(
+          'return await prefs.getAutoDownloadSizeLimit() <= 0;'),
+      isTrue,
+    );
+  });
 }

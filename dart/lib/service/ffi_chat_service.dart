@@ -4000,8 +4000,8 @@ class FfiChatService {
       if (_pendingAddFriend[serverId]?.isEmpty ?? false) {
         _pendingAddFriend.remove(serverId);
       }
-      pkgffi.malloc.free(psv);
-      pkgffi.malloc.free(pword);
+      // The `finally` below frees both buffers; freeing them here too was a
+      // double free on this path.
       return AddFriendResult(
         resultCode: -1,
         userId: serverId,
@@ -4991,6 +4991,27 @@ class FfiChatService {
                       uid,
                       fileNumber,
                       eventInstanceId,
+                    );
+                    if (_pollDisposed) {
+                      pkgffi.malloc.free(buf);
+                      return; // service disposed while we were away — never touch native again
+                    }
+                    continue;
+                  }
+                  // An auto-download limit of 0 means the host takes no files
+                  // at all (a text-only client): refuse the transfer before a
+                  // history row, an unread count or a download exists — images
+                  // included, which otherwise bypass the limit below.
+                  if (await _incomingFilesDisabled()) {
+                    if (_pollDisposed) {
+                      pkgffi.malloc.free(buf);
+                      return;
+                    }
+                    await _cancelFileTransferBestEffort(
+                      uid,
+                      fileNumber,
+                      instanceId: eventInstanceId,
+                      reason: 'incoming files disabled',
                     );
                     if (_pollDisposed) {
                       pkgffi.malloc.free(buf);
@@ -11838,6 +11859,18 @@ class FfiChatService {
     }
   }
 
+  /// True when the host set the auto-download limit to 0 or less: it takes
+  /// no incoming files (see the file_request handler).
+  Future<bool> _incomingFilesDisabled() async {
+    final prefs = _prefs;
+    if (prefs == null) return false;
+    try {
+      return await prefs.getAutoDownloadSizeLimit() <= 0;
+    } catch (_) {
+      return false;
+    }
+  }
+
   Future<void> rejectFileTransfer(String peerId, int fileNumber,
       {int? instanceId}) async {
     final normalizedPeerId = _normalizeFriendId(peerId);
@@ -12920,7 +12953,9 @@ class FfiChatService {
               msg.contentKind == item.contentKind &&
               _offlineRowMatchesItem(msg, item, itemMs));
       if (matches) {
-        final updated = msg.copyWith(isPending: false);
+        // Not pending any more, and not delivered either: say so, so hosts
+        // can show a failed message instead of a sent one.
+        final updated = msg.copyWith(isPending: false, isFailed: true);
         history[i] = updated;
         _lastByPeer[normalizedPeerId] = updated;
         try {

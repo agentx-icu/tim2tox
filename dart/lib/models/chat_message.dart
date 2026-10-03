@@ -173,6 +173,7 @@ class ChatMessage {
     this.fileName,
     this.mediaKind,
     this.isPending = false,
+    this.isFailed = false,
     this.isReceived = false,
     this.isRead = false,
     this.msgID,
@@ -196,6 +197,11 @@ class ChatMessage {
   final String? fileName;
   final String? mediaKind; // 'image' | 'video' | 'audio' | 'file' | 'custom'
   final bool isPending;
+
+  /// Our own message that could not be sent: a queued (offline) send whose
+  /// drain failed. It is no longer pending and was never delivered; hosts
+  /// show it as failed instead of sent.
+  final bool isFailed;
   final bool isReceived;
   final bool isRead;
   final String? msgID;
@@ -266,6 +272,9 @@ class ChatMessage {
         // Backward compatible: gated like cloudCustomData, so rows without the
         // flag keep serializing byte-identically.
         if (needReadReceipt) 'needReadReceipt': true,
+        // Backward compatible: gated, so rows that never failed keep
+        // serializing byte-identically.
+        if (isFailed) 'isFailed': true,
       };
 
   factory ChatMessage.fromJson(Map<String, dynamic> json) => ChatMessage(
@@ -294,12 +303,14 @@ class ChatMessage {
         // Backward compatible: pre-existing history has no cloudCustomData key.
         cloudCustomData: json['cloudCustomData'] as String?,
         needReadReceipt: json['needReadReceipt'] as bool? ?? false,
+        isFailed: json['isFailed'] as bool? ?? false,
       );
 
   ChatMessage copyWith({
     bool? isReceived,
     bool? isRead,
     bool? isPending,
+    bool? isFailed,
     String? filePath,
     String? fileName,
     int? fileSize,
@@ -321,6 +332,7 @@ class ChatMessage {
       fileName: fileName ?? this.fileName,
       mediaKind: mediaKind,
       isPending: isPending ?? this.isPending,
+      isFailed: isFailed ?? this.isFailed,
       isReceived: isReceived ?? this.isReceived,
       isRead: isRead ?? this.isRead,
       msgID: msgID,

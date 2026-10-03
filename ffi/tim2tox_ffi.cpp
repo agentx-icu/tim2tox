@@ -2483,6 +2483,19 @@ void tim2tox_ffi_set_callback(tim2tox_event_cb cb, void* user_data) {
     g_cb_user.store(user_data);
 }
 
+// Peer-chosen text (a request's wording, a nickname) inside a tab/newline
+// framed list: a tab, CR or LF in it would add a field or a whole fake line
+// (e.g. a forged applicant with any public key). Flattened to spaces, the way
+// tim2tox_ffi_get_pending_group_invites treats group names.
+static void AppendListField(std::string& out, const char* text) {
+    const std::size_t start = out.size();
+    out.append(text ? text : "");
+    for (std::size_t i = start; i < out.size(); ++i) {
+        char& c = out[i];
+        if (c == '\t' || c == '\n' || c == '\r') c = ' ';
+    }
+}
+
 int tim2tox_ffi_get_friend_list(char* buffer, int buffer_len) {
     if (!IsCurrentInstanceInited() || !buffer || buffer_len <= 0) return 0;
     struct LCb : public V2TIMValueCallback<V2TIMFriendInfoVector> {
@@ -2498,9 +2511,9 @@ int tim2tox_ffi_get_friend_list(char* buffer, int buffer_len) {
                 std::string nick = fi.friendRemark.CString(); // may be empty
                 // online flag from role storage, see impl mapping
                 int online = (fi.userFullInfo.role == V2TIM_USER_STATUS_ONLINE) ? 1 : 0;
-                s.append(uid);
+                AppendListField(s, uid.c_str());
                 s.push_back('\t');
-                s.append(nick);
+                AppendListField(s, nick.c_str());
                 s.push_back('\t');
                 s.append(online ? "1" : "0");
                 s.push_back('\n');
@@ -2580,9 +2593,9 @@ static int get_friend_applications_impl(V2TIMManager* manager, char* buffer, int
             std::string s;
             for (size_t i = 0; i < r.applicationList.Size(); ++i) {
                 const auto& a = r.applicationList[i];
-                s.append(a.userID.CString());
+                AppendListField(s, a.userID.CString());
                 s.push_back('\t');
-                s.append(a.addWording.CString());
+                AppendListField(s, a.addWording.CString());
                 s.push_back('\n');
             }
             { std::lock_guard<std::mutex> lk(m); out.swap(s); done=true; }

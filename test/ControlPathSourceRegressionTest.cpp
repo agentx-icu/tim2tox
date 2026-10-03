@@ -536,4 +536,31 @@ TEST(ControlPathSourceRegressionTest, NlohmannProvisioningIsFfiOnly) {
     EXPECT_EQ(ffi_cmake.find("execute_process"), std::string::npos);
 }
 
+
+TEST(ControlPathSourceRegressionTest,
+     PeerTextIsFlattenedInTabNewlineFramedLists) {
+    const std::string ffi_source = ReadSource(TIM2TOX_FFI_SOURCE_PATH);
+    const std::string helper = SourceSection(
+        ffi_source,
+        "static void AppendListField(",
+        "int tim2tox_ffi_get_friend_list(");
+    EXPECT_NE(helper.find("c == '\\t' || c == '\\n' || c == '\\r'"),
+              std::string::npos);
+    // A request's wording and a friend's nickname are chosen by the peer: a
+    // raw tab or newline would forge fields or a whole applicant line.
+    const std::string friends = SourceSection(
+        ffi_source,
+        "int tim2tox_ffi_get_friend_list(",
+        "static int get_friend_applications_impl(");
+    EXPECT_NE(friends.find("AppendListField(s, nick.c_str())"), std::string::npos);
+    EXPECT_EQ(friends.find("s.append(nick)"), std::string::npos);
+    const std::string applications = SourceSection(
+        ffi_source,
+        "static int get_friend_applications_impl(",
+        "int tim2tox_ffi_get_friend_applications(");
+    EXPECT_NE(applications.find("AppendListField(s, a.addWording.CString())"),
+              std::string::npos);
+    EXPECT_EQ(applications.find("s.append(a.addWording"), std::string::npos);
+}
+
 }

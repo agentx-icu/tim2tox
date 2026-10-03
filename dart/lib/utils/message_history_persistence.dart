@@ -3733,6 +3733,8 @@ class MessageHistoryPersistence {
           ? ChatMessageContentKind.action
           : ChatMessageContentKind.normal,
       isPending: isPending,
+      // A failed send stays failed through a merge of its duplicate copies.
+      isFailed: updated.isFailed || existing.isFailed,
       isReceived: isReceived,
       isRead: isRead,
       msgID: mergedMsgID,
