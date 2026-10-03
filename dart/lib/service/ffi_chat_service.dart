@@ -12874,13 +12874,19 @@ class FfiChatService {
     await _saveHistory(historyKey);
     // Publish the row as it is NOW: a drain may already have sent (or failed)
     // it while the writes above were awaited.
+    // A row trimmed out of the window meanwhile is not published at all: a
+    // captured copy could contradict what the drain already emitted.
     final at = history.lastIndexWhere((m) => m.isSelf && m.msgID == msgID);
-    final current = at >= 0 ? history[at] : pending;
-    final last = _lastByPeer[historyKey];
-    if (last != null && last.msgID == msgID) _lastByPeer[historyKey] = current;
-    try {
-      _messages.add(current);
-    } catch (_) {}
+    if (at >= 0) {
+      final current = history[at];
+      final last = _lastByPeer[historyKey];
+      if (last != null && last.msgID == msgID) {
+        _lastByPeer[historyKey] = current;
+      }
+      try {
+        _messages.add(current);
+      } catch (_) {}
+    }
     if (isGroup) {
       unawaited(_sendPendingGroupMessages(conversation));
     } else if (_friendOnlineStatus[historyKey] == 'online') {
