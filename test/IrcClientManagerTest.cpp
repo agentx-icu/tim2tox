@@ -27,6 +27,7 @@
 using socket_handle_t = SOCKET;
 constexpr socket_handle_t kInvalidSocket = INVALID_SOCKET;
 static void close_socket(socket_handle_t socket) { closesocket(socket); }
+static void shutdown_socket(socket_handle_t socket) { shutdown(socket, SD_BOTH); }
 #else
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -37,6 +38,7 @@ static void close_socket(socket_handle_t socket) { closesocket(socket); }
 using socket_handle_t = int;
 constexpr socket_handle_t kInvalidSocket = -1;
 static void close_socket(socket_handle_t socket) { close(socket); }
+static void shutdown_socket(socket_handle_t socket) { shutdown(socket, SHUT_RDWR); }
 #endif
 
 namespace {
@@ -115,15 +117,14 @@ public:
             }));
     }
 
-    // Simulate a server-side drop: close the current client socket so the
-    // client's recv() returns and its reconnect path engages. run() then accepts
-    // the reconnection on a fresh socket.
+    // Simulate a server-side drop: shut the current client socket down so the
+    // client's recv() returns and its reconnect path engages. run() then closes
+    // it and accepts the reconnection on a fresh socket. shutdown(), not
+    // close(): run() is blocked in recv() on this very fd, and on Linux a
+    // close() from another thread does not wake it (see stop()).
     void dropClient() {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (client_fd_ != kInvalidSocket) {
-            close_socket(client_fd_);
-            client_fd_ = kInvalidSocket;
-        }
+        if (client_fd_ != kInvalidSocket) shutdown_socket(client_fd_);
     }
 
 private:
@@ -169,8 +170,8 @@ private:
                     pending.erase(0, pos + 1);
                 }
             }
-            // Client gone. Close it unless dropClient() already did (it nulls
-            // client_fd_ under the lock, so a match here means we own the close).
+            // Client gone (peer closed, or dropClient()/stop() shut it down).
+            // run() owns every close of an accepted socket.
             std::lock_guard<std::mutex> lock(mutex_);
             if (client_fd_ == accepted) {
                 close_socket(accepted);
@@ -181,15 +182,27 @@ private:
 
     void stop() {
         if (stopped_.exchange(true)) return;
-        if (client_fd_ != kInvalidSocket) {
-            close_socket(client_fd_);
-            client_fd_ = kInvalidSocket;
+        // Wake run() with shutdown(), not close(). Closing an fd that another
+        // thread is blocked on in recv()/accept() wakes that thread on macOS
+        // but NOT on Linux, where the server thread stayed in recv() forever
+        // (the client under test is only disconnected in TearDown, after this
+        // destructor) and join() hung the whole suite. shutdown() wakes both.
+        // The client fd is left for run() to close (it owns that close once
+        // recv() returns), so it is never closed twice.
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (client_fd_ != kInvalidSocket) shutdown_socket(client_fd_);
         }
         if (listen_fd_ != kInvalidSocket) {
+            shutdown_socket(listen_fd_);
             close_socket(listen_fd_);
             listen_fd_ = kInvalidSocket;
         }
         if (thread_.joinable()) thread_.join();
+        if (client_fd_ != kInvalidSocket) {
+            close_socket(client_fd_);
+            client_fd_ = kInvalidSocket;
+        }
     }
 
     int port_ = 0;

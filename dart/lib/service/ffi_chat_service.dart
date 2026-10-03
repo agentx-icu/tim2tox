@@ -1215,10 +1215,11 @@ class FfiChatService {
 
   /// One-shot read-receipt intent for the NEXT sendText/sendGroupText, armed
   /// by Tim2ToxSdkPlatform.sendMessage right before it dispatches (same
-  /// pattern as [armNextSendCloudCustomData]). KNOWN GAP: the offline-queue
-  /// early return consumes nothing, so a send that lands in the offline queue
-  /// leaves the flag armed for the next send — benign (one extra indicator)
-  /// and rare; thread it through the queue items to close.
+  /// pattern as [armNextSendCloudCustomData]). Every send branch consumes it:
+  /// online sends and the group offline branch stamp it on the row (drain
+  /// flips the pending row in place); the offline C2C and self branches drop
+  /// it (the composer only derives intent for groups, and nobody can receipt
+  /// a note to self).
   bool _armedSendNeedReadReceipt = false;
   void armNextSendNeedReadReceipt(bool value) {
     _armedSendNeedReadReceipt = value;
@@ -2324,9 +2325,13 @@ class FfiChatService {
   /// complete the transport underneath was. Viewing the conversation is the
   /// trigger that does exist on every platform, so it drives both kinds.
   ///
-  /// Deliberately NOT done: propagating `needReadReceipt` in the group text
-  /// frame. It would change the wire format of every group message to carry a
-  /// bit the reader does not need — the reader knows it read the row.
+  /// Deliberately NOT done: carrying `needReadReceipt` on the wire. It is
+  /// author-local metadata (it gates the author's receipt menu and receipt
+  /// query); product group read reporting runs through the conversation/read
+  /// APIs, subject to their own eligibility and bounds. A carrier would need
+  /// capability negotiation with older builds, a new control kind and a
+  /// per-(group, author, message) correlation store, and a reader that gated
+  /// on it would stop receipting authors that never announce.
   void _sendReadReceiptsOnView(String normalizedId) {
     if (_knownGroups.contains(normalizedId)) {
       _sendGroupReadReceiptsOnView(normalizedId);
@@ -11216,15 +11221,20 @@ class FfiChatService {
     // history sync, so a message "sent" then was lost for good while showing
     // as delivered. Queue it; it drains when the group connects.
     if (!_isConnected || !_groupWireReady(groupId)) {
-      // Offline: consume (drop) the armed read-receipt intent so it cannot
-      // leak onto an unrelated NEXT send; queued items do not carry it yet.
-      _consumeArmedNeedReadReceipt();
+      // Offline: the armed read-receipt intent is consumed HERE (it must not
+      // leak onto an unrelated next send) and stamped on the pending row. The
+      // intent is author-local metadata -- it never travels on the wire -- so
+      // the queue item does not need it: drain flips this same row in place
+      // (copyWith), and the row persists the flag across a restart. It used to
+      // be dropped, so a group message composed offline lost its receipt
+      // indicator/menu once the page was reloaded from history.
       return _queueOfflineGroupText(
         groupId,
         text,
         cloudCustomData: cloudCustomData,
         clientMessageID: clientMessageID,
         contentKind: outgoing.contentKind,
+        needReadReceipt: _consumeArmedNeedReadReceipt(),
       );
     }
     _sendGroupTextByKindChecked(groupId, text, outgoing.contentKind);
@@ -11256,7 +11266,8 @@ class FfiChatService {
   Future<ChatMessage> _queueOfflineGroupText(String groupId, String text,
       {String? cloudCustomData,
       String? clientMessageID,
-      required ChatMessageContentKind contentKind}) async {
+      required ChatMessageContentKind contentKind,
+      bool needReadReceipt = false}) async {
     _validateTextTransportPayload(text);
     if (contentKind == ChatMessageContentKind.action && text.isEmpty) {
       throw _InvalidTextTransportPayload('ACTION payload must not be empty.');
@@ -11292,6 +11303,7 @@ class FfiChatService {
       // survives restart before reconnect (drain flips this same row to
       // delivered, keeping it). Parity with the C2C offline path.
       cloudCustomData: cloudCustomData,
+      needReadReceipt: needReadReceipt,
       contentKind: contentKind,
     );
     _lastByPeer[groupId] = msg;
@@ -11375,20 +11387,34 @@ class FfiChatService {
         // nothing and is DROPPED by the unresolved-control path — the flip
         // side of the pollution fix. The durable queue-clear ordering below is
         // unchanged; this only moves an in-memory field write earlier.
+        //
+        // NOT gated on isPending: history loading clears isPending on every
+        // row from a previous session, while the queue item survives the
+        // restart and drains here. A row composed offline before a restart
+        // used to be skipped, so it never got the alias and no read receipt
+        // could ever correlate to it. Identity is the queue item's own msgID
+        // (_offlineRowMatchesItem), not the pending flag -- so a non-pending
+        // row is only taken on that exact identity: a legacy item without a
+        // msgID matches by millisecond, which two identical texts can share,
+        // and it keeps the pending gate. A row that already carries a `gmid:`
+        // alias was sent and is never re-stamped.
+        var stampedSettledRow = false;
         if (drainedAlias != null && history != null) {
           final itemMs = item.timestamp.millisecondsSinceEpoch;
+          final exactIdentity = item.msgID?.isNotEmpty ?? false;
           for (int i = history.length - 1; i >= 0; i--) {
             final msg = history[i];
             if (msg.isSelf &&
-                msg.isPending &&
+                (msg.isPending || exactIdentity) &&
                 msg.filePath == null &&
                 msg.text == item.text &&
                 msg.contentKind == item.contentKind &&
-                !msg.altMsgIds.contains(drainedAlias) &&
+                !msg.altMsgIds.any((id) => id.startsWith('gmid:')) &&
                 _offlineRowMatchesItem(msg, item, itemMs)) {
               history[i] = msg.copyWith(
                 altMsgIds: [...msg.altMsgIds, drainedAlias],
               );
+              stampedSettledRow = !msg.isPending;
               break;
             }
           }
@@ -11426,6 +11452,14 @@ class FfiChatService {
               } catch (_) {}
               break;
             }
+          }
+          // A restarted (already non-pending) row skipped the flip above, so
+          // its new alias must be persisted here or the next restart drops it
+          // while the queue item is already gone.
+          if (stampedSettledRow) {
+            try {
+              await _saveHistory(groupId);
+            } catch (_) {}
           }
         }
         await Future.delayed(const Duration(milliseconds: 100));
