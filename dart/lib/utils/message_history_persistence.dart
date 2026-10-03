@@ -3668,16 +3668,18 @@ class MessageHistoryPersistence {
         (m) => identical(m, row) || (rowId != null && _idMatches(m, rowId)));
     if (index < 0) return Future.value();
     final current = list[index];
+    // A failure is only taken over when the ids prove it is the SAME
+    // message; the caller's match may be a content heuristic.
+    final sameId = duplicate.msgID != null && _idMatches(current, duplicate.msgID!);
     final newIds = <String>{
       if (duplicate.msgID != null) duplicate.msgID!,
       ...duplicate.altMsgIds,
     }..removeWhere((id) => _idMatches(current, id));
-    // The duplicate may carry news about the same message: a send failure.
-    final becameFailed = duplicate.isFailed && !current.isFailed;
+    final becameFailed = sameId && duplicate.isFailed && !current.isFailed;
     if (newIds.isEmpty && !becameFailed) return Future.value();
     list[index] = current.copyWith(
       altMsgIds: ({...current.altMsgIds, ...newIds}.toList()..sort()),
-      isFailed: current.isFailed || duplicate.isFailed,
+      isFailed: current.isFailed || becameFailed,
     );
     return _scheduleDebouncedSave(normalizedId);
   }

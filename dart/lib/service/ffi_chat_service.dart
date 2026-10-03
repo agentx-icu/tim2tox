@@ -11542,7 +11542,8 @@ class FfiChatService {
         // and the message lost with no UI signal.
         if (sent) {
           // Delivered, but the queue entry could not be removed: retry the
-          // removal once; never report a delivered message as failed.
+          // removal once, show the row as delivered (the reconcile after the
+          // removal never ran), and never report it failed.
           _logger?.logError(
               '[FfiChatService] queued item sent but its queue entry could '
               'not be removed',
@@ -11551,6 +11552,7 @@ class FfiChatService {
           try {
             await _offlineQueuePersistence.removeItem(storageKey, item);
           } catch (_) {}
+          await _reconcileSentItem(groupId, history, item);
           continue;
         }
         _logger?.logError(
@@ -12746,7 +12748,8 @@ class FfiChatService {
         }
         if (sent) {
           // Delivered, but the queue entry could not be removed: retry the
-          // removal once; never report a delivered message as failed.
+          // removal once, show the row as delivered (the reconcile after the
+          // removal never ran), and never report it failed.
           _logger?.logError(
               '[FfiChatService] queued item sent but its queue entry could '
               'not be removed',
@@ -12755,6 +12758,7 @@ class FfiChatService {
           try {
             await _offlineQueuePersistence.removeItem(storageKey, item);
           } catch (_) {}
+          await _reconcileSentItem(normalizedPeerId, history, item);
           continue;
         }
         _logger?.logError(
@@ -12987,6 +12991,30 @@ class FfiChatService {
   // On drain failure, flip the matching pending history record to
   // non-pending so the UI can render it as failed. The queue entry is NOT
   // re-enqueued — one drain attempt per online transition by design.
+  /// The row of a queued [item] that WAS sent although the drain threw
+  /// afterwards (the queue removal): delivered, neither pending nor failed.
+  /// Exact identity only (the item's msgID, or the exact-ms legacy match).
+  Future<void> _reconcileSentItem(String key, List<ChatMessage>? history,
+      OfflineMessageItem item) async {
+    if (history == null) return;
+    final itemMs = item.timestamp.millisecondsSinceEpoch;
+    for (int i = history.length - 1; i >= 0; i--) {
+      final msg = history[i];
+      if (!msg.isSelf || !_offlineRowMatchesItem(msg, item, itemMs)) continue;
+      if (!msg.isPending && !msg.isFailed) return;
+      final updated = msg.copyWith(isPending: false, isFailed: false);
+      history[i] = updated;
+      _lastByPeer[key] = updated;
+      try {
+        await _saveHistory(key);
+      } catch (_) {}
+      try {
+        _messages.add(updated);
+      } catch (_) {}
+      return;
+    }
+  }
+
   void _markPendingItemFailed(String normalizedPeerId,
       List<ChatMessage>? history, OfflineMessageItem item,
       {required bool isFile}) {
@@ -12997,19 +13025,11 @@ class FfiChatService {
     final itemMs = item.timestamp.millisecondsSinceEpoch;
     for (int i = history.length - 1; i >= 0; i--) {
       final msg = history[i];
-      if (!msg.isSelf || msg.isFailed) continue;
-      // History loading clears isPending, so after a restart the queued
-      // row is no longer marked pending: accept it then too, but only by
-      // its exact msgID (never by a timestamp match on a delivered row).
-      if (!msg.isPending &&
-          (item.msgID == null ||
-              item.msgID!.isEmpty ||
-              msg.msgID != item.msgID ||
-              // Delivery evidence wins over a failed later attempt.
-              msg.isReceived ||
-              msg.isRead)) {
-        continue;
-      }
+      // Pending rows only. After a restart history loading clears
+      // isPending, and a non-pending row may already have been delivered
+      // (a send whose queue removal never reached disk): reporting that as
+      // failed would invite a duplicate resend, so it is left as it is.
+      if (!msg.isSelf || !msg.isPending) continue;
       final matches = isFile
           ? (msg.filePath == item.filePath &&
               _offlineRowMatchesItem(msg, item, itemMs))

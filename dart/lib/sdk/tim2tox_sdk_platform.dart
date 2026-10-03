@@ -1289,14 +1289,33 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
       // A queued send that failed (ChatMessage.isFailed) is recorded where
       // reSendMessage looks for failed messages, so "resend" works for it as
       // for a direct send that failed.
-      if (chatMsg.isSelf && chatMsg.isFailed) {
-        unawaited(
-          _persistFinalizedFailedMessage(
-            message: v2Msg,
-            receiver: v2Msg.userID ?? '',
-            groupID: v2Msg.groupID ?? '',
-          ).catchError((Object _) {}),
-        );
+      final String? rowId = chatMsg.msgID;
+      if (chatMsg.isSelf && chatMsg.isFailed && rowId != null) {
+        final save = _persistFinalizedFailedMessage(
+          message: v2Msg,
+          receiver: v2Msg.userID ?? '',
+          groupID: v2Msg.groupID ?? '',
+        ).catchError((Object _) {});
+        _queuedFailureSaves[rowId] = save;
+        unawaited(save);
+      } else if (chatMsg.isSelf &&
+          !chatMsg.isPending &&
+          rowId != null &&
+          _queuedFailureSaves.containsKey(rowId)) {
+        // A queued failure that a later replay delivered: its failed entry
+        // must not force the row back to SEND_FAIL or stay resendable.
+        // Ordered after the save it undoes.
+        final saved = _queuedFailureSaves.remove(rowId)!;
+        final receiver = v2Msg.userID;
+        final group = v2Msg.groupID;
+        unawaited(saved.then((_) {
+          return Tim2ToxFailedMessagePersistence.removeFailedMessage(
+            messageID: rowId,
+            userID: group == null || group.isEmpty ? receiver : null,
+            groupID: group == null || group.isEmpty ? null : group,
+            accountToxId: ffiService.getSelfToxId(),
+          );
+        }).catchError((Object _) {}));
       }
 
       // Determine forwardTargetID from the fixed userID/groupID
@@ -2651,6 +2670,10 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
   /// One Tox message after the qTox fragmenter's safety margin
   /// (TOX_MAX_MESSAGE_LENGTH - 50, see QToxMessageFragmenter.h).
   static const int _kMaxSingleFragmentBytes = 1322;
+
+  /// Failed-entry saves for queued sends that failed, by msgID: a later
+  /// successful replay removes the entry after its save completed.
+  final Map<String, Future<void>> _queuedFailureSaves = {};
 
   Future<void> _persistFinalizedFailedMessage({
     required V2TimMessage message,

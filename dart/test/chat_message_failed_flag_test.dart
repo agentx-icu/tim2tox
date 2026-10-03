@@ -63,15 +63,6 @@ void main() {
     );
   });
 
-  test('a queued row restored after a restart can still be marked failed', () {
-    final mark = service.substring(
-      service.indexOf('void _markPendingItemFailed('),
-      service.indexOf('Future<void> _loadOfflineQueue()'),
-    );
-    expect(mark, contains('if (!msg.isSelf || msg.isFailed) continue;'));
-    expect(mark, contains('msg.msgID != item.msgID'));
-    expect(mark, contains('copyWith(isPending: false, isFailed: true)'));
-  });
 
   test('both history merge paths keep a failure', () {
     expect(persistence,
@@ -94,14 +85,6 @@ void main() {
     );
   });
 
-  test('a row with delivery evidence is never marked failed', () {
-    final mark = service.substring(
-      service.indexOf('void _markPendingItemFailed('),
-      service.indexOf('Future<void> _loadOfflineQueue()'),
-    );
-    expect(mark, contains('msg.isReceived ||'));
-    expect(mark, contains('msg.isRead'));
-  });
 
   test('a later successful replay clears an earlier failure', () {
     expect(service, contains('existing.copyWith(isPending: false, isFailed: false)'));
@@ -110,13 +93,42 @@ void main() {
   });
 
   test('a duplicate carrying a failure keeps it on the absorbed row', () {
-    expect(persistence, contains('isFailed: current.isFailed || duplicate.isFailed'));
+    expect(persistence, contains('isFailed: current.isFailed || becameFailed'));
   });
 
   test('queued failures are recorded for SDK resend', () {
     final platform =
         File('lib/sdk/tim2tox_sdk_platform.dart').readAsStringSync();
-    expect(platform, contains('if (chatMsg.isSelf && chatMsg.isFailed) {'));
+    expect(platform, contains('if (chatMsg.isSelf && chatMsg.isFailed && rowId != null) {'));
     expect(platform, contains('_persistFinalizedFailedMessage('));
+  });
+
+  test('only a still-pending row is marked failed (never a possibly sent one)',
+      () {
+    final mark = service.substring(
+      service.indexOf('void _markPendingItemFailed('),
+      service.indexOf('Future<void> _loadOfflineQueue()'),
+    );
+    expect(mark, contains('if (!msg.isSelf || !msg.isPending) continue;'));
+    expect(mark, contains('copyWith(isPending: false, isFailed: true)'));
+  });
+
+  test('a send whose queue removal threw still reconciles its row', () {
+    expect(
+      RegExp(r'await _reconcileSentItem\(').allMatches(service).length,
+      2,
+    );
+    expect(service, contains('msg.copyWith(isPending: false, isFailed: false);'));
+  });
+
+  test('a failure is absorbed only on proven identity', () {
+    expect(persistence, contains('final becameFailed = sameId && duplicate.isFailed'));
+  });
+
+  test('a later delivery removes the queued failure entry', () {
+    final platform =
+        File('lib/sdk/tim2tox_sdk_platform.dart').readAsStringSync();
+    expect(platform, contains('_queuedFailureSaves.remove(rowId)'));
+    expect(platform, contains('Tim2ToxFailedMessagePersistence.removeFailedMessage('));
   });
 }
