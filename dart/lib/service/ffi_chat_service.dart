@@ -11480,6 +11480,7 @@ class FfiChatService {
                 await _saveHistory(groupId);
               } catch (_) {}
               if (exactFailed) {
+                _reportFailureCleared(msg.msgID);
                 try {
                   _messages.add(history[i]);
                 } catch (_) {}
@@ -12837,6 +12838,7 @@ class FfiChatService {
     if (onDispatched != null) await onDispatched();
 
     if (pendingMsg != null && pendingMsgIndex != null && history != null) {
+      if (pendingMsg.isFailed) _reportFailureCleared(pendingMsg.msgID);
       final updatedMsg = pendingMsg.copyWith(isPending: false, isFailed: false);
       history[pendingMsgIndex] = updatedMsg;
       _lastByPeer[normalizedPeerId] = updatedMsg;
@@ -12890,6 +12892,7 @@ class FfiChatService {
           await _saveHistory(normalizedPeerId);
         } catch (_) {}
         if (wasFailed) {
+          _reportFailureCleared(updatedMsg.msgID);
           try {
             _messages.add(updatedMsg);
           } catch (_) {}
@@ -12976,6 +12979,7 @@ class FfiChatService {
     // accepted, before the history reconcile (see _drainTextItem).
     if (onDispatched != null) await onDispatched();
     if (pendingMsg != null && pendingMsgIndex != null && history != null) {
+      if (pendingMsg.isFailed) _reportFailureCleared(pendingMsg.msgID);
       final updatedMsg = pendingMsg.copyWith(isPending: false, isFailed: false);
       history[pendingMsgIndex] = updatedMsg;
       _lastByPeer[normalizedPeerId] = updatedMsg;
@@ -12991,6 +12995,19 @@ class FfiChatService {
   // On drain failure, flip the matching pending history record to
   // non-pending so the UI can render it as failed. The queue entry is NOT
   // re-enqueued — one drain attempt per online transition by design.
+  /// Called with the msgID of an own message that had been marked failed
+  /// and was delivered by a later replay, so hosts can drop whatever they
+  /// recorded about the failure (Tim2ToxSdkPlatform: its failed-message
+  /// store, which would otherwise force the row back to SEND_FAIL).
+  void Function(String msgID)? onFailureCleared;
+
+  void _reportFailureCleared(String? msgID) {
+    if (msgID == null || msgID.isEmpty) return;
+    try {
+      onFailureCleared?.call(msgID);
+    } catch (_) {}
+  }
+
   /// The row of a queued [item] that WAS sent although the drain threw
   /// afterwards (the queue removal): delivered, neither pending nor failed.
   /// Exact identity only (the item's msgID, or the exact-ms legacy match).
@@ -13001,7 +13018,15 @@ class FfiChatService {
     for (int i = history.length - 1; i >= 0; i--) {
       final msg = history[i];
       if (!msg.isSelf || !_offlineRowMatchesItem(msg, item, itemMs)) continue;
-      if (!msg.isPending && !msg.isFailed) return;
+      if (!msg.isPending && !msg.isFailed) {
+        // Already settled, but the drain may have changed it in memory
+        // (a group row's fresh `gmid:` alias): persist that.
+        try {
+          await _saveHistory(key);
+        } catch (_) {}
+        return;
+      }
+      if (msg.isFailed) _reportFailureCleared(msg.msgID);
       final updated = msg.copyWith(isPending: false, isFailed: false);
       history[i] = updated;
       _lastByPeer[key] = updated;

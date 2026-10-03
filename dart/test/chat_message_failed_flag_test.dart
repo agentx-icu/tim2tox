@@ -119,6 +119,8 @@ void main() {
       2,
     );
     expect(service, contains('msg.copyWith(isPending: false, isFailed: false);'));
+    // A settled row is still saved (a group row's fresh alias).
+    expect(service, contains("(a group row's fresh `gmid:` alias): persist that."));
   });
 
   test('a failure is absorbed only on proven identity', () {
@@ -128,7 +130,12 @@ void main() {
   test('a later delivery removes the queued failure entry', () {
     final platform =
         File('lib/sdk/tim2tox_sdk_platform.dart').readAsStringSync();
-    expect(platform, contains('_queuedFailureSaves.remove(rowId)'));
-    expect(platform, contains('Tim2ToxFailedMessagePersistence.removeFailedMessage('));
+    // Reported by the transport, so it also works after a restart.
+    expect(platform, contains('ffiService.onFailureCleared = _onQueuedFailureCleared;'));
+    expect(platform, contains('removeFailedMessagesByIDs('));
+    expect(
+      RegExp(r'_reportFailureCleared\(').allMatches(service).length,
+      greaterThanOrEqualTo(5),
+    );
   });
 }
