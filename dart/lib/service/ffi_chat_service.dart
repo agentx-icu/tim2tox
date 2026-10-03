@@ -11411,6 +11411,7 @@ class FfiChatService {
       try {
         _sendGroupTextByKindChecked(groupId, item.text, item.contentKind);
         sent = true;
+        _markDispatched(item);
         // The row was created while offline, so it has no cross-peer alias:
         // the pseudo id only exists once the message is actually on the wire.
         // Capture it now, immediately after the synchronous send, and stamp it
@@ -12680,6 +12681,16 @@ class FfiChatService {
   /// msgIDs whose cancellation is being persisted: no drain may claim them.
   final Set<String> _cancellingSends = <String>{};
 
+  /// msgIDs whose native send succeeded this session. Kept apart from the
+  /// queue: when the queue removal after a send fails, the item lingers, and
+  /// it must neither be cancelled (it is out) nor dispatched again.
+  final Set<String> _dispatchedSends = <String>{};
+
+  void _markDispatched(OfflineMessageItem item) {
+    final id = item.msgID;
+    if (id != null && id.isNotEmpty) _dispatchedSends.add(id);
+  }
+
   bool _rowCancelled(List<ChatMessage>? history, String? msgID) =>
       msgID != null &&
       msgID.isNotEmpty &&
@@ -12696,6 +12707,7 @@ class FfiChatService {
     if (hasId &&
         (_cancellingSends.contains(id) ||
             _claimedSends.contains(id) ||
+            _dispatchedSends.contains(id) ||
             _rowCancelled(history, id))) {
       return false;
     }
@@ -12707,11 +12719,14 @@ class FfiChatService {
     return true;
   }
 
-  /// Drops a queue item whose row was durably cancelled (a cancel whose queue
-  /// removal did not reach disk, e.g. across a crash).
+  /// Drops a queue item whose row was durably cancelled (a crash between the
+  /// cancel's history write and its queue removal) or that was already sent
+  /// this session (its post-send removal failed).
   Future<void> _dropCancelledItem(String storageKey, OfflineMessageItem item,
       List<ChatMessage>? history) async {
-    if (!_rowCancelled(history, item.msgID)) return;
+    final sentAlready =
+        item.msgID != null && _dispatchedSends.contains(item.msgID);
+    if (!sentAlready && !_rowCancelled(history, item.msgID)) return;
     try {
       await _offlineQueuePersistence.removeItem(storageKey, item);
     } catch (_) {}
@@ -12745,7 +12760,9 @@ class FfiChatService {
     if (msgID.isEmpty || (!isGroup && isSelfPeer(conversation))) {
       return SendControlResult.notApplicable;
     }
-    if (_claimedSends.contains(msgID)) return SendControlResult.alreadyClaimed;
+    if (_claimedSends.contains(msgID) || _dispatchedSends.contains(msgID)) {
+      return SendControlResult.alreadyClaimed;
+    }
     if (_cancellingSends.contains(msgID)) {
       return SendControlResult.notApplicable;
     }
@@ -12760,8 +12777,9 @@ class FfiChatService {
           ? -1
           : history.lastIndexWhere((m) => m.isSelf && m.msgID == msgID);
       ChatMessage? cancelled;
+      ChatMessage? before;
       if (history != null && index >= 0) {
-        final before = history[index];
+        before = history[index];
         cancelled =
             before.copyWith(isPending: false, isFailed: false, isCancelled: true);
         history[index] = cancelled;
@@ -12774,14 +12792,21 @@ class FfiChatService {
           history[index] = before;
           return SendControlResult.persistFailed;
         }
-        if (before.isFailed) _reportFailureCleared(msgID);
       }
       try {
         await _offlineQueuePersistence.removeItem(found.queueKey, found.item);
       } catch (_) {
-        // Without a durable cancelled row the item would still be sent.
-        if (cancelled == null) return SendControlResult.persistFailed;
+        // Success only once the item is out of the queue: the history row
+        // alone is not a lasting marker (it can leave the trimmed window).
+        // Put the row back to pending; the caller may retry the cancel.
+        if (history != null && cancelled != null && before != null) {
+          final at = history.lastIndexWhere((m) => identical(m, cancelled));
+          if (at >= 0) history[at] = before;
+          await _saveHistory(found.historyKey);
+        }
+        return SendControlResult.persistFailed;
       }
+      if (before != null && before.isFailed) _reportFailureCleared(msgID);
       if (cancelled != null) {
         final last = _lastByPeer[found.historyKey];
         if (last != null && last.msgID == msgID) {
@@ -12847,10 +12872,14 @@ class FfiChatService {
     }
     _reportFailureCleared(msgID);
     await _saveHistory(historyKey);
+    // Publish the row as it is NOW: a drain may already have sent (or failed)
+    // it while the writes above were awaited.
+    final at = history.lastIndexWhere((m) => m.isSelf && m.msgID == msgID);
+    final current = at >= 0 ? history[at] : pending;
     final last = _lastByPeer[historyKey];
-    if (last != null && last.msgID == msgID) _lastByPeer[historyKey] = pending;
+    if (last != null && last.msgID == msgID) _lastByPeer[historyKey] = current;
     try {
-      _messages.add(pending);
+      _messages.add(current);
     } catch (_) {}
     if (isGroup) {
       unawaited(_sendPendingGroupMessages(conversation));
@@ -12909,6 +12938,7 @@ class FfiChatService {
         // succeeds and before the history reconcile (via onDispatched) —
         // shrinking the dup-send-on-crash window.
         Future<void> remover() async {
+          _markDispatched(item);
           sent = true;
           await _offlineQueuePersistence.removeItem(storageKey, item);
           dispatched = true;

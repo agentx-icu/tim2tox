@@ -74,6 +74,19 @@ class _StubFfi extends Tim2ToxFfi {
           };
 }
 
+/// A queue whose single-item removal can be made to fail.
+class _FlakyQueue extends OfflineMessageQueuePersistence {
+  _FlakyQueue({required super.queueFilePath});
+
+  bool failRemove = false;
+
+  @override
+  Future<void> removeItem(String peerId, OfflineMessageItem item) {
+    if (failRemove) return Future.error(const FileSystemException('disk'));
+    return super.removeItem(peerId, item);
+  }
+}
+
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
 
@@ -82,12 +95,12 @@ void main() {
   late String queueFile;
   late _StubFfi ffiStub;
   late MessageHistoryPersistence history;
-  late OfflineMessageQueuePersistence queue;
+  late _FlakyQueue queue;
   late FfiChatService service;
 
   Future<FfiChatService> open() async {
     history = MessageHistoryPersistence(historyDirectory: historyDir);
-    queue = OfflineMessageQueuePersistence(queueFilePath: queueFile);
+    queue = _FlakyQueue(queueFilePath: queueFile);
     await queue.loadQueue(clearOnLoad: false);
     final s = FfiChatService(
       ffiForTesting: ffiStub,
@@ -188,6 +201,40 @@ void main() {
     await service.retryPendingC2cMessages(_peer);
     expect(ffiStub.sent, isEmpty);
     expect(queue.getMessages(_peer), isEmpty);
+  });
+
+  test('a cancel whose queue removal fails keeps the message pending',
+      () async {
+    final row = await service.sendTextWithResult(_peer, 'still going');
+    queue.failRemove = true;
+    expect(await service.cancelQueuedMessage(_peer, row.msgID!),
+        SendControlResult.persistFailed);
+    expect(rowOf(row.msgID!).isCancelled, isFalse);
+    expect(rowOf(row.msgID!).isPending, isTrue);
+    expect(queue.getMessages(_peer), hasLength(1));
+
+    queue.failRemove = false;
+    await peerOnline();
+    await service.retryPendingC2cMessages(_peer);
+    expect(ffiStub.sent, ['still going'], reason: 'not cancelled: it sends');
+  });
+
+  test('a sent item whose queue cleanup failed is neither cancelled nor '
+      'sent twice', () async {
+    final row = await service.sendTextWithResult(_peer, 'once');
+    await peerOnline();
+    queue.failRemove = true;
+    await service.retryPendingC2cMessages(_peer);
+    expect(ffiStub.sent, ['once']);
+    expect(queue.getMessages(_peer), hasLength(1), reason: 'cleanup failed');
+
+    expect(await service.cancelQueuedMessage(_peer, row.msgID!),
+        SendControlResult.alreadyClaimed);
+    queue.failRemove = false;
+    await service.retryPendingC2cMessages(_peer);
+    expect(ffiStub.sent, ['once'], reason: 'no duplicate send');
+    expect(queue.getMessages(_peer), isEmpty, reason: 'the leftover is dropped');
+    expect(rowOf(row.msgID!).isCancelled, isFalse);
   });
 
   test('retry re-queues a failed row under its own msgID, once', () async {
