@@ -12944,7 +12944,14 @@ class FfiChatService {
     final itemMs = item.timestamp.millisecondsSinceEpoch;
     for (int i = history.length - 1; i >= 0; i--) {
       final msg = history[i];
-      if (!msg.isSelf || !msg.isPending) continue;
+      if (!msg.isSelf || msg.isFailed) continue;
+      // History loading clears isPending, so after a restart the queued
+      // row is no longer marked pending: accept it then too, but only by
+      // its exact msgID (never by a timestamp match on a delivered row).
+      if (!msg.isPending &&
+          (item.msgID == null || item.msgID!.isEmpty || msg.msgID != item.msgID)) {
+        continue;
+      }
       final matches = isFile
           ? (msg.filePath == item.filePath &&
               _offlineRowMatchesItem(msg, item, itemMs))
