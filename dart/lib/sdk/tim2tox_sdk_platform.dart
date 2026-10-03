@@ -1286,6 +1286,19 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
               '[Tim2ToxSdkPlatform] After conversion: v2Msg.userID=${v2Msg.userID}, v2Msg.groupID=${v2Msg.groupID}');
       }
 
+      // A queued send that failed (ChatMessage.isFailed) is recorded where
+      // reSendMessage looks for failed messages, so "resend" works for it as
+      // for a direct send that failed.
+      if (chatMsg.isSelf && chatMsg.isFailed) {
+        unawaited(
+          _persistFinalizedFailedMessage(
+            message: v2Msg,
+            receiver: v2Msg.userID ?? '',
+            groupID: v2Msg.groupID ?? '',
+          ).catchError((Object _) {}),
+        );
+      }
+
       // Determine forwardTargetID from the fixed userID/groupID
       String? forwardTargetID;
       if (forwardTargetUserID != null || forwardTargetGroupID != null) {

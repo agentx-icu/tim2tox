@@ -11394,8 +11394,11 @@ class FfiChatService {
       // iteration awaited persistence.
       if (_pollDisposed) return;
       var dispatched = false;
+      // See the C2C drain: set once the send succeeded, before the removal.
+      var sent = false;
       try {
         _sendGroupTextByKindChecked(groupId, item.text, item.contentKind);
+        sent = true;
         // The row was created while offline, so it has no cross-peer alias:
         // the pseudo id only exists once the message is actually on the wire.
         // Capture it now, immediately after the synchronous send, and stamp it
@@ -11458,19 +11461,29 @@ class FfiChatService {
           final itemMs = item.timestamp.millisecondsSinceEpoch;
           for (int i = history.length - 1; i >= 0; i--) {
             final msg = history[i];
+            // A row an earlier attempt marked failed (exact identity only)
+            // is delivered now as well.
+            final exactFailed = msg.isFailed &&
+                (item.msgID?.isNotEmpty ?? false) &&
+                msg.msgID == item.msgID;
             if (msg.isSelf &&
-                msg.isPending &&
+                (msg.isPending || exactFailed) &&
                 msg.filePath == null &&
                 msg.text == item.text &&
                 msg.contentKind == item.contentKind &&
                 _offlineRowMatchesItem(msg, item, itemMs)) {
               // The alias was stamped before the awaits above; this only
-              // clears the pending flag.
-              history[i] = msg.copyWith(isPending: false);
+              // clears the pending (or failed) flag.
+              history[i] = msg.copyWith(isPending: false, isFailed: false);
               _lastByPeer[groupId] = history[i];
               try {
                 await _saveHistory(groupId);
               } catch (_) {}
+              if (exactFailed) {
+                try {
+                  _messages.add(history[i]);
+                } catch (_) {}
+              }
               break;
             }
           }
@@ -11527,6 +11540,19 @@ class FfiChatService {
         // attempt per online transition, matching C2C semantics). Previously this
         // catch only removed the item, leaving the bubble stuck pending forever
         // and the message lost with no UI signal.
+        if (sent) {
+          // Delivered, but the queue entry could not be removed: retry the
+          // removal once; never report a delivered message as failed.
+          _logger?.logError(
+              '[FfiChatService] queued item sent but its queue entry could '
+              'not be removed',
+              e,
+              stackTrace);
+          try {
+            await _offlineQueuePersistence.removeItem(storageKey, item);
+          } catch (_) {}
+          continue;
+        }
         _logger?.logError(
             '[FfiChatService] _sendPendingGroupMessages: drain failed for group $groupId',
             e,
@@ -12646,11 +12672,16 @@ class FfiChatService {
       // (false "failed" UX) and double-remove. Guard on it so the failure path
       // only runs for a genuine pre-dispatch send failure.
       var dispatched = false;
+      // True once the FFI send succeeded, even if the durable queue removal
+      // that follows throws: the message is out, so it must never be marked
+      // failed.
+      var sent = false;
       try {
         // The queue entry is removed INSIDE the drain, right after the FFI send
         // succeeds and before the history reconcile (via onDispatched) —
         // shrinking the dup-send-on-crash window.
         Future<void> remover() async {
+          sent = true;
           await _offlineQueuePersistence.removeItem(storageKey, item);
           dispatched = true;
         }
@@ -12711,6 +12742,19 @@ class FfiChatService {
               '(message delivered; row will self-heal on reload)',
               e,
               stackTrace);
+          continue;
+        }
+        if (sent) {
+          // Delivered, but the queue entry could not be removed: retry the
+          // removal once; never report a delivered message as failed.
+          _logger?.logError(
+              '[FfiChatService] queued item sent but its queue entry could '
+              'not be removed',
+              e,
+              stackTrace);
+          try {
+            await _offlineQueuePersistence.removeItem(storageKey, item);
+          } catch (_) {}
           continue;
         }
         _logger?.logError(
@@ -12789,7 +12833,7 @@ class FfiChatService {
     if (onDispatched != null) await onDispatched();
 
     if (pendingMsg != null && pendingMsgIndex != null && history != null) {
-      final updatedMsg = pendingMsg.copyWith(isPending: false);
+      final updatedMsg = pendingMsg.copyWith(isPending: false, isFailed: false);
       history[pendingMsgIndex] = updatedMsg;
       _lastByPeer[normalizedPeerId] = updatedMsg;
       try {
@@ -12829,15 +12873,23 @@ class FfiChatService {
       }
       if (existing != null && existingIndex != null && history != null) {
         // Already present (e.g. a prior drain delivered it): ensure it reads as
-        // delivered, but do NOT append a second row and do NOT re-emit on the
-        // message stream — the row was streamed when first created.
-        final updatedMsg =
-            existing.isPending ? existing.copyWith(isPending: false) : existing;
+        // delivered, but do NOT append a second row. A row an earlier attempt
+        // marked failed (the item survived because its removal did not reach
+        // disk) is delivered now: clear the failure and re-emit that change.
+        final wasFailed = existing.isFailed;
+        final updatedMsg = existing.isPending || wasFailed
+            ? existing.copyWith(isPending: false, isFailed: false)
+            : existing;
         history[existingIndex] = updatedMsg;
         _lastByPeer[normalizedPeerId] = updatedMsg;
         try {
           await _saveHistory(normalizedPeerId);
         } catch (_) {}
+        if (wasFailed) {
+          try {
+            _messages.add(updatedMsg);
+          } catch (_) {}
+        }
       } else {
         // Genuinely absent: create a fresh delivered message but keep the
         // original composition timestamp.
@@ -12903,8 +12955,9 @@ class FfiChatService {
       final itemMs = item.timestamp.millisecondsSinceEpoch;
       for (int i = history.length - 1; i >= 0; i--) {
         final msg = history[i];
+        // A row an earlier attempt marked failed is this item's row too.
         if (msg.isSelf &&
-            msg.isPending &&
+            (msg.isPending || msg.isFailed) &&
             msg.filePath == filePath &&
             _offlineRowMatchesItem(msg, item, itemMs)) {
           pendingMsg = msg;
@@ -12919,7 +12972,7 @@ class FfiChatService {
     // accepted, before the history reconcile (see _drainTextItem).
     if (onDispatched != null) await onDispatched();
     if (pendingMsg != null && pendingMsgIndex != null && history != null) {
-      final updatedMsg = pendingMsg.copyWith(isPending: false);
+      final updatedMsg = pendingMsg.copyWith(isPending: false, isFailed: false);
       history[pendingMsgIndex] = updatedMsg;
       _lastByPeer[normalizedPeerId] = updatedMsg;
       try {
@@ -12949,7 +13002,12 @@ class FfiChatService {
       // row is no longer marked pending: accept it then too, but only by
       // its exact msgID (never by a timestamp match on a delivered row).
       if (!msg.isPending &&
-          (item.msgID == null || item.msgID!.isEmpty || msg.msgID != item.msgID)) {
+          (item.msgID == null ||
+              item.msgID!.isEmpty ||
+              msg.msgID != item.msgID ||
+              // Delivery evidence wins over a failed later attempt.
+              msg.isReceived ||
+              msg.isRead)) {
         continue;
       }
       final matches = isFile

@@ -3672,9 +3672,12 @@ class MessageHistoryPersistence {
       if (duplicate.msgID != null) duplicate.msgID!,
       ...duplicate.altMsgIds,
     }..removeWhere((id) => _idMatches(current, id));
-    if (newIds.isEmpty) return Future.value();
+    // The duplicate may carry news about the same message: a send failure.
+    final becameFailed = duplicate.isFailed && !current.isFailed;
+    if (newIds.isEmpty && !becameFailed) return Future.value();
     list[index] = current.copyWith(
       altMsgIds: ({...current.altMsgIds, ...newIds}.toList()..sort()),
+      isFailed: current.isFailed || duplicate.isFailed,
     );
     return _scheduleDebouncedSave(normalizedId);
   }

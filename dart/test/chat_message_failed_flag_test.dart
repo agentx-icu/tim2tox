@@ -82,4 +82,41 @@ void main() {
     expect(prefer, contains('final isFailed = existing.isFailed || msg.isFailed;'));
     expect(prefer, contains('isFailed: isFailed,'));
   });
+
+  test('a sent item whose queue removal fails is never marked failed', () {
+    // C2C: `sent` flips before the durable removal; the catch honours it.
+    expect(service, contains('sent = true;\n          await _offlineQueuePersistence.removeItem(storageKey, item);'));
+    // Group: set right after the native send.
+    expect(service, contains('_sendGroupTextByKindChecked(groupId, item.text, item.contentKind);\n        sent = true;'));
+    expect(
+      RegExp(r'if \(sent\) \{').allMatches(service).length,
+      greaterThanOrEqualTo(2),
+    );
+  });
+
+  test('a row with delivery evidence is never marked failed', () {
+    final mark = service.substring(
+      service.indexOf('void _markPendingItemFailed('),
+      service.indexOf('Future<void> _loadOfflineQueue()'),
+    );
+    expect(mark, contains('msg.isReceived ||'));
+    expect(mark, contains('msg.isRead'));
+  });
+
+  test('a later successful replay clears an earlier failure', () {
+    expect(service, contains('existing.copyWith(isPending: false, isFailed: false)'));
+    expect(service, contains('(msg.isPending || msg.isFailed) &&\n            msg.filePath == filePath'));
+    expect(service, contains('history[i] = msg.copyWith(isPending: false, isFailed: false);'));
+  });
+
+  test('a duplicate carrying a failure keeps it on the absorbed row', () {
+    expect(persistence, contains('isFailed: current.isFailed || duplicate.isFailed'));
+  });
+
+  test('queued failures are recorded for SDK resend', () {
+    final platform =
+        File('lib/sdk/tim2tox_sdk_platform.dart').readAsStringSync();
+    expect(platform, contains('if (chatMsg.isSelf && chatMsg.isFailed) {'));
+    expect(platform, contains('_persistFinalizedFailedMessage('));
+  });
 }
