@@ -995,6 +995,7 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
       }
     };
     _messagesSubscription?.cancel();
+    ffiService.onFailureCleared = _onQueuedFailureCleared;
     _messagesSubscription = ffiService.messages.listen((chatMsg) async {
       if (_debugLog)
         print(
@@ -1284,6 +1285,20 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
         if (_debugLog)
           print(
               '[Tim2ToxSdkPlatform] After conversion: v2Msg.userID=${v2Msg.userID}, v2Msg.groupID=${v2Msg.groupID}');
+      }
+
+      // A queued send that failed (ChatMessage.isFailed) is recorded where
+      // reSendMessage looks for failed messages, so "resend" works for it as
+      // for a direct send that failed.
+      final String? rowId = chatMsg.msgID;
+      if (chatMsg.isSelf && chatMsg.isFailed && rowId != null) {
+        final save = _persistFinalizedFailedMessage(
+          message: v2Msg,
+          receiver: v2Msg.userID ?? '',
+          groupID: v2Msg.groupID ?? '',
+        ).catchError((Object _) {});
+        _queuedFailureSaves[rowId] = save;
+        unawaited(save);
       }
 
       // Determine forwardTargetID from the fixed userID/groupID
@@ -2638,6 +2653,27 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
   /// One Tox message after the qTox fragmenter's safety margin
   /// (TOX_MAX_MESSAGE_LENGTH - 50, see QToxMessageFragmenter.h).
   static const int _kMaxSingleFragmentBytes = 1322;
+
+  /// Failed-entry saves for queued sends that failed, by msgID: a later
+  /// successful replay removes the entry after its save completed.
+  final Map<String, Future<void>> _queuedFailureSaves = {};
+
+  /// FfiChatService.onFailureCleared: a queued failure was delivered by a
+  /// later replay (in this run or after a restart). Its failed entry must
+  /// not force the row back to SEND_FAIL or stay resendable. Ordered after
+  /// a save of the same entry still in flight.
+  void _onQueuedFailureCleared(String msgID) {
+    final Future<void> saved =
+        _queuedFailureSaves.remove(msgID) ?? Future<void>.value();
+    unawaited(
+      saved
+          .then((_) => Tim2ToxFailedMessagePersistence.removeFailedMessagesByIDs(
+                messageIDs: {msgID},
+                accountToxId: ffiService.getSelfToxId(),
+              ))
+          .catchError((Object _) => 0),
+    );
+  }
 
   Future<void> _persistFinalizedFailedMessage({
     required V2TimMessage message,

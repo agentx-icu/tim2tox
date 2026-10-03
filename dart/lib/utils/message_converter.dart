@@ -138,6 +138,8 @@ class MessageConverter {
       mediaKind: mediaKind,
       fileSize: fileSize,
       isPending: isPending,
+      isFailed: isSelf &&
+          v2Msg.status == MessageStatus.V2TIM_MSG_STATUS_SEND_FAIL,
       isReceived: isReceived,
       isRead: isRead,
       msgID: v2Msg.msgID,

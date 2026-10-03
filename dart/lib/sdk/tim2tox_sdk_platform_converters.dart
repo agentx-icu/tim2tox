@@ -244,6 +244,9 @@ extension Tim2ToxSdkPlatformConverters on Tim2ToxSdkPlatform {
           // Set message status - CRITICAL: For sent messages, default to SEND_SUCC unless explicitly pending or failed
           if (chatMsg.isPending) {
             msg.status = MessageStatus.V2TIM_MSG_STATUS_SENDING;
+          } else if (chatMsg.isSelf && chatMsg.isFailed) {
+            // A queued send whose drain failed (ChatMessage.isFailed).
+            msg.status = MessageStatus.V2TIM_MSG_STATUS_SEND_FAIL;
           } else if (chatMsg.isSelf) {
             // For self-sent messages, default to SEND_SUCC unless explicitly marked as failed
             msg.status = MessageStatus.V2TIM_MSG_STATUS_SEND_SUCC;
@@ -309,6 +312,9 @@ extension Tim2ToxSdkPlatformConverters on Tim2ToxSdkPlatform {
           // Set message status - CRITICAL: For sent messages, default to SEND_SUCC unless explicitly pending or failed
           if (chatMsg.isPending) {
             msg.status = MessageStatus.V2TIM_MSG_STATUS_SENDING;
+          } else if (chatMsg.isSelf && chatMsg.isFailed) {
+            // A queued send whose drain failed (ChatMessage.isFailed).
+            msg.status = MessageStatus.V2TIM_MSG_STATUS_SEND_FAIL;
           } else if (chatMsg.isSelf) {
             // For self-sent messages, default to SEND_SUCC unless explicitly marked as failed
             msg.status = MessageStatus.V2TIM_MSG_STATUS_SEND_SUCC;
@@ -410,6 +416,9 @@ extension Tim2ToxSdkPlatformConverters on Tim2ToxSdkPlatform {
     // - SEND_FAIL should only be set when explicitly known to have failed (e.g., from FFI error or timeout)
     if (chatMsg.isPending) {
       msg.status = MessageStatus.V2TIM_MSG_STATUS_SENDING;
+    } else if (chatMsg.isSelf && chatMsg.isFailed) {
+      // A queued send whose drain failed (ChatMessage.isFailed).
+      msg.status = MessageStatus.V2TIM_MSG_STATUS_SEND_FAIL;
     } else if (chatMsg.isSelf) {
       // For self-sent messages, default to SEND_SUCC unless explicitly marked as failed
       // isReceived=true means message was received by peer, so definitely SEND_SUCC

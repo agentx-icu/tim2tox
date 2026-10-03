@@ -3625,7 +3625,10 @@ class MessageHistoryPersistence {
     final isReceived = existing.isReceived || msg.isReceived;
     final isRead = existing.isRead || msg.isRead;
     final needReadReceipt = existing.needReadReceipt || msg.needReadReceipt;
+    // A failed send stays failed whichever copy wins.
+    final isFailed = existing.isFailed || msg.isFailed;
     if (sameAliases &&
+        isFailed == winner.isFailed &&
         isReceived == winner.isReceived &&
         isRead == winner.isRead &&
         needReadReceipt == winner.needReadReceipt &&
@@ -3634,6 +3637,7 @@ class MessageHistoryPersistence {
     }
     return winner.copyWith(
       altMsgIds: aliases,
+      isFailed: isFailed,
       isReceived: isReceived,
       isRead: isRead,
       needReadReceipt: needReadReceipt,
@@ -3664,13 +3668,18 @@ class MessageHistoryPersistence {
         (m) => identical(m, row) || (rowId != null && _idMatches(m, rowId)));
     if (index < 0) return Future.value();
     final current = list[index];
+    // A failure is only taken over when the ids prove it is the SAME
+    // message; the caller's match may be a content heuristic.
+    final sameId = duplicate.msgID != null && _idMatches(current, duplicate.msgID!);
     final newIds = <String>{
       if (duplicate.msgID != null) duplicate.msgID!,
       ...duplicate.altMsgIds,
     }..removeWhere((id) => _idMatches(current, id));
-    if (newIds.isEmpty) return Future.value();
+    final becameFailed = sameId && duplicate.isFailed && !current.isFailed;
+    if (newIds.isEmpty && !becameFailed) return Future.value();
     list[index] = current.copyWith(
       altMsgIds: ({...current.altMsgIds, ...newIds}.toList()..sort()),
+      isFailed: current.isFailed || becameFailed,
     );
     return _scheduleDebouncedSave(normalizedId);
   }
@@ -3733,6 +3742,8 @@ class MessageHistoryPersistence {
           ? ChatMessageContentKind.action
           : ChatMessageContentKind.normal,
       isPending: isPending,
+      // A failed send stays failed through a merge of its duplicate copies.
+      isFailed: updated.isFailed || existing.isFailed,
       isReceived: isReceived,
       isRead: isRead,
       msgID: mergedMsgID,
