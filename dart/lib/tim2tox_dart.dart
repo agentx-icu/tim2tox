@@ -5,6 +5,7 @@
 
 // Models
 export 'models/chat_message.dart';
+export 'models/send_control_result.dart';
 
 // Service layer (includes Tim2ToxFfi)
 export 'service/ffi_chat_service.dart';
