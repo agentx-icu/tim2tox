@@ -3627,8 +3627,11 @@ class MessageHistoryPersistence {
     final needReadReceipt = existing.needReadReceipt || msg.needReadReceipt;
     // A failed send stays failed whichever copy wins.
     final isFailed = existing.isFailed || msg.isFailed;
+    // Likewise a cancelled send stays cancelled (it must never look sent).
+    final isCancelled = existing.isCancelled || msg.isCancelled;
     if (sameAliases &&
         isFailed == winner.isFailed &&
+        isCancelled == winner.isCancelled &&
         isReceived == winner.isReceived &&
         isRead == winner.isRead &&
         needReadReceipt == winner.needReadReceipt &&
@@ -3638,6 +3641,7 @@ class MessageHistoryPersistence {
     return winner.copyWith(
       altMsgIds: aliases,
       isFailed: isFailed,
+      isCancelled: isCancelled,
       isReceived: isReceived,
       isRead: isRead,
       needReadReceipt: needReadReceipt,
@@ -3744,6 +3748,7 @@ class MessageHistoryPersistence {
       isPending: isPending,
       // A failed send stays failed through a merge of its duplicate copies.
       isFailed: updated.isFailed || existing.isFailed,
+      isCancelled: updated.isCancelled || existing.isCancelled,
       isReceived: isReceived,
       isRead: isRead,
       msgID: mergedMsgID,

@@ -174,6 +174,7 @@ class ChatMessage {
     this.mediaKind,
     this.isPending = false,
     this.isFailed = false,
+    this.isCancelled = false,
     this.isReceived = false,
     this.isRead = false,
     this.msgID,
@@ -202,6 +203,11 @@ class ChatMessage {
   /// drain failed. It is no longer pending and was never delivered; hosts
   /// show it as failed instead of sent.
   final bool isFailed;
+
+  /// Our own queued message that the user cancelled before any drain handed
+  /// it to transport (`FfiChatService.cancelQueuedMessage`). Never pending,
+  /// never delivered, and never re-queued after a restart.
+  final bool isCancelled;
   final bool isReceived;
   final bool isRead;
   final String? msgID;
@@ -275,6 +281,8 @@ class ChatMessage {
         // Backward compatible: gated, so rows that never failed keep
         // serializing byte-identically.
         if (isFailed) 'isFailed': true,
+        // Backward compatible: gated like isFailed.
+        if (isCancelled) 'isCancelled': true,
       };
 
   factory ChatMessage.fromJson(Map<String, dynamic> json) => ChatMessage(
@@ -304,6 +312,7 @@ class ChatMessage {
         cloudCustomData: json['cloudCustomData'] as String?,
         needReadReceipt: json['needReadReceipt'] as bool? ?? false,
         isFailed: json['isFailed'] as bool? ?? false,
+        isCancelled: json['isCancelled'] as bool? ?? false,
       );
 
   ChatMessage copyWith({
@@ -311,6 +320,7 @@ class ChatMessage {
     bool? isRead,
     bool? isPending,
     bool? isFailed,
+    bool? isCancelled,
     String? filePath,
     String? fileName,
     int? fileSize,
@@ -333,6 +343,7 @@ class ChatMessage {
       mediaKind: mediaKind,
       isPending: isPending ?? this.isPending,
       isFailed: isFailed ?? this.isFailed,
+      isCancelled: isCancelled ?? this.isCancelled,
       isReceived: isReceived ?? this.isReceived,
       isRead: isRead ?? this.isRead,
       msgID: msgID,
