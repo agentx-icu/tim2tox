@@ -20,6 +20,7 @@
 #include "V2TIMSignalingManager.h"
 #include "V2TIMCommunityManager.h"
 #include "Tim2ToxControlPacket.h"
+#include "GroupWireReadiness.h"
 
 class V2TIMSignalingManagerImpl;
 class V2TIMMessageManagerImpl;
@@ -153,6 +154,10 @@ public:
 
     // Helper methods for accessing private data
     bool GetGroupNumberFromID(const V2TIMString& groupID, Tox_Group_Number& group_number);
+    // NGC only: false while the group is still syncing after a join, rejoin,
+    // invite accept or restore, and while it has no confirmed peer. A send
+    // then reaches nobody even though tox_group_is_connected() is true.
+    bool IsGroupWireReady(Tox_Group_Number group_number);
     bool GetChatIdFromGroupID(const V2TIMString& groupID, uint8_t chat_id[TOX_GROUP_CHAT_ID_SIZE]);
     bool GetGroupIDFromChatId(const uint8_t chat_id[TOX_GROUP_CHAT_ID_SIZE], V2TIMString& groupID);
     bool IsTemporaryInviteGroupID(const V2TIMString& groupID) const;
@@ -890,6 +895,12 @@ private:
     // yet: group_number -> (invite id, the invite). Restored on refusal.
     std::unordered_map<Tox_Group_Number, std::pair<std::string, PendingInvite>> accepted_invites_;
     void MarkFreshGroupJoin(Tox_Group_Number group_number);
+    // Which NGC groups a send can reach right now (tim2tox_ffi_group_wire_ready).
+    // Fed by the join/rejoin/accept/restore sites and toxcore's self_join,
+    // peer_join and peer_exit. Guarded by mutex_, like fresh_group_joins_.
+    tim2tox::GroupWireReadiness group_wire_readiness_;
+    void BeginGroupWireSync(Tox_Group_Number group_number);
+    void HandleGroupPeerConfirmed(Tox_Group_Number group_number, Tox_Group_Peer_Number peer_id);
     std::atomic<uint64_t> next_message_seq_{1};
     std::atomic<uint64_t> next_group_seq_{1};
     uint64_t next_pending_delivery_root_id_{1};

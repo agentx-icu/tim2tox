@@ -1080,12 +1080,18 @@ bool V2TIMManagerImpl::InitSDK(uint32_t sdkAppID, const V2TIMSDKConfig& config) 
             static_cast<void>(0);
             static_cast<void>(0);
             this->HandleGroupPeerJoin(group_number, peer_id);
+            this->HandleGroupPeerConfirmed(group_number, peer_id);
         }
     );
     static_cast<void>(0);
     static_cast<void>(0);
     tox_manager_->setGroupPeerExitCallback(
         [this](Tox_Group_Number group_number, Tox_Group_Peer_Number peer_id, Tox_Group_Exit_Type exit_type, const uint8_t* name, size_t name_length) {
+            {
+                // toxcore fires peer_exit only for confirmed peers.
+                std::lock_guard<std::mutex> lock(mutex_);
+                group_wire_readiness_.PeerExited(group_number, peer_id);
+            }
             this->HandleGroupPeerExit(group_number, peer_id, exit_type, name, name_length);
         }
     );
@@ -1109,6 +1115,9 @@ bool V2TIMManagerImpl::InitSDK(uint32_t sdkAppID, const V2TIMSDKConfig& config) 
                 std::vector<Tox_Group_Number> group_list(group_count);
                 tox_manager_->getGroupList(group_list.data(), group_count);
                 for (Tox_Group_Number group_number : group_list) {
+                    // Restored groups load as CS_CONNECTING: nothing is
+                    // deliverable until toxcore syncs them again.
+                    BeginGroupWireSync(group_number);
                     this->HandleGroupSelfJoin(group_number);
                 }
             }
@@ -1128,6 +1137,10 @@ bool V2TIMManagerImpl::InitSDK(uint32_t sdkAppID, const V2TIMSDKConfig& config) 
                 std::lock_guard<std::mutex> lock(mutex_);
                 fresh_group_joins_.erase(group_number);
                 accepted_invites_.erase(group_number);
+                // Synced. Still not wire-ready until a peer is confirmed
+                // (usually one round trip later, see peer_join below); if
+                // one already is, the self-join notification below drains.
+                group_wire_readiness_.SyncDone(group_number);
             }
             this->HandleGroupSelfJoin(group_number);
             // Really in: tell online friends which member we are here (MM-6).
@@ -1324,6 +1337,7 @@ bool V2TIMManagerImpl::InitSDK(uint32_t sdkAppID, const V2TIMSDKConfig& config) 
             V2TIM_LOG(kInfo, "[GroupInvite] ✅ Successfully accepted group invite");
             V2TIM_LOG(kInfo, "[GroupInvite] group_number={}, tempGroupID={}", group_number, gid);
             MarkFreshGroupJoin(group_number);
+            BeginGroupWireSync(group_number);
             
             // Store temporary group mapping (will be updated to actual groupID in HandleGroupSelfJoin)
             {
@@ -2366,6 +2380,7 @@ void V2TIMManagerImpl::ResetGroupSessionState() {
         group_peer_snapshots_.clear();
         group_peer_id_cache_.clear();
         fresh_group_joins_.clear();
+        group_wire_readiness_.Clear();
         accepted_invites_.clear();
         online_identity_friends_.clear();
         pending_identity_challenges_.clear();
@@ -4487,6 +4502,9 @@ void V2TIMManagerImpl::JoinGroup(const V2TIMString& groupID, const V2TIMString& 
         } else {
             MarkFreshGroupJoin(group_number);
         }
+        // A rejoin (gc_rejoin_group) marks every peer connection for deletion
+        // and goes back to CS_CONNECTING; a fresh join starts there.
+        BeginGroupWireSync(group_number);
         V2TIM_LOG(kInfo, "[JoinGroup] ✅ Successfully joined group using chat_id, group_number={}", group_number);
         // Persist chat_id for this instance (groupID may be 64-char chat_id when joining public group)
         SetGroupChatIdInStorage(groupID.CString(), stored_chat_id);
@@ -4680,6 +4698,7 @@ void V2TIMManagerImpl::JoinGroup(const V2TIMString& groupID, const V2TIMString& 
         }
         V2TIM_LOG(kInfo, "[JoinGroup] ✅ Successfully accepted invite, group_number={}", group_number);
         MarkFreshGroupJoin(group_number);
+        BeginGroupWireSync(group_number);
         {
             // Kept until toxcore confirms the join: a refusal (password,
             // full) hands the invite back so it can be redeemed again.
@@ -5214,6 +5233,7 @@ void V2TIMManagerImpl::QuitGroup(const V2TIMString& groupID, V2TIMCallback* call
         if (resolved_group_number != UINT32_MAX) {
             group_number_to_group_id_.erase(resolved_group_number);
             fresh_group_joins_.erase(resolved_group_number);
+            group_wire_readiness_.Forget(resolved_group_number);
             accepted_invites_.erase(resolved_group_number);
             dart_known_chat_id_.erase(groupID.CString());
             dart_known_type_.erase(groupID.CString());
@@ -5344,6 +5364,7 @@ void V2TIMManagerImpl::DismissGroup(const V2TIMString& groupID, V2TIMCallback* c
         if (resolved_group_number != UINT32_MAX) {
             group_number_to_group_id_.erase(resolved_group_number);
             fresh_group_joins_.erase(resolved_group_number);
+            group_wire_readiness_.Forget(resolved_group_number);
             accepted_invites_.erase(resolved_group_number);
             dart_known_chat_id_.erase(groupID.CString());
             dart_known_type_.erase(groupID.CString());
@@ -10498,6 +10519,7 @@ void V2TIMManagerImpl::EraseGroupLocalState(const V2TIMString& groupID) {
         group_number_to_group_id_.erase(gnum);
         group_peer_id_cache_.erase(gnum);
         fresh_group_joins_.erase(gnum);
+        group_wire_readiness_.Forget(gnum);
         accepted_invites_.erase(gnum);
         // Dart forgets a left/refused group's identity; so must this record,
         // or a same-session rejoin under the same id is never re-persisted.
@@ -11112,6 +11134,38 @@ void V2TIMManagerImpl::MarkFreshGroupJoin(Tox_Group_Number group_number) {
     fresh_group_joins_.insert(group_number);
 }
 
+void V2TIMManagerImpl::BeginGroupWireSync(Tox_Group_Number group_number) {
+    if (group_number == UINT32_MAX || IsConferenceMapKey(group_number)) return;
+    std::lock_guard<std::mutex> lock(mutex_);
+    group_wire_readiness_.BeginSync(group_number);
+}
+
+bool V2TIMManagerImpl::IsGroupWireReady(Tox_Group_Number group_number) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return group_wire_readiness_.Ready(group_number);
+}
+
+// toxcore's peer_join: the peer is confirmed, the only kind a lossless group
+// send reaches. The first one after a (re)join is when queued group texts
+// become deliverable, and toxcore's self_join (the other drain trigger) can
+// precede it by a round trip, so tell Dart again: groupJoinNotification is
+// idempotent there and drains the group's queue.
+void V2TIMManagerImpl::HandleGroupPeerConfirmed(Tox_Group_Number group_number,
+                                                Tox_Group_Peer_Number peer_id) {
+    V2TIMString groupID;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!group_wire_readiness_.PeerConfirmed(group_number, peer_id)) return;
+        auto it = group_number_to_group_id_.find(group_number);
+        if (it != group_number_to_group_id_.end()) groupID = it->second;
+    }
+    // An invite alias is never published (HandleGroupSelfJoin promotes it).
+    if (groupID.Empty() || IsTemporaryInviteGroupID(groupID)) return;
+    V2TIM_LOG(kInfo, "HandleGroupPeerConfirmed: group {} has a confirmed peer; notifying Dart to drain",
+              groupID.CString());
+    DartNotifyGroupJoin(groupID.CString(), GetInstanceIdFromManager(this), GetSessionEpoch());
+}
+
 void V2TIMManagerImpl::HandleGroupPrivacyState(Tox_Group_Number group_number, Tox_Group_Privacy_State privacy_state) {
     static_cast<void>(0);
     static_cast<void>(0);
@@ -11668,6 +11722,7 @@ void V2TIMManagerImpl::RejoinKnownGroups() {
 
             if (err_join == TOX_ERR_GROUP_JOIN_OK && group_number != UINT32_MAX) {
                 rejoin_successes++;
+                BeginGroupWireSync(group_number);
                 V2TIMString groupID(line_trim.c_str());
                 // Strategy:
                 // 1. Pre-register chat_id→groupID (first-wins) so HandleGroupSelfJoin can resolve.

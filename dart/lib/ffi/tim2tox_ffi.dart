@@ -765,8 +765,8 @@ class Tim2ToxFfi {
               ffi.Pointer<pkgffi.Utf8>,
               int,
               ffi.Pointer<pkgffi.Utf8>)>('tim2tox_ffi_restore_group_invite');
-  /// 1 = a group send can reach someone, 0 = NGC group still connecting,
-  /// -1 = unknown group. See tim2tox_ffi.h.
+  /// 1 = a group send can reach someone, 0 = NGC group still syncing or
+  /// without a confirmed peer, -1 = unknown group. See tim2tox_ffi.h.
   late final int Function(ffi.Pointer<pkgffi.Utf8>) groupWireReady = _lib
       .lookupFunction<_reject_group_invite_c, int Function(ffi.Pointer<pkgffi.Utf8>)>(
           'tim2tox_ffi_group_wire_ready');

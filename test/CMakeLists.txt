@@ -87,6 +87,10 @@ target_compile_definitions(file_transfer_security_source_regression_test PRIVATE
     TIM2TOX_FFI_SOURCE_PATH="${CMAKE_SOURCE_DIR}/ffi/tim2tox_ffi.cpp"
     TIM2TOX_MANAGER_SOURCE_PATH="${CMAKE_SOURCE_DIR}/source/ToxManager.cpp")
 add_executable(tim2tox_control_packet_test Tim2ToxControlPacketTest.cpp)
+add_executable(group_wire_readiness_test GroupWireReadinessTest.cpp)
+target_compile_definitions(group_wire_readiness_test PRIVATE
+    TIM2TOX_MANAGER_SOURCE_PATH="${CMAKE_SOURCE_DIR}/source/V2TIMManagerImpl.cpp"
+    TIM2TOX_FFI_SOURCE_PATH="${CMAKE_SOURCE_DIR}/ffi/tim2tox_ffi.cpp")
 add_executable(tox_profile_encryption_at_rest_test ToxProfileEncryptionAtRestTest.cpp)
 # Drives InitSDK/UnInitSDK through the FFI entry points, so it needs the FFI
 # library (configure the test tree with -DBUILD_FFI=ON to get it).
@@ -230,6 +234,8 @@ target_link_libraries(av_conference_audio_queue_test PRIVATE
     ${TIM2TOX_GTEST_MAIN_TARGET})
 target_link_libraries(group_canonical_identity_source_regression_test PRIVATE
     ${TIM2TOX_GTEST_MAIN_TARGET})
+target_link_libraries(group_wire_readiness_test PRIVATE
+    ${TIM2TOX_GTEST_MAIN_TARGET})
 target_link_libraries(qtox_avatar_source_contract_test PRIVATE
     ${TIM2TOX_GTEST_MAIN_TARGET})
 target_link_libraries(control_path_source_regression_test PRIVATE
@@ -267,6 +273,7 @@ add_test(NAME dart_send_message_contract_test
 add_test(NAME file_transfer_security_source_regression_test
     COMMAND file_transfer_security_source_regression_test)
 gtest_discover_tests(tim2tox_control_packet_test)
+gtest_discover_tests(group_wire_readiness_test)
 gtest_discover_tests(tox_profile_encryption_at_rest_test)
 gtest_discover_tests(qtox_message_fragmenter_test)
 add_test(NAME qtox_transport_source_regression_test
