@@ -553,6 +553,9 @@ PHASE4_GROUP=(
   "test/scenarios/scenario_group_topic_revert_test.dart"
   "test/scenarios/scenario_group_moderation_test.dart"
   "test/scenarios/scenario_group_receipt_control_row_test.dart"
+  # A text composed right after a rejoin is queued, not lost to a group that
+  # reports connected while CS_CONNECTING (tim2tox#28).
+  "test/scenarios/scenario_group_rejoin_wire_ready_test.dart"
   # Group search by NAME from a node that JOINED (native SearchGroups resolves
   # the live NGC name instead of the EnsureGroupInfoExists placeholder).
   "test/scenarios/scenario_group_search_by_name_test.dart"

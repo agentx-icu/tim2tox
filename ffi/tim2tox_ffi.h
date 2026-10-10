@@ -303,12 +303,16 @@ int tim2tox_ffi_restore_group_invite(const char* invite_id, const char* inviter_
                                      int64_t received_ms, const char* cookie_hex);
 int tim2tox_ffi_send_group_text(const char* group_id, const char* text);
 // Can a message sent to this group reach anyone right now?
-//   1  = yes (NGC group connected to at least one peer at some point this
-//        session, or a legacy conference, which has no such state)
-//   0  = known NGC group still connecting (restored from the savefile and no
-//        peer handshake yet). tox_group_send_message SUCCEEDS in that state —
-//        gc_send_message treats "zero confirmed peers" as success — so the
-//        message would be reported sent and reach nobody.
+//   1  = yes (NGC group synced and at least one peer confirmed right now, or
+//        a legacy conference, which has no such state)
+//   0  = known NGC group that cannot reach anyone: still syncing after a
+//        join, rejoin, invite accept or restart (CS_CONNECTING, which
+//        tox_group_is_connected also reports as connected), or synced with
+//        no confirmed peer (alone in the group, every peer gone).
+//        tox_group_send_message SUCCEEDS in that state — gc_send_message
+//        treats "zero confirmed peers" as success — so the message would be
+//        reported sent and reach nobody. The first confirmed peer posts a
+//        groupJoinNotification so the caller can drain what it queued.
 //   -1 = no such group mapped (let the send fail the normal way)
 int tim2tox_ffi_group_wire_ready(const char* group_id);
 // Tox NGC pseudo message id of the group message most recently sent on this

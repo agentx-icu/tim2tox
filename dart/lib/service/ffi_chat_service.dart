@@ -9602,10 +9602,10 @@ class FfiChatService {
     }
   }
 
-  /// Strictly "toxcore reports the group connected" (tox_group_is_connected:
-  /// the sync handshake is done, which is also when toxcore fires its own
-  /// self-join). Unlike [_groupWireReady], an unknown group or an older
-  /// library is NOT confirmation.
+  /// Strictly "native reports the group wire-ready": toxcore's sync
+  /// handshake is done (its own self-join) and a peer is confirmed. Unlike
+  /// [_groupWireReady], an unknown group or an older library is NOT
+  /// confirmation.
   bool _groupJoinConfirmed(String groupId) {
     final p = groupId.toNativeUtf8();
     try {
@@ -10036,7 +10036,8 @@ class FfiChatService {
   Future<void> registerJoinedGroupState(String groupId) async {
     if (_sessionClosed) return; // see [_sessionClosed]
     // Native reports EVERY self-join here, including a restored group's
-    // reconnect — the moment queued texts become deliverable.
+    // reconnect, and again when the group gets its first confirmed peer —
+    // the moment queued texts become deliverable.
     unawaited(_sendPendingGroupMessages(groupId).catchError((Object e,
         StackTrace st) {
       _logger?.logError(
@@ -11236,12 +11237,13 @@ class FfiChatService {
     // it as pending; drain on the next conn:success.
     //
     // "Connected" has to mean the GROUP, not just our DHT link. A group
-    // restored from the savefile stays CONNECTING until a peer handshake
-    // completes — seconds to minutes after conn:success — and in that state
-    // tox_group_send_message SUCCEEDS while delivering to nobody
-    // (gc_send_message: `sent > 0 || confirmed_peers == 0`). NGC has no
-    // history sync, so a message "sent" then was lost for good while showing
-    // as delivered. Queue it; it drains when the group connects.
+    // restored from the savefile, or just rejoined, stays CONNECTING until a
+    // peer handshake completes — seconds to minutes after conn:success — and
+    // in that state tox_group_send_message SUCCEEDS while delivering to
+    // nobody (gc_send_message: `sent > 0 || confirmed_peers == 0`). NGC has
+    // no history sync, so a message "sent" then was lost for good while
+    // showing as delivered. Queue it; it drains when native reports the
+    // group's first confirmed peer (a groupJoinNotification).
     if (!_isConnected || !_groupWireReady(groupId)) {
       // Offline: the armed read-receipt intent is consumed HERE (it must not
       // leak onto an unrelated next send) and stamped on the pending row. The
@@ -11392,7 +11394,8 @@ class FfiChatService {
       }
       if (!_isConnected || !_groupWireReady(groupId)) {
         // Not (yet) deliverable: keep the rest queued. The drain runs again on
-        // the next conn:success and when this group reports its self-join.
+        // the next conn:success and when this group reports its self-join or
+        // its first confirmed peer.
         _logger?.log(
             '[FfiChatService] _sendPendingGroupMessages: $groupId not deliverable yet; ${pending.length - pending.indexOf(item)} item(s) kept in queue');
         break;

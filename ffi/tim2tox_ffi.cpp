@@ -2921,7 +2921,11 @@ int tim2tox_ffi_group_wire_ready(const char* group_id) {
     Tox_Err_Group_Is_Connected err_conn;
     const bool connected = session.manager()->isGroupConnected(group_number, &err_conn);
     if (err_conn != TOX_ERR_GROUP_IS_CONNECTED_OK) return -1;
-    return connected ? 1 : 0;
+    if (!connected) return 0;
+    // tox_group_is_connected() is also true for CS_CONNECTING (a rejoin, a
+    // restored group), where gc_send_message() reports success and reaches
+    // nobody. Ready means synced AND at least one confirmed peer.
+    return manager_impl->IsGroupWireReady(group_number) ? 1 : 0;
 }
 
 int tim2tox_ffi_send_group_action(const char* group_id, const char* text) {
