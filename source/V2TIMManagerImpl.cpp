@@ -5232,9 +5232,7 @@ void V2TIMManagerImpl::QuitGroup(const V2TIMString& groupID, V2TIMCallback* call
         group_id_to_group_number_.erase(groupID);
         if (resolved_group_number != UINT32_MAX) {
             group_number_to_group_id_.erase(resolved_group_number);
-            fresh_group_joins_.erase(resolved_group_number);
-            group_wire_readiness_.Forget(resolved_group_number);
-            accepted_invites_.erase(resolved_group_number);
+            ForgetGroupNumberLocked(resolved_group_number);
             dart_known_chat_id_.erase(groupID.CString());
             dart_known_type_.erase(groupID.CString());
         } else {
@@ -5363,9 +5361,7 @@ void V2TIMManagerImpl::DismissGroup(const V2TIMString& groupID, V2TIMCallback* c
         group_id_to_group_number_.erase(groupID);
         if (resolved_group_number != UINT32_MAX) {
             group_number_to_group_id_.erase(resolved_group_number);
-            fresh_group_joins_.erase(resolved_group_number);
-            group_wire_readiness_.Forget(resolved_group_number);
-            accepted_invites_.erase(resolved_group_number);
+            ForgetGroupNumberLocked(resolved_group_number);
             dart_known_chat_id_.erase(groupID.CString());
             dart_known_type_.erase(groupID.CString());
         } else {
@@ -10505,28 +10501,57 @@ void V2TIMManagerImpl::ErasePeerIdCacheEntry(Tox_Group_Number group_number, cons
     }
 }
 
-void V2TIMManagerImpl::EraseGroupLocalState(const V2TIMString& groupID) {
+void V2TIMManagerImpl::ForgetGroupNumberLocked(Tox_Group_Number group_number) {
+    if (group_number == UINT32_MAX) return;
+    group_peer_id_cache_.erase(group_number);
+    fresh_group_joins_.erase(group_number);
+    group_wire_readiness_.Forget(group_number);
+    accepted_invites_.erase(group_number);
+}
+
+void V2TIMManagerImpl::EraseGroupLocalState(const V2TIMString& groupID,
+                                            Tox_Group_Number group_number) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    EraseGroupLocalStateLocked(groupID, group_number);
+}
+
+void V2TIMManagerImpl::EraseGroupLocalStateLocked(const V2TIMString& groupID,
+                                                  Tox_Group_Number group_number) {
     // Mirrors the inline map cleanup in QuitGroup (group_id_to_group_number_ /
     // group_number_to_group_id_ / chat-id maps) and additionally prunes the
     // peer-id cache GetGroupMemberList reads. Non-Tox state only — the caller
     // (e.g. a self-kick) has already lost the Tox group connection, so there is
     // no tox_group_leave to make.
-    std::lock_guard<std::mutex> lock(mutex_);
+    //
+    // The number toxcore gave the caller is forgotten directly: resolving it
+    // through the id alone missed it whenever the id mapping was already gone
+    // (a refused invite join drops its alias first), and the stale readiness
+    // then made the next group in that slot unsendable forever.
+    ForgetGroupNumberLocked(group_number);
+    if (group_number != UINT32_MAX) {
+        auto reverse = group_number_to_group_id_.find(group_number);
+        if (reverse != group_number_to_group_id_.end() && reverse->second == groupID) {
+            group_number_to_group_id_.erase(reverse);
+        }
+    }
+    if (groupID.Empty()) return;
     auto it = group_id_to_group_number_.find(groupID);
     if (it != group_id_to_group_number_.end()) {
         const Tox_Group_Number gnum = it->second;
         group_id_to_group_number_.erase(it);
-        group_number_to_group_id_.erase(gnum);
-        group_peer_id_cache_.erase(gnum);
-        fresh_group_joins_.erase(gnum);
-        group_wire_readiness_.Forget(gnum);
-        accepted_invites_.erase(gnum);
-        // Dart forgets a left/refused group's identity; so must this record,
-        // or a same-session rejoin under the same id is never re-persisted.
-        dart_known_chat_id_.erase(groupID.CString());
-        dart_known_type_.erase(groupID.CString());
+        // Only this id's reverse entry: an inconsistent forward map must not
+        // let one group's cleanup unmap another group.
+        auto reverse = group_number_to_group_id_.find(gnum);
+        if (reverse != group_number_to_group_id_.end() && reverse->second == groupID) {
+            group_number_to_group_id_.erase(reverse);
+        }
+        ForgetGroupNumberLocked(gnum);
         V2TIM_LOG(kInfo, "EraseGroupLocalState: removed group_number={} maps + peer cache for group {}", gnum, groupID.CString());
     }
+    // Dart forgets a left/refused group's identity; so must this record,
+    // or a same-session rejoin under the same id is never re-persisted.
+    dart_known_chat_id_.erase(groupID.CString());
+    dart_known_type_.erase(groupID.CString());
     auto chat_it = group_id_to_chat_id_.find(groupID);
     if (chat_it != group_id_to_chat_id_.end()) {
         std::ostringstream oss;
@@ -10535,7 +10560,10 @@ void V2TIMManagerImpl::EraseGroupLocalState(const V2TIMString& groupID) {
         }
         const std::string chat_id_hex = oss.str();
         group_id_to_chat_id_.erase(chat_it);
-        chat_id_to_group_id_.erase(chat_id_hex);
+        auto by_chat = chat_id_to_group_id_.find(chat_id_hex);
+        if (by_chat != chat_id_to_group_id_.end() && by_chat->second == groupID) {
+            chat_id_to_group_id_.erase(by_chat);
+        }
         V2TIM_LOG(kInfo, "EraseGroupLocalState: removed chat_id maps (chat_id_hex={}) for group {}", chat_id_hex, groupID.CString());
     }
 }
@@ -10649,7 +10677,7 @@ void V2TIMManagerImpl::HandleGroupModeration(Tox_Group_Number group_number, Tox_
                 // to _quitGroups, clears history). groupID is a local copy, so
                 // erasing the maps does not invalidate it.
                 V2TIM_LOG(kInfo, "HandleGroupModeration: SELF was kicked from group {}; erasing local state + notifying Dart cleanup", groupID.CString());
-                EraseGroupLocalState(groupID);
+                EraseGroupLocalState(groupID, group_number);
                 DartNotifyGroupKicked(groupID.CString(), GetInstanceIdFromManager(this), GetSessionEpoch());
                 // toxcore keeps a kicked group around as CS_DISCONNECTED (and
                 // writes it to the savefile). While it exists,
@@ -11069,9 +11097,23 @@ void V2TIMManagerImpl::HandleGroupJoinFail(Tox_Group_Number group_number, Tox_Gr
             invite_id = accepted->second.first;
             PendingInvite restored = accepted->second.second;
             restored.group_number = UINT32_MAX;
-            const V2TIMString invite_key(invite_id.c_str());
-            pending_group_invites_[invite_key] = std::move(restored);
+            pending_group_invites_[V2TIMString(invite_id.c_str())] = std::move(restored);
             accepted_invites_.erase(accepted);
+        }
+        if (fresh) {
+            // Undo the join here, under the same lock as the invite restore
+            // (a retry through the restored invite cannot interleave) and
+            // BEFORE the alias cleanup below: an auto-accepted invite to a
+            // never-seen group is mapped under the invite alias itself until
+            // toxcore's self-join (a manual accept promotes it at once), so
+            // erasing the alias first left nothing to resolve the number
+            // through and its wire readiness (still awaiting a sync) outlived
+            // the group — the next group toxcore put in that slot was never
+            // sendable. The number is forgotten even when no id maps to it.
+            EraseGroupLocalStateLocked(groupID, group_number);
+        }
+        if (!invite_id.empty()) {
+            const V2TIMString invite_key(invite_id.c_str());
             // The accept left the invite id mapped (number + chat id): a
             // retry through it would then take the join-by-chat-id path,
             // which cannot enter a private group. Back to a bare invite.
@@ -11108,7 +11150,7 @@ void V2TIMManagerImpl::HandleGroupJoinFail(Tox_Group_Number group_number, Tox_Gr
     DartNotifyGroupJoinFailed(groupID.CString(), chat_id_hex.c_str(), reason, !fresh,
                               invite_id.c_str(), GetInstanceIdFromManager(this), GetSessionEpoch());
     if (!fresh) return;
-    EraseGroupLocalState(groupID);
+    // (Local state was already erased above, with the invite restore.)
     // toxcore leaves a rejected join as a CS_DISCONNECTED group, and while it
     // exists every later invite to (or join of) that group is dropped as
     // "already added" — a retry with the right password could never work.

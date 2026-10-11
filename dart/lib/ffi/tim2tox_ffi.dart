@@ -75,6 +75,8 @@ typedef _send_group_text_c = ffi.Int32 Function(
 typedef _get_pending_group_invites_c = ffi.Int32 Function(
     ffi.Pointer<ffi.Int8>, ffi.Int32);
 typedef _reject_group_invite_c = ffi.Int32 Function(ffi.Pointer<pkgffi.Utf8>);
+typedef _debug_group_set_password_c = ffi.Int32 Function(
+    ffi.Pointer<pkgffi.Utf8>, ffi.Pointer<pkgffi.Utf8>);
 typedef _restore_group_invite_c = ffi.Int32 Function(
     ffi.Pointer<pkgffi.Utf8>,
     ffi.Pointer<pkgffi.Utf8>,
@@ -770,6 +772,17 @@ class Tim2ToxFfi {
   late final int Function(ffi.Pointer<pkgffi.Utf8>) groupWireReady = _lib
       .lookupFunction<_reject_group_invite_c, int Function(ffi.Pointer<pkgffi.Utf8>)>(
           'tim2tox_ffi_group_wire_ready');
+  /// TEST SEAM (auto_tests only): toxcore group number of an NGC group id
+  /// on the current instance, or -1.
+  late final int Function(ffi.Pointer<pkgffi.Utf8>) debugGroupNumber = _lib
+      .lookupFunction<_reject_group_invite_c, int Function(ffi.Pointer<pkgffi.Utf8>)>(
+          'tim2tox_ffi_debug_group_number');
+  /// TEST SEAM (auto_tests only): founder sets ("" clears) an NGC group's
+  /// join password. 1 = set, 0 = toxcore refused, -1 = unknown group.
+  late final int Function(ffi.Pointer<pkgffi.Utf8>, ffi.Pointer<pkgffi.Utf8>)
+      debugGroupSetPassword = _lib.lookupFunction<_debug_group_set_password_c,
+              int Function(ffi.Pointer<pkgffi.Utf8>, ffi.Pointer<pkgffi.Utf8>)>(
+          'tim2tox_ffi_debug_group_set_password');
   late final int Function(ffi.Pointer<pkgffi.Utf8>) rejectGroupInvite =
       _lib.lookupFunction<_reject_group_invite_c,
           int Function(ffi.Pointer<pkgffi.Utf8>)>(

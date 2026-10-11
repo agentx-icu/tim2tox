@@ -102,6 +102,26 @@ TEST(GroupWireReadinessTest, ForgetAndClearDropEverything) {
     EXPECT_FALSE(r.AwaitingSync(kOtherGroup));
 }
 
+TEST(GroupWireReadinessTest, RefusedJoinSlotReusedByCreatedGroupBecomesReady) {
+    // A refused invite join leaves its group number awaiting a sync that never
+    // comes; toxcore then deletes the group and hands the number to the next
+    // one. A group WE create gets no BeginSync (and no self_join), so only
+    // Forget on the refusal lets its first confirmed peer make it ready.
+    GroupWireReadiness r;
+    r.BeginSync(kGroup);   // the accept
+    r.Forget(kGroup);      // the refusal
+    EXPECT_TRUE(r.PeerConfirmed(kGroup, 5));  // created group, slot reused
+    EXPECT_TRUE(r.Ready(kGroup));
+}
+
+TEST(GroupWireReadinessTest, UnforgottenRefusedJoinBlocksTheReusedSlot) {
+    // The bug pinned above: without Forget the reused slot never turns ready.
+    GroupWireReadiness r;
+    r.BeginSync(kGroup);
+    EXPECT_FALSE(r.PeerConfirmed(kGroup, 5));
+    EXPECT_FALSE(r.Ready(kGroup));
+}
+
 std::string ReadSource(const char* path) {
     std::ifstream input(path, std::ios::binary);
     EXPECT_TRUE(input.good()) << path;
@@ -168,10 +188,18 @@ TEST(GroupWireReadinessSourceTest, ToxcoreCallbacksFeedTheTracker) {
     EXPECT_NE(manager.find("group_wire_readiness_.PeerExited(group_number, peer_id);"),
               std::string::npos);
     EXPECT_NE(manager.find("group_wire_readiness_.Clear();"), std::string::npos);
-    // Every place that forgets a fresh join forgets its readiness as well.
-    EXPECT_EQ(Count(manager, "group_wire_readiness_.Forget("),
-              Count(manager, "fresh_group_joins_.erase(resolved_group_number);") +
-                  Count(manager, "fresh_group_joins_.erase(gnum);"));
+    // Per-number state is forgotten in exactly one place, which forgets the
+    // fresh join, the accepted invite and the peer cache along with it.
+    EXPECT_EQ(Count(manager, "group_wire_readiness_.Forget("), 1u);
+    const std::string forget = SourceSection(
+        manager, "void V2TIMManagerImpl::ForgetGroupNumberLocked(",
+        "void V2TIMManagerImpl::EraseGroupLocalState(");
+    EXPECT_NE(forget.find("group_wire_readiness_.Forget(group_number);"), std::string::npos);
+    EXPECT_NE(forget.find("fresh_group_joins_.erase(group_number);"), std::string::npos);
+    EXPECT_NE(forget.find("accepted_invites_.erase(group_number);"), std::string::npos);
+    EXPECT_NE(forget.find("group_peer_id_cache_.erase(group_number);"), std::string::npos);
+    // Quit and dismiss both go through it (they used to skip the peer cache).
+    EXPECT_EQ(Count(manager, "ForgetGroupNumberLocked(resolved_group_number);"), 2u);
 
     const std::string confirmed = SourceSection(
         manager, "void V2TIMManagerImpl::HandleGroupPeerConfirmed(",
@@ -183,6 +211,51 @@ TEST(GroupWireReadinessSourceTest, ToxcoreCallbacksFeedTheTracker) {
     const std::size_t notify = confirmed.find("DartNotifyGroupJoin(");
     ASSERT_NE(notify, std::string::npos);
     EXPECT_LT(unlock, notify);
+}
+
+TEST(GroupWireReadinessSourceTest, LeavingGroupForgetsItsNumberNotJustItsId) {
+    const std::string manager = ReadSource(TIM2TOX_MANAGER_SOURCE_PATH);
+    const std::string erase = SourceSection(
+        manager, "void V2TIMManagerImpl::EraseGroupLocalStateLocked(",
+        "void V2TIMManagerImpl::HandleGroupModeration(");
+    // The caller's number is forgotten before (and independently of) the id
+    // lookup, which finds nothing once an alias mapping is gone.
+    const std::size_t direct = erase.find("ForgetGroupNumberLocked(group_number);");
+    const std::size_t by_id = erase.find("group_id_to_group_number_.find(groupID)");
+    ASSERT_NE(direct, std::string::npos);
+    ASSERT_NE(by_id, std::string::npos);
+    EXPECT_LT(direct, by_id);
+    // Reverse entries are only erased when they still name this group.
+    EXPECT_EQ(erase.find("group_number_to_group_id_.erase(gnum);"), std::string::npos);
+    EXPECT_EQ(erase.find("chat_id_to_group_id_.erase(chat_id_hex);"), std::string::npos);
+
+    // A self-kick passes toxcore's number.
+    EXPECT_NE(manager.find("EraseGroupLocalState(groupID, group_number);"), std::string::npos);
+    EXPECT_EQ(manager.find("EraseGroupLocalState(groupID);"), std::string::npos);
+}
+
+TEST(GroupWireReadinessSourceTest, RefusedJoinForgetsItsNumberBeforeDroppingTheAlias) {
+    const std::string manager = ReadSource(TIM2TOX_MANAGER_SOURCE_PATH);
+    const std::string fail = SourceSection(
+        manager, "void V2TIMManagerImpl::HandleGroupJoinFail(",
+        "void V2TIMManagerImpl::MarkFreshGroupJoin(");
+    const std::size_t restore = fail.find("accepted_invites_.erase(accepted);");
+    const std::size_t erase = fail.find("EraseGroupLocalStateLocked(groupID, group_number);");
+    const std::size_t alias = fail.find("group_id_to_group_number_.erase(alias_number);");
+    const std::size_t notify = fail.find("DartNotifyGroupJoinFailed(");
+    ASSERT_NE(restore, std::string::npos);
+    ASSERT_NE(erase, std::string::npos);
+    ASSERT_NE(alias, std::string::npos);
+    ASSERT_NE(notify, std::string::npos);
+    // Invite handed back first (its record is per-number state), then the
+    // number forgotten, then the alias dropped; all before Dart hears of it.
+    EXPECT_LT(restore, erase);
+    EXPECT_LT(erase, alias);
+    EXPECT_LT(alias, notify);
+    // Undone only for a join started this session, and not a second time
+    // after the notifications.
+    EXPECT_NE(fail.find("if (fresh) {"), std::string::npos);
+    EXPECT_EQ(fail.find("EraseGroupLocalState(groupID"), std::string::npos);
 }
 
 }  // namespace

@@ -304,6 +304,9 @@ public:
                          Tox_Err_Group_Send_Message* error = nullptr);
     bool setGroupTopic(Tox_Group_Number group_number, const uint8_t* topic, size_t length,
                       Tox_Err_Group_Topic_Set* error = nullptr);
+    // Founder only; empty (nullptr, 0) clears it. Used by a test seam.
+    bool setGroupPassword(Tox_Group_Number group_number, const uint8_t* password, size_t length,
+                          Tox_Err_Group_Set_Password* error = nullptr);
     bool getGroupTopic(Tox_Group_Number group_number, uint8_t* topic, size_t max_length,
                       Tox_Err_Group_State_Query* error = nullptr);
     bool getGroupName(Tox_Group_Number group_number, uint8_t* name, size_t max_length,

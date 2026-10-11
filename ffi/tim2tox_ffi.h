@@ -315,6 +315,13 @@ int tim2tox_ffi_send_group_text(const char* group_id, const char* text);
 //        groupJoinNotification so the caller can drain what it queued.
 //   -1 = no such group mapped (let the send fail the normal way)
 int tim2tox_ffi_group_wire_ready(const char* group_id);
+// TEST SEAM (auto_tests only): toxcore group number of an NGC group id on the
+// current instance, or -1.
+int tim2tox_ffi_debug_group_number(const char* group_id);
+// TEST SEAM (auto_tests only): founder sets ("" clears) an NGC group's join
+// password on the current instance. 1 = set, 0 = toxcore refused, -1 = no
+// session / unknown or non-NGC group.
+int tim2tox_ffi_debug_group_set_password(const char* group_id, const char* password);
 // Tox NGC pseudo message id of the group message most recently sent on this
 // thread (first fragment), or -1 if the last send produced none. Valid only
 // immediately after a successful group send on the same thread.
