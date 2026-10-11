@@ -1428,6 +1428,16 @@ bool ToxManager::setGroupTopic(Tox_Group_Number group_number, const uint8_t* top
     return tox_group_set_topic(tox_.get(), group_number, topic, length, error);
 }
 
+bool ToxManager::setGroupPassword(Tox_Group_Number group_number, const uint8_t* password, size_t length,
+                                  Tox_Err_Group_Set_Password* error) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!tox_) {
+        if (error) *error = TOX_ERR_GROUP_SET_PASSWORD_GROUP_NOT_FOUND;
+        return false;
+    }
+    return tox_group_set_password(tox_.get(), group_number, password, length, error);
+}
+
 bool ToxManager::getGroupTopic(Tox_Group_Number group_number, uint8_t* topic, size_t max_length,
                               Tox_Err_Group_State_Query* error) {
     std::lock_guard<std::mutex> lock(mutex_);

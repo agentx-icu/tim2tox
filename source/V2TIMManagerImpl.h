@@ -989,7 +989,20 @@ private:
     // peer-id cache). Mirrors the inline cleanup in QuitGroup; used when this
     // client is removed from a group WITHOUT a local QuitGroup call (e.g. being
     // kicked). Acquires mutex_ internally — callers must NOT hold it.
-    void EraseGroupLocalState(const V2TIMString& groupID);
+    // group_number: the number toxcore reported for the group, when known. Its
+    // per-number state is forgotten even if the id no longer maps to it (the
+    // number is about to be freed and may be reused by an unrelated group).
+    void EraseGroupLocalState(const V2TIMString& groupID,
+                              Tox_Group_Number group_number = UINT32_MAX);
+    // Same, with mutex_ already held.
+    void EraseGroupLocalStateLocked(const V2TIMString& groupID,
+                                    Tox_Group_Number group_number);
+    // Forget the per-session NGC bookkeeping keyed by a group number: the
+    // peer-id cache, a fresh join, wire readiness and an accepted invite.
+    // Called wherever the group leaves the session, since toxcore hands the
+    // freed number to the next group. (AV-conference and peer-snapshot state
+    // keyed by conference map keys has its own cleanup.) mutex_ held.
+    void ForgetGroupNumberLocked(Tox_Group_Number group_number);
     // Drop one (group, public key) -> peer_id cache entry. Case-insensitive on
     // the key. Acquires mutex_ internally.
     void ErasePeerIdCacheEntry(Tox_Group_Number group_number, const std::string& public_key_hex);

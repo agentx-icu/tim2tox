@@ -2928,6 +2928,40 @@ int tim2tox_ffi_group_wire_ready(const char* group_id) {
     return manager_impl->IsGroupWireReady(group_number) ? 1 : 0;
 }
 
+// TEST SEAM (auto_tests only): the toxcore group number an NGC group id maps
+// to on the current instance, or -1. Lets a scenario prove a slot was reused.
+int tim2tox_ffi_debug_group_number(const char* group_id) {
+    if (!IsCurrentInstanceInited() || !group_id) return -1;
+    V2TIMManagerImpl* manager_impl = GetCurrentInstance();
+    if (!manager_impl) return -1;
+    Tox_Group_Number group_number = UINT32_MAX;
+    if (!manager_impl->GetGroupNumberFromID(group_id, group_number)) return -1;
+    if (group_number == UINT32_MAX || IsConferenceMapKey(group_number)) return -1;
+    return static_cast<int>(group_number);
+}
+
+// TEST SEAM (auto_tests only): founder sets (or, with "", clears) an NGC
+// group's join password on the current instance, so a scenario can make a
+// join be refused. Tim2Tox has no product API for this.
+//   1 = set, 0 = toxcore refused (not founder, too long, ...),
+//  -1 = no session / unknown or non-NGC group.
+int tim2tox_ffi_debug_group_set_password(const char* group_id, const char* password) {
+    if (!IsCurrentInstanceInited() || !group_id) return -1;
+    V2TIMManagerImpl* manager_impl = GetCurrentInstance();
+    if (!manager_impl) return -1;
+    const auto session = manager_impl->AcquireToxSession();
+    if (!session) return -1;
+    Tox_Group_Number group_number = UINT32_MAX;
+    if (!manager_impl->GetGroupNumberFromID(group_id, group_number)) return -1;
+    if (group_number == UINT32_MAX || IsConferenceMapKey(group_number)) return -1;
+    const std::string pw = password ? password : "";
+    Tox_Err_Group_Set_Password err = TOX_ERR_GROUP_SET_PASSWORD_OK;
+    const bool ok = session.manager()->setGroupPassword(
+        group_number,
+        pw.empty() ? nullptr : reinterpret_cast<const uint8_t*>(pw.data()), pw.size(), &err);
+    return ok && err == TOX_ERR_GROUP_SET_PASSWORD_OK ? 1 : 0;
+}
+
 int tim2tox_ffi_send_group_action(const char* group_id, const char* text) {
     if (!IsCurrentInstanceInited() || !group_id || !text) return 0;
     struct SendCb : public V2TIMSendCallback {
