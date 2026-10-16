@@ -64,14 +64,17 @@ void main() {
   });
 
 
-  test('both history merge paths keep a failure', () {
-    expect(persistence,
-        contains('isFailed: updated.isFailed || existing.isFailed'));
+  test('both history merge paths keep a failure unless it was delivered', () {
+    expect(persistence, contains('isFailed: _mergedFailure(existing, updated,'));
     final prefer = persistence.substring(
       persistence.indexOf('static ChatMessage _preferLoadedCopy('),
     );
-    expect(prefer, contains('final isFailed = existing.isFailed || msg.isFailed;'));
+    expect(prefer, contains('final isFailed = _mergedFailure(existing, msg,'));
     expect(prefer, contains('isFailed: isFailed,'));
+    final rule = persistence.substring(
+      persistence.indexOf('static bool _mergedFailure('),
+    );
+    expect(rule, contains('if (isReceived || isRead) return false;'));
   });
 
   test('a sent item whose queue removal fails is never marked failed', () {
@@ -103,14 +106,15 @@ void main() {
     expect(platform, contains('_persistFinalizedFailedMessage('));
   });
 
-  test('only a still-pending row is marked failed (never a possibly sent one)',
-      () {
+  test('a failed drain marks its pending row, or its exact-id row unless a '
+      'receipt proved it delivered', () {
     final mark = service.substring(
-      service.indexOf('void _markPendingItemFailed('),
-      service.indexOf('Future<void> _loadOfflineQueue()'),
+      service.indexOf('int _failedRowIndex('),
+      service.indexOf('Future<void> _sendPendingMessagesClaiming('),
     );
-    expect(mark, contains('if (!msg.isSelf || !msg.isPending) continue;'));
-    expect(mark, contains('copyWith(isPending: false, isFailed: true)'));
+    expect(mark, contains('if (!msg.isSelf || msg.isCancelled) continue;'));
+    expect(mark, contains('if (msg.isPending) return i;'));
+    expect(mark, contains('!_deliveryProven(msg)'));
   });
 
   test('a send whose queue removal threw still reconciles its row', () {
@@ -124,7 +128,7 @@ void main() {
   });
 
   test('a failure is absorbed only on proven identity', () {
-    expect(persistence, contains('final becameFailed = sameId && duplicate.isFailed'));
+    expect(persistence, contains('final becameFailed = sameId &&\n        duplicate.isFailed'));
   });
 
   test('a later delivery removes the queued failure entry', () {

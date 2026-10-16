@@ -99,8 +99,18 @@ class MessageConverter {
 
     // Determine message status
     final isPending = v2Msg.status == MessageStatus.V2TIM_MSG_STATUS_SENDING;
-    final isReceived = v2Msg.status == MessageStatus.V2TIM_MSG_STATUS_SEND_SUCC;
-    final isRead = v2Msg.isRead ?? false;
+    // On our own message SEND_SUCC only means it left; delivery and read are
+    // the PEER's (isPeerRead, from a receipt). Deriving isReceived from
+    // SEND_SUCC would make every copy look delivered and outrank a genuine
+    // failure in history merges.
+    final peerRead = v2Msg.isPeerRead ?? false;
+    final isReceived = isSelf
+        ? peerRead
+        : v2Msg.status == MessageStatus.V2TIM_MSG_STATUS_SEND_SUCC;
+    final isRead = isSelf ? peerRead : (v2Msg.isRead ?? false);
+    final isCancelled = isSelf &&
+        v2Msg.status == MessageStatus.V2TIM_MSG_STATUS_LOCAL_REVOKED &&
+        queuedCancelledFromLocalCustomData(v2Msg.localCustomData);
 
     final timestamp = timestampOf(v2Msg, receivedAt ?? DateTime.now());
 
@@ -140,6 +150,7 @@ class MessageConverter {
       isPending: isPending,
       isFailed: isSelf &&
           v2Msg.status == MessageStatus.V2TIM_MSG_STATUS_SEND_FAIL,
+      isCancelled: isCancelled,
       isReceived: isReceived,
       isRead: isRead,
       msgID: v2Msg.msgID,

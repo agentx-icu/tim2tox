@@ -20,6 +20,7 @@ OfflineMessageItem textItem(
     msgID: id,
     cloudCustomData: cloudCustomData,
     contentKind: contentKind,
+    control: null,
   );
 }
 

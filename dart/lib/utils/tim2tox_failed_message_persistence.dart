@@ -194,6 +194,7 @@ class Tim2ToxFailedMessagePersistence {
     String? userID,
     String? groupID,
     String? accountToxId,
+    bool queued = false,
   }) async {
     try {
       // Create message data to save. v2 schema (P0-12): extra optional
@@ -252,6 +253,9 @@ class Tim2ToxFailedMessagePersistence {
         'msgID': message.msgID,
         // Read-receipt intent must survive the failed->resend round trip.
         if (message.needReadReceipt == true) 'needReadReceipt': true,
+        // Recorded for a queued send's failed history row: that row is the
+        // authority on the message's state (see isQueuedFailureEntry).
+        if (queued) 'queued': true,
         'timestamp': message.timestamp,
         'elemType': message.elemType,
         'text': message.textElem?.text,

@@ -210,6 +210,29 @@ class MessageHistoryPersistence {
   // Maximum number of messages to keep in memory per conversation
   static const int _maxMessagesInMemory = 1000;
 
+  /// True for an own msgID whose send went out in this session
+  /// (FfiChatService sets it). A copy saying such a message failed is stale
+  /// (e.g. a failure callback delivered after a successful retry) and must
+  /// not mark the row failed again.
+  bool Function(String msgID)? sentThisSession;
+
+  /// The failure two copies of one message agree on: either copy's failure,
+  /// unless a receipt proved it delivered or it went out this session
+  /// ([sent], see [sentThisSession]).
+  static bool _mergedFailure(ChatMessage a, ChatMessage b,
+      {required bool isReceived,
+      required bool isRead,
+      bool Function(String msgID)? sent}) {
+    if (!a.isFailed && !b.isFailed) return false;
+    if (isReceived || isRead) return false;
+    if (sent == null) return true;
+    final ids = <String>{
+      if (a.msgID != null) a.msgID!,
+      if (b.msgID != null) b.msgID!,
+    };
+    return !ids.any(sent);
+  }
+
   /// On-disk format written by [saveHistory] (`version` key).
   static const int _historyFormatVersion = 2;
 
@@ -3625,8 +3648,9 @@ class MessageHistoryPersistence {
     final isReceived = existing.isReceived || msg.isReceived;
     final isRead = existing.isRead || msg.isRead;
     final needReadReceipt = existing.needReadReceipt || msg.needReadReceipt;
-    // A failed send stays failed whichever copy wins.
-    final isFailed = existing.isFailed || msg.isFailed;
+    // A failed send stays failed whichever copy wins, unless it was delivered.
+    final isFailed = _mergedFailure(existing, msg,
+        isReceived: isReceived, isRead: isRead);
     // Likewise a cancelled send stays cancelled (it must never look sent).
     final isCancelled = existing.isCancelled || msg.isCancelled;
     if (sameAliases &&
@@ -3679,7 +3703,16 @@ class MessageHistoryPersistence {
       if (duplicate.msgID != null) duplicate.msgID!,
       ...duplicate.altMsgIds,
     }..removeWhere((id) => _idMatches(current, id));
-    final becameFailed = sameId && duplicate.isFailed && !current.isFailed;
+    // ...and never onto a row that was delivered, cancelled, or sent this
+    // session (a stale failure copy).
+    final becameFailed = sameId &&
+        duplicate.isFailed &&
+        !current.isFailed &&
+        !current.isCancelled &&
+        _mergedFailure(current, duplicate,
+            isReceived: current.isReceived,
+            isRead: current.isRead,
+            sent: sentThisSession);
     if (newIds.isEmpty && !becameFailed) return Future.value();
     list[index] = current.copyWith(
       altMsgIds: ({...current.altMsgIds, ...newIds}.toList()..sort()),
@@ -3746,8 +3779,10 @@ class MessageHistoryPersistence {
           ? ChatMessageContentKind.action
           : ChatMessageContentKind.normal,
       isPending: isPending,
-      // A failed send stays failed through a merge of its duplicate copies.
-      isFailed: updated.isFailed || existing.isFailed,
+      // A failed send stays failed through a merge of its duplicate copies,
+      // unless it was delivered.
+      isFailed: _mergedFailure(existing, updated,
+          isReceived: isReceived, isRead: isRead, sent: sentThisSession),
       isCancelled: updated.isCancelled || existing.isCancelled,
       isReceived: isReceived,
       isRead: isRead,

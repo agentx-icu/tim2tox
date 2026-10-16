@@ -582,6 +582,10 @@ class FfiChatService {
       final id = _ffi.getCurrentInstanceId();
       if (id != 0) _instanceId = id;
     } catch (_) {}
+    // A retry whose failure is being cleared durably is on its way out: a
+    // stale failure copy must not land on it either.
+    _messageHistoryPersistence.sentThisSession = (id) =>
+        _dispatchedSends.contains(id) || _clearingRetryFailures.contains(id);
   }
 
   /// Create MessageHistoryPersistence with instance ID support
@@ -3481,6 +3485,14 @@ class FfiChatService {
     }
   }
 
+  /// [_saveHistory] for callers whose next step depends on the write being
+  /// durable (send control): the persistence error reaches them.
+  Future<void> _saveHistoryStrict(String id) async {
+    final list = _messageHistoryPersistence.getCachedList(id);
+    if (list == null || list.isEmpty) return;
+    await _messageHistoryPersistence.saveHistory(id, list);
+  }
+
   // Load message history for a conversation (delegate to persistence service)
   Future<void> _loadHistory(String id) async {
     if (_draftDisposing) return;
@@ -3488,14 +3500,38 @@ class FfiChatService {
     final messages = await _messageHistoryPersistence.loadHistory(id,
         quitGroups: quitGroups);
     if (_draftDisposing) return;
+    final pendingAgain = _restoreQueuedPending(id);
     if (messages.isNotEmpty) {
       // Persistence already owns the in-memory list; we only need to refresh
       // conversation-preview state here. `messages` is a copy (sorting the
       // cache in place used to reverse its arrival order); stable (GH-6).
       sortChatMessagesChronologically(messages, newestFirst: true);
       final lastMsg = messages.first;
-      _lastByPeer[id] = lastMsg;
+      _lastByPeer[id] = pendingAgain[lastMsg.msgID] ?? lastMsg;
     }
+  }
+
+  /// Loading clears isPending (a row of an earlier session is not in
+  /// flight), but our row whose send is still queued is: it shows pending
+  /// again instead of sent. Memory only; the queue item is the record.
+  /// Returns the rows it changed, by msgID.
+  Map<String, ChatMessage> _restoreQueuedPending(String id) {
+    final history = _historyById[id];
+    if (history == null || history.isEmpty) return const {};
+    // A send that went out this session is not pending, whatever its
+    // lingering queue item (a failed post-send removal) says.
+    final queued = _offlineQueuePersistence.queuedMsgIDs(dispatchableOnly: true)
+      ..removeAll(_dispatchedSends);
+    if (queued.isEmpty) return const {};
+    final changed = <String, ChatMessage>{};
+    for (var i = 0; i < history.length; i++) {
+      final m = history[i];
+      final msgID = m.msgID;
+      if (!m.isSelf || m.isPending || m.isCancelled || msgID == null) continue;
+      if (!queued.contains(msgID)) continue;
+      history[i] = changed[msgID] = m.copyWith(isPending: true, isFailed: false);
+    }
+    return changed;
   }
 
   // Load all message histories (called on init) - delegate to persistence service
@@ -6868,6 +6904,7 @@ class FfiChatService {
       msgID: msgID,
       cloudCustomData: cloudCustomData,
       contentKind: contentKind,
+      control: null,
     ));
     final msg = ChatMessage(
       text: text,
@@ -6899,7 +6936,7 @@ class FfiChatService {
   Future<ChatMessage> _queueOfflineFile(
       String normalizedPeerId, String filePath, int fileSize) async {
     // INVARIANT (drain depends on this): the queue item and the pending row
-    // MUST share this one `now` — `_drainFileItem` / `_markPendingItemFailed`
+    // MUST share this one `now` — `_drainFileItem` / `_failedRowIndex`
     // identify this item's row by EXACT-ms timestamp equality. Don't split.
     final now = DateTime.now();
     final fileName = p.basename(filePath);
@@ -6916,6 +6953,7 @@ class FfiChatService {
       msgID: msgID,
       cloudCustomData: null,
       contentKind: ChatMessageContentKind.normal,
+      control: null,
     ));
     final kind = _detectKind(filePath);
     final msg = ChatMessage(
@@ -9078,9 +9116,13 @@ class FfiChatService {
       for (var i = history.length - 1; i >= 0; i--) {
         final msg = history[i];
         if (msg.isSelf && msg.altMsgIds.contains(nativeMsgID)) {
-          if (!msg.isReceived) {
-            final updated = msg.copyWith(isReceived: true);
+          // A cancelled row was never sent: an ACK cannot be about it.
+          if (msg.isCancelled) return;
+          if (!msg.isReceived || msg.isFailed) {
+            // Delivered: whatever an earlier attempt recorded, it did not fail.
+            final updated = msg.copyWith(isReceived: true, isFailed: false);
             history[i] = updated;
+            if (msg.isFailed) _reportFailureCleared(msg.msgID);
             unawaited(_saveHistory(peer));
             _messages.add(updated);
           }
@@ -10851,10 +10893,12 @@ class FfiChatService {
       final tallyKey = _localGroupRowId(msgID, groupID);
       // Only our OWN rows have receivers worth counting: receipts from older
       // toxee members still arrive broadcast for everyone's messages, and
-      // tallying those grew these maps without bound on every device.
+      // tallying those grew these maps without bound on every device. A
+      // cancelled row was never sent, so nobody can have received it.
       final ownRow = (_historyById[groupID] ?? const <ChatMessage>[]).any(
           (m) =>
               m.isSelf &&
+              !m.isCancelled &&
               (m.msgID == tallyKey ||
                   m.msgID == msgID ||
                   m.altMsgIds.contains(msgID)));
@@ -10916,16 +10960,31 @@ class FfiChatService {
           return byTime != 0 ? byTime : a.compareTo(b); // GH-6 stable tiebreak
         });
       }
+      // A content match may only take a row that went out: not one that is
+      // still queued and has not been handed to transport this session (a
+      // restart clears isPending, so the queue is what says it).
+      final unsent = hashWanted == null
+          ? const <String>{}
+          : (_offlineQueuePersistence.queuedMsgIDs()
+            ..removeAll(_dispatchedSends));
       for (final i in order) {
         final msg = history[i];
-        final matched = hashWanted != null
-            ? (msg.isSelf &&
-                !(receiptType == 'received' ? msg.isReceived : msg.isRead) &&
-                _c2cTextHash(msg.text) == hashWanted)
-            // Alias-aware: a group receipt carries the cross-peer id, which
-            // lives in altMsgIds, never in msgID.
-            : ((msg.msgID == msgID || msg.altMsgIds.contains(msgID)) &&
-                msg.isSelf);
+        // A cancelled row was never sent: no receipt is about it.
+        final matched = msg.isCancelled
+            ? false
+            : hashWanted != null
+                ? (msg.isSelf &&
+                    // A send that threw never put the whole text on the
+                    // wire, so a full-text hash cannot be about a failed row
+                    // (oldest-first, it would steal a later twin's receipt).
+                    !msg.isFailed &&
+                    !unsent.contains(msg.msgID) &&
+                    !(receiptType == 'received' ? msg.isReceived : msg.isRead) &&
+                    _c2cTextHash(msg.text) == hashWanted)
+                // Alias-aware: a group receipt carries the cross-peer id,
+                // which lives in altMsgIds, never in msgID.
+                : ((msg.msgID == msgID || msg.altMsgIds.contains(msgID)) &&
+                    msg.isSelf);
         if (hashWanted != null &&
             msg.isSelf &&
             !matched &&
@@ -10948,17 +11007,20 @@ class FfiChatService {
           if (groupID != null) _bumpDiag('groupReceiptsRowMatched');
           // Update self-sent message receipt status
           ChatMessage updatedMsg;
+          // Delivered: a failure an earlier attempt recorded is stale.
           if (receiptType == 'received') {
             // Idempotent: a replayed (or second member's) receipt that
             // changes no flag must not rewrite history or re-emit the row.
-            if (msg.isReceived) break;
-            updatedMsg = msg.copyWith(isReceived: true);
+            if (msg.isReceived && !msg.isFailed) break;
+            updatedMsg = msg.copyWith(isReceived: true, isFailed: false);
           } else if (receiptType == 'read') {
-            if (msg.isReceived && msg.isRead) break;
-            updatedMsg = msg.copyWith(isReceived: true, isRead: true);
+            if (msg.isReceived && msg.isRead && !msg.isFailed) break;
+            updatedMsg =
+                msg.copyWith(isReceived: true, isRead: true, isFailed: false);
           } else {
             return; // Unknown receipt type
           }
+          if (msg.isFailed) _reportFailureCleared(msg.msgID);
           history[i] = updatedMsg;
           await _saveHistory(id);
           // Emit updated message to stream for UI update
@@ -11079,6 +11141,13 @@ class FfiChatService {
     }
     return null;
   }
+
+  /// TEST-ONLY: apply a peer receipt as if it had arrived on the wire (a
+  /// `bind:<sha256(text)>` msgID is a C2C content receipt).
+  Future<void> debugHandleReceiptForTest(
+          String msgID, String receiptType, String sender,
+          {String? groupID}) =>
+      _handleReceipt(msgID, receiptType, sender, groupID);
 
   /// TEST-ONLY: drop the in-memory receipt tallies, leaving the persisted row
   /// flags alone — i.e. put this service in exactly the state a restart
@@ -11314,6 +11383,7 @@ class FfiChatService {
       msgID: msgID,
       cloudCustomData: cloudCustomData,
       contentKind: contentKind,
+      control: null,
     ));
     final msg = ChatMessage(
       text: text,
@@ -11384,7 +11454,7 @@ class FfiChatService {
     if (pending.isEmpty) return;
     _logger?.log(
         '[FfiChatService] _sendPendingGroupMessages: draining ${pending.length} item(s) for groupId=$groupId');
-    final history = _historyById[groupId];
+    var history = _historyById[groupId];
     for (final item in pending) {
       // We only queue text items today; skip anything that snuck in as a
       // file (group file transfer is unsupported anyway — see sendGroupFile).
@@ -11404,9 +11474,25 @@ class FfiChatService {
       // iteration awaited persistence.
       if (_pollDisposed) return;
       if (!_claimForDispatch(storageKey, item, history, claimed)) {
-        // Cancelled, owned by another drain, or gone since the snapshot.
-        await _dropCancelledItem(storageKey, item, history);
+        // A tombstone, cancelled, owned by someone else, or gone since the
+        // snapshot.
+        await _settleRefusedItem(storageKey, groupId, item, history);
         continue;
+      }
+      if (item.control == OfflineSendControl.retry) {
+        final cleared =
+            await _clearRetryFailureDurably(groupId, history, item);
+        if (!cleared ||
+            _pollDisposed ||
+            !_isConnected ||
+            !_groupWireReady(groupId)) {
+          // Keep it queued; the drain runs again on the next trigger.
+          _claimedSends.remove(item.msgID);
+          claimed.remove(item.msgID);
+          break;
+        }
+        // The clear may have loaded the conversation.
+        history ??= _historyById[groupId];
       }
       var dispatched = false;
       // See the C2C drain: set once the send succeeded, before the removal.
@@ -11576,8 +11662,10 @@ class FfiChatService {
             '[FfiChatService] _sendPendingGroupMessages: drain failed for group $groupId',
             e,
             stackTrace);
-        _markPendingItemFailed(groupId, history, item, isFile: false);
-        await _offlineQueuePersistence.removeItem(storageKey, item);
+        if (!await _commitDrainFailure(storageKey, groupId, history, item,
+            isFile: false)) {
+          break;
+        }
       }
     }
   }
@@ -12681,8 +12769,14 @@ class FfiChatService {
   /// ends; a sent item is gone from the queue by then).
   final Set<String> _claimedSends = <String>{};
 
-  /// msgIDs whose cancellation is being persisted: no drain may claim them.
-  final Set<String> _cancellingSends = <String>{};
+  /// msgIDs a cancel or retry is working on (held across its queue write):
+  /// no drain may claim them and no other send-control call may start.
+  final Set<String> _sendControlOps = <String>{};
+
+  /// Retry msgIDs whose row failure a drain is clearing durably right before
+  /// dispatch (see [_clearRetryFailureDurably]). Only that window: a failure
+  /// committed afterwards is genuine and must not be vetoed.
+  final Set<String> _clearingRetryFailures = <String>{};
 
   /// msgIDs whose native send succeeded this session. Kept apart from the
   /// queue: when the queue removal after a send fails, the item lingers, and
@@ -12700,15 +12794,57 @@ class FfiChatService {
       history != null &&
       history.any((m) => m.isSelf && m.msgID == msgID && m.isCancelled);
 
+  /// A peer receipt or a native delivery ACK reached this row: it was
+  /// delivered, whatever an earlier attempt recorded.
+  static bool _deliveryProven(ChatMessage row) => row.isReceived || row.isRead;
+
+  /// Index of our own row [msgID] in [history], or -1.
+  static int _ownRowIndex(List<ChatMessage> history, String msgID) =>
+      history.lastIndexWhere((m) => m.isSelf && m.msgID == msgID);
+
+  /// Index of [captured]'s row in [history] now, after an await: by msgID
+  /// (its current version), or by identity for a legacy row without one.
+  static int _currentRowIndex(List<ChatMessage> history, ChatMessage captured) {
+    final id = captured.msgID;
+    return id != null && id.isNotEmpty
+        ? _ownRowIndex(history, id)
+        : history.lastIndexWhere((m) => identical(m, captured));
+  }
+
+  static OfflineMessageItem _withControl(
+          OfflineMessageItem item, String? control) =>
+      (
+        kind: item.kind,
+        text: item.text,
+        filePath: item.filePath,
+        fileName: item.fileName,
+        timestamp: item.timestamp,
+        msgID: item.msgID,
+        cloudCustomData: item.cloudCustomData,
+        contentKind: item.contentKind,
+        control: control,
+      );
+
+  /// Hands [row] to listeners and keeps the conversation preview on it.
+  void _publishRow(String historyKey, ChatMessage row) {
+    final last = _lastByPeer[historyKey];
+    if (last != null && last.msgID == row.msgID) _lastByPeer[historyKey] = row;
+    try {
+      _messages.add(row);
+    } catch (_) {}
+  }
+
   /// Whether a drain may dispatch [item] now; claims its msgID when so.
-  /// False when it was cancelled, is being cancelled, is owned by another
-  /// drain, or is no longer queued since the snapshot was taken.
+  /// False when it is a tombstone, when a cancel or retry is working on it,
+  /// when another drain owns it or already sent it, when its row was
+  /// cancelled, or when it is no longer queued since the snapshot was taken.
   bool _claimForDispatch(String storageKey, OfflineMessageItem item,
       List<ChatMessage>? history, List<String> claimed) {
+    if (!OfflineSendControl.dispatchable(item.control)) return false;
     final id = item.msgID;
     final hasId = id != null && id.isNotEmpty;
     if (hasId &&
-        (_cancellingSends.contains(id) ||
+        (_sendControlOps.contains(id) ||
             _claimedSends.contains(id) ||
             _dispatchedSends.contains(id) ||
             _rowCancelled(history, id))) {
@@ -12722,21 +12858,100 @@ class FfiChatService {
     return true;
   }
 
-  /// Drops a queue item whose row was durably cancelled (a crash between the
-  /// cancel's history write and its queue removal) or that was already sent
-  /// this session (its post-send removal failed).
-  Future<void> _dropCancelledItem(String storageKey, OfflineMessageItem item,
-      List<ChatMessage>? history) async {
-    final sentAlready =
-        item.msgID != null && _dispatchedSends.contains(item.msgID);
-    if (!sentAlready && !_rowCancelled(history, item.msgID)) return;
+  /// Settles a queue item the drain refused to dispatch. A tombstone is
+  /// reconciled with its row ([_settleTombstone]). A plain item is dropped
+  /// when it was already sent this session (its post-send removal failed) or
+  /// when its row is durably cancelled (written by builds that cancelled the
+  /// row before the queue item). Items a cancel or retry is working on are
+  /// left to it.
+  Future<void> _settleRefusedItem(String storageKey, String historyKey,
+      OfflineMessageItem item, List<ChatMessage>? history) async {
+    final id = item.msgID;
+    if (id != null && _sendControlOps.contains(id)) return;
+    if (!OfflineSendControl.dispatchable(item.control)) {
+      await _settleTombstone(storageKey, historyKey, item, history);
+      return;
+    }
+    final sentAlready = id != null && _dispatchedSends.contains(id);
+    if (!sentAlready && !_rowCancelled(history, id)) return;
     try {
       await _offlineQueuePersistence.removeItem(storageKey, item);
     } catch (_) {}
   }
 
+  /// Makes the row of a cancelled / failed tombstone say so durably, then
+  /// removes the tombstone. Delivery proof beats a failed tombstone (the row
+  /// stays delivered). The tombstone stays when the row is not in the loaded
+  /// window or the history write fails; it is never dispatched either way,
+  /// and the next drain tries again.
+  ///
+  /// [owner] is the cancel that holds this message's op guard itself.
+  Future<void> _settleTombstone(String storageKey, String historyKey,
+      OfflineMessageItem item, List<ChatMessage>? history,
+      {bool owner = false}) async {
+    if (history == null) return;
+    // [item] may be a drain's snapshot: a retry may have turned it back into
+    // a send (and sent it) meanwhile. Only the tombstone still queued counts.
+    if (!_getOfflineQueue(storageKey).contains(item)) return;
+    final id = item.msgID;
+    final hasId = id != null && id.isNotEmpty;
+    if (hasId && !owner && _sendControlOps.contains(id)) return;
+    final at = _tombstoneRowIndex(history, item);
+    if (at < 0) {
+      // A legacy item without a msgID whose row is not in the window can
+      // never be matched again; it is never dispatched, so let it go.
+      if (!hasId) {
+        try {
+          await _offlineQueuePersistence.removeItem(storageKey, item);
+        } catch (_) {}
+      }
+      return;
+    }
+    final row = history[at];
+    ChatMessage settled = row;
+    if (item.control == OfflineSendControl.cancelled) {
+      if (!row.isCancelled) {
+        settled =
+            row.copyWith(isPending: false, isFailed: false, isCancelled: true);
+      }
+    } else if (!row.isCancelled &&
+        !_deliveryProven(row) &&
+        !(hasId && _dispatchedSends.contains(id))) {
+      if (!row.isFailed || row.isPending) {
+        settled = row.copyWith(isPending: false, isFailed: true);
+      }
+    }
+    if (!identical(settled, row)) {
+      history[at] = settled;
+      if (row.isFailed && !settled.isFailed) _reportFailureCleared(row.msgID);
+      _publishRow(historyKey, settled);
+    }
+    try {
+      await _saveHistoryStrict(historyKey);
+      await _offlineQueuePersistence.removeItem(storageKey, item);
+    } catch (_) {}
+  }
+
+  /// The row a tombstone [item] is about: by msgID, or for a legacy item
+  /// without one by its content and exact instant. -1 when not loaded.
+  int _tombstoneRowIndex(List<ChatMessage> history, OfflineMessageItem item) {
+    final id = item.msgID;
+    if (id != null && id.isNotEmpty) return _ownRowIndex(history, id);
+    final itemMs = item.timestamp.millisecondsSinceEpoch;
+    final isFile = item.filePath?.isNotEmpty ?? false;
+    return history.lastIndexWhere((m) =>
+        m.isSelf &&
+        (isFile
+            ? m.filePath == item.filePath
+            : (m.filePath == null &&
+                m.text == item.text &&
+                m.contentKind == item.contentKind)) &&
+        _offlineRowMatchesItem(m, item, itemMs));
+  }
+
   /// (history key, queue key, item) of the queued TEXT item [msgID] in a
-  /// C2C ([isGroup] false) or group conversation, or null.
+  /// C2C ([isGroup] false) or group conversation, whatever its control, or
+  /// null.
   ({String historyKey, String queueKey, OfflineMessageItem item})?
       _queuedTextItem(String conversation, String msgID, bool isGroup) {
     final historyKey = isGroup ? conversation : _normalizeFriendId(conversation);
@@ -12755,8 +12970,13 @@ class FfiChatService {
 
   /// Cancels our queued text [msgID] in [conversation] (a peer key, or a
   /// group id with [isGroup]) before any drain hands it to transport. The
-  /// row stays, marked [ChatMessage.isCancelled], and is never re-queued
-  /// after a restart. A persistence failure keeps it pending.
+  /// row stays, marked [ChatMessage.isCancelled], and is never sent, also
+  /// after a restart.
+  ///
+  /// The cancel commits when the queue item durably becomes a cancelled
+  /// tombstone; nothing in memory changes before that, so a failed write
+  /// leaves everything as it was ([SendControlResult.persistFailed]). The
+  /// tombstone is removed once the row durably says cancelled.
   Future<SendControlResult> cancelQueuedMessage(
       String conversation, String msgID,
       {bool isGroup = false}) async {
@@ -12766,63 +12986,51 @@ class FfiChatService {
     if (_claimedSends.contains(msgID) || _dispatchedSends.contains(msgID)) {
       return SendControlResult.alreadyClaimed;
     }
-    if (_cancellingSends.contains(msgID)) {
+    if (_sendControlOps.contains(msgID)) {
       return SendControlResult.notApplicable;
     }
     final found = _queuedTextItem(conversation, msgID, isGroup);
-    if (found == null) return SendControlResult.notApplicable;
+    if (found == null || !OfflineSendControl.dispatchable(found.item.control)) {
+      return SendControlResult.notApplicable;
+    }
     // From here on no drain can claim it (checked synchronously before any
     // dispatch).
-    _cancellingSends.add(msgID);
+    _sendControlOps.add(msgID);
     try {
-      final history = _historyById[found.historyKey];
-      final index = history == null
-          ? -1
-          : history.lastIndexWhere((m) => m.isSelf && m.msgID == msgID);
-      ChatMessage? cancelled;
-      ChatMessage? before;
-      if (history != null && index >= 0) {
-        before = history[index];
-        cancelled =
-            before.copyWith(isPending: false, isFailed: false, isCancelled: true);
-        history[index] = cancelled;
-        try {
-          // Durable BEFORE the queue removal: a crash in between leaves a
-          // queue item whose row says cancelled, which the drain drops.
-          await _messageHistoryPersistence.saveHistory(
-              found.historyKey, history);
-        } catch (_) {
-          history[index] = before;
-          return SendControlResult.persistFailed;
-        }
-      }
+      final tombstone = _withControl(found.item, OfflineSendControl.cancelled);
       try {
-        await _offlineQueuePersistence.removeItem(found.queueKey, found.item);
-      } catch (_) {
-        // Success only once the item is out of the queue: the history row
-        // alone is not a lasting marker (it can leave the trimmed window).
-        // Put the row back to pending; the caller may retry the cancel.
-        if (history != null && cancelled != null && before != null) {
-          final at = history.lastIndexWhere((m) => identical(m, cancelled));
-          if (at >= 0) history[at] = before;
-          await _saveHistory(found.historyKey);
+        if (!await _offlineQueuePersistence.replaceItem(
+            found.queueKey, found.item, tombstone)) {
+          return SendControlResult.notApplicable;
         }
+      } catch (_) {
         return SendControlResult.persistFailed;
       }
-      if (before != null && before.isFailed) _reportFailureCleared(msgID);
-      if (cancelled != null) {
-        final last = _lastByPeer[found.historyKey];
-        if (last != null && last.msgID == msgID) {
-          _lastByPeer[found.historyKey] = cancelled;
-        }
-        try {
-          _messages.add(cancelled);
-        } catch (_) {}
-      }
+      await _settleTombstone(found.queueKey, found.historyKey, tombstone,
+          _historyById[found.historyKey],
+          owner: true);
       return SendControlResult.success;
     } finally {
-      _cancellingSends.remove(msgID);
+      _sendControlOps.remove(msgID);
     }
+  }
+
+  /// Our own row [msgID] in a loaded conversation: its conversation (a peer
+  /// key, or a group id with [isGroup]) and the row as it is now, or null.
+  ({String conversation, bool isGroup, ChatMessage row})? findOwnLoadedRow(
+      String msgID) {
+    if (msgID.isEmpty) return null;
+    for (final entry in _historyById.entries) {
+      final at = _ownRowIndex(entry.value, msgID);
+      if (at < 0) continue;
+      final row = entry.value[at];
+      return (
+        conversation: entry.key,
+        isGroup: row.groupId?.isNotEmpty ?? false,
+        row: row,
+      );
+    }
+    return null;
   }
 
   /// Re-queues our FAILED text [msgID] under the same msgID and row (no new
@@ -12830,6 +13038,11 @@ class FfiChatService {
   /// confirmed failed qualify; a second call finds the row pending and is
   /// [SendControlResult.notApplicable]. Stable local ids are not end-to-end
   /// exactly-once delivery.
+  ///
+  /// The retry commits when the queue durably holds a
+  /// [OfflineSendControl.retry] item for it (a failed tombstone is turned
+  /// into one). The row may still say failed on disk after that; the drain
+  /// clears that durably before it sends.
   Future<SendControlResult> retryFailedMessage(
       String conversation, String msgID,
       {bool isGroup = false}) async {
@@ -12848,47 +13061,54 @@ class FfiChatService {
             !m.isCancelled &&
             (m.filePath == null || m.filePath!.isEmpty));
     if (history == null || index < 0) return SendControlResult.notApplicable;
-    if (_claimedSends.contains(msgID) ||
-        _queuedTextItem(conversation, msgID, isGroup) != null) {
+    if (_claimedSends.contains(msgID) || _sendControlOps.contains(msgID)) {
       return SendControlResult.notApplicable;
     }
-    final before = history[index];
-    // Synchronously pending again: a double tap finds no failed row.
-    final pending = before.copyWith(isPending: true, isFailed: false);
-    history[index] = pending;
-    final queueKey = isGroup ? _groupOfflineQueueKey(conversation) : historyKey;
-    try {
-      await _addToOfflineQueue(queueKey, (
-        kind: 'text',
-        text: before.text,
-        filePath: null,
-        fileName: null,
-        // The row's own instant: the drain's legacy matcher keys on it.
-        timestamp: before.timestamp,
-        msgID: msgID,
-        cloudCustomData: before.cloudCustomData,
-        contentKind: before.contentKind,
-      ));
-    } catch (_) {
-      history[index] = before;
-      return SendControlResult.persistFailed;
+    // Already queued (plain or retry, e.g. a retry whose failure clear did
+    // not reach disk before a restart) or cancelled: nothing to add.
+    final existing = _queuedTextItem(conversation, msgID, isGroup);
+    if (existing != null &&
+        existing.item.control != OfflineSendControl.failed) {
+      return SendControlResult.notApplicable;
     }
-    _reportFailureCleared(msgID);
-    await _saveHistory(historyKey);
-    // Publish the row as it is NOW: a drain may already have sent (or failed)
-    // it while the writes above were awaited.
-    // A row trimmed out of the window meanwhile is not published at all: a
-    // captured copy could contradict what the drain already emitted.
-    final at = history.lastIndexWhere((m) => m.isSelf && m.msgID == msgID);
-    if (at >= 0) {
-      final current = history[at];
-      final last = _lastByPeer[historyKey];
-      if (last != null && last.msgID == msgID) {
-        _lastByPeer[historyKey] = current;
-      }
+    _sendControlOps.add(msgID);
+    try {
+      final before = history[index];
       try {
-        _messages.add(current);
-      } catch (_) {}
+        if (existing != null) {
+          if (!await _offlineQueuePersistence.replaceItem(
+              existing.queueKey,
+              existing.item,
+              _withControl(existing.item, OfflineSendControl.retry))) {
+            return SendControlResult.notApplicable;
+          }
+        } else {
+          await _addToOfflineQueue(
+              isGroup ? _groupOfflineQueueKey(conversation) : historyKey, (
+            kind: 'text',
+            text: before.text,
+            filePath: null,
+            fileName: null,
+            // The row's own instant: the drain's legacy matcher keys on it.
+            timestamp: before.timestamp,
+            msgID: msgID,
+            cloudCustomData: before.cloudCustomData,
+            contentKind: before.contentKind,
+            control: OfflineSendControl.retry,
+          ));
+        }
+      } catch (_) {
+        return SendControlResult.persistFailed;
+      }
+      final at = _ownRowIndex(history, msgID);
+      if (at >= 0) {
+        final pending = history[at].copyWith(isPending: true, isFailed: false);
+        history[at] = pending;
+        _publishRow(historyKey, pending);
+        unawaited(_saveHistory(historyKey));
+      }
+    } finally {
+      _sendControlOps.remove(msgID);
     }
     if (isGroup) {
       unawaited(_sendPendingGroupMessages(conversation));
@@ -12896,6 +13116,112 @@ class FfiChatService {
       unawaited(_sendPendingMessages(historyKey));
     }
     return SendControlResult.success;
+  }
+
+  /// Before a [OfflineSendControl.retry] item is dispatched: its row may
+  /// still say failed on disk, and a send after that would let a later Retry
+  /// send it again. Durably clear the failure first. False keeps the item
+  /// queued (the marker stays, so the next attempt clears again): also when
+  /// the conversation's history cannot be loaded, since its row may be the
+  /// failed one. A row that left the loaded window (over 1000 newer rows) is
+  /// sent as is; a Retry cannot reach it there.
+  ///
+  /// For the whole wait a stale failure copy cannot merge into the row
+  /// ([_clearingRetryFailures], see sentThisSession); a failure that still
+  /// shows up meanwhile keeps the item queued. Nothing awaits between this
+  /// and the native send, which marks the msgID dispatched.
+  Future<bool> _clearRetryFailureDurably(String historyKey,
+      List<ChatMessage>? history, OfflineMessageItem item) async {
+    if (item.control != OfflineSendControl.retry) return true;
+    final id = item.msgID;
+    if (id == null || id.isEmpty) return true;
+    _clearingRetryFailures.add(id);
+    try {
+      return await _clearRetryFailureOf(historyKey, history, id);
+    } finally {
+      _clearingRetryFailures.remove(id);
+    }
+  }
+
+  Future<bool> _clearRetryFailureOf(
+      String historyKey, List<ChatMessage>? history, String id) async {
+    if (history == null) {
+      try {
+        await _loadHistory(historyKey);
+      } catch (_) {}
+      history = _historyById[historyKey];
+      if (history == null) return false;
+    }
+    final at = _ownRowIndex(history, id);
+    if (at < 0) return true;
+    final row = history[at];
+    if (row.isCancelled) return false;
+    if (row.isFailed || !row.isPending) {
+      history[at] = row.copyWith(isPending: true, isFailed: false);
+    }
+    try {
+      await _saveHistoryStrict(historyKey);
+    } catch (_) {
+      return false;
+    }
+    final now = _ownRowIndex(history, id);
+    if (now >= 0 && (history[now].isFailed || history[now].isCancelled)) {
+      return false;
+    }
+    _reportFailureCleared(id);
+    return true;
+  }
+
+  /// A queued [item] failed to send and nothing went out. The failure is
+  /// committed as a [OfflineSendControl.failed] tombstone before the row
+  /// changes, so the item never leaves the queue before the row durably says
+  /// failed. Returns false when the item stays queued as it is: no row of it
+  /// is loaded (it is retried on the next online transition rather than
+  /// dropped) or the queue write failed.
+  Future<bool> _commitDrainFailure(String storageKey, String historyKey,
+      List<ChatMessage>? history, OfflineMessageItem item,
+      {required bool isFile}) async {
+    if (history == null || _failedRowIndex(history, item, isFile: isFile) < 0) {
+      return false;
+    }
+    final tombstone = _withControl(item, OfflineSendControl.failed);
+    try {
+      if (!await _offlineQueuePersistence.replaceItem(
+          storageKey, item, tombstone)) {
+        return false;
+      }
+    } catch (_) {
+      return false;
+    }
+    await _settleTombstone(storageKey, historyKey, tombstone, history);
+    return true;
+  }
+
+  /// The row a failed drain of [item] marks failed: its pending row, or
+  /// (after a restart, which clears isPending) the row with the item's exact
+  /// msgID unless a receipt proved it delivered. Never a cancelled row.
+  int _failedRowIndex(List<ChatMessage> history, OfflineMessageItem item,
+      {required bool isFile}) {
+    final itemMs = item.timestamp.millisecondsSinceEpoch;
+    final exactId = item.msgID;
+    for (int i = history.length - 1; i >= 0; i--) {
+      final msg = history[i];
+      if (!msg.isSelf || msg.isCancelled) continue;
+      final sameContent = isFile
+          ? msg.filePath == item.filePath
+          : (msg.filePath == null &&
+              msg.text == item.text &&
+              msg.contentKind == item.contentKind);
+      if (!sameContent || !_offlineRowMatchesItem(msg, item, itemMs)) continue;
+      if (msg.isPending) return i;
+      if (exactId != null &&
+          exactId.isNotEmpty &&
+          msg.msgID == exactId &&
+          !_deliveryProven(msg)) {
+        return i;
+      }
+    }
+    return -1;
   }
 
   Future<void> _sendPendingMessagesClaiming(
@@ -12920,21 +13246,35 @@ class FfiChatService {
     final messagesToSend = List<OfflineMessageItem>.from(
         hasNormalizedQueue ? keyForNormalized : keyForRaw);
 
-    final history = _historyById[normalizedPeerId] ?? _historyById[peerId];
+    final historyKey =
+        _historyById[normalizedPeerId] != null ? normalizedPeerId : peerId;
+    var history = _historyById[historyKey];
 
     for (final item in messagesToSend) {
       if (!_claimForDispatch(storageKey, item, history, claimed)) {
-        // Cancelled, owned by another drain, or gone since the snapshot.
-        await _dropCancelledItem(storageKey, item, history);
+        // A tombstone, cancelled, owned by someone else, or gone since the
+        // snapshot.
+        await _settleRefusedItem(storageKey, historyKey, item, history);
         continue;
       }
+      // Only a retry item awaits here: for every other item the claim and the
+      // native send stay one synchronous stretch (cancel arbitration).
+      if (item.control == OfflineSendControl.retry &&
+          !await _clearRetryFailureDurably(historyKey, history, item)) {
+        // Keep it queued: the next online transition clears and sends it.
+        _claimedSends.remove(item.msgID);
+        claimed.remove(item.msgID);
+        break;
+      }
+      // The clear may have loaded the conversation.
+      history ??= _historyById[historyKey];
       final isFile = item.kind == 'file' ||
           (item.filePath != null && item.filePath!.isNotEmpty);
       // #25 Option B: `dispatched` flips true the instant the FFI send has
       // succeeded and the queue entry has been durably removed (inside the
       // drain, via onDispatched), BEFORE the history reconcile. codex Property
       // 5: the reconcile can still throw AFTER dispatch — without this flag the
-      // catch below would `_markPendingItemFailed` an already-DELIVERED message
+      // catch below would `_commitDrainFailure` an already-DELIVERED message
       // (false "failed" UX) and double-remove. Guard on it so the failure path
       // only runs for a genuine pre-dispatch send failure.
       var dispatched = false;
@@ -13030,11 +13370,13 @@ class FfiChatService {
             '[FfiChatService] _sendPendingMessages: drain failed for ${isFile ? "file" : "text"} item',
             e,
             stackTrace);
-        _markPendingItemFailed(normalizedPeerId, history, item, isFile: isFile);
-        // One drain attempt per online transition: real failures (not
-        // offline-during-drain) remove the item, matching the prior
-        // bulk-clear semantics.
-        await _offlineQueuePersistence.removeItem(storageKey, item);
+        // One drain attempt per online transition: a real failure (not
+        // offline-during-drain) leaves the queue once the row durably says
+        // failed. Without a loaded row the item stays for the next transition.
+        if (!await _commitDrainFailure(storageKey, historyKey, history, item,
+            isFile: isFile)) {
+          break;
+        }
       }
     }
   }
@@ -13102,16 +13444,22 @@ class FfiChatService {
     if (onDispatched != null) await onDispatched();
 
     if (pendingMsg != null && pendingMsgIndex != null && history != null) {
-      if (pendingMsg.isFailed) _reportFailureCleared(pendingMsg.msgID);
-      final updatedMsg = pendingMsg.copyWith(isPending: false, isFailed: false);
-      history[pendingMsgIndex] = updatedMsg;
-      _lastByPeer[normalizedPeerId] = updatedMsg;
-      try {
-        await _saveHistory(normalizedPeerId);
-      } catch (_) {}
-      try {
-        _messages.add(updatedMsg);
-      } catch (_) {}
+      // Re-found after the await: the window may have been trimmed and a
+      // receipt may have replaced the row meanwhile.
+      final at = _currentRowIndex(history, pendingMsg);
+      if (at >= 0) {
+        final current = history[at];
+        if (current.isFailed) _reportFailureCleared(current.msgID);
+        final updatedMsg = current.copyWith(isPending: false, isFailed: false);
+        history[at] = updatedMsg;
+        _lastByPeer[normalizedPeerId] = updatedMsg;
+        try {
+          await _saveHistory(normalizedPeerId);
+        } catch (_) {}
+        try {
+          _messages.add(updatedMsg);
+        } catch (_) {}
+      }
     } else {
       // Fallback: no matching *pending* row in the in-memory history (lost
       // across restart, trimmed, or composition→item timestamp drift > 10s).
@@ -13243,22 +13591,23 @@ class FfiChatService {
     // accepted, before the history reconcile (see _drainTextItem).
     if (onDispatched != null) await onDispatched();
     if (pendingMsg != null && pendingMsgIndex != null && history != null) {
-      if (pendingMsg.isFailed) _reportFailureCleared(pendingMsg.msgID);
-      final updatedMsg = pendingMsg.copyWith(isPending: false, isFailed: false);
-      history[pendingMsgIndex] = updatedMsg;
-      _lastByPeer[normalizedPeerId] = updatedMsg;
-      try {
-        await _saveHistory(normalizedPeerId);
-      } catch (_) {}
-      try {
-        _messages.add(updatedMsg);
-      } catch (_) {}
+      final at = _currentRowIndex(history, pendingMsg);
+      if (at >= 0) {
+        final current = history[at];
+        if (current.isFailed) _reportFailureCleared(current.msgID);
+        final updatedMsg = current.copyWith(isPending: false, isFailed: false);
+        history[at] = updatedMsg;
+        _lastByPeer[normalizedPeerId] = updatedMsg;
+        try {
+          await _saveHistory(normalizedPeerId);
+        } catch (_) {}
+        try {
+          _messages.add(updatedMsg);
+        } catch (_) {}
+      }
     }
   }
 
-  // On drain failure, flip the matching pending history record to
-  // non-pending so the UI can render it as failed. The queue entry is NOT
-  // re-enqueued — one drain attempt per online transition by design.
   /// Called with the msgID of an own message that had been marked failed
   /// and was delivered by a later replay, so hosts can drop whatever they
   /// recorded about the failure (Tim2ToxSdkPlatform: its failed-message
@@ -13304,47 +13653,18 @@ class FfiChatService {
     }
   }
 
-  void _markPendingItemFailed(String normalizedPeerId,
-      List<ChatMessage>? history, OfflineMessageItem item,
-      {required bool isFile}) {
-    if (history == null) return;
-    // Identity via _offlineRowMatchesItem (msgID-first, exact-ms fallback) —
-    // not a ±10s window, which could flip the WRONG pending row to failed when
-    // two identical texts/files were queued close together.
-    final itemMs = item.timestamp.millisecondsSinceEpoch;
-    for (int i = history.length - 1; i >= 0; i--) {
-      final msg = history[i];
-      // Pending rows only. After a restart history loading clears
-      // isPending, and a non-pending row may already have been delivered
-      // (a send whose queue removal never reached disk): reporting that as
-      // failed would invite a duplicate resend, so it is left as it is.
-      if (!msg.isSelf || !msg.isPending) continue;
-      final matches = isFile
-          ? (msg.filePath == item.filePath &&
-              _offlineRowMatchesItem(msg, item, itemMs))
-          : (msg.filePath == null &&
-              msg.text == item.text &&
-              msg.contentKind == item.contentKind &&
-              _offlineRowMatchesItem(msg, item, itemMs));
-      if (matches) {
-        // Not pending any more, and not delivered either: say so, so hosts
-        // can show a failed message instead of a sent one.
-        final updated = msg.copyWith(isPending: false, isFailed: true);
-        history[i] = updated;
-        _lastByPeer[normalizedPeerId] = updated;
-        try {
-          _messages.add(updated);
-        } catch (_) {}
-        unawaited(_saveHistory(normalizedPeerId).catchError((_) {}));
-        break;
-      }
-    }
-  }
-
   // Load offline message queue from disk (delegate to persistence service).
   // Queue persists across restart; drain runs on the next online transition.
+  //
+  // The histories are loaded before it: rows still queued show pending again.
   Future<void> _loadOfflineQueue() async {
     await _offlineQueuePersistence.loadQueue(clearOnLoad: false);
+    for (final id in _historyById.keys.toList()) {
+      final changed = _restoreQueuedPending(id);
+      final last = _lastByPeer[id];
+      final restored = last == null ? null : changed[last.msgID];
+      if (restored != null) _lastByPeer[id] = restored;
+    }
   }
 
   /// Clear all account data (history, offline queue, files)

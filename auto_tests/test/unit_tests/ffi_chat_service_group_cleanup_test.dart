@@ -51,6 +51,7 @@ void main() {
       msgID: 'message-1',
       cloudCustomData: null,
       contentKind: ChatMessageContentKind.normal,
+      control: null,
     );
     await queuePersistence.addMessage('group:$groupId', item);
     await queuePersistence.addMessage(groupId, item);
@@ -81,6 +82,7 @@ void main() {
       msgID: 'queued-message',
       cloudCustomData: null,
       contentKind: ChatMessageContentKind.normal,
+      control: null,
     );
     await service.registerJoinedGroupState(groupId);
     service.messageHistoryPersistence.setCachedHistory(groupId, [message]);
