@@ -8072,6 +8072,9 @@ class FfiChatService {
       conversationId: conversationId,
       history: _messageHistoryPersistence.getHistory(conversationId),
       senderBound: senderBound,
+      // The reader stamped the alias with ITS local id for this group; read
+      // it in ours (see rebaseToxGroupMessageAlias). Envelope group only.
+      groupAliasScope: eventGroupId,
     )) {
       if (isControlPayload) {
         // Refused, not content: drop it. Applying it would let a peer flip
@@ -8088,9 +8091,13 @@ class FfiChatService {
     }
 
     if (decoded['type'] == 'receipt') {
+      final msgID = decoded['msgID'] as String;
       unawaited(
         _handleReceipt(
-          decoded['msgID'] as String,
+          eventGroupId == null
+              ? msgID
+              : rebaseToxGroupMessageAlias(msgID, groupId: eventGroupId) ??
+                  msgID,
           decoded['receiptType'] as String,
           sender,
           // STRICTLY the envelope group: a C2C-delivered body carrying a
