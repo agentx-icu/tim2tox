@@ -228,6 +228,32 @@ void main() {
       await rowSub.cancel();
     });
 
+    test('a row that holds the alias as sent is applied under that id',
+        () async {
+      // Authorization accepts the id as sent before a rebased one, so the
+      // receipt must be applied under the SAME id, not always the rebased one.
+      await persistence.appendHistory(
+        _authorGroup,
+        ChatMessage(
+          text: 'authored line',
+          fromUserId: _authorKey,
+          isSelf: true,
+          timestamp: DateTime.now(),
+          groupId: _authorGroup,
+          msgID: 'local-row',
+          altMsgIds: [_alias(_readerGroup)],
+        ),
+      );
+
+      service.ingestActionEvent(
+          _groupReceipt(_authorGroup, _alias(_readerGroup), 'read'));
+      await waitForHistoryFile(
+          _authorGroup, (c) => c.contains('"isRead":true'));
+
+      expect(rowOf(_authorGroup, 'local-row').isRead, isTrue);
+      expect(service.getMessageReaders('local-row'), [_readerKey]);
+    });
+
     test('a RECEIVED flips isReceived only and fires no read event', () async {
       await authorRow(_authorGroup, 'local-row');
       final readEvents = <Object>[];
@@ -362,58 +388,93 @@ void main() {
             reason: 'the wrapper must not be stored as a chat row');
       });
 
-      test('does not rebase onto a group other than the one it consults', () {
-        // Payload names tox_9 while the callback arrived on tox_4: the hook
-        // consults tox_9's rows, so it must not rebase onto tox_4 as well.
-        final protocol = {
-          'type': 'receipt',
-          'msgID': _alias(_readerGroup),
-          'receiptType': 'read',
-          'sender': _readerKey,
-        };
-        expect(
-          BinaryReplacementHistoryHook.resolveControlMsgId(protocol,
-              groupAliasScope: _authorGroup),
-          _alias(_authorGroup),
+      /// Every row persisted under [groupIds] with the wrapper's id: a
+      /// receipt the hook refuses to swallow is stored like any message.
+      Iterable<ChatMessage> storedWrappers(List<String> groupIds) => [
+            for (final id in groupIds)
+              ...persistence
+                  .getHistory(id)
+                  .where((m) => m.msgID == 'receipt-wrapper'),
+          ];
+
+      test('does not rebase onto the callback group while consulting another',
+          () async {
+        // The payload names tox_9 while the callback arrived on tox_4, so the
+        // hook consults tox_9's rows. A tox_9 row that carries the tox_4
+        // spelling of the alias would match if the hook rebased onto the
+        // callback group anyway.
+        await persistence.appendHistory(
+          _otherGroup,
+          ChatMessage(
+            text: 'authored line',
+            fromUserId: _authorKey,
+            isSelf: true,
+            timestamp: DateTime.now(),
+            groupId: _otherGroup,
+            msgID: 'row-h',
+            altMsgIds: [_alias(_authorGroup)],
+          ),
         );
-        expect(
-          BinaryReplacementHistoryHook.resolveControlMsgId(protocol),
-          _alias(_readerGroup),
-          reason: 'no transport group, no rebasing',
-        );
-        expect(
-          BinaryReplacementHistoryHook.resolveControlMsgId(
-              {...protocol, 'type': 'reaction'},
-              groupAliasScope: _authorGroup),
-          _alias(_readerGroup),
-          reason: 'only receipts are rebased',
-        );
+        BinaryReplacementHistoryHook.initialize(persistence, _authorKey);
+
+        await BinaryReplacementHistoryHook.saveMessage(wrapper(
+          _receiptBody(_alias(_readerGroup), 'read', groupID: _otherGroup),
+          groupID: _authorGroup,
+        ));
+
+        expect(storedWrappers([_authorGroup, _otherGroup]), isNotEmpty,
+            reason: 'a conflicting receipt must not be authorized');
       });
 
       test('never rebases a C2C callback that names a group', () async {
         await authorRow(_authorGroup, 'local-row');
         BinaryReplacementHistoryHook.initialize(persistence, _authorKey);
 
-        expect(
-          BinaryReplacementHistoryHook.shouldConsumeInternalProtocolCustomData(
-            data: _receiptBody(_alias(_readerGroup), 'read',
-                groupID: _authorGroup),
-            callbackSender: _readerKey,
-            conversationId: _authorGroup,
-            history: persistence.getHistory(_authorGroup),
+        await BinaryReplacementHistoryHook.saveMessage(wrapper(
+          _receiptBody(_alias(_readerGroup), 'read', groupID: _authorGroup),
+          userID: _readerKey,
+        ));
+
+        expect(storedWrappers([_authorGroup, _readerKey]), isNotEmpty,
+            reason: 'a C2C packet carries no transport group to rebase onto');
+      });
+
+      test('resolves the id as sent before a rebased one', () {
+        final history = [
+          ChatMessage(
+            text: 'authored line',
+            fromUserId: _authorKey,
+            isSelf: true,
+            timestamp: DateTime.now(),
+            groupId: _authorGroup,
+            msgID: 'local-row',
+            altMsgIds: [_alias(_authorGroup)],
           ),
-          isFalse,
-        );
+        ];
+        String? target(String msgID, {String? scope, String type = 'read'}) =>
+            BinaryReplacementHistoryHook.resolveInternalProtocolTarget(
+              data: type == 'reaction'
+                  ? jsonEncode({
+                      'type': 'reaction',
+                      'msgID': msgID,
+                      'reactionID': 'thumbs',
+                      'action': 'add',
+                      'sender': _readerKey,
+                    })
+                  : _receiptBody(msgID, type),
+              history: history,
+              groupAliasScope: scope,
+            );
+        expect(target(_alias(_authorGroup), scope: _authorGroup),
+            _alias(_authorGroup));
+        expect(target(_alias(_readerGroup), scope: _authorGroup),
+            _alias(_authorGroup));
+        expect(target(_alias(_readerGroup)), isNull,
+            reason: 'no transport group, no rebasing');
         expect(
-          BinaryReplacementHistoryHook.shouldConsumeInternalProtocolCustomData(
-            data: _receiptBody(_alias(_readerGroup), 'read'),
-            callbackSender: _readerKey,
-            conversationId: _authorGroup,
-            history: persistence.getHistory(_authorGroup),
-            groupAliasScope: _authorGroup,
-          ),
-          isTrue,
-        );
+            target(_alias(_readerGroup), scope: _authorGroup, type: 'reaction'),
+            isNull,
+            reason: 'only receipts are rebased');
       });
     });
   });

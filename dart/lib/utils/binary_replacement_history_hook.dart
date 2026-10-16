@@ -560,22 +560,43 @@ class BinaryReplacementHistoryHook {
         );
   }
 
-  /// The id a control's `msgID` names in OUR history: a group receipt's
-  /// cross-peer alias re-scoped onto the group it arrived on (see
-  /// [rebaseToxGroupMessageAlias]), anything else unchanged. Only receipts,
-  /// and only with a transport [groupAliasScope]: a C2C packet never gets one.
-  static String resolveControlMsgId(
-    Map<String, String> internalProtocol, {
+  /// The id under which a control's `msgID` names a row of [history], or
+  /// null when it names none. The id as sent wins; failing that, a group
+  /// receipt's cross-peer alias is re-scoped onto [groupAliasScope], the group
+  /// it arrived on (see [rebaseToxGroupMessageAlias]). Only receipts, and only
+  /// with a transport scope: a C2C packet never gets one. Authorization and
+  /// application must both use THIS id, or a receipt could be authorized by
+  /// one row and then fail to find it.
+  static String? resolveInternalProtocolTarget({
+    required String? data,
+    required Iterable<ChatMessage> history,
     String? groupAliasScope,
   }) {
+    final internalProtocol = _decodeInternalProtocolCustomData(data);
+    if (internalProtocol == null) return null;
+    return _resolveTarget(internalProtocol, history, groupAliasScope);
+  }
+
+  static String? _resolveTarget(
+    Map<String, String> internalProtocol,
+    Iterable<ChatMessage> history,
+    String? groupAliasScope,
+  ) {
+    bool names(String id) => history.any(
+          (message) => message.msgID == id || message.altMsgIds.contains(id),
+        );
     final msgID = internalProtocol['msgID']!;
+    if (names(msgID)) return msgID;
     if (groupAliasScope == null ||
         groupAliasScope.isEmpty ||
         internalProtocol['type'] != 'receipt') {
-      return msgID;
+      return null;
     }
-    return rebaseToxGroupMessageAlias(msgID, groupId: groupAliasScope) ??
-        msgID;
+    final rebased =
+        rebaseToxGroupMessageAlias(msgID, groupId: groupAliasScope);
+    return rebased != null && rebased != msgID && names(rebased)
+        ? rebased
+        : null;
   }
 
   static bool _shouldConsumeInternalProtocol(
@@ -595,18 +616,7 @@ class BinaryReplacementHistoryHook {
     if (senderBound && callbackSender != internalProtocol['sender']) {
       return false;
     }
-    final referencedMsgId = internalProtocol['msgID']!;
-    final resolvedMsgId = resolveControlMsgId(
-      internalProtocol,
-      groupAliasScope: groupAliasScope,
-    );
-    bool names(ChatMessage message, String id) =>
-        message.msgID == id || message.altMsgIds.contains(id);
-    return history.any(
-      (message) =>
-          names(message, referencedMsgId) ||
-          (resolvedMsgId != referencedMsgId && names(message, resolvedMsgId)),
-    );
+    return _resolveTarget(internalProtocol, history, groupAliasScope) != null;
   }
 
   static Map<String, String>? _decodeInternalProtocolCustomData(String? data) {
