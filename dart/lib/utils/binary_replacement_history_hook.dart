@@ -320,11 +320,19 @@ class BinaryReplacementHistoryHook {
           ? payloadGroupId
           : (groupId.isNotEmpty ? groupId : (v2Msg.userID ?? ''));
       final callbackSender = v2Msg.sender ?? v2Msg.userID ?? '';
+      // A receipt's alias is re-scoped onto the CALLBACK group (the
+      // transport it arrived on), and only when the history consulted is
+      // that same group's: a payload naming another group must never be
+      // authorized against one group's rows while rebased onto another's.
+      final aliasScope = groupId.isNotEmpty && conversationId == groupId
+          ? groupId
+          : null;
       if (_shouldConsumeInternalProtocol(
         internalProtocol,
         callbackSender: callbackSender,
         conversationId: conversationId,
         history: capturedPersistence.getHistory(conversationId),
+        groupAliasScope: aliasScope,
       )) {
         return;
       }
@@ -538,6 +546,7 @@ class BinaryReplacementHistoryHook {
     required String conversationId,
     required Iterable<ChatMessage> history,
     bool senderBound = true,
+    String? groupAliasScope,
   }) {
     final internalProtocol = _decodeInternalProtocolCustomData(data);
     return internalProtocol != null &&
@@ -547,7 +556,47 @@ class BinaryReplacementHistoryHook {
           conversationId: conversationId,
           history: history,
           senderBound: senderBound,
+          groupAliasScope: groupAliasScope,
         );
+  }
+
+  /// The id under which a control's `msgID` names a row of [history], or
+  /// null when it names none. The id as sent wins; failing that, a group
+  /// receipt's cross-peer alias is re-scoped onto [groupAliasScope], the group
+  /// it arrived on (see [rebaseToxGroupMessageAlias]). Only receipts, and only
+  /// with a transport scope: a C2C packet never gets one. Authorization and
+  /// application must both use THIS id, or a receipt could be authorized by
+  /// one row and then fail to find it.
+  static String? resolveInternalProtocolTarget({
+    required String? data,
+    required Iterable<ChatMessage> history,
+    String? groupAliasScope,
+  }) {
+    final internalProtocol = _decodeInternalProtocolCustomData(data);
+    if (internalProtocol == null) return null;
+    return _resolveTarget(internalProtocol, history, groupAliasScope);
+  }
+
+  static String? _resolveTarget(
+    Map<String, String> internalProtocol,
+    Iterable<ChatMessage> history,
+    String? groupAliasScope,
+  ) {
+    bool names(String id) => history.any(
+          (message) => message.msgID == id || message.altMsgIds.contains(id),
+        );
+    final msgID = internalProtocol['msgID']!;
+    if (names(msgID)) return msgID;
+    if (groupAliasScope == null ||
+        groupAliasScope.isEmpty ||
+        internalProtocol['type'] != 'receipt') {
+      return null;
+    }
+    final rebased =
+        rebaseToxGroupMessageAlias(msgID, groupId: groupAliasScope);
+    return rebased != null && rebased != msgID && names(rebased)
+        ? rebased
+        : null;
   }
 
   static bool _shouldConsumeInternalProtocol(
@@ -556,6 +605,7 @@ class BinaryReplacementHistoryHook {
     required String conversationId,
     required Iterable<ChatMessage> history,
     bool senderBound = true,
+    String? groupAliasScope,
   }) {
     if (conversationId.isEmpty || callbackSender.isEmpty) {
       return false;
@@ -566,12 +616,7 @@ class BinaryReplacementHistoryHook {
     if (senderBound && callbackSender != internalProtocol['sender']) {
       return false;
     }
-    final referencedMsgId = internalProtocol['msgID']!;
-    return history.any(
-      (message) =>
-          message.msgID == referencedMsgId ||
-          message.altMsgIds.contains(referencedMsgId),
-    );
+    return _resolveTarget(internalProtocol, history, groupAliasScope) != null;
   }
 
   static Map<String, String>? _decodeInternalProtocolCustomData(String? data) {

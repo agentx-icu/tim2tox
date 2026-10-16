@@ -8066,12 +8066,16 @@ class FfiChatService {
     // groupID: a crafted C2C ACTION carrying a groupID field must not be
     // able to shed the sender binding.
     final senderBound = eventGroupId == null || decoded['type'] != 'receipt';
+    final history = _messageHistoryPersistence.getHistory(conversationId);
     if (!BinaryReplacementHistoryHook.shouldConsumeInternalProtocolCustomData(
       data: body,
       callbackSender: sender,
       conversationId: conversationId,
-      history: _messageHistoryPersistence.getHistory(conversationId),
+      history: history,
       senderBound: senderBound,
+      // The reader stamped the alias with ITS local id for this group; read
+      // it in ours (see rebaseToxGroupMessageAlias). Envelope group only.
+      groupAliasScope: eventGroupId,
     )) {
       if (isControlPayload) {
         // Refused, not content: drop it. Applying it would let a peer flip
@@ -8090,7 +8094,13 @@ class FfiChatService {
     if (decoded['type'] == 'receipt') {
       unawaited(
         _handleReceipt(
-          decoded['msgID'] as String,
+          // The id the authorization above matched, so both name one row.
+          BinaryReplacementHistoryHook.resolveInternalProtocolTarget(
+                data: body,
+                history: history,
+                groupAliasScope: eventGroupId,
+              ) ??
+              decoded['msgID'] as String,
           decoded['receiptType'] as String,
           sender,
           // STRICTLY the envelope group: a C2C-delivered body carrying a
