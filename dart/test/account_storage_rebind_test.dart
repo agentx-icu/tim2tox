@@ -40,6 +40,7 @@ OfflineMessageItem _queueItem(String text, {required String id}) => (
       msgID: id,
       cloudCustomData: null,
       contentKind: ChatMessageContentKind.normal,
+      control: null,
     );
 
 List<String> _historyFiles(Directory dir) {

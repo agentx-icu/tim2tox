@@ -307,6 +307,7 @@ void main() {
         msgID: msgID,
         cloudCustomData: null,
         contentKind: ChatMessageContentKind.normal,
+        control: null,
       );
 
   test('a text an older build queued for self is reconciled locally', () async {
@@ -424,6 +425,7 @@ void main() {
           msgID: null,
           cloudCustomData: null,
           contentKind: ChatMessageContentKind.normal,
+          control: null,
         );
     await queue.addMessage(_selfKey, legacy('first'));
     await queue.addMessage(_selfKey, legacy('second'));

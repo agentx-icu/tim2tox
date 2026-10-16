@@ -90,6 +90,7 @@ import 'package:tencent_cloud_chat_sdk/enum/image_types.dart';
 import 'package:tencent_cloud_chat_sdk/enum/utils.dart';
 import '../service/ffi_chat_service.dart';
 import '../models/chat_message.dart';
+import '../models/send_control_result.dart';
 import '../utils/binary_replacement_history_hook.dart';
 import '../utils/control_message_envelope.dart';
 import '../utils/message_converter.dart';
@@ -134,6 +135,7 @@ Future<void> _persistFailedSend({
   required String receiver,
   required String groupID,
   required String? accountToxId,
+  bool queued = false,
 }) async {
   if (accountToxId == null || accountToxId.isEmpty) return;
   final group = groupID.isNotEmpty ? groupID : null;
@@ -157,6 +159,7 @@ Future<void> _persistFailedSend({
     userID: user,
     groupID: group,
     accountToxId: accountToxId,
+    queued: queued,
   );
 }
 
@@ -1244,6 +1247,8 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
           print(
               '[Tim2ToxSdkPlatform] Set userID/groupID from forwardTarget: userID=$forwardTargetUserID, groupID=$forwardTargetGroupID');
         // Store forward target info in localCustomData for future reference
+        // Merged into what the conversion stamped (content kind, the
+        // cancelled marker), never replacing it.
         try {
           final customData = <String, dynamic>{
             'forwardTarget': {
@@ -1251,7 +1256,13 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
               'groupID': forwardTargetGroupID,
             },
           };
-          v2Msg.localCustomData = json.encode(customData);
+          final existing = v2Msg.localCustomData;
+          final merged = mergeIntoLocalCustomData(existing, customData);
+          // Data that is not a JSON object is replaced, as before.
+          v2Msg.localCustomData = identical(merged, existing) &&
+                  (existing?.isNotEmpty ?? false)
+              ? json.encode(customData)
+              : merged;
         } catch (e) {
           // Failed to store forward target info, continue anyway
         }
@@ -1289,13 +1300,15 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
 
       // A queued send that failed (ChatMessage.isFailed) is recorded where
       // reSendMessage looks for failed messages, so "resend" works for it as
-      // for a direct send that failed.
+      // for a direct send that failed. Tagged queued: the history row stays
+      // the authority on whether it is still failed.
       final String? rowId = chatMsg.msgID;
       if (chatMsg.isSelf && chatMsg.isFailed && rowId != null) {
         final save = _persistFinalizedFailedMessage(
           message: v2Msg,
           receiver: v2Msg.userID ?? '',
           groupID: v2Msg.groupID ?? '',
+          queued: true,
         ).catchError((Object _) {});
         _queuedFailureSaves[rowId] = save;
         unawaited(save);
@@ -2675,16 +2688,49 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
     );
   }
 
+  /// reSendMessage for a failed text row in history: re-queued in place by
+  /// [FfiChatService.retryFailedMessage]; the row (pending again) is what
+  /// UIKit gets back. Its failed-message entry is cleared once the drain has
+  /// durably cleared the row's failure (onFailureCleared).
+  Future<V2TimValueCallback<V2TimMessage>> _retryQueuedFailure(
+      String conversation, String msgID,
+      {required bool isGroup, required String accountToxId}) async {
+    final result = await ffiService.retryFailedMessage(conversation, msgID,
+        isGroup: isGroup);
+    final row = ffiService.findOwnLoadedRow(msgID)?.row;
+    // The conversation is known here: an own C2C row alone would convert
+    // without its receiver.
+    final data = row == null
+        ? null
+        : chatMessageToV2TimMessage(row, ffiService.selfId,
+            forwardTargetUserID: isGroup ? null : conversation,
+            forwardTargetGroupID: isGroup ? conversation : null);
+    return switch (result) {
+      SendControlResult.success =>
+        V2TimValueCallback<V2TimMessage>(code: 0, desc: 'ok', data: data),
+      SendControlResult.persistFailed => V2TimValueCallback<V2TimMessage>(
+          code: -1,
+          desc: 'reSendMessage: could not queue msgID=$msgID (storage error)',
+          data: data),
+      _ => V2TimValueCallback<V2TimMessage>(
+          code: -1,
+          desc: 'reSendMessage: msgID=$msgID cannot be retried now',
+          data: data),
+    };
+  }
+
   Future<void> _persistFinalizedFailedMessage({
     required V2TimMessage message,
     required String receiver,
     required String groupID,
+    bool queued = false,
   }) {
     return _persistFailedSend(
       message: message,
       receiver: receiver,
       groupID: groupID,
       accountToxId: ffiService.getSelfToxId(),
+      queued: queued,
     );
   }
 
@@ -7158,6 +7204,16 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
           desc: 'reSendMessage: current account identity is unavailable',
         );
       }
+      // History first. A failed text row is re-queued in place (same row,
+      // same msgID) by the service's send control, whether or not the
+      // failed-message entry made it to disk (it is written asynchronously).
+      final own = ffiService.findOwnLoadedRow(msgID);
+      final ownText = own != null && (own.row.filePath?.isEmpty ?? true);
+      if (ownText && own.row.isFailed && !own.row.isCancelled) {
+        return _retryQueuedFailure(own.conversation, msgID,
+            isGroup: own.isGroup, accountToxId: accountToxId);
+      }
+
       final stored =
           await Tim2ToxFailedMessagePersistence.findFailedMessageByID(
         messageID: msgID,
@@ -7168,6 +7224,24 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
         return V2TimValueCallback<V2TimMessage>(
           code: -1,
           desc: 'reSendMessage: failed message not found for msgID=$msgID',
+        );
+      }
+
+      // A queued send's entry whose row no longer says failed (delivered by a
+      // replay, cancelled, or pending again) is stale: its clean-up did not
+      // reach disk. Drop it; sending again would duplicate the message.
+      if (own != null &&
+          !own.row.isFailed &&
+          isQueuedFailureEntry(stored.messageData)) {
+        try {
+          await Tim2ToxFailedMessagePersistence.removeFailedMessagesByIDs(
+            messageIDs: {msgID},
+            accountToxId: accountToxId,
+          );
+        } catch (_) {}
+        return V2TimValueCallback<V2TimMessage>(
+          code: -1,
+          desc: 'reSendMessage: msgID=$msgID is not failed any more',
         );
       }
 

@@ -85,6 +85,36 @@ int? toxGroupMsgIdFromLocalCustomData(String? data) {
   }
 }
 
+/// `localCustomData` key marking our own send that was cancelled before it
+/// went out ([ChatMessage.isCancelled]). Its V2TIM status is
+/// `V2TIM_MSG_STATUS_LOCAL_REVOKED`; the key tells it apart from anything
+/// else that might carry that status.
+const String queuedCancelledLocalCustomDataKey = 'tim2tox.queuedCancelled';
+
+Map<String, dynamic>? _localCustomDataObject(String? data) {
+  if (data == null || data.isEmpty) return <String, dynamic>{};
+  final trimmed = data.trimLeft();
+  if (!trimmed.startsWith('{')) return null;
+  try {
+    final decoded = jsonDecode(trimmed);
+    return decoded is Map<String, dynamic> ? decoded : null;
+  } on FormatException {
+    return null;
+  }
+}
+
+/// Whether [data] carries the [queuedCancelledLocalCustomDataKey] marker.
+bool queuedCancelledFromLocalCustomData(String? data) =>
+    _localCustomDataObject(data)?[queuedCancelledLocalCustomDataKey] == true;
+
+/// [data] with [entries] merged in, keeping every key it already had. Data
+/// that is not a JSON object is returned unchanged (never overwritten).
+String? mergeIntoLocalCustomData(String? data, Map<String, dynamic> entries) {
+  final object = _localCustomDataObject(data);
+  if (object == null) return data;
+  return jsonEncode({...object, ...entries});
+}
+
 /// The cross-path identity of one NGC group message, scoped so that a 32-bit
 /// random pseudo id cannot collide across groups or authors. Both inbound
 /// paths stamp it into [ChatMessage.altMsgIds]: the poll path from the

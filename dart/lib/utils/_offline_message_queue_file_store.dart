@@ -147,6 +147,7 @@ class _OfflineMessageQueueFileStore {
       msgID: _optionalString(raw, 'msgID'),
       cloudCustomData: _optionalString(raw, 'cloudCustomData'),
       contentKind: chatMessageContentKindFromJson(raw['contentKind']),
+      control: _optionalString(raw, 'control'),
     );
   }
 
@@ -160,6 +161,7 @@ class _OfflineMessageQueueFileStore {
       'msgID': item.msgID,
       if (item.cloudCustomData != null) 'cloudCustomData': item.cloudCustomData,
       'contentKind': item.contentKind.name,
+      if (item.control != null) 'control': item.control,
     };
   }
 

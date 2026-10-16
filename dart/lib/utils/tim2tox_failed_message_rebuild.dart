@@ -158,6 +158,13 @@ bool isUnsupportedGroupMedia(V2TimMessage message) {
   return (message: rebuilt, error: null);
 }
 
+/// Whether a failed-message [entry] was recorded for a queued send's failed
+/// history row (`saveFailedMessage(queued: true)`). Such an entry is only a
+/// lookup aid: the history row decides whether the message is failed, so a
+/// stale entry (its clean-up did not reach disk) never brings a failure back.
+bool isQueuedFailureEntry(Map<String, dynamic> entry) =>
+    entry['queued'] == true;
+
 /// Merge persisted failed rows into one `getHistoryMessageListV2` page.
 ///
 /// Failed sends that never reached the Dart history store (a send that threw,
@@ -175,7 +182,12 @@ bool isUnsupportedGroupMedia(V2TimMessage message) {
 ///
 /// Rows whose id/msgID is in [historyIds] are not added again; if such a row
 /// is on this page it is marked `SEND_FAIL` (the persistence is authoritative:
-/// rows leave it only on a successful resend or a delete).
+/// rows leave it only on a successful resend or a delete) — except on a row
+/// that was cancelled or that the peer read, which a failure cannot describe.
+///
+/// Entries recorded for a queued send's failed history row
+/// ([isQueuedFailureEntry]) are skipped: that row is in history and already
+/// says whether it is failed.
 List<V2TimMessage> mergeFailedRowsIntoHistoryPage({
   required List<V2TimMessage> page,
   required List<({String conversationKey, Map<String, dynamic> entry})>
@@ -190,6 +202,7 @@ List<V2TimMessage> mergeFailedRowsIntoHistoryPage({
   final additions = <V2TimMessage>[];
   final seenAdded = <String>{};
   for (final row in failedRows) {
+    if (isQueuedFailureEntry(row.entry)) continue;
     final ids = <String>{
       if (row.entry['id'] case final String id when id.isNotEmpty) id,
       if (row.entry['msgID'] case final String m when m.isNotEmpty) m,
@@ -213,6 +226,10 @@ List<V2TimMessage> mergeFailedRowsIntoHistoryPage({
     additions.add(rebuilt);
   }
   for (final msg in merged) {
+    if (msg.status == MessageStatus.V2TIM_MSG_STATUS_LOCAL_REVOKED ||
+        msg.isPeerRead == true) {
+      continue;
+    }
     if (failedIds.contains(msg.msgID) || failedIds.contains(msg.id)) {
       msg.status = MessageStatus.V2TIM_MSG_STATUS_SEND_FAIL;
     }

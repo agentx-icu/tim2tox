@@ -24,6 +24,11 @@ part '_offline_message_queue_file_store.dart';
 /// `cloudCustomData` carries sender-side reply/forward metadata. It is optional
 /// so old queue files retain their JSON shape and new plain messages do not gain
 /// a redundant key.
+/// `control` is the durable send-control state of the item (see
+/// [OfflineSendControl]); null is a plain queued send. It lives here, not on
+/// the history row, because the queue is not windowed and is written before
+/// any in-memory row changes: a crash at any point leaves a state the next
+/// drain can finish.
 typedef OfflineMessageItem = ({
   String kind,
   String text,
@@ -33,7 +38,28 @@ typedef OfflineMessageItem = ({
   String? msgID,
   String? cloudCustomData,
   ChatMessageContentKind contentKind,
+  String? control,
 });
+
+/// Values of [OfflineMessageItem.control].
+abstract final class OfflineSendControl {
+  /// Queued again by a retry. The row may still say failed on disk, so the
+  /// drain durably clears that failure before every dispatch attempt: a row
+  /// that is failed on disk was never sent after it was marked failed.
+  static const String retry = 'retry';
+
+  /// Tombstone of a cancelled send: never dispatched. Removed once the row
+  /// durably says cancelled.
+  static const String cancelled = 'cancelled';
+
+  /// Tombstone of a send that failed: never dispatched. Removed once the row
+  /// durably says failed (or a receipt proved it delivered after all).
+  static const String failed = 'failed';
+
+  /// Whether a drain may hand an item with [control] to transport.
+  static bool dispatchable(String? control) =>
+      control == null || control == retry;
+}
 
 /// Raised when the primary queue file cannot be parsed and no valid backup can
 /// restore it. The corrupt files are left untouched for diagnostics.
@@ -224,6 +250,16 @@ class OfflineMessageQueuePersistence {
     return List<OfflineMessageItem>.from(_offlineQueue[peerId] ?? const []);
   }
 
+  /// msgIDs of every queued item, whatever its peer; with [dispatchableOnly]
+  /// only those a drain may still send (no tombstones).
+  Set<String> queuedMsgIDs({bool dispatchableOnly = false}) => {
+        for (final list in _offlineQueue.values)
+          for (final item in list)
+            if (!dispatchableOnly ||
+                OfflineSendControl.dispatchable(item.control))
+              if (item.msgID case final String id when id.isNotEmpty) id,
+      };
+
   /// Remove messages for a peer from the queue.
   Future<void> removeMessages(String peerId) {
     return _runSerialized(() async {
@@ -265,6 +301,23 @@ class OfflineMessageQueuePersistence {
       }
       await _writeSnapshot(snapshot);
       _replaceCache(snapshot);
+    });
+  }
+
+  /// Replace [old] in [peerId]'s queue with [updated], in place, and persist
+  /// immediately. Completes with false (and writes nothing) when [old] is no
+  /// longer queued, e.g. a drain removed it meanwhile.
+  Future<bool> replaceItem(
+      String peerId, OfflineMessageItem old, OfflineMessageItem updated) {
+    return _runSerialized(() async {
+      final snapshot = _snapshotQueue(_offlineQueue);
+      final list = snapshot[peerId];
+      final index = list?.indexOf(old) ?? -1;
+      if (list == null || index < 0) return false;
+      list[index] = updated;
+      await _writeSnapshot(snapshot);
+      _replaceCache(snapshot);
+      return true;
     });
   }
 

@@ -242,7 +242,12 @@ extension Tim2ToxSdkPlatformConverters on Tim2ToxSdkPlatform {
           // reopened chat rebuilt from history always rendered ':sent'.
           msg.isPeerRead = chatMsg.isSelf && chatMsg.isRead;
           // Set message status - CRITICAL: For sent messages, default to SEND_SUCC unless explicitly pending or failed
-          if (chatMsg.isPending) {
+          if (chatMsg.isSelf && chatMsg.isCancelled) {
+            // Cancelled before it went out: never sent, never read, no Retry.
+            msg.status = MessageStatus.V2TIM_MSG_STATUS_LOCAL_REVOKED;
+            msg.localCustomData = mergeIntoLocalCustomData(
+                msg.localCustomData, {queuedCancelledLocalCustomDataKey: true});
+          } else if (chatMsg.isPending) {
             msg.status = MessageStatus.V2TIM_MSG_STATUS_SENDING;
           } else if (chatMsg.isSelf && chatMsg.isFailed) {
             // A queued send whose drain failed (ChatMessage.isFailed).
@@ -310,7 +315,12 @@ extension Tim2ToxSdkPlatformConverters on Tim2ToxSdkPlatform {
           // reopened chat rebuilt from history always rendered ':sent'.
           msg.isPeerRead = chatMsg.isSelf && chatMsg.isRead;
           // Set message status - CRITICAL: For sent messages, default to SEND_SUCC unless explicitly pending or failed
-          if (chatMsg.isPending) {
+          if (chatMsg.isSelf && chatMsg.isCancelled) {
+            // Cancelled before it went out: never sent, never read, no Retry.
+            msg.status = MessageStatus.V2TIM_MSG_STATUS_LOCAL_REVOKED;
+            msg.localCustomData = mergeIntoLocalCustomData(
+                msg.localCustomData, {queuedCancelledLocalCustomDataKey: true});
+          } else if (chatMsg.isPending) {
             msg.status = MessageStatus.V2TIM_MSG_STATUS_SENDING;
           } else if (chatMsg.isSelf && chatMsg.isFailed) {
             // A queued send whose drain failed (ChatMessage.isFailed).
@@ -414,7 +424,12 @@ extension Tim2ToxSdkPlatformConverters on Tim2ToxSdkPlatform {
     // - If isPending=false and isSelf=true: SEND_SUCC (sent message, default to success unless explicitly failed)
     // - If isPending=false and isSelf=false: SEND_SUCC (received message, always success)
     // - SEND_FAIL should only be set when explicitly known to have failed (e.g., from FFI error or timeout)
-    if (chatMsg.isPending) {
+    if (chatMsg.isSelf && chatMsg.isCancelled) {
+      // Cancelled before it went out: never sent, never read, no Retry.
+      msg.status = MessageStatus.V2TIM_MSG_STATUS_LOCAL_REVOKED;
+      msg.localCustomData = mergeIntoLocalCustomData(
+          msg.localCustomData, {queuedCancelledLocalCustomDataKey: true});
+    } else if (chatMsg.isPending) {
       msg.status = MessageStatus.V2TIM_MSG_STATUS_SENDING;
     } else if (chatMsg.isSelf && chatMsg.isFailed) {
       // A queued send whose drain failed (ChatMessage.isFailed).

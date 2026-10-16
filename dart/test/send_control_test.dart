@@ -4,11 +4,19 @@
 // these tests pin the arbitration: cancel wins while the item is only
 // queued, the drain never sends a cancelled item (also across a restart),
 // and a claimed item reports alreadyClaimed.
+//
+// Durability: every send-control decision is committed on the queue item
+// first (a cancelled / failed tombstone, a retry marker) and the history row
+// follows. The crash tests reopen a second service on the same files while
+// the first one's history store keeps failing, so nothing it holds in memory
+// can reach disk afterwards.
 
+import 'dart:async';
 import 'dart:convert';
 import 'dart:ffi' as ffi;
 import 'dart:io';
 
+import 'package:crypto/crypto.dart';
 import 'package:ffi/ffi.dart' as pkgffi;
 import 'package:flutter_test/flutter_test.dart';
 import 'package:path/path.dart' as p;
@@ -74,18 +82,50 @@ class _StubFfi extends Tim2ToxFfi {
           };
 }
 
-/// A queue whose single-item removal can be made to fail.
+/// A queue whose single-item writes can be made to fail.
 class _FlakyQueue extends OfflineMessageQueuePersistence {
   _FlakyQueue({required super.queueFilePath});
 
   bool failRemove = false;
+  bool failReplace = false;
+  bool failAdd = false;
 
   @override
   Future<void> removeItem(String peerId, OfflineMessageItem item) {
     if (failRemove) return Future.error(const FileSystemException('disk'));
     return super.removeItem(peerId, item);
   }
+
+  @override
+  Future<bool> replaceItem(
+      String peerId, OfflineMessageItem old, OfflineMessageItem updated) {
+    if (failReplace) return Future.error(const FileSystemException('disk'));
+    return super.replaceItem(peerId, old, updated);
+  }
+
+  @override
+  Future<void> addMessage(String peerId, OfflineMessageItem item) {
+    if (failAdd) return Future.error(const FileSystemException('disk'));
+    return super.addMessage(peerId, item);
+  }
 }
+
+/// A history store whose writes can be made to fail (every write goes
+/// through [saveHistory], debounced and retried ones included).
+class _FlakyHistory extends MessageHistoryPersistence {
+  _FlakyHistory({required super.historyDirectory});
+
+  bool failSave = false;
+
+  @override
+  Future<void> saveHistory(String conversationId, List<ChatMessage> messages) {
+    if (failSave) return Future.error(const FileSystemException('disk'));
+    return super.saveHistory(conversationId, messages);
+  }
+}
+
+String _bind(String text) =>
+    'bind:${sha256.convert(utf8.encode(text)).toString()}';
 
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
@@ -94,12 +134,13 @@ void main() {
   late String historyDir;
   late String queueFile;
   late _StubFfi ffiStub;
-  late MessageHistoryPersistence history;
+  late _FlakyHistory history;
   late _FlakyQueue queue;
   late FfiChatService service;
+  final crashed = <FfiChatService>[];
 
   Future<FfiChatService> open() async {
-    history = MessageHistoryPersistence(historyDirectory: historyDir);
+    history = _FlakyHistory(historyDirectory: historyDir);
     queue = _FlakyQueue(queueFilePath: queueFile);
     await queue.loadQueue(clearOnLoad: false);
     final s = FfiChatService(
@@ -129,11 +170,39 @@ void main() {
 
   tearDown(() async {
     await service.dispose();
+    for (final s in crashed) {
+      try {
+        await s.dispose();
+      } catch (_) {}
+    }
+    crashed.clear();
     if (await tempDir.exists()) await tempDir.delete(recursive: true);
   });
 
   ChatMessage rowOf(String msgID, {String peer = _peer}) =>
       service.getHistory(peer).singleWhere((m) => m.msgID == msgID);
+
+  /// The process dies: the current service is abandoned with its history
+  /// store failing every write from now on (so it cannot repair disk later),
+  /// and a fresh one opens the same files. History is reloaded from disk.
+  Future<void> crashAndReopen() async {
+    history.failSave = true;
+    crashed.add(service);
+    service = await open();
+    await service.loadHistory(_peer);
+  }
+
+  /// A queued text whose drain failed: its row says failed, nothing queued.
+  Future<ChatMessage> failedRow(String text) async {
+    final row = await service.sendTextWithResult(_peer, text);
+    await peerOnline();
+    ffiStub.throwOnSend = true;
+    await service.retryPendingC2cMessages(_peer);
+    ffiStub.throwOnSend = false;
+    expect(rowOf(row.msgID!).isFailed, isTrue);
+    expect(queue.getMessages(_peer), isEmpty);
+    return rowOf(row.msgID!);
+  }
 
   test('a queued text is cancelled: kept as a cancelled row, never sent',
       () async {
@@ -203,20 +272,237 @@ void main() {
     expect(queue.getMessages(_peer), isEmpty);
   });
 
-  test('a cancel whose queue removal fails keeps the message pending',
-      () async {
+  test('a cancel whose queue write fails changes nothing', () async {
     final row = await service.sendTextWithResult(_peer, 'still going');
-    queue.failRemove = true;
+    queue.failReplace = true;
     expect(await service.cancelQueuedMessage(_peer, row.msgID!),
         SendControlResult.persistFailed);
     expect(rowOf(row.msgID!).isCancelled, isFalse);
     expect(rowOf(row.msgID!).isPending, isTrue);
-    expect(queue.getMessages(_peer), hasLength(1));
+    expect(queue.getMessages(_peer).single.control, isNull);
+
+    queue.failReplace = false;
+    await peerOnline();
+    await service.retryPendingC2cMessages(_peer);
+    expect(ffiStub.sent, ['still going'], reason: 'not cancelled: it sends');
+  });
+
+  test('a cancel stands once its tombstone is written, though its clean-up '
+      'fails', () async {
+    final row = await service.sendTextWithResult(_peer, 'stopped');
+    queue.failRemove = true;
+    expect(await service.cancelQueuedMessage(_peer, row.msgID!),
+        SendControlResult.success);
+    expect(rowOf(row.msgID!).isCancelled, isTrue);
+    expect(queue.getMessages(_peer).single.control,
+        OfflineSendControl.cancelled);
 
     queue.failRemove = false;
     await peerOnline();
     await service.retryPendingC2cMessages(_peer);
-    expect(ffiStub.sent, ['still going'], reason: 'not cancelled: it sends');
+    expect(ffiStub.sent, isEmpty);
+    expect(queue.getMessages(_peer), isEmpty, reason: 'the drain cleans up');
+  });
+
+  test('a cancel whose row write never landed holds across a crash', () async {
+    final row = await service.sendTextWithResult(_peer, 'never');
+    await history.flushPendingSaves();
+    history.failSave = true;
+    expect(await service.cancelQueuedMessage(_peer, row.msgID!),
+        SendControlResult.success);
+    expect(queue.getMessages(_peer).single.control,
+        OfflineSendControl.cancelled);
+
+    await crashAndReopen();
+    expect(rowOf(row.msgID!).isCancelled, isFalse,
+        reason: 'disk still had the queued row');
+    await peerOnline();
+    await service.retryPendingC2cMessages(_peer);
+    expect(ffiStub.sent, isEmpty);
+    expect(rowOf(row.msgID!).isCancelled, isTrue,
+        reason: 'the tombstone re-applies the cancel');
+    expect(queue.getMessages(_peer), isEmpty);
+  });
+
+  test('a cancel while a cancel or retry holds the message is refused',
+      () async {
+    final row = await service.sendTextWithResult(_peer, 'twice');
+    final results = await Future.wait([
+      service.cancelQueuedMessage(_peer, row.msgID!),
+      service.cancelQueuedMessage(_peer, row.msgID!),
+    ]);
+    expect(results,
+        [SendControlResult.success, SendControlResult.notApplicable]);
+  });
+
+  test('a retry whose queue write fails changes nothing', () async {
+    final row = await failedRow('nope');
+    queue.failAdd = true;
+    expect(await service.retryFailedMessage(_peer, row.msgID!),
+        SendControlResult.persistFailed);
+    expect(rowOf(row.msgID!).isFailed, isTrue);
+    expect(rowOf(row.msgID!).isPending, isFalse);
+    expect(queue.getMessages(_peer), isEmpty);
+  });
+
+  test('a retried send clears its failure durably before it goes out',
+      () async {
+    final row = await failedRow('again');
+    await history.flushPendingSaves();
+    history.failSave = true;
+    expect(await service.retryFailedMessage(_peer, row.msgID!),
+        SendControlResult.success);
+    expect(queue.getMessages(_peer).single.control, OfflineSendControl.retry);
+    // The kicked drain and an immediate second one both find the row write
+    // failing: neither may send while disk still says failed.
+    await Future<void>.delayed(const Duration(milliseconds: 50));
+    await service.retryPendingC2cMessages(_peer);
+    expect(ffiStub.sent, isEmpty);
+    expect(queue.getMessages(_peer).single.control, OfflineSendControl.retry);
+
+    history.failSave = false;
+    await service.retryPendingC2cMessages(_peer);
+    expect(ffiStub.sent, ['again']);
+    expect(rowOf(row.msgID!).isFailed, isFalse);
+    expect(rowOf(row.msgID!).isPending, isFalse);
+    expect(queue.getMessages(_peer), isEmpty);
+  });
+
+  test('a second retry after a crash adds no second queue item', () async {
+    final row = await failedRow('once more');
+    await history.flushPendingSaves();
+    history.failSave = true;
+    expect(await service.retryFailedMessage(_peer, row.msgID!),
+        SendControlResult.success);
+    await Future<void>.delayed(const Duration(milliseconds: 50));
+
+    await crashAndReopen();
+    expect(rowOf(row.msgID!).isPending, isTrue,
+        reason: 'disk says failed, but the retry is queued');
+    expect(await service.retryFailedMessage(_peer, row.msgID!),
+        SendControlResult.notApplicable);
+    expect(queue.getMessages(_peer), hasLength(1));
+
+    await peerOnline();
+    await service.retryPendingC2cMessages(_peer);
+    expect(ffiStub.sent, ['once more']);
+    expect(rowOf(row.msgID!).isFailed, isFalse);
+  });
+
+  test('a queued retry loads its history and clears the failure before it '
+      'sends after a crash', () async {
+    final row = await failedRow('reloaded');
+    await history.flushPendingSaves();
+    history.failSave = true;
+    expect(await service.retryFailedMessage(_peer, row.msgID!),
+        SendControlResult.success);
+    await Future<void>.delayed(const Duration(milliseconds: 50));
+    expect(ffiStub.sent, isEmpty);
+
+    crashed.add(service);
+    service = await open(); // the conversation is not loaded yet
+    await peerOnline();
+    await service.retryPendingC2cMessages(_peer);
+    expect(ffiStub.sent, ['reloaded']);
+    expect(rowOf(row.msgID!).isFailed, isFalse);
+    await history.flushPendingSaves();
+
+    await crashAndReopen();
+    expect(rowOf(row.msgID!).isFailed, isFalse, reason: 'cleared on disk');
+    expect(await service.retryFailedMessage(_peer, row.msgID!),
+        SendControlResult.notApplicable);
+  });
+
+  test('a failed send whose row write fails keeps a failed tombstone that is '
+      'never sent', () async {
+    final row = await service.sendTextWithResult(_peer, 'broken');
+    await history.flushPendingSaves();
+    await peerOnline();
+    ffiStub.throwOnSend = true;
+    history.failSave = true;
+    await service.retryPendingC2cMessages(_peer);
+    expect(queue.getMessages(_peer).single.control, OfflineSendControl.failed);
+
+    ffiStub.throwOnSend = false;
+    await crashAndReopen();
+    expect(rowOf(row.msgID!).isFailed, isFalse, reason: 'the write was lost');
+    await peerOnline();
+    await service.retryPendingC2cMessages(_peer);
+    expect(ffiStub.sent, isEmpty, reason: 'a tombstone is never dispatched');
+    expect(rowOf(row.msgID!).isFailed, isTrue);
+    expect(queue.getMessages(_peer), isEmpty);
+  });
+
+  test('a failed send without a loaded row stays queued', () async {
+    await service.sendTextWithResult(_peer, 'kept');
+    await history.flushPendingSaves();
+    history.failSave = true;
+    crashed.add(service);
+    service = await open(); // history not loaded
+    await peerOnline();
+    ffiStub.throwOnSend = true;
+    await service.retryPendingC2cMessages(_peer);
+    expect(queue.getMessages(_peer).single.control, isNull);
+  });
+
+  test('rows still queued show pending after a startup load', () async {
+    final row = await service.sendTextWithResult(_peer, 'boot');
+    await history.flushPendingSaves();
+    history.failSave = true;
+    crashed.add(service);
+    service = await open();
+    await service.installAccountStorage(
+        historyDirectory: historyDir, queueFilePath: queueFile);
+    expect(rowOf(row.msgID!).isPending, isTrue);
+  });
+
+  test('a committed failure stays failed when its published row is echoed '
+      'back into history', () async {
+    // The SDK listener converts every published row and the history hook
+    // appends it again: a genuine failure must survive its own echo.
+    final row = await service.sendTextWithResult(_peer, 'echo');
+    await peerOnline();
+    final echo = service.messages.listen((m) {
+      if (m.isFailed) unawaited(history.appendHistory(_peer, m));
+    });
+    ffiStub.throwOnSend = true;
+    await service.retryPendingC2cMessages(_peer);
+    await Future<void>.delayed(const Duration(milliseconds: 50));
+    await echo.cancel();
+    expect(rowOf(row.msgID!).isFailed, isTrue);
+  });
+
+  test('a content receipt never lands on a row that did not go out',
+      () async {
+    final queued = await service.sendTextWithResult(_peer, 'hi');
+    await service.debugHandleReceiptForTest(_bind('hi'), 'received', _peer);
+    expect(rowOf(queued.msgID!).isReceived, isFalse, reason: 'still queued');
+
+    await service.cancelQueuedMessage(_peer, queued.msgID!);
+    await peerOnline();
+    final sent = await service.sendTextWithResult(_peer, 'hi');
+    expect(ffiStub.sent, ['hi']);
+    await service.debugHandleReceiptForTest(_bind('hi'), 'received', _peer);
+    expect(rowOf(queued.msgID!).isReceived, isFalse, reason: 'cancelled');
+    expect(rowOf(sent.msgID!).isReceived, isTrue);
+  });
+
+  test('a content receipt for a queued row waits for its send across a '
+      'restart', () async {
+    final row = await service.sendTextWithResult(_peer, 'later');
+    await history.flushPendingSaves();
+    await crashAndReopen();
+    expect(rowOf(row.msgID!).isPending, isTrue,
+        reason: 'still queued: pending again, not sent');
+    await service.debugHandleReceiptForTest(_bind('later'), 'received', _peer);
+    expect(rowOf(row.msgID!).isReceived, isFalse);
+  });
+
+  test('an exact receipt proves delivery and clears a failure', () async {
+    final row = await failedRow('arrived');
+    await service.debugHandleReceiptForTest(row.msgID!, 'received', _peer);
+    expect(rowOf(row.msgID!).isReceived, isTrue);
+    expect(rowOf(row.msgID!).isFailed, isFalse);
   });
 
   test('a sent item whose queue cleanup failed is neither cancelled nor '
@@ -227,6 +513,9 @@ void main() {
     await service.retryPendingC2cMessages(_peer);
     expect(ffiStub.sent, ['once']);
     expect(queue.getMessages(_peer), hasLength(1), reason: 'cleanup failed');
+    await service.loadHistory(_peer);
+    expect(rowOf(row.msgID!).isPending, isFalse,
+        reason: 'it went out: a lingering queue item does not make it pending');
 
     expect(await service.cancelQueuedMessage(_peer, row.msgID!),
         SendControlResult.alreadyClaimed);
