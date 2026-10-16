@@ -127,6 +127,34 @@ String toxGroupMessageAlias({
 }) =>
     '$toxGroupMessageAliasPrefix$groupId|${senderPk.toUpperCase()}|$pseudoMsgId';
 
+final RegExp _toxGroupMessageAliasTail =
+    RegExp(r'\|([0-9A-Fa-f]{64})\|(0|[1-9][0-9]{0,9})$');
+
+/// [id] re-scoped onto OUR local [groupId], or null when [id] is not a
+/// strict [toxGroupMessageAlias].
+///
+/// The `<gid>` segment of an alias is the LOCAL group id of whoever minted it,
+/// and two members may know one group under different local ids (`tox_3` on
+/// one device, `tox_4` on the other). A receipt echoes the alias the READER
+/// stamped, so the author has to read it in its own group's terms: a receipt
+/// that arrived on group G can only be about a message in G. The author key
+/// and the pseudo id are the actual identity and are kept as they are. Parsed
+/// from the right, so a group id containing `|` is still accepted.
+String? rebaseToxGroupMessageAlias(String id, {required String groupId}) {
+  if (!id.startsWith(toxGroupMessageAliasPrefix)) return null;
+  final tail = _toxGroupMessageAliasTail.firstMatch(id);
+  if (tail == null || tail.start == toxGroupMessageAliasPrefix.length) {
+    return null;
+  }
+  final pseudoMsgId = int.parse(tail.group(2)!);
+  if (pseudoMsgId > 0xFFFFFFFF) return null;
+  return toxGroupMessageAlias(
+    groupId: groupId,
+    senderPk: tail.group(1)!,
+    pseudoMsgId: pseudoMsgId,
+  );
+}
+
 /// The group identity alias a row carries, or null (C2C, legacy conference,
 /// custom packets, or a native library that predates the id).
 String? toxGroupMessageAliasOf(ChatMessage message) {

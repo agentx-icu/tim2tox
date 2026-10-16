@@ -668,6 +668,9 @@ PHASE14_UNIT=(
   # Cross-peer group message alias: header parsing (new + legacy forms),
   # alias stamping, persistence round-trip, receipt->local-row correlation.
   "test/unit_tests/ffi_chat_service_group_alias_test.dart"
+  # The same alias when two members know the group under different local
+  # ids: the author re-scopes a receipt onto the group it arrived on.
+  "test/unit_tests/ffi_chat_service_group_receipt_local_id_test.dart"
   "test/unit_tests/message_history_persistence_test.dart"
   # CR-05/CR-06/CR-07 + S17/S18 cloudCustomData reply persistence + the
   # cross-path history de-duplication invariant. 19 tests, pure Dart.
