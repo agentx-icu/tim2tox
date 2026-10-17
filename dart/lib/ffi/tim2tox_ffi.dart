@@ -521,6 +521,19 @@ typedef _iterate_instance_c = ffi.Int32 Function(ffi.Int64);
 typedef _set_default_test_mode_c = ffi.Int32 Function(ffi.Int32);
 
 /// Low-level FFI bindings to tim2tox C library
+// Rendezvous groups (tim2tox_ffi.h "Rendezvous groups").
+typedef _rendezvous_set_convention_c = ffi.Int32 Function(
+    ffi.Pointer<pkgffi.Utf8>, ffi.Pointer<pkgffi.Utf8>);
+typedef _rendezvous_join_c = ffi.Int32 Function(
+    ffi.Pointer<ffi.Uint8>, ffi.Pointer<pkgffi.Utf8>, ffi.Pointer<pkgffi.Utf8>);
+typedef _rendezvous_leave_c = ffi.Int32 Function(ffi.Pointer<pkgffi.Utf8>);
+typedef _rendezvous_leave_all_c = ffi.Int32 Function();
+typedef _rendezvous_send_c = ffi.Int32 Function(ffi.Pointer<pkgffi.Utf8>,
+    ffi.Pointer<pkgffi.Utf8>, ffi.Pointer<ffi.Uint8>, ffi.Int32);
+typedef _rendezvous_peer_count_c = ffi.Int32 Function(ffi.Pointer<pkgffi.Utf8>);
+typedef _rendezvous_drop_count_c = ffi.Int32 Function();
+typedef _dht_announce_capable_count_c = ffi.Int32 Function();
+
 class Tim2ToxFfi {
   Tim2ToxFfi._(this._lib);
 
@@ -891,6 +904,37 @@ class Tim2ToxFfi {
           _send_group_custom_c,
           int Function(ffi.Pointer<pkgffi.Utf8>, ffi.Pointer<ffi.Uint8>,
               int)>('tim2tox_ffi_send_group_custom');
+  // --- Rendezvous groups (see RendezvousTransport) ---
+  late final int Function(ffi.Pointer<pkgffi.Utf8>, ffi.Pointer<pkgffi.Utf8>)
+      rendezvousSetConvention = _lib.lookupFunction<
+          _rendezvous_set_convention_c,
+          int Function(ffi.Pointer<pkgffi.Utf8>,
+              ffi.Pointer<pkgffi.Utf8>)>('tim2tox_ffi_rendezvous_set_convention');
+  late final int Function(ffi.Pointer<ffi.Uint8>, ffi.Pointer<pkgffi.Utf8>,
+          ffi.Pointer<pkgffi.Utf8>) rendezvousJoin =
+      _lib.lookupFunction<
+          _rendezvous_join_c,
+          int Function(ffi.Pointer<ffi.Uint8>, ffi.Pointer<pkgffi.Utf8>,
+              ffi.Pointer<pkgffi.Utf8>)>('tim2tox_ffi_rendezvous_join');
+  late final int Function(ffi.Pointer<pkgffi.Utf8>) rendezvousLeave =
+      _lib.lookupFunction<_rendezvous_leave_c,
+          int Function(ffi.Pointer<pkgffi.Utf8>)>('tim2tox_ffi_rendezvous_leave');
+  late final int Function() rendezvousLeaveAll = _lib.lookupFunction<
+      _rendezvous_leave_all_c, int Function()>('tim2tox_ffi_rendezvous_leave_all');
+  late final int Function(ffi.Pointer<pkgffi.Utf8>, ffi.Pointer<pkgffi.Utf8>,
+          ffi.Pointer<ffi.Uint8>, int) rendezvousSend =
+      _lib.lookupFunction<
+          _rendezvous_send_c,
+          int Function(ffi.Pointer<pkgffi.Utf8>, ffi.Pointer<pkgffi.Utf8>,
+              ffi.Pointer<ffi.Uint8>, int)>('tim2tox_ffi_rendezvous_send');
+  late final int Function(ffi.Pointer<pkgffi.Utf8>) rendezvousPeerCount =
+      _lib.lookupFunction<_rendezvous_peer_count_c,
+          int Function(ffi.Pointer<pkgffi.Utf8>)>('tim2tox_ffi_rendezvous_peer_count');
+  late final int Function() rendezvousDropCount = _lib.lookupFunction<
+      _rendezvous_drop_count_c, int Function()>('tim2tox_ffi_rendezvous_drop_count');
+  late final int Function() dhtAnnounceCapableCount = _lib.lookupFunction<
+      _dht_announce_capable_count_c,
+      int Function()>('tim2tox_ffi_dht_announce_capable_count');
   late final int Function(
           int, ffi.Pointer<pkgffi.Utf8>, ffi.Pointer<pkgffi.Utf8>)
       sendFileNative = _lib.lookupFunction<

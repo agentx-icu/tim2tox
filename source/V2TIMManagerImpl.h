@@ -21,6 +21,7 @@
 #include "V2TIMCommunityManager.h"
 #include "Tim2ToxControlPacket.h"
 #include "GroupWireReadiness.h"
+#include "RendezvousGroups.h"
 
 class V2TIMSignalingManagerImpl;
 class V2TIMMessageManagerImpl;
@@ -401,6 +402,31 @@ public:
     // can be told apart from one the previous account's session emitted on
     // the same instance id (an account switch reuses instance 0).
     int64_t GetSessionEpoch() const { return session_epoch_.load(std::memory_order_acquire); }
+
+    // --- Rendezvous groups (transport-only NGC groups, see RendezvousGroups.h
+    // and V2TIMManagerImpl_Rendezvous.cpp). All act on this instance.
+    // 1 accepted (outcome via rendezvous_* events), 0 refused, 2 already present.
+    int RendezvousJoin(const uint8_t* seed, size_t seed_len, const char* name, const char* nick);
+    int RendezvousLeave(const char* chat_id_hex);           // 1 left/leaving, 0 unknown
+    int RendezvousLeaveAll();                                // number of cells, -1 no session
+    // 1 sent, 0 not sent, -1 too large, -2 unknown peer, -3 unknown group.
+    int RendezvousSend(const char* chat_id_hex, const char* peer_pk_hex, const uint8_t* data, int len);
+    int RendezvousPeerCount(const char* chat_id_hex);        // >= 0, -1 unknown
+    uint64_t RendezvousDropCount() const;
+    // Lines are instance-stamped by the sink the FFI layer installs BEFORE
+    // InitSDK; lines produced earlier are buffered (bounded) and flushed.
+    void SetRendezvousEventSink(std::function<void(const std::string&)> sink);
+    void SetRendezvousConvention(const std::string& name_prefix, const std::string& seed_prefix);
+    bool IsRendezvousGroupNumber(Tox_Group_Number group_number) const;
+    bool RendezvousInviteIsOurs(const uint8_t* invite_data, size_t length, const std::string& group_name) const;
+    // Planner step: join -> found timers, watchdog, back-offs. Called by the
+    // event loop between iterations and, in test mode (no event thread), by
+    // the FFI iterate hooks that also drain the task queue.
+    void RendezvousTick();
+    void RendezvousLeaveZombies(Tox* tox);
+    void RendezvousConfirmRetired(Tox* tox, uint64_t now_ms);
+    bool RendezvousReleaseIfReused(Tox_Group_Number group_number);
+    static bool RendezvousGroupIs(Tox* tox, Tox_Group_Number group_number, const std::string& chat_id_hex);
 
     // Test-mode controls (auto_tests harness only). When enabled, InitSDK skips
     // starting the per-instance event_thread and installs a process-global
@@ -898,6 +924,28 @@ private:
     // Which NGC groups a send can reach right now (tim2tox_ffi_group_wire_ready).
     // Fed by the join/rejoin/accept/restore sites and toxcore's self_join,
     // peer_join and peer_exit. Guarded by mutex_, like fresh_group_joins_.
+    // Rendezvous bookkeeping (own leaf mutex) + its event sink.
+    tim2tox::RendezvousGroups rendezvous_;
+    std::function<void(const std::string&)> rendezvous_sink_;
+    mutable std::mutex rendezvous_sink_mutex_;
+    static uint64_t RendezvousNowMs(const Tox* tox);
+    void RendezvousEmit(const std::string& line);
+    void RendezvousExecute(const ToxSessionGuard& session, const tim2tox::RendezvousGroups::Action& action,
+                           uint64_t now_ms);
+    void RendezvousStart();                // InitSDK, after the savedata restore loop
+    void RendezvousShutdown();             // UnInitSDK, while the event thread is alive
+    bool RendezvousLeaveAllNow();          // runs on the event thread (or inline fallback)
+    bool RendezvousRestoredZombie(Tox* tox, Tox_Group_Number group_number);
+    bool RendezvousSelfJoinOfZombie(Tox_Group_Number group_number);
+    void RendezvousOnSelfJoin(Tox_Group_Number group_number);
+    void RendezvousOnPeerJoin(Tox_Group_Number group_number, Tox_Group_Peer_Number peer_id);
+    void RendezvousOnPeerExit(Tox_Group_Number group_number, Tox_Group_Peer_Number peer_id,
+                              Tox_Group_Exit_Type exit_type);
+    void RendezvousOnJoinFail(Tox_Group_Number group_number, Tox_Group_Join_Fail fail_type);
+    void RendezvousOnModeration(Tox_Group_Number group_number, Tox_Group_Peer_Number target_peer_id,
+                                Tox_Group_Mod_Event mod_type);
+    void RendezvousOnPacket(Tox_Group_Number group_number, Tox_Group_Peer_Number peer_id, const uint8_t* data,
+                            size_t length, bool is_private);
     tim2tox::GroupWireReadiness group_wire_readiness_;
     void BeginGroupWireSync(Tox_Group_Number group_number);
     void HandleGroupPeerConfirmed(Tox_Group_Number group_number, Tox_Group_Peer_Number peer_id);

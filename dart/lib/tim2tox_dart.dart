@@ -10,6 +10,7 @@ export 'models/send_control_result.dart';
 // Service layer (includes Tim2ToxFfi)
 export 'service/ffi_chat_service.dart';
 export 'service/file_receive_failure.dart';
+export 'service/rendezvous_transport.dart';
 
 // FFI bindings (hide Tim2ToxFfi to avoid conflict with service layer)
 export 'ffi/tim2tox_ffi.dart' hide Tim2ToxFfi;

@@ -158,6 +158,40 @@ int tim2tox_ffi_send_c2c_control(const char* user_id, const unsigned char* data,
 // data_len: length of data in bytes
 int tim2tox_ffi_send_group_custom(const char* group_id, const unsigned char* data, int data_len);
 
+// --- Rendezvous groups -------------------------------------------------------
+// Transport-only NGC public groups whose Chat ID is derived from a 32-byte seed
+// (tox_group_new_with_seed). Never a V2TIM group, never listed, never in
+// history. Outcomes arrive as poll lines (instance-stamped):
+//   rendezvous_joined:<chat_id_hex>:<founded 0|1>
+//   rendezvous_left:<chat_id_hex>:<kicked|failed|stale|left|full|refound>
+//   rendezvous_peer:<chat_id_hex>:<peer_pk_hex>:<join|exit>
+//   rendezvous_peers_changed:<chat_id_hex>:<count>      (coalesced form)
+//   rendezvous_full:<chat_id_hex>
+//   rendezvous_packet:<chat_id_hex>:<peer_pk_hex>:<b|p>:<hex payload>
+// Name/seed convention used to recognise a cell restored from savedata; call
+// before init (defaults are toxee's "toxee-nearby/v1/" and "toxee/nearby/v1|").
+// 1 ok, 0 bad args.
+int tim2tox_ffi_rendezvous_set_convention(const char* name_prefix, const char* seed_prefix);
+// Join (or, after 30 s without peers, found) the cell of `seed32` with group
+// name `name` (<= 48 bytes) and nick `nick`. 1 accepted, 0 refused, 2 already.
+int tim2tox_ffi_rendezvous_join(const unsigned char* seed32, const char* name, const char* nick);
+// 1 leaving, 0 unknown cell.
+int tim2tox_ffi_rendezvous_leave(const char* chat_id_hex);
+// Number of cells asked to leave, -1 when not initialized.
+int tim2tox_ffi_rendezvous_leave_all(void);
+// Broadcast (peer_pk_hex NULL/empty) or private lossless packet. The payload
+// is opaque; the complete frame (6-byte header + payload) must be <= 1200
+// bytes, i.e. 0 <= len <= 1194 (a header-only frame is valid). 1 sent,
+// 0 not sent, -1 too large, -2 unknown peer, -3 unknown cell.
+int tim2tox_ffi_rendezvous_send(const char* chat_id_hex, const char* peer_pk_hex, const unsigned char* data, int len);
+// Confirmed peers in the cell, -1 unknown cell.
+int tim2tox_ffi_rendezvous_peer_count(const char* chat_id_hex);
+// Packets/lines dropped natively (budgets, unknown peers, oversize), cumulative.
+int tim2tox_ffi_rendezvous_drop_count(void);
+// tox_dht_get_num_closelist_announce_capable for the current instance, -1
+// when not initialized. 0 means DHT announces (group discovery) cannot work yet.
+int tim2tox_ffi_dht_announce_capable_count(void);
+
 // Poll next received text message for the given instance (or broadcast events with instance_id 0).
 // instance_id: current instance; only events for this instance or broadcast (id 0) are returned.
 // Returns number of bytes written (excluding terminating 0), or 0 if none.

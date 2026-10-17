@@ -8,6 +8,7 @@ extern "C" {
 #include "toxcore/os_memory.h"    // os_memory (the Memory* encrypt_data/decrypt_data take)
 }
 #include "Tim2ToxPacketIds.h"
+#include "Tim2ToxGroupPacket.h"
 #include <random>
 #include <map>
 #include "QToxMessageFragmenter.h"
@@ -220,14 +221,11 @@ private:
 // (file sync, history sync, ...); without a signature every foreign packet
 // became a "[Custom Message]" bubble, a history row and a notification.
 //   0xB7 'T' '2' 'T' <version=1> <kind>
-static constexpr uint8_t kTim2ToxGroupPacketMagic[4] = {0xB7, 'T', '2', 'T'};
-static constexpr uint8_t kTim2ToxGroupPacketVersion = 1;
-static constexpr size_t kTim2ToxGroupPacketHeaderSize = 6;
-enum : uint8_t {
-    kTim2ToxGroupPacketCustomMessage = 1,  // broadcast: V2TIM custom elem payload
-    kTim2ToxGroupPacketReceipt = 2,        // private: receipt JSON for the author
-    kTim2ToxGroupPacketIdentityProof = 3,  // private: MM-6 identity proof
-};
+// The framing itself lives in Tim2ToxGroupPacket.{h,cpp}, shared with the
+// rendezvous transport (kind 4); these are the chat kinds this file speaks.
+static constexpr uint8_t kTim2ToxGroupPacketCustomMessage = tim2tox::group_packet::kCustomMessage;
+static constexpr uint8_t kTim2ToxGroupPacketReceipt = tim2tox::group_packet::kReceipt;
+static constexpr uint8_t kTim2ToxGroupPacketIdentityProof = tim2tox::group_packet::kIdentityProof;
 
 static std::string EscapeJsonForReceipt(const std::string& value) {
     std::string out;
@@ -421,27 +419,14 @@ static bool ParseStrictReceiptJson(const uint8_t* data, size_t length, StrictGro
 }
 
 static std::vector<uint8_t> WrapTim2ToxGroupPacket(uint8_t kind, const uint8_t* data, size_t length) {
-    std::vector<uint8_t> packet;
-    packet.reserve(kTim2ToxGroupPacketHeaderSize + length);
-    packet.insert(packet.end(), kTim2ToxGroupPacketMagic, kTim2ToxGroupPacketMagic + 4);
-    packet.push_back(kTim2ToxGroupPacketVersion);
-    packet.push_back(kind);
-    if (length > 0) packet.insert(packet.end(), data, data + length);
-    return packet;
+    return tim2tox::group_packet::Wrap(kind, data, length);
 }
 
 // Returns the payload of a tim2tox group packet of the given kind, or false
 // for anything else (foreign packets are ignored, never rendered).
 static bool UnwrapTim2ToxGroupPacket(uint8_t kind, const uint8_t* data, size_t length,
                                      const uint8_t** payload, size_t* payload_length) {
-    if (data == nullptr || length < kTim2ToxGroupPacketHeaderSize ||
-        memcmp(data, kTim2ToxGroupPacketMagic, 4) != 0 ||
-        data[4] != kTim2ToxGroupPacketVersion || data[5] != kind) {
-        return false;
-    }
-    *payload = data + kTim2ToxGroupPacketHeaderSize;
-    *payload_length = length - kTim2ToxGroupPacketHeaderSize;
-    return true;
+    return tim2tox::group_packet::Unwrap(kind, data, length, payload, payload_length);
 }
 
 class ReceiverGroupMessageIdOverrideGuard {
@@ -1087,6 +1072,10 @@ bool V2TIMManagerImpl::InitSDK(uint32_t sdkAppID, const V2TIMSDKConfig& config) 
     static_cast<void>(0);
     tox_manager_->setGroupPeerExitCallback(
         [this](Tox_Group_Number group_number, Tox_Group_Peer_Number peer_id, Tox_Group_Exit_Type exit_type, const uint8_t* name, size_t name_length) {
+            if (rendezvous_.Owns(group_number)) {
+                this->RendezvousOnPeerExit(group_number, peer_id, exit_type);
+                return;  // rendezvous group: no readiness bookkeeping
+            }
             {
                 // toxcore fires peer_exit only for confirmed peers.
                 std::lock_guard<std::mutex> lock(mutex_);
@@ -1115,6 +1104,9 @@ bool V2TIMManagerImpl::InitSDK(uint32_t sdkAppID, const V2TIMSDKConfig& config) 
                 std::vector<Tox_Group_Number> group_list(group_count);
                 tox_manager_->getGroupList(group_list.data(), group_count);
                 for (Tox_Group_Number group_number : group_list) {
+                    // A rendezvous cell that survived in savedata (crash) is
+                    // transport only: leave it here, never register it.
+                    if (RendezvousRestoredZombie(tox, group_number)) continue;
                     // Restored groups load as CS_CONNECTING: nothing is
                     // deliverable until toxcore syncs them again.
                     BeginGroupWireSync(group_number);
@@ -1126,10 +1118,16 @@ bool V2TIMManagerImpl::InitSDK(uint32_t sdkAppID, const V2TIMSDKConfig& config) 
             // Conference mappings will be rebuilt in RejoinKnownGroups when known groups are synced
         }
     }
+    // Rendezvous admission opens only now, after the restore sweep above.
+    RendezvousStart();
     
     // Register callback for future group joins (new groups will trigger this callback)
     tox_manager_->setGroupSelfJoinCallback(
         [this](Tox_Group_Number group_number) {
+            if (rendezvous_.Owns(group_number)) {
+                this->RendezvousOnSelfJoin(group_number);
+                return;  // rendezvous group: no readiness / identity bookkeeping
+            }
             {
                 // toxcore's own self-join: we are really in. From here on a
                 // rejection is a failed RE-join (the manual HandleGroupSelfJoin
@@ -1173,6 +1171,10 @@ bool V2TIMManagerImpl::InitSDK(uint32_t sdkAppID, const V2TIMSDKConfig& config) 
     // Register new group API callback (tox_callback_group_invite)
     tox_manager_->setGroupInviteGroupCallback(
         [this](Tox_Friend_Number friend_number, const uint8_t* invite_data, size_t invite_data_length, const std::string& invited_group_name) {
+            if (RendezvousInviteIsOurs(invite_data, invite_data_length, invited_group_name)) {
+                V2TIM_LOG(kInfo, "[GroupInvite] dropped: invite to a rendezvous cell (transport only)");
+                return;
+            }
             V2TIM_LOG(kInfo, "[GroupInvite] ========== Received group invite ==========");
             V2TIM_LOG(kInfo, "[GroupInvite] friend_number={}, invite_data_length={}", friend_number, invite_data_length);
             
@@ -2204,6 +2206,8 @@ bool V2TIMManagerImpl::InitSDK(uint32_t sdkAppID, const V2TIMSDKConfig& config) 
                     if (group_manager_) {
                         group_manager_->CheckMuteExpiries();
                     }
+                    // Rendezvous planner: join -> found timers, watchdog, back-offs.
+                    RendezvousTick();
                     Tox* t = tox_manager_->getTox();
                     uint32_t interval = t ? tox_iteration_interval(t) : 50;
                     std::this_thread::sleep_for(std::chrono::milliseconds(interval));
@@ -2259,6 +2263,9 @@ void V2TIMManagerImpl::UnInitSDK() {
             return;
         }
     }
+    // Rendezvous cells are left FIRST, while the event thread is alive and
+    // pins are still admitted; the final save below must not carry them.
+    RendezvousShutdown();
     ClearPendingDeliveries();
 #ifdef BUILD_TOXAV
     ClearAVConferenceAudioCallback();
@@ -2369,6 +2376,7 @@ void V2TIMManagerImpl::UnInitSDK() {
 // account's chat_id under the old ID. Runs after the event/background threads
 // are joined and tox_manager_ is gone, so nothing else touches these maps.
 void V2TIMManagerImpl::ResetGroupSessionState() {
+    rendezvous_.Clear();
     {
         std::lock_guard<std::mutex> lock(mutex_);
         group_id_to_group_number_.clear();
@@ -6210,6 +6218,7 @@ void V2TIMManagerImpl::AnnounceGroupIdentities(uint32_t only_friend, Tox_Group_N
     }
     std::string digests;  // raw 32-byte digests, concatenated
     for (const Tox_Group_Number group_number : groups) {
+        if (rendezvous_.Owns(group_number)) continue;  // rendezvous cells are never announced to friends
         uint8_t chat_id[TOX_GROUP_CHAT_ID_SIZE];
         uint8_t self_key[TOX_PUBLIC_KEY_SIZE];
         Tox_Err_Group_State_Query err_chat;
@@ -7109,6 +7118,9 @@ void V2TIMManagerImpl::SetAutoAcceptGroupInvites(bool enabled) {
 // --- Implementation of Internal Handlers ---
 
 void V2TIMManagerImpl::HandleGroupMessageGroup(Tox_Group_Number group_number, Tox_Group_Peer_Number peer_id, TOX_MESSAGE_TYPE type, const uint8_t* message_data, size_t length, Tox_Group_Message_Id message_id) {
+    if (rendezvous_.Owns(group_number)) {
+        return;  // rendezvous group: transport only
+    }
     // Publish the shared pseudo id for the whole synchronous delivery below:
     // BOTH the ACTION branch (NotifyGroupActionMessage) and the normal-text
     // branch notify the FFI simple listener, which stamps it into the polled
@@ -7559,6 +7571,10 @@ void V2TIMManagerImpl::HandleGroupCustomPacket(
     Tox_Group_Peer_Number peer_id,
     const uint8_t* data,
     size_t length) {
+    if (rendezvous_.Owns(group_number)) {
+        RendezvousOnPacket(group_number, peer_id, data, length, false);
+        return;  // rendezvous group: transport only
+    }
     if (data == nullptr || length == 0 || !running_) return;
     // Only tim2tox's own custom messages are chat content; other clients'
     // packets on this shared channel are their protocols, not messages.
@@ -7645,6 +7661,10 @@ void V2TIMManagerImpl::HandleGroupCustomPrivatePacket(
     Tox_Group_Peer_Number peer_id,
     const uint8_t* data,
     size_t length) {
+    if (rendezvous_.Owns(group_number)) {
+        RendezvousOnPacket(group_number, peer_id, data, length, true);
+        return;  // rendezvous group: transport only
+    }
     if (!running_) return;
     const uint8_t* payload = nullptr;
     size_t payload_length = 0;
@@ -7805,6 +7825,9 @@ int V2TIMManagerImpl::SendGroupReceipt(const V2TIMString& groupID, const std::st
 }
 
 void V2TIMManagerImpl::HandleGroupPrivateMessage(Tox_Group_Number group_number, Tox_Group_Peer_Number peer_id, TOX_MESSAGE_TYPE type, const uint8_t* message_data, size_t length, Tox_Group_Message_Id message_id) {
+    if (rendezvous_.Owns(group_number)) {
+        return;  // rendezvous group: transport only
+    }
     static_cast<void>(0);
     static_cast<void>(0);
     Tox* tox = GetToxManager()->getTox();
@@ -10050,6 +10073,9 @@ void V2TIMManagerImpl::NotifyGroupMemberKicked(const V2TIMString& groupID, const
 // HandleGroupMessageGroup is already defined above at line 1878
 
 void V2TIMManagerImpl::HandleGroupTopic(Tox_Group_Number group_number, Tox_Group_Peer_Number peer_id, const uint8_t* topic, size_t length) {
+    if (rendezvous_.Owns(group_number)) {
+        return;  // rendezvous group: transport only
+    }
     V2TIMString groupID;
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -10093,6 +10119,9 @@ void V2TIMManagerImpl::HandleGroupTopic(Tox_Group_Number group_number, Tox_Group
 }
 
 void V2TIMManagerImpl::HandleGroupPeerNameGroup(Tox_Group_Number group_number, Tox_Group_Peer_Number peer_id, const uint8_t* name, size_t length) {
+    if (rendezvous_.Owns(group_number)) {
+        return;  // rendezvous group: transport only
+    }
     V2TIMString groupID;
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -10138,6 +10167,10 @@ void V2TIMManagerImpl::HandleGroupPeerNameGroup(Tox_Group_Number group_number, T
 }
 
 void V2TIMManagerImpl::HandleGroupPeerJoin(Tox_Group_Number group_number, Tox_Group_Peer_Number peer_id) {
+    if (rendezvous_.Owns(group_number)) {
+        RendezvousOnPeerJoin(group_number, peer_id);
+        return;  // rendezvous group: transport only
+    }
     // Log which instance is handling peer join (for multi-instance debugging)
     // Note: GetCurrentInstanceId is already declared at file scope (line 27)
     int64_t current_instance_id = GetCurrentInstanceId();
@@ -10306,6 +10339,10 @@ void V2TIMManagerImpl::HandleGroupPeerJoin(Tox_Group_Number group_number, Tox_Gr
 }
 
 void V2TIMManagerImpl::HandleGroupPeerExit(Tox_Group_Number group_number, Tox_Group_Peer_Number peer_id, Tox_Group_Exit_Type exit_type, const uint8_t* name, size_t name_length) {
+    if (rendezvous_.Owns(group_number)) {
+        RendezvousOnPeerExit(group_number, peer_id, exit_type);
+        return;  // rendezvous group: transport only
+    }
     V2TIMString groupID;
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -10569,6 +10606,10 @@ void V2TIMManagerImpl::EraseGroupLocalStateLocked(const V2TIMString& groupID,
 }
 
 void V2TIMManagerImpl::HandleGroupModeration(Tox_Group_Number group_number, Tox_Group_Peer_Number source_peer_id, Tox_Group_Peer_Number target_peer_id, Tox_Group_Mod_Event mod_type) {
+    if (rendezvous_.Owns(group_number)) {
+        RendezvousOnModeration(group_number, target_peer_id, mod_type);
+        return;  // rendezvous group: transport only
+    }
     V2TIM_LOG(kInfo, "[HandleGroupModeration] ENTRY instance_id={} group_number={} source_peer={} target_peer={} mod_type={}",
               (long long)GetInstanceIdFromManager(this), group_number, source_peer_id, target_peer_id, static_cast<int>(mod_type));
     V2TIMString groupID;
@@ -10758,7 +10799,17 @@ void V2TIMManagerImpl::HandleGroupModeration(Tox_Group_Number group_number, Tox_
     }
 }
 
+// A retiring rendezvous number reused by an ordinary group created before the
+// next tick must not lose its creation: RendezvousReleaseIfReused() releases
+// it (chat id checked) and the self-join is then handled normally.
 void V2TIMManagerImpl::HandleGroupSelfJoin(Tox_Group_Number group_number) {
+    if (rendezvous_.Owns(group_number) && !RendezvousReleaseIfReused(group_number)) {
+        RendezvousOnSelfJoin(group_number);
+        return;  // rendezvous group: transport only
+    }
+    if (RendezvousSelfJoinOfZombie(group_number)) {
+        return;  // a rendezvous group restored from savedata: left on the event thread
+    }
     static_cast<void>(0);
     static_cast<void>(0);
     static_cast<void>(0);
@@ -11073,6 +11124,10 @@ void V2TIMManagerImpl::HandleGroupSelfJoin(Tox_Group_Number group_number) {
 }
 
 void V2TIMManagerImpl::HandleGroupJoinFail(Tox_Group_Number group_number, Tox_Group_Join_Fail fail_type) {
+    if (rendezvous_.Owns(group_number)) {
+        RendezvousOnJoinFail(group_number, fail_type);
+        return;  // rendezvous group: transport only
+    }
     // The group refused us (wrong/missing password, full, or unknown). This
     // used to be only logged, so the group sat in the list "joined" forever
     // with no peers and no explanation.
@@ -11194,6 +11249,9 @@ bool V2TIMManagerImpl::IsGroupWireReady(Tox_Group_Number group_number) {
 // idempotent there and drains the group's queue.
 void V2TIMManagerImpl::HandleGroupPeerConfirmed(Tox_Group_Number group_number,
                                                 Tox_Group_Peer_Number peer_id) {
+    if (rendezvous_.Owns(group_number)) {
+        return;  // rendezvous group: transport only
+    }
     V2TIMString groupID;
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -11209,6 +11267,9 @@ void V2TIMManagerImpl::HandleGroupPeerConfirmed(Tox_Group_Number group_number,
 }
 
 void V2TIMManagerImpl::HandleGroupPrivacyState(Tox_Group_Number group_number, Tox_Group_Privacy_State privacy_state) {
+    if (rendezvous_.Owns(group_number)) {
+        return;  // rendezvous group: transport only
+    }
     static_cast<void>(0);
     static_cast<void>(0);
     static_cast<void>(0);
@@ -11247,6 +11308,9 @@ void V2TIMManagerImpl::HandleGroupPrivacyState(Tox_Group_Number group_number, To
 }
 
 void V2TIMManagerImpl::HandleGroupVoiceState(Tox_Group_Number group_number, Tox_Group_Voice_State voice_state) {
+    if (rendezvous_.Owns(group_number)) {
+        return;  // rendezvous group: transport only
+    }
     V2TIMString groupID;
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -11274,6 +11338,9 @@ void V2TIMManagerImpl::HandleGroupVoiceState(Tox_Group_Number group_number, Tox_
 }
 
 void V2TIMManagerImpl::HandleGroupPeerStatus(Tox_Group_Number group_number, Tox_Group_Peer_Number peer_id, TOX_USER_STATUS status) {
+    if (rendezvous_.Owns(group_number)) {
+        return;  // rendezvous group: transport only
+    }
     V2TIMString groupID;
     {
         std::lock_guard<std::mutex> lock(mutex_);

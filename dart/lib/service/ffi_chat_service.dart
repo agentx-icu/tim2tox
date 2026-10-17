@@ -8,6 +8,7 @@ import 'package:path_provider/path_provider.dart';
 import 'package:path/path.dart' as p;
 import 'package:crypto/crypto.dart';
 import '../ffi/tim2tox_ffi.dart';
+import 'rendezvous_transport.dart';
 import '../models/chat_message.dart';
 import '../models/send_control_result.dart';
 import '../interfaces/preferences_service.dart';
@@ -606,6 +607,10 @@ class FfiChatService {
   }
 
   final Tim2ToxFfi _ffi;
+
+  /// Transport-only rendezvous groups (people-nearby cells). Fed from the
+  /// poll loop BEFORE any message branch; see RendezvousTransport.
+  late final RendezvousTransport rendezvous = RendezvousTransport(_ffi);
   final ExtendedPreferencesService? _prefs;
   final DraftPreferencesService? _draftPrefs;
   final LoggerService? _logger;
@@ -4484,7 +4489,11 @@ class FfiChatService {
                 }
               }
               // Expected events via polling queue
-              if (s.startsWith('conn:')) {
+              if (rendezvous.handleLine(s,
+                   instanceId: sourceInstanceId ?? 0)) {
+                // Rendezvous event: consumed by the transport, never a message,
+                // never history, never a conversation.
+              } else if (s.startsWith('conn:')) {
                 // conn:success or conn:failed
                 if (s == 'conn:success') {
                   final wasOffline = !_isConnected;
@@ -14093,6 +14102,7 @@ class FfiChatService {
   Future<void> dispose() => _disposeFuture ??= _disposeImpl();
 
   Future<void> _disposeImpl() async {
+    await rendezvous.dispose();
     _disposing = true;
     _sessionClosed = true;
     // Order matters here — the previous arrangement had a race where a poll
