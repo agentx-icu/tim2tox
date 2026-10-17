@@ -59,6 +59,11 @@ set(TIM2TOX_CORE_SRCS
     QToxMessageFragmenter.cpp
     Tim2ToxControlPacket.cpp
     V2TIMManagerImpl.cpp
+    V2TIMManagerImpl_Rendezvous.cpp
+    RendezvousGroups.cpp
+    RendezvousGroupsCodec.cpp
+    RendezvousGroupsEvents.cpp
+    Tim2ToxGroupPacket.cpp
     V2TIMMessageManagerImpl.cpp
     V2TIMFriendshipManagerImpl.cpp
     V2TIMGroupManagerImpl.cpp

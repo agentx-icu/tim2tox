@@ -100,6 +100,16 @@ ls -la build/ffi/libtim2tox_ffi.so      # Linux
 nm -g build/ffi/libtim2tox_ffi.dylib | grep Dart_PostCObject_DL
 ```
 
+## toxcore fork
+
+`third_party/c-toxcore` tracks the `agentx-icu/c-toxcore` fork, branch
+`agentx/group-new-with-seed`: upstream v0.2.23-rc.1 plus one additive private
+API, `tox_group_new_with_seed` (`toxcore/tox_private.h`), which derives an NGC
+group's keypair — and so its Chat ID — from a caller-supplied 32-byte seed.
+tim2tox's rendezvous groups (`doc/architecture/RENDEZVOUS_GROUPS.md`) need it;
+everything else in the build is unchanged. The same commit is proposed to
+upstream TokTok/c-toxcore; when it lands the submodule can move back.
+
 ## FAQ
 
 ### How do I force a rebuild?

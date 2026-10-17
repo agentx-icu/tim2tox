@@ -40,7 +40,7 @@ C++ does **not** persist message history. Persistence lives entirely on the Dart
 
 ## Layout — by responsibility
 
-- `source/` — C++ core. `V2TIMManagerImpl`, `V2TIMMessageManagerImpl`, `V2TIMFriendshipManagerImpl`, `V2TIMGroupManagerImpl`, `V2TIMConversationManagerImpl`, `V2TIMSignalingManagerImpl`, `ToxManager`, `ToxAVManager`. Knows nothing about Dart or Platform.
+- `source/` — C++ core. `V2TIMManagerImpl`, `V2TIMMessageManagerImpl`, `V2TIMFriendshipManagerImpl`, `V2TIMGroupManagerImpl`, `V2TIMConversationManagerImpl`, `V2TIMSignalingManagerImpl`, `ToxManager`, `ToxAVManager`. Knows nothing about Dart or Platform. `RendezvousGroups` + `V2TIMManagerImpl_Rendezvous.cpp` are the transport-only NGC cells behind toxee's people-nearby feature (`doc/architecture/RENDEZVOUS_GROUPS.md`): never a V2TIM group, never history.
 - `include/` — V2TIM-style C++ headers (public API surface of the C++ core).
 - `ffi/` — C FFI. `tim2tox_ffi.{h,cpp}` is the high-level C API used by the Platform path; `dart_compat_layer.cpp` + `dart_compat_*.cpp` are the `Dart*` symbols used by the binary-replacement path. `callback_bridge.{h,cpp}` and `json_parser.{h,cpp}` are shared by both. The compat layer was split out of a 3200-line file into 13 modules (see `doc/architecture/MODULARIZATION.md`) — keep that split when adding new categories.
 - `dart/lib/` — Dart package `tim2tox_dart` (path-dep'd by integrators).
@@ -53,7 +53,7 @@ C++ does **not** persist message history. Persistence lives entirely on the Dart
   - `instance/` — `Tim2ToxInstance` (multi-instance context).
   - `models/` — `ChatMessage`, fake UIKit models.
   - `tim2tox_dart.dart` is the public barrel.
-- `third_party/c-toxcore` — vendored Tox protocol implementation. CMake guards against double-add with `if(NOT TARGET toxcore_static)`.
+- `third_party/c-toxcore` — vendored Tox protocol implementation, built from the `agentx-icu/c-toxcore` fork (branch `agentx/group-new-with-seed`, upstream v0.2.23-rc.1 + the private `tox_group_new_with_seed` API that rendezvous groups need; an upstream PR is open). CMake guards against double-add with `if(NOT TARGET toxcore_static)`.
 - `auto_tests/` — Dart/Flutter scenario suite. 74 scenario files (73 mode-aware + 1 virtual-clock smoke). Each scenario is a **single file** that runs wall-clock by default and virtual-clock under `RUN_VIRTUAL=1` (it reads `shouldRunVirtual` and gates `VirtualClock.enableEarly/enableForScenario`; the `*Virtual` body helpers fall back to real-time when the clock is off). There are no `*_virtual_test.dart` siblings. Borrows test-case design from `c-toxcore/auto_tests/`. See `auto_tests/README.md` and `auto_tests/VIRTUAL_CLOCK.md`.
 - `test/` — small C++ unit tests (`ToxUtilTest.cpp`, `V2TIMMessageTest.cpp`, `V2TIMStringTest.cpp`), gated by `-DTIM2TOX_BUILD_TESTS=ON`.
 - `example/` — standalone C/C++ usage examples (echo bot, client). Not part of the Flutter integration path.

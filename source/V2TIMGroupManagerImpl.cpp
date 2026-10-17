@@ -1076,6 +1076,8 @@ void V2TIMGroupManagerImpl::GetJoinedGroupList(V2TIMValueCallback<V2TIMGroupInfo
                 // Note: We can access manager_impl_'s private members because V2TIMGroupManagerImpl is a friend class
                 std::lock_guard<std::mutex> lock(manager_impl_->mutex_);
                 for (Tox_Group_Number group_number : group_list) {
+                    // Rendezvous cells are transport only: never a listed / managed group.
+                    if (manager_impl_ && manager_impl_->IsRendezvousGroupNumber(group_number)) continue;
                     // Try to find groupID from manager_impl_'s mapping
                     auto it = manager_impl_->group_number_to_group_id_.find(group_number);
                     if (it != manager_impl_->group_number_to_group_id_.end()) {
@@ -3889,6 +3891,8 @@ std::vector<std::string> V2TIMGroupManagerImpl::GetAllGroupIDsSync() {
             // Generate temporary IDs from group numbers as fallback
             // This is not ideal, but necessary when mappings are empty on startup
             for (Tox_Group_Number group_number : group_list) {
+                // Rendezvous cells are transport only: never a listed / managed group.
+                if (manager_impl_ && manager_impl_->IsRendezvousGroupNumber(group_number)) continue;
                 // Generate a temporary ID - this will be replaced when GetJoinedGroupList is called
                 char temp_id[32];
                 snprintf(temp_id, sizeof(temp_id), "tox_%u", group_number);

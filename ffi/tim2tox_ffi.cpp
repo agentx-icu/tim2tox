@@ -28,6 +28,7 @@
 #include "ToxUtil.h"
 #include "Nat64Synthesis.h"
 #include "V2TIMManagerImpl.h"
+#include "toxcore/tox_private.h"
 #include "V2TIMMessageManagerImpl.h"
 #include "V2TIMLog.h"
 #include "dart_send_message_contract.h"
@@ -473,7 +474,8 @@ inline EventClass Classify(const std::string& line) {
     if (HasPrefix(line, "progress_recv:")) return IsFinalProgress(line, 3) ? kState : kLossy;
     if (HasPrefix(line, "c2c:") || HasPrefix(line, "c2caction:") ||
         HasPrefix(line, "c2cbin:") || HasPrefix(line, "gtext:") ||
-        HasPrefix(line, "gaction:") || HasPrefix(line, "gcustombin:")) {
+        HasPrefix(line, "gaction:") || HasPrefix(line, "gcustombin:") ||
+        HasPrefix(line, "rendezvous_packet:")) {
         return kChat;
     }
     return kState;
@@ -1020,6 +1022,18 @@ ToxManager::FileControlCallback ToxManager::getFileControlCallback() const {
 // Register file/typing callbacks on a given instance's ToxManager.
 // Must be called for each instance (default in tim2tox_ffi_init, test instances in create_test_instance_ex)
 // so that file receive and progress callbacks run with the correct manager_impl for instance routing.
+// Rendezvous event lines are instance-stamped at the source: installed on the
+// manager BEFORE InitSDK so the restore sweep's lines are not lost (the
+// manager buffers a bounded number of lines produced before this runs).
+static void InstallRendezvousEventSink(V2TIMManagerImpl* manager_impl) {
+    if (!manager_impl) return;
+    manager_impl->SetRendezvousEventSink([manager_impl](const std::string& line) {
+        const int64_t instance_id = GetInstanceIdFromManager(manager_impl);
+        if (instance_id == kInstanceIdDestroyed) return;
+        G.simple_listener.enqueue_text_line_for_instance(instance_id, line);
+    });
+}
+
 static void RegisterToxManagerFileCallbacks(V2TIMManagerImpl* manager_impl) {
     if (!manager_impl) return;
     ToxManager* tox_manager = manager_impl->GetToxManager();
@@ -1501,6 +1515,7 @@ static int64_t CreateManagedInstance(const char* init_path,
 
     if (!headless) {
         instance->AddSDKListener(&G.sdk_listener);
+        InstallRendezvousEventSink(instance);
     }
     V2TIM_LOG(kInfo, "[ffi] {}: event=init_sdk status=start", tag);
     bool ok = instance->InitSDK(0, cfg);
@@ -1992,6 +2007,7 @@ int tim2tox_ffi_init_with_path(const char* init_path) {
     }
     V2TIMManagerImpl* manager_impl = GetCurrentInstance();
     manager_impl->AddSDKListener(&G.sdk_listener);
+    InstallRendezvousEventSink(manager_impl);
     bool ok = manager_impl->InitSDK(0, cfg);
     if (!ok) return 0;
     manager_impl->AddSimpleMsgListener(&G.simple_listener);
@@ -3402,6 +3418,68 @@ int tim2tox_ffi_send_group_custom(const char* group_id, const unsigned char* dat
     return msg_id.Empty() ? 0 : 1;
 }
 
+// --- Rendezvous groups (see tim2tox_ffi.h) ------------------------------------
+
+int tim2tox_ffi_rendezvous_set_convention(const char* name_prefix, const char* seed_prefix) {
+    if (!name_prefix || !seed_prefix || !name_prefix[0] || !seed_prefix[0]) return 0;
+    V2TIMManagerImpl* manager_impl = GetCurrentInstance();
+    if (!manager_impl) return 0;
+    manager_impl->SetRendezvousConvention(name_prefix, seed_prefix);
+    return 1;
+}
+
+int tim2tox_ffi_rendezvous_join(const unsigned char* seed32, const char* name, const char* nick) {
+    if (!IsCurrentInstanceInited() || !seed32 || !name || !nick) return 0;
+    V2TIMManagerImpl* manager_impl = GetCurrentInstance();
+    if (!manager_impl) return 0;
+    return manager_impl->RendezvousJoin(seed32, 32, name, nick);
+}
+
+int tim2tox_ffi_rendezvous_leave(const char* chat_id_hex) {
+    if (!IsCurrentInstanceInited() || !chat_id_hex) return 0;
+    V2TIMManagerImpl* manager_impl = GetCurrentInstance();
+    if (!manager_impl) return 0;
+    return manager_impl->RendezvousLeave(chat_id_hex);
+}
+
+int tim2tox_ffi_rendezvous_leave_all(void) {
+    if (!IsCurrentInstanceInited()) return -1;
+    V2TIMManagerImpl* manager_impl = GetCurrentInstance();
+    if (!manager_impl) return -1;
+    return manager_impl->RendezvousLeaveAll();
+}
+
+int tim2tox_ffi_rendezvous_send(const char* chat_id_hex, const char* peer_pk_hex, const unsigned char* data, int len) {
+    // len == 0 (header-only frame) is valid; data may then be null.
+    if (!IsCurrentInstanceInited() || !chat_id_hex || len < 0 || (len > 0 && !data)) return 0;
+    V2TIMManagerImpl* manager_impl = GetCurrentInstance();
+    if (!manager_impl) return 0;
+    return manager_impl->RendezvousSend(chat_id_hex, peer_pk_hex, data, len);
+}
+
+int tim2tox_ffi_rendezvous_peer_count(const char* chat_id_hex) {
+    if (!IsCurrentInstanceInited() || !chat_id_hex) return -1;
+    V2TIMManagerImpl* manager_impl = GetCurrentInstance();
+    if (!manager_impl) return -1;
+    return manager_impl->RendezvousPeerCount(chat_id_hex);
+}
+
+int tim2tox_ffi_rendezvous_drop_count(void) {
+    V2TIMManagerImpl* manager_impl = GetCurrentInstance();
+    if (!manager_impl) return 0;
+    const uint64_t drops = manager_impl->RendezvousDropCount();
+    return drops > static_cast<uint64_t>(INT32_MAX) ? INT32_MAX : static_cast<int>(drops);
+}
+
+int tim2tox_ffi_dht_announce_capable_count(void) {
+    if (!IsCurrentInstanceInited()) return -1;
+    V2TIMManagerImpl* manager_impl = GetCurrentInstance();
+    if (!manager_impl) return -1;
+    const V2TIMManagerImpl::ToxSessionGuard session = manager_impl->AcquireToxSession();
+    if (!session) return -1;
+    return static_cast<int>(tox_dht_get_num_closelist_announce_capable(session.tox()));
+}
+
 namespace {
 
 // Carries the pin, not a raw copy of the handle. ResolveFilePeer used to take
@@ -3672,6 +3750,8 @@ int tim2tox_ffi_iterate_current_instance(int count) {
         }
         if (!manager) return i > 0 ? 1 : 0;
         manager->iterate(0);
+        // Test-mode pumps have no event thread: run the rendezvous planner here.
+        manager_impl->RendezvousTick();
     }
     return 1;
 }
@@ -3732,6 +3812,9 @@ int tim2tox_ffi_iterate_instance(int64_t instance_id) {
     ToxManager* tm = impl->GetToxManager();
     if (!tm || tm->isShuttingDown()) return 0;
     tm->iterate(0);
+    // Rendezvous planner (join -> found timers etc.): in test mode nothing
+    // else drives it, exactly like the signaling timeouts below.
+    impl->RendezvousTick();
     // Iterate-driven signaling timeout dispatch. In test mode the deadline is
     // measured against the virtual clock, so OnInvitationTimeout fires when
     // pumpTestTick has advanced enough virtual ms — no wall-clock dependency.
@@ -3772,6 +3855,8 @@ int tim2tox_ffi_iterate_all_instances(int count) {
                 tox_manager = session.manager_shared();
             }
             if (tox_manager) tox_manager->iterate(0);
+            // Test-mode pumps have no event thread: run the rendezvous planner here.
+            manager->RendezvousTick();
         }
     }
     return static_cast<int>(copy.size());

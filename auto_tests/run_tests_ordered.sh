@@ -562,6 +562,9 @@ PHASE4_GROUP=(
   # Group search by NAME from a node that JOINED (native SearchGroups resolves
   # the live NGC name instead of the EnsureGroupInfoExists placeholder).
   "test/scenarios/scenario_group_search_by_name_test.dart"
+  # Rendezvous cells (people nearby): join-or-found by seed, broadcast and
+  # private payloads, isolation from the V2TIM group list, budgets, leave.
+  "test/scenarios/scenario_rendezvous_group_test.dart"
 )
 
 PHASE5_TOXAV=(
