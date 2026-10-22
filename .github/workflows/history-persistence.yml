@@ -1,0 +1,42 @@
+name: History persistence
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  history-persistence:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: dart
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.41.9'
+          channel: stable
+          cache: true
+      - run: flutter pub get
+      - name: Check schema guard and regression formatting
+        run: dart format --output=none --set-exit-if-changed lib/utils/history_schema_guard.dart test/history_schema_downgrade_test.dart
+      - name: Analyze schema guard and regression
+        run: flutter analyze --no-pub lib/utils/history_schema_guard.dart test/history_schema_downgrade_test.dart
+      - name: Test history and queue persistence
+        run: >-
+          flutter test --no-pub
+          test/history_schema_downgrade_test.dart
+          test/history_write_failure_signal_test.dart
+          test/offline_message_queue_persistence_test.dart
+          test/tim2tox_failed_message_persistence_test.dart
+          --reporter expanded

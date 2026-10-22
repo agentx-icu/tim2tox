@@ -22,3 +22,10 @@ Regression tests: `dart/test/history_schema_downgrade_test.dart`, plus the
 integrator's history concurrency and load-resilience suites. The policy is shared
 Dart and covers all desktop and mobile hosts. It does not replace store ownership
 or protect against an unrelated process modifying a file concurrently.
+
+The `History persistence` GitHub Actions workflow runs the schema regression,
+write-failure signaling, offline queue and failed-message persistence suites on
+pull requests and master pushes. It uses a clean library checkout and public
+Dart dependencies; neither integrator overrides nor a native FFI binary are
+required. Formatting and analysis cover the schema guard and its regression
+file. This storage gate does not certify SDK/native or installed-app behavior.

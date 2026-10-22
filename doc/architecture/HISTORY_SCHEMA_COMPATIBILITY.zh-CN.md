@@ -15,3 +15,8 @@
 回归测试为 `dart/test/history_schema_downgrade_test.dart`，并结合接入应用的历史
 并发和读取恢复测试。此共享 Dart 策略覆盖桌面和移动端；它不能代替存储独占，
 也不保护无关进程并发修改同一文件。
+
+GitHub Actions 的 `History persistence` 工作流在 PR 与 master push 时运行
+schema 回归、写入失败通知、离线队列与失败消息持久化测试。它使用干净的库检出和
+公开 Dart 依赖，不依赖集成方 overrides 或原生 FFI 二进制；格式和静态分析覆盖
+schema guard 与其回归文件。该存储检查不代表 SDK/原生集成或安装包行为已验证。
