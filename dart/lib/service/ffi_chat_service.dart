@@ -3579,6 +3579,8 @@ class FfiChatService {
           _lastByPeer[conversationId] = lastMsg;
         }
       }
+    } on HistorySchemaNewerThanAppException {
+      rethrow;
     } catch (e) {
       // Silently handle errors
     }

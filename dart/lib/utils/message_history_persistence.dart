@@ -5,6 +5,8 @@
 ///
 /// Storage location: `<appDir>/chat_history/<conversationId>.json`
 /// Data format: JSON with conversationId and messages array
+import 'history_schema_guard.dart';
+export 'history_schema_guard.dart';
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
@@ -171,6 +173,9 @@ class MessageHistoryPersistence {
         // Fences complete normally; defensive only.
       }
       if (barrier != null) await barrier;
+      final primary = await _getHistoryFile(normalizedId);
+      await requireSupportedHistorySchema(primary, _historyFormatVersion);
+      await requireSupportedHistorySchema(File('${primary.path}.bak'), _historyFormatVersion);
       return await body();
     } finally {
       // The fence only SERIALIZES (the next operation ignores this one's
@@ -970,6 +975,9 @@ class MessageHistoryPersistence {
   Future<({bool ok, bool destHoldsOnlyOurs, String? destDigest})>
       _mergeHistoryFiles(File from, File into,
           {bool destRowsAreOurs = false}) async {
+    for (final file in [from, into, File('${into.path}.bak')]) {
+      await requireSupportedHistorySchema(file, _historyFormatVersion);
+    }
     // Rows this session has deleted must not come back through the merge: the
     // destination copy made by an earlier, partially failed pass still holds
     // them, and dedupe would keep it (codex 2026-09-26).
@@ -2092,7 +2100,13 @@ class MessageHistoryPersistence {
     // C1: the lock slot is claimed synchronously inside [_serialized], so
     // concurrent callers serialize deterministically.
     return _serialized(normalizedId,
-        () => _writeMainFile(normalizedId, messages, token, deleteSeqAtStart));
+        () => _writeMainFile(normalizedId, messages, token, deleteSeqAtStart))
+        .catchError((Object error, StackTrace stack) {
+      if (error is! HistorySchemaNewerThanAppException) {
+        _armSaveRetry(normalizedId, error, stack);
+      }
+      Error.throwWithStackTrace(error, stack);
+    });
   }
 
   bool _emptyIsADelete(String normalizedId) =>
@@ -2104,84 +2118,73 @@ class MessageHistoryPersistence {
     // Cleared (or the whole store reset) while this save waited: the rows it
     // carries were discarded on purpose; writing them would resurrect them.
     if (_isStale(normalizedId, token)) return;
-    try {
-      final file = await _getHistoryFile(normalizedId);
-      final backupFile = await _getBackupFile(normalizedId);
-      final tempFile = await _getTempFile(normalizedId);
+    final file = await _getHistoryFile(normalizedId);
+    final backupFile = await _getBackupFile(normalizedId);
+    final tempFile = await _getTempFile(normalizedId);
 
-      // Create backup of existing file if it exists
-      if (await file.exists()) {
-        try {
-          await file.copy(backupFile.path);
-        } catch (e) {
-          // Backup failed, but continue with save
-        }
-      }
-
-      // Prepare data.
-      //
-      // P1-15: rewrite absolute filePaths under the well-known media-storage
-      // roots into placeholders so a profile that moves between devices (or
-      // re-installs that change the AppSupport path) doesn't end up with
-      // dangling paths in its history. Unknown / outside-root paths are
-      // left as-is to keep the change strictly additive.
-      final storageRoots = await _resolveStorageRoots();
-      // Overflow rows first: if this throws, the main file below is NOT
-      // rewritten, so the rows it still holds are not lost.
-      await _drainPendingArchive(normalizedId, storageRoots);
-      final jsonList = messages.map((msg) {
-        final m = msg.toJson();
-        final fp = m['filePath'];
-        if (fp is String && fp.isNotEmpty) {
-          m['filePath'] = _relativizePath(fp, storageRoots);
-        }
-        return m;
-      }).toList();
-      final data = {
-        'conversationId': normalizedId,
-        // P1-15: bump format to 2 to signal that filePath may contain
-        // placeholder tokens. v1 readers will treat them as opaque strings;
-        // v2 readers rehydrate via [_resolvePath].
-        'version': _historyFormatVersion,
-        'lastViewTimestamp': _lastViewTimestampById[normalizedId] ?? 0,
-        'messages': jsonList,
-      };
-      final jsonString = jsonEncode(data);
-
-      // C2: write→fsync→close→rename for crash durability. Tox is P2P, no
-      // server can backfill, so a half-flushed page-cache buffer at the
-      // moment of a kernel/process crash means permanent data loss.
-      final raf = await tempFile.open(mode: FileMode.write);
+    // Create backup of existing file if it exists
+    if (await file.exists()) {
       try {
-        await raf.writeString(jsonString);
-        await raf.flush();
-      } finally {
-        await raf.close();
+        await file.copy(backupFile.path);
+      } catch (e) {
+        // Backup failed, but continue with save
       }
-      await _renameWithRetry(tempFile, file.path);
-      // Deletes that happened before this save was called are on disk now.
-      _clearTombstonesUpTo(normalizedId, deleteSeqAtStart);
-
-      // X10: delete the backup we just used as a safety net.
-      try {
-        if (await backupFile.exists()) {
-          await backupFile.delete();
-        }
-      } catch (_) {
-        // Best-effort cleanup; leave the stale .bak for the 7-day sweep.
-      }
-      _saveRetryAttempts.remove(normalizedId);
-      _saveRetryTimers.remove(normalizedId)?.cancel();
-    } catch (e, st) {
-      // GH-7: this used to settle only the fence completer and return
-      // normally, so every caller's failure handling (updateFilePathSafely's
-      // rollback, the hook's disk-quota catch) was dead and a failed write was
-      // silent. Propagate it, and keep the in-memory state marked dirty so a
-      // bounded retry re-attempts the write without waiting for the next
-      // message.
-      _armSaveRetry(normalizedId, e, st);
-      rethrow;
     }
+
+    // Prepare data.
+    //
+    // P1-15: rewrite absolute filePaths under the well-known media-storage
+    // roots into placeholders so a profile that moves between devices (or
+    // re-installs that change the AppSupport path) doesn't end up with
+    // dangling paths in its history. Unknown / outside-root paths are
+    // left as-is to keep the change strictly additive.
+    final storageRoots = await _resolveStorageRoots();
+    // Overflow rows first: if this throws, the main file below is NOT
+    // rewritten, so the rows it still holds are not lost.
+    await _drainPendingArchive(normalizedId, storageRoots);
+    final jsonList = messages.map((msg) {
+      final m = msg.toJson();
+      final fp = m['filePath'];
+      if (fp is String && fp.isNotEmpty) {
+        m['filePath'] = _relativizePath(fp, storageRoots);
+      }
+      return m;
+    }).toList();
+    final data = {
+      'conversationId': normalizedId,
+      // P1-15: bump format to 2 to signal that filePath may contain
+      // placeholder tokens. v1 readers will treat them as opaque strings;
+      // v2 readers rehydrate via [_resolvePath].
+      'version': _historyFormatVersion,
+      'lastViewTimestamp': _lastViewTimestampById[normalizedId] ?? 0,
+      'messages': jsonList,
+    };
+    final jsonString = jsonEncode(data);
+
+    // C2: write→fsync→close→rename for crash durability. Tox is P2P, no
+    // server can backfill, so a half-flushed page-cache buffer at the
+    // moment of a kernel/process crash means permanent data loss.
+    final raf = await tempFile.open(mode: FileMode.write);
+    try {
+      await raf.writeString(jsonString);
+      await raf.flush();
+    } finally {
+      await raf.close();
+    }
+    await _renameWithRetry(tempFile, file.path);
+    // Deletes that happened before this save was called are on disk now.
+    _clearTombstonesUpTo(normalizedId, deleteSeqAtStart);
+
+    // X10: delete the backup we just used as a safety net.
+    try {
+      if (await backupFile.exists()) {
+        await backupFile.delete();
+      }
+    } catch (_) {
+      // Best-effort cleanup; leave the stale .bak for the 7-day sweep.
+    }
+    _saveRetryAttempts.remove(normalizedId);
+    _saveRetryTimers.remove(normalizedId)?.cancel();
   }
 
   /// Re-save [normalizedId]'s cached list (debounce timer, retry timer,
@@ -2347,8 +2350,7 @@ class MessageHistoryPersistence {
         // model and saving it back would silently strip what we don't know.
         final fileVersion = (decoded['version'] as int?) ?? 1;
         if (fileVersion > _historyFormatVersion) {
-          await _quarantine(file, 'newer-v$fileVersion');
-          return [];
+          throw HistorySchemaNewerThanAppException(fileVersion, _historyFormatVersion);
         }
         // New format with metadata
         actualId = decoded['conversationId'] as String?;
@@ -2429,6 +2431,8 @@ class MessageHistoryPersistence {
                 ((decoded['version'] as int?) ?? 1) < 2),
         skippedRows: skippedRows,
       );
+    } on HistorySchemaNewerThanAppException {
+      rethrow;
     } catch (e) {
       // Try to load from backup on any error
       return await _loadFromBackup(normalizedId, token,
@@ -2772,6 +2776,8 @@ class MessageHistoryPersistence {
           result[entry.key] = entry.value;
         }
       }
+    } on HistorySchemaNewerThanAppException {
+      rethrow;
     } catch (e) {
       // Return whatever we've loaded so far
     }
@@ -2852,6 +2858,8 @@ class MessageHistoryPersistence {
       // key for C2C conversations the user has sent into.
       final conversationKey = ConversationIdUtils.normalize(sanitizedId);
       return MapEntry(conversationKey, messages);
+    } on HistorySchemaNewerThanAppException {
+      rethrow;
     } catch (_) {
       return null;
     }
