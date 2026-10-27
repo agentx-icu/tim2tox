@@ -38,7 +38,8 @@ void main() {
     late TestScenario scenario;
     late TestNode alice;
     late TestNode bob;
-    late RendezvousTransport raw; // calls, routed per instance with runWithInstance
+    late RendezvousTransport
+        raw; // calls, routed per instance with runWithInstance
     late Stream<RendezvousEvent> events; // from the shared polling service
     final received = <RendezvousEvent>[];
     StreamSubscription<RendezvousEvent>? sub;
@@ -68,7 +69,8 @@ void main() {
             timeout: const Duration(seconds: 15)),
       ]);
       raw = RendezvousTransport(ffi_lib.Tim2ToxFfi.open());
-      final platform = TencentCloudChatSdkPlatform.instance as Tim2ToxSdkPlatform;
+      final platform =
+          TencentCloudChatSdkPlatform.instance as Tim2ToxSdkPlatform;
       events = platform.ffiService.rendezvous.events;
       sub = events.listen(received.add);
     });
@@ -81,25 +83,29 @@ void main() {
 
     Future<void> pumpUntil(bool Function() condition,
         {required String what,
-        int maxTicks = 120,
+        Duration timeout = const Duration(seconds: 120),
         int advanceMs = 1000}) async {
-      for (var i = 0; i < maxTicks && !condition(); i++) {
-        await pumpTestTick(scenario,
-            advanceMs: advanceMs, iterationsPerInstance: 20);
-      }
-      expect(condition(), isTrue, reason: 'timed out waiting for $what');
+      // A pump advances native time only in virtual mode. In wall-clock mode
+      // its short socket yield does not pay for the 30-second join-to-found
+      // timer, so a fixed tick count would expire before founding is possible.
+      await waitUntilWithVirtualPump(scenario, condition,
+          timeout: timeout,
+          description: what,
+          advanceMs: advanceMs,
+          iterationsPerInstance: 20);
     }
 
-    Iterable<T> of<T extends RendezvousEvent>(TestNode node) =>
-        received.whereType<T>().where((e) => e.instanceId == node.testInstanceHandle);
+    Iterable<T> of<T extends RendezvousEvent>(TestNode node) => received
+        .whereType<T>()
+        .where((e) => e.instanceId == node.testInstanceHandle);
 
     test('join-or-found, payloads, isolation, budget, leave', () async {
       final seed = _seed();
 
       // Alice: nobody is in the cell, so the join turns into a found after
       // kJoinToFoundMs (30 s) without any peer.
-      final aliceRc = alice.runWithInstance(
-          () => raw.join(seed, name: _name, nick: 'a1b2c3d4'));
+      final aliceRc = alice
+          .runWithInstance(() => raw.join(seed, name: _name, nick: 'a1b2c3d4'));
       expect(aliceRc, 1, reason: 'alice join accepted');
       expect(
           alice.runWithInstance(
@@ -107,21 +113,25 @@ void main() {
           2,
           reason: 'second request for the same cell reports already present');
       await pumpUntil(() => of<RendezvousJoined>(alice).isNotEmpty,
-          what: 'alice joined (founded) the cell', maxTicks: 60);
+          what: 'alice joined (founded) the cell',
+          timeout: const Duration(seconds: 60));
       final aliceJoined = of<RendezvousJoined>(alice).first;
       expect(aliceJoined.founded, isTrue);
       final chatId = aliceJoined.chatIdHex;
       expect(chatId.length, 64);
 
       // Bob: same seed -> same chat id -> joins Alice's group via the DHT.
-      expect(bob.runWithInstance(() => raw.join(seed, name: _name, nick: 'e5f6a7b8')), 1);
+      expect(
+          bob.runWithInstance(
+              () => raw.join(seed, name: _name, nick: 'e5f6a7b8')),
+          1);
       await pumpUntil(
           () =>
               of<RendezvousJoined>(bob).any((e) => e.chatIdHex == chatId) &&
               of<RendezvousPeer>(alice).any((e) => e.joined) &&
               of<RendezvousPeer>(bob).any((e) => e.joined),
           what: 'bob joined and both saw a peer',
-          maxTicks: 90);
+          timeout: const Duration(seconds: 90));
       expect(of<RendezvousJoined>(bob).first.founded, isFalse,
           reason: 'bob must have joined, not founded a second group');
       final alicePk = of<RendezvousPeer>(bob).first.peerPkHex;
@@ -142,7 +152,8 @@ void main() {
       final hello = Uint8List.fromList(utf8.encode('{"t":"presence","v":1}'));
       expect(bob.runWithInstance(() => raw.send(chatId, hello)), 1);
       await pumpUntil(() => of<RendezvousPacket>(alice).isNotEmpty,
-          what: 'alice received bob broadcast', maxTicks: 30);
+          what: 'alice received bob broadcast',
+          timeout: const Duration(seconds: 30));
       final pkt = of<RendezvousPacket>(alice).first;
       expect(pkt.isPrivate, isFalse);
       expect(pkt.peerPkHex, bobPk);
@@ -150,9 +161,13 @@ void main() {
 
       // Alice sends a private packet to Bob only.
       final intent = Uint8List.fromList(utf8.encode('{"t":"intent","v":1}'));
-      expect(alice.runWithInstance(() => raw.send(chatId, intent, peerPkHex: bobPk)), 1);
+      expect(
+          alice.runWithInstance(
+              () => raw.send(chatId, intent, peerPkHex: bobPk)),
+          1);
       await pumpUntil(() => of<RendezvousPacket>(bob).isNotEmpty,
-          what: 'bob received alice private packet', maxTicks: 30);
+          what: 'bob received alice private packet',
+          timeout: const Duration(seconds: 30));
       final priv = of<RendezvousPacket>(bob).first;
       expect(priv.isPrivate, isTrue);
       expect(priv.peerPkHex, alicePk);
@@ -161,7 +176,10 @@ void main() {
           reason: 'a private packet never echoes to its sender');
 
       // Error codes of send.
-      expect(alice.runWithInstance(() => raw.send(chatId, intent, peerPkHex: 'f' * 64)), -2);
+      expect(
+          alice.runWithInstance(
+              () => raw.send(chatId, intent, peerPkHex: 'f' * 64)),
+          -2);
       expect(alice.runWithInstance(() => raw.send('0' * 64, intent)), -3);
       expect(
           alice.runWithInstance(() => raw.send(
@@ -191,15 +209,17 @@ void main() {
               of<RendezvousLeft>(bob).any((e) => e.reason == 'left') &&
               of<RendezvousPeer>(alice).any((e) => !e.joined),
           what: 'bob left and alice saw the exit',
-          maxTicks: 60);
+          timeout: const Duration(seconds: 60));
       expect(bob.runWithInstance(() => raw.peerCount(chatId)), -1);
       expect(bob.runWithInstance(() => raw.leave(chatId)), isFalse);
 
       // Leave-all on Alice leaves her founded cell too.
       expect(alice.runWithInstance(() => raw.leaveAll()), 1);
-      await pumpUntil(() => of<RendezvousLeft>(alice).any((e) => e.reason == 'left'),
-          what: 'alice left her cell', maxTicks: 30);
+      await pumpUntil(
+          () => of<RendezvousLeft>(alice).any((e) => e.reason == 'left'),
+          what: 'alice left her cell',
+          timeout: const Duration(seconds: 30));
       expect(alice.runWithInstance(() => raw.peerCount(chatId)), -1);
-    });
+    }, timeout: const Timeout(Duration(seconds: 170)));
   });
 }
