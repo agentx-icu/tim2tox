@@ -2575,16 +2575,33 @@ class MessageHistoryPersistence {
       if (tombstoned > 0) _scheduleDebouncedSave(targetId).ignore();
       return List<ChatMessage>.from(deduplicatedList);
     }
-    final liveIds = <String>{for (final m in live) ...identitiesOf(m)};
-    final fileIds = <String>{
-      for (final m in deduplicatedList) ...identitiesOf(m),
+    // Like appendHistory / _dedupeByIdentity, aliases only identify a row
+    // within its direction. A shared multi-node harness can hold the author's
+    // self row and a peer's inbound copy with the same cross-peer alias.
+    final livePrimaryIds = <String>{
+      for (final m in live) identitiesOf(m).first,
     };
+    final filePrimaryIds = <String>{
+      for (final m in deduplicatedList) identitiesOf(m).first,
+    };
+    final liveIds = <String>{
+      for (final m in live)
+        for (final id in identitiesOf(m)) '${m.isSelf}|$id',
+    };
+    final fileIds = <String>{
+      for (final m in deduplicatedList)
+        for (final id in identitiesOf(m)) '${m.isSelf}|$id',
+    };
+    bool represented(
+            ChatMessage message, Set<String> primaryIds, Set<String> ids) =>
+        primaryIds.contains(identitiesOf(message).first) ||
+        identitiesOf(message).any((id) => ids.contains('${message.isSelf}|$id'));
     // Tombstoned rows were already filtered out above.
     final fromFileOnly = deduplicatedList
-        .where((m) => !identitiesOf(m).any(liveIds.contains))
+        .where((m) => !represented(m, livePrimaryIds, liveIds))
         .toList();
     final liveOnly =
-        live.any((m) => !identitiesOf(m).any(fileIds.contains));
+        live.any((m) => !represented(m, filePrimaryIds, fileIds));
     if (fromFileOnly.isNotEmpty) {
       final merged = <ChatMessage>[...fromFileOnly, ...live];
       sortChatMessagesChronologically(merged);

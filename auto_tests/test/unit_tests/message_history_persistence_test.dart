@@ -739,6 +739,104 @@ void main() {
     });
   });
 
+  group('Reload while live group traffic arrives', () {
+    const conversationId = 'tox_group_0';
+    const alias = 'gmid:tox_group_0|group-sender|42';
+
+    ChatMessage groupRow(String id,
+            {required bool isSelf, bool isRead = false}) =>
+        ChatMessage(
+          text: 'restart tick probe',
+          fromUserId: isSelf ? 'author-account' : 'author-group-key',
+          isSelf: isSelf,
+          isRead: isRead,
+          timestamp: DateTime.fromMillisecondsSinceEpoch(1000),
+          groupId: conversationId,
+          msgID: id,
+          altMsgIds: const [alias],
+        );
+
+    for (final diskIsSelf in [true, false]) {
+      test(
+          'shared group alias keeps opposite directions (disk self=$diskIsSelf)',
+          () async {
+        final persistence =
+            MessageHistoryPersistence(historyDirectory: tempDir.path);
+        addTearDown(persistence.dispose);
+        await persistence.saveHistory(conversationId,
+            [groupRow('disk-row', isSelf: diskIsSelf, isRead: true)]);
+
+        // The load claims the disk fence synchronously. A native callback
+        // arriving across its awaits materializes the peer's copy in memory.
+        final loading = persistence.loadHistory(conversationId);
+        persistence
+            .appendHistory(
+                conversationId, groupRow('live-row', isSelf: !diskIsSelf))
+            .ignore();
+        final reloaded = await loading;
+
+        expect(reloaded, hasLength(2),
+            reason: 'a peer copy must not replace the author row sharing its '
+                'cross-peer alias');
+        final authored = reloaded.singleWhere((m) => m.msgID == 'disk-row');
+        expect(authored.isSelf, diskIsSelf);
+        expect(authored.isRead, isTrue);
+        expect(authored.altMsgIds, contains(alias));
+        final live = reloaded.singleWhere((m) => m.msgID == 'live-row');
+        expect(live.isSelf, !diskIsSelf);
+        expect(live.isRead, isFalse);
+
+        await persistence.flushPendingSaves();
+        final fresh = MessageHistoryPersistence(historyDirectory: tempDir.path);
+        addTearDown(fresh.dispose);
+        final durable = await fresh.loadHistory(conversationId);
+        expect(durable.map((m) => m.msgID),
+            unorderedEquals(['disk-row', 'live-row']));
+        expect(
+            durable.singleWhere((m) => m.msgID == 'disk-row').isRead, isTrue);
+      });
+    }
+
+    test('same-direction alias still keeps the newer live copy', () async {
+      final persistence =
+          MessageHistoryPersistence(historyDirectory: tempDir.path);
+      addTearDown(persistence.dispose);
+      await persistence
+          .saveHistory(conversationId, [groupRow('disk-row', isSelf: false)]);
+
+      final loading = persistence.loadHistory(conversationId);
+      persistence
+          .appendHistory(
+              conversationId, groupRow('live-row', isSelf: false, isRead: true))
+          .ignore();
+      final reloaded = await loading;
+
+      expect(reloaded, hasLength(1));
+      expect(reloaded.single.msgID, 'live-row');
+      expect(reloaded.single.isRead, isTrue);
+    });
+
+    test('same primary ID still matches across directions', () async {
+      final persistence =
+          MessageHistoryPersistence(historyDirectory: tempDir.path);
+      addTearDown(persistence.dispose);
+      await persistence
+          .saveHistory(conversationId, [groupRow('shared-row', isSelf: true)]);
+
+      final loading = persistence.loadHistory(conversationId);
+      persistence
+          .appendHistory(conversationId,
+              groupRow('shared-row', isSelf: false, isRead: true))
+          .ignore();
+      final reloaded = await loading;
+
+      expect(reloaded, hasLength(1));
+      expect(reloaded.single.msgID, 'shared-row');
+      expect(reloaded.single.isSelf, isFalse);
+      expect(reloaded.single.isRead, isTrue);
+    });
+  });
+
   group('S17/S18: cloudCustomData survives a cross-path merge', () {
     // toxee double-writes an outbound send through both hybrid paths; the two
     // copies meet in _mergeMessages and only ONE carries the sender-side
