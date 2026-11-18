@@ -10,6 +10,9 @@
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:tencent_cloud_chat_sdk/enum/message_elem_type.dart';
+import 'package:tencent_cloud_chat_sdk/models/v2_tim_message.dart';
+import 'package:tencent_cloud_chat_sdk/models/v2_tim_text_elem.dart';
 import 'package:test/test.dart';
 import 'package:tim2tox_dart/models/chat_message.dart';
 import 'package:tim2tox_dart/service/ffi_chat_service.dart';
@@ -84,7 +87,8 @@ void main() {
 
   group('group event header', () {
     test('parses the pseudo id segment', () {
-      final parsed = FfiChatService.parseGroupHeader('$_groupId|$_authorKey|m42');
+      final parsed =
+          FfiChatService.parseGroupHeader('$_groupId|$_authorKey|m42');
       expect(parsed, isNotNull);
       expect(parsed!.groupId, _groupId);
       expect(parsed.sender, _authorKey);
@@ -153,28 +157,32 @@ void main() {
     expect(reloadedRow.msgID, row.msgID);
   });
 
-  test('the duplicate path merges the alias onto an already-saved row',
-      () async {
-    // This is the PRODUCT's normal path: in hybrid mode the native advanced
-    // listener persists the row first (with no alias — MessageConverter has
-    // none to give), and the polled copy that carries the pseudo id arrives
-    // second and lands in the duplicate branch. If that branch did not merge,
-    // the row would stay alias-less forever and every later receipt would be
-    // dropped as unresolved — working in tests, dead in the app.
-    expect(
-      service.ingestInboundGroupText(
-        gid: _groupId,
-        from: _authorKey,
-        text: 'delivered twice',
-      ),
-      isTrue,
+  test('the poll copy adds the alias to an already-saved native row', () async {
+    const nativeId = 'msg_0_1_1';
+    const text = 'delivered twice';
+    final sentAt = DateTime.now().millisecondsSinceEpoch;
+    // Exercise the advanced listener's history path with a legacy callback
+    // that has no group identity. The poll copy can supply the missing id.
+    BinaryReplacementHistoryHook.initialize(persistence, _readerKey);
+    final nativeMessage = V2TimMessage(
+      msgID: nativeId,
+      groupID: _groupId,
+      sender: _authorKey,
+      timestamp: sentAt ~/ 1000,
+      isSelf: false,
+      elemType: MessageElemType.V2TIM_ELEM_TYPE_TEXT,
+      textElem: V2TimTextElem(text: text),
     );
-    expect(service.getHistory(_groupId).single.altMsgIds, isEmpty);
+    await BinaryReplacementHistoryHook.saveMessage(nativeMessage);
+    final saved = service.getHistory(_groupId).single;
+    expect(saved.msgID, nativeId);
+    expect(saved.altMsgIds, isEmpty);
 
     service.ingestInboundGroupText(
       gid: _groupId,
       from: _authorKey,
-      text: 'delivered twice',
+      text: text,
+      epochMs: sentAt,
       pseudoMsgId: 9001,
     );
 
@@ -185,19 +193,53 @@ void main() {
     );
     final rows = service.getHistory(_groupId);
     expect(rows, hasLength(1), reason: 'the duplicate must not add a row');
-    expect(rows.single.altMsgIds, contains(alias));
+    expect(rows.single.msgID, nativeId);
+    final mergedIds = List<String>.of(rows.single.altMsgIds);
+    expect(mergedIds, hasLength(2));
+    expect(mergedIds, contains(alias));
 
-    // Idempotent: a third delivery of the same message must not duplicate the
-    // alias (and must not re-receipt).
+    // Replaying the same wire identity keeps the row and its aliases intact.
     service.ingestInboundGroupText(
       gid: _groupId,
       from: _authorKey,
-      text: 'delivered twice',
+      text: text,
+      epochMs: sentAt,
       pseudoMsgId: 9001,
     );
-    expect(service.getHistory(_groupId).single.altMsgIds, [alias]);
+    expect(service.getHistory(_groupId).single.altMsgIds, mergedIds);
     // The merge persists through an unawaited save; let it land.
     await waitForHistoryFile((contents) => contents.contains(alias));
+  });
+
+  test('identical text on two poll deliveries keeps both rows', () async {
+    const text = 'same text';
+    final sentAt = DateTime.now().millisecondsSinceEpoch;
+    service.ingestInboundGroupText(
+      gid: _groupId,
+      from: _authorKey,
+      text: text,
+      epochMs: sentAt,
+    );
+    service.ingestInboundGroupText(
+      gid: _groupId,
+      from: _authorKey,
+      text: text,
+      epochMs: sentAt,
+      pseudoMsgId: 9001,
+    );
+
+    final rows = service.getHistory(_groupId);
+    expect(rows, hasLength(2));
+    expect(rows.first.msgID, isNot(rows.last.msgID));
+    expect(rows.first.altMsgIds, isEmpty);
+    expect(rows.last.altMsgIds, [
+      FfiChatService.groupMessageAlias(
+        groupId: _groupId,
+        senderPk: _authorKey,
+        pseudoMsgId: 9001,
+      )
+    ]);
+    await persistence.flushPendingSaves();
   });
 
   test('a row without a pseudo id keeps the legacy shape', () {
