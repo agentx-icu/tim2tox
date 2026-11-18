@@ -471,6 +471,7 @@ inline bool IsFinalProgress(const std::string& line, int done_field) {
 inline EventClass Classify(const std::string& line) {
     if (HasPrefix(line, "typing:")) return kLossy;
     if (HasPrefix(line, "progress_send:")) return IsFinalProgress(line, 2) ? kState : kLossy;
+    if (HasPrefix(line, "file_send_progress:")) return IsFinalProgress(line, 3) ? kState : kLossy;
     if (HasPrefix(line, "progress_recv:")) return IsFinalProgress(line, 3) ? kState : kLossy;
     if (HasPrefix(line, "c2c:") || HasPrefix(line, "c2caction:") ||
         HasPrefix(line, "c2cbin:") || HasPrefix(line, "gtext:") ||
@@ -813,6 +814,7 @@ struct SendContext {
     std::unique_ptr<FILE, FileCloser> file{nullptr};
     std::vector<uint8_t> memory;
     uint64_t size = 0;
+    int64_t transfer_id = 0;
     std::mutex read_mutex;
 
     size_t Read(uint64_t position, uint8_t* output, size_t length) {
@@ -866,6 +868,36 @@ static std::shared_ptr<SendContext> FindSendContext(int64_t instance_id,
                                                     : context_it->second;
 }
 
+static void EnqueueSendProgress(Tox* tox, int64_t instance_id,
+                                uint32_t friend_number,
+                                const SendContext& context, uint64_t sent) {
+    if (context.transfer_id != 0) {
+        G.simple_listener.enqueue_text_line_for_instance(
+            instance_id, "file_send_progress:" + std::to_string(instance_id) +
+                             ":" + std::to_string(context.transfer_id) +
+                             ":" + std::to_string(sent) +
+                             ":" + std::to_string(context.size));
+        return;
+    }
+    if (!context.file) return;  // Avatars have no outgoing chat row.
+
+    // Keep the event shape for clients of the legacy ABI.
+    uint8_t pubkey[TOX_PUBLIC_KEY_SIZE];
+    if (!tox_friend_get_public_key(tox, friend_number, pubkey, nullptr)) return;
+    const std::string uid = ToxUtil::tox_bytes_to_hex(pubkey, sizeof(pubkey));
+    G.simple_listener.enqueue_text_line("progress_send:" + uid + ":" +
+                                       std::to_string(sent) + ":" +
+                                       std::to_string(context.size));
+}
+
+static void EnqueueTrackedSendFailure(int64_t instance_id,
+                                      const std::shared_ptr<SendContext>& context) {
+    if (!context || context->transfer_id == 0) return;
+    G.simple_listener.enqueue_text_line_for_instance(
+        instance_id, "file_send_failed:" + std::to_string(instance_id) +
+                         ":" + std::to_string(context->transfer_id));
+}
+
 // Closes an unfinished receive, deletes its data file and its
 // ".<name>.t2t-receiving" marker, and forgets the context (checklist M5: a failed or
 // cancelled receive must not leave a partial file filling the disk). Returns
@@ -880,21 +912,27 @@ static bool DiscardReceive(int64_t instance_id, uint64_t key,
         if (instance_it == G.recv_files.end()) return false;
         auto it = instance_it->second.find(key);
         if (it == instance_it->second.end()) return false;
-        if (it->second.fp) fclose(it->second.fp);
-        path = it->second.path;
+        if (it->second.fp) {
+            fclose(it->second.fp);
+            path = it->second.path;
+        }
         if (sender_hex_out) *sender_hex_out = it->second.sender_hex;
         if (kind_out) *kind_out = it->second.kind;
         instance_it->second.erase(it);
+        if (instance_it->second.empty()) G.recv_files.erase(instance_it);
     }
-    tim2tox::file_io::RemoveUtf8(path);
-    tim2tox::file_io::RemoveUtf8(tim2tox::file_io::ReceiveMarkerPath(path));
+    // An unopened offer has no file and can reuse a previous receive's name.
+    if (!path.empty()) {
+        tim2tox::file_io::RemoveUtf8(path);
+        tim2tox::file_io::RemoveUtf8(tim2tox::file_io::ReceiveMarkerPath(path));
+    }
     return true;
 }
 
 // Reports a receive that failed locally to Dart. Routed by instance id
 // (event_line_parser kRoutedPrefixes). Format:
 //   file_recv_failed:<instance_id>:<sender_hex>:<file_number>:<reason>
-// reason: "no_space" (ENOSPC / EDQUOT) or "io".
+// reason: "no_space" (ENOSPC / EDQUOT), "io", or "disconnected".
 static void EnqueueReceiveFailed(int64_t instance_id, const std::string& sender_hex,
                                  uint32_t file_number, const char* reason) {
     std::string line = "file_recv_failed:" + std::to_string(instance_id) + ":" +
@@ -971,6 +1009,52 @@ static void EraseSendContextsForInstance(int64_t instance_id) {
     G.send_files.erase(instance_id);
 }
 
+static void FailSendContextsForPeer(int64_t instance_id, uint32_t friend_number) {
+    std::vector<std::shared_ptr<SendContext>> interrupted;
+    {
+        std::lock_guard<std::mutex> lock(G.send_mtx);
+        const auto instance = G.send_files.find(instance_id);
+        if (instance == G.send_files.end()) return;
+        auto& transfers = instance->second;
+        for (auto it = transfers.begin(); it != transfers.end();) {
+            if ((it->first >> 32) == friend_number) {
+                interrupted.push_back(std::move(it->second));
+                it = transfers.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        if (transfers.empty()) G.send_files.erase(instance);
+    }
+    for (const auto& context : interrupted) {
+        EnqueueTrackedSendFailure(instance_id, context);
+    }
+}
+
+static void FailReceiveContextsForPeer(int64_t instance_id,
+                                       uint32_t friend_number) {
+    std::vector<uint64_t> interrupted;
+    {
+        std::lock_guard<std::mutex> lock(G.send_mtx);
+        const auto instance = G.recv_files.find(instance_id);
+        if (instance == G.recv_files.end()) return;
+        for (const auto& transfer : instance->second) {
+            if ((transfer.first >> 32) == friend_number) {
+                interrupted.push_back(transfer.first);
+            }
+        }
+    }
+    for (const uint64_t key : interrupted) {
+        std::string sender_hex;
+        uint32_t kind = 0;
+        if (DiscardReceive(instance_id, key, &sender_hex, &kind) &&
+            kind != TOX_FILE_KIND_AVATAR) {
+            EnqueueReceiveFailed(instance_id, sender_hex,
+                                 static_cast<uint32_t>(key), "disconnected");
+        }
+    }
+}
+
 static void EraseRecvContextsForInstance(int64_t instance_id) {
     std::lock_guard<std::mutex> lock(G.send_mtx);
     const auto instance_it = G.recv_files.find(instance_id);
@@ -1038,6 +1122,14 @@ static void RegisterToxManagerFileCallbacks(V2TIMManagerImpl* manager_impl) {
     if (!manager_impl) return;
     ToxManager* tox_manager = manager_impl->GetToxManager();
     if (!tox_manager) return;
+    tox_manager->setFilePeerDisconnectedCallback([manager_impl](uint32_t friend_number) {
+        // toxcore clears the peer's file slots without file-control callbacks.
+        const int64_t instance_id = GetInstanceIdFromManager(manager_impl);
+        if (instance_id != kInstanceIdDestroyed) {
+            FailSendContextsForPeer(instance_id, friend_number);
+            FailReceiveContextsForPeer(instance_id, friend_number);
+        }
+    });
     tox_manager->setFriendTypingCallback([manager_impl](uint32_t friend_number, bool typing) {
         ToxManager* tm = manager_impl->GetToxManager();
         if (!tm) return;
@@ -1088,6 +1180,8 @@ static void RegisterToxManagerFileCallbacks(V2TIMManagerImpl* manager_impl) {
                                std::to_string(file_number);
             G.simple_listener.enqueue_text_line_for_instance(instance_id, line);
             if (control == TOX_FILE_CONTROL_CANCEL) {
+                EnqueueTrackedSendFailure(instance_id,
+                                          FindSendContext(instance_id, key));
                 EraseSendContext(instance_id, key);
                 // A peer-cancelled RECEIVE: close it and delete the partial
                 // data + marker right away (checklist M5).
@@ -1106,36 +1200,35 @@ static void RegisterToxManagerFileCallbacks(V2TIMManagerImpl* manager_impl) {
         int64_t instance_id = GetInstanceIdFromManager(manager_impl);
         if (instance_id == kInstanceIdDestroyed) return;
         uint64_t key = (static_cast<uint64_t>(friend_number) << 32) | file_number;
-        if (length == 0) {
-            EraseSendContext(instance_id, key);
-            return;
-        }
         const std::shared_ptr<SendContext> context =
             FindSendContext(instance_id, key);
         if (!context) return;
+        if (length == 0) {
+            EnqueueSendProgress(tox, instance_id, friend_number, *context,
+                                context->size);
+            EraseSendContext(instance_id, key);
+            return;
+        }
         std::vector<uint8_t> buf(length);
         const size_t nread = context->Read(position, buf.data(), length);
         if (nread != length) {
             tox_file_control(tox, friend_number, file_number,
                              TOX_FILE_CONTROL_CANCEL, nullptr);
+            EnqueueTrackedSendFailure(instance_id, context);
             EraseSendContext(instance_id, key);
             V2TIM_LOG(kError,
                       "[ffi] file_chunk: type=send status=read_failed count={}",
                       length);
             return;
         }
-        tox_file_send_chunk(tox, friend_number, file_number, position,
-                            buf.data(), nread, nullptr);
-        uint8_t pubkey[TOX_PUBLIC_KEY_SIZE];
-        TOX_ERR_FRIEND_GET_PUBLIC_KEY err;
-        if (tox_friend_get_public_key(tox, friend_number, pubkey, &err) && err == TOX_ERR_FRIEND_GET_PUBLIC_KEY_OK) {
-            std::string uid = ToxUtil::tox_bytes_to_hex(pubkey, TOX_PUBLIC_KEY_SIZE);
-            uint64_t sent = position + nread;
-            char line[256];
-            snprintf(line, sizeof(line), "progress_send:%s:%llu:%llu", uid.c_str(),
-                     (unsigned long long)sent,
-                     (unsigned long long)context->size);
-            G.simple_listener.enqueue_text_line(line);
+        if (!tox_file_send_chunk(tox, friend_number, file_number, position,
+                                 buf.data(), nread, nullptr)) {
+            return;
+        }
+        const uint64_t sent = position + nread;
+        // The final queued chunk still requires the peer's acknowledgment.
+        if (sent < context->size) {
+            EnqueueSendProgress(tox, instance_id, friend_number, *context, sent);
         }
     });
     tox_manager->setFileRecvCallback([manager_impl](uint32_t friend_number, uint32_t file_number, uint32_t kind, uint64_t file_size, const uint8_t* filename, size_t filename_length) {
@@ -1426,6 +1519,9 @@ static void RegisterToxManagerFileCallbacks(V2TIMManagerImpl* manager_impl) {
                 auto it = instance_it->second.find(key);
                 if (it != instance_it->second.end()) {
                     it->second.received = received_end;
+                    // EOF below publishes 100% only after flush, close and
+                    // file-size verification. The host moves the file at 100%.
+                    if (received_end == it->second.size) return;
                     // PROTOCOL LIMITATION (tracked for the framing redesign): ':'-delimited; a path
                     // containing ':' mis-parses on the Dart split(':') side. Escaping/reframing is a
                     // breaking ABI change and out of scope. Build with std::string so the path is
@@ -3499,11 +3595,9 @@ namespace {
 
 // Carries the pin, not a raw copy of the handle. ResolveFilePeer used to take
 // the guard as a local and return only `Tox*`: the guard died with the return
-// statement and every caller then did its file sizing, context setup and
-// tox_file_send() on an UNPINNED pointer a concurrent UnInitSDK could have
-// tox_kill()ed (codex 2026-09-24). Moving the guard in makes the comment in
-// ResolveFilePeer true — the pin really does cover friend lookup, file_send and
-// the first chunk — because the struct outlives all of them in the caller.
+// statement, leaving callers with an unpinned Tox pointer. Keep ownership
+// here until the caller finishes or switches to the iterate lock to dispatch
+// an offer and publish its send context as one operation.
 struct ResolvedFilePeer {
     int64_t instance_id = 0;
     V2TIMManagerImpl::ToxSessionGuard session;
@@ -3545,9 +3639,7 @@ int ResolveFilePeer(int64_t instance_id, const char* user_id,
         return -1;
     }
     V2TIMManagerImpl* manager = GetInstanceFromId(resolved_instance_id);
-    // Pinned across the friend lookup + file_send + first chunk sequence. The
-    // guard is MOVED into *peer below, so it outlives this function and keeps
-    // the caller's tox_file_send() on a live instance.
+    // Pin through friend lookup and transfer the guard to the caller.
     auto session = manager == nullptr
                        ? V2TIMManagerImpl::ToxSessionGuard()
                        : manager->AcquireToxSession();
@@ -3594,9 +3686,39 @@ uint64_t FileTransferKey(uint32_t friend_number, uint32_t file_number) {
     return (static_cast<uint64_t>(friend_number) << 32) | file_number;
 }
 
+int DispatchFileOffer(ResolvedFilePeer& peer, uint32_t kind,
+                      const uint8_t* file_id, const std::string& wire_name,
+                      std::shared_ptr<SendContext> context) {
+    if (peer.session_ended()) return -1;
+    const auto manager = peer.session.manager_shared();
+    // The offer and context must be published together before the next
+    // disconnect or chunk callback. Drop the pin before waiting for iterate:
+    // a profile save quiesces pins before taking the same iterate lock.
+    peer.session = {};
+    auto iterate_lock = manager->lockIterate();
+    Tox* tox = manager->getTox();  // The iterate lock also excludes shutdown.
+    if (!tox || manager->isAdmissionClosed()) return -1;
+    TOX_ERR_FILE_SEND error;
+    const uint32_t file_number = tox_file_send(
+        tox, peer.friend_number, kind, context->size, file_id,
+        reinterpret_cast<const uint8_t*>(wire_name.data()), wire_name.size(),
+        &error);
+    if (error == TOX_ERR_FILE_SEND_FRIEND_NOT_CONNECTED) return -4;
+    if (error != TOX_ERR_FILE_SEND_OK) {
+        V2TIM_LOG(kError, "[ffi] file_send: tox_file_send failed err={}", error);
+        return -7;
+    }
+    if (manager->isAdmissionClosed()) return -1;
+    StoreSendContext(peer.instance_id,
+                     FileTransferKey(peer.friend_number, file_number),
+                     std::move(context));
+    return 1;
 }
 
-int tim2tox_ffi_send_file(int64_t instance_id, const char* user_id, const char* file_path) {
+}
+
+static int SendFile(int64_t instance_id, const char* user_id,
+                    const char* file_path, int64_t transfer_id) {
     if (file_path == nullptr) return -1;
     ResolvedFilePeer peer;
     const int resolve_result =
@@ -3612,6 +3734,7 @@ int tim2tox_ffi_send_file(int64_t instance_id, const char* user_id, const char* 
     auto context = std::make_shared<SendContext>();
     context->file.reset(tim2tox::file_io::OpenUtf8(path, "rb"));
     context->size = file_size;
+    context->transfer_id = transfer_id;
     if (context->file == nullptr) {
         V2TIM_LOG(kError, "[ffi] send_file: failed to open local file");
         return -6;
@@ -3621,30 +3744,22 @@ int tim2tox_ffi_send_file(int64_t instance_id, const char* user_id, const char* 
     if (pos != std::string::npos) name = path.substr(pos + 1);
     const std::string wire_name =
         tim2tox::file_io::TruncateUtf8Filename(name);
-    // Opening and sizing the file took time; refuse rather than start a
-    // transfer nothing will ever pump (the pin kept the handle valid, it did
-    // not keep the session current).
-    if (peer.session_ended()) {
-        V2TIM_LOG(kError, "[ffi] send_file: session ended before tox_file_send");
-        return -1;
-    }
-    TOX_ERR_FILE_SEND f_err;
-    uint32_t file_no = tox_file_send(
-        peer.tox(), peer.friend_number, TOX_FILE_KIND_DATA, file_size, nullptr,
-        reinterpret_cast<const uint8_t*>(wire_name.c_str()), wire_name.size(),
-        &f_err);
-    if (f_err != TOX_ERR_FILE_SEND_OK) {
-        V2TIM_LOG(kError, "[ffi] send_file: tox_file_send failed err={}", f_err);
-        return -7;
-    }
-    if (peer.session_ended()) {
-        V2TIM_LOG(kError, "[ffi] send_file: session ended during tox_file_send; not publishing success");
-        return -1;
-    }
-    StoreSendContext(peer.instance_id,
-                     FileTransferKey(peer.friend_number, file_no),
-                     std::move(context));
-    return 1;
+    return DispatchFileOffer(peer, TOX_FILE_KIND_DATA, nullptr, wire_name,
+                             std::move(context));
+}
+
+int tim2tox_ffi_send_file(int64_t instance_id, const char* user_id,
+                         const char* file_path) {
+    return SendFile(instance_id, user_id, file_path, 0);
+}
+
+int64_t tim2tox_ffi_send_file_tracked(int64_t instance_id, const char* user_id,
+                                     const char* file_path) {
+    static std::atomic<int64_t> next_transfer_id{1};
+    const int64_t transfer_id =
+        next_transfer_id.fetch_add(1, std::memory_order_relaxed);
+    const int result = SendFile(instance_id, user_id, file_path, transfer_id);
+    return result == 1 ? transfer_id : result;
 }
 
 int tim2tox_ffi_send_avatar(int64_t instance_id, const char* user_id, const uint8_t* avatar_data, size_t avatar_size) {
@@ -3678,32 +3793,10 @@ int tim2tox_ffi_send_avatar(int64_t instance_id, const char* user_id, const uint
         return -5;
     }
     const std::string wire_name = LowerHex(file_id.data(), file_id.size());
-    if (peer.session_ended()) {
-        V2TIM_LOG(kError,
-                  "[ffi] file_send: type=avatar status=session_ended count={}",
-                  avatar_size);
-        return -1;
-    }
-    TOX_ERR_FILE_SEND send_error;
-    const uint32_t file_number = tox_file_send(
-        peer.tox(), peer.friend_number, TOX_FILE_KIND_AVATAR, context->size,
-        file_id.data(), reinterpret_cast<const uint8_t*>(wire_name.data()),
-        wire_name.size(), &send_error);
-    if (send_error != TOX_ERR_FILE_SEND_OK) {
-        V2TIM_LOG(kError,
-                  "[ffi] file_send: type=avatar status=send_failed count={}",
-                  avatar_size);
-        return -7;
-    }
-    if (peer.session_ended()) {
-        V2TIM_LOG(kError,
-                  "[ffi] file_send: type=avatar status=session_ended count={}",
-                  avatar_size);
-        return -1;
-    }
-    StoreSendContext(peer.instance_id,
-                     FileTransferKey(peer.friend_number, file_number),
-                     std::move(context));
+    const int result = DispatchFileOffer(peer, TOX_FILE_KIND_AVATAR,
+                                         file_id.data(), wire_name,
+                                         std::move(context));
+    if (result < 0) return result;
     V2TIM_LOG(kInfo, "[ffi] file_send: type=avatar status=sent count={}",
               avatar_size);
     return 1;
@@ -4207,6 +4300,8 @@ int tim2tox_ffi_file_control(int64_t instance_id, const char* user_id, uint32_t 
     if (control == 2) { // CANCEL
         // Clean up file context
         uint64_t key = (static_cast<uint64_t>(friend_no) << 32) | file_number;
+        EnqueueTrackedSendFailure(instance_id, FindSendContext(instance_id, key));
+        EraseSendContext(instance_id, key);
         {
             std::lock_guard<std::mutex> lk(G.send_mtx);
             auto instance_it = G.recv_files.find(instance_id);

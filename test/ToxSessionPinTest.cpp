@@ -296,30 +296,38 @@ TEST(ToxSessionPinTest, TheFilePathKeepsItsPinPastResolve) {
     EXPECT_EQ(resolved.find("Tox* tox = nullptr;"), std::string::npos)
         << "a raw Tox* member is exactly the copy that outlived the pin";
 
-    // Each of the three senders must run tox_file_send() off the pinned handle
-    // and must re-check currency before publishing success.
-    struct Sender {
-        const char* name;
-        const char* start;
-        const char* end;
-    };
-    const Sender senders[] = {
-        {"send_file", "int tim2tox_ffi_send_file(", "int tim2tox_ffi_send_avatar("},
-        {"send_avatar", "int tim2tox_ffi_send_avatar(", "int tim2tox_ffi_delete_avatar("},
-        {"delete_avatar", "int tim2tox_ffi_delete_avatar(",
-         "int tim2tox_ffi_iterate_current_instance("},
-    };
-    for (const Sender& sender : senders) {
-        const std::string body = SourceSection(ffi, sender.start, sender.end);
-        EXPECT_EQ(body.find("peer.tox,"), std::string::npos)
-            << sender.name << " must not use a raw handle copied out of the guard";
-        EXPECT_NE(body.find("peer.tox()"), std::string::npos)
-            << sender.name << " must read the handle through the pin";
-        EXPECT_NE(body.find("peer.session_ended()"), std::string::npos)
-            << sender.name
-            << " must refuse a send whose session ended: the pin keeps the memory "
-               "valid, not the session current";
-    }
+    const std::string legacy_send = SourceSection(
+        ffi, "int tim2tox_ffi_send_file(", "int64_t tim2tox_ffi_send_file_tracked(");
+    EXPECT_NE(legacy_send.find("SendFile(instance_id, user_id, file_path, 0)"),
+              std::string::npos);
+    const std::string tracked_send = SourceSection(
+        ffi, "int64_t tim2tox_ffi_send_file_tracked(", "int tim2tox_ffi_send_avatar(");
+    EXPECT_NE(tracked_send.find("SendFile(instance_id, user_id, file_path, transfer_id)"),
+              std::string::npos);
+
+    const std::string file = SourceSection(
+        ffi, "static int SendFile(", "int tim2tox_ffi_send_file(");
+    const std::string avatar = SourceSection(
+        ffi, "int tim2tox_ffi_send_avatar(", "int tim2tox_ffi_delete_avatar(");
+    EXPECT_NE(file.find("DispatchFileOffer(peer, TOX_FILE_KIND_DATA"),
+              std::string::npos);
+    EXPECT_NE(avatar.find("DispatchFileOffer(peer, TOX_FILE_KIND_AVATAR"),
+              std::string::npos);
+
+    const std::string offer =
+        SourceSection(ffi, "int DispatchFileOffer(", "static int SendFile(");
+    const size_t release_pin = offer.find("peer.session = {};");
+    const size_t iterate_lock = offer.find("manager->lockIterate()");
+    const size_t get_tox = offer.find("manager->getTox()");
+    ASSERT_NE(get_tox, std::string::npos);
+    EXPECT_LT(release_pin, iterate_lock);
+    EXPECT_LT(iterate_lock, get_tox);
+    EXPECT_NE(offer.find("manager->isAdmissionClosed()"), std::string::npos);
+
+    const std::string delete_avatar = SourceSection(
+        ffi, "int tim2tox_ffi_delete_avatar(", "int tim2tox_ffi_iterate_current_instance(");
+    EXPECT_NE(delete_avatar.find("peer.tox()"), std::string::npos);
+    EXPECT_NE(delete_avatar.find("peer.session_ended()"), std::string::npos);
 }
 
 // Finding 4. Two Dart-exposed entry points still used unpinned managers: one

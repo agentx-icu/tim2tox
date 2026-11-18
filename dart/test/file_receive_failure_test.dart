@@ -19,6 +19,13 @@ void main() {
       );
     });
 
+    test('disconnect has no local storage failure reason', () {
+      final event =
+          parseFileRecvFailedEvent('file_recv_failed:3:ABCD:1:disconnected');
+      expect(event?.instanceId, 3);
+      expect(event?.reason, isNull);
+    });
+
     test('rejects malformed lines', () {
       for (final line in [
         'file_recv_failed:',

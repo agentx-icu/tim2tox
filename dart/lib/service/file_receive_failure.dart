@@ -71,8 +71,9 @@ class FileControlException implements Exception {
 }
 
 /// A parsed `file_recv_failed:<instance_id>:<sender_hex>:<file_number>:<reason>`
-/// native event, or null when [line] is not a well-formed one.
-({int instanceId, String uid, int fileNumber, FileReceiveFailureReason reason})?
+/// native event, or null when [line] is not a well-formed one. A disconnected
+/// transfer has no local failure reason to surface.
+({int instanceId, String uid, int fileNumber, FileReceiveFailureReason? reason})?
     parseFileRecvFailedEvent(String line) {
   const prefix = 'file_recv_failed:';
   if (!line.startsWith(prefix)) return null;
@@ -87,9 +88,11 @@ class FileControlException implements Exception {
     instanceId: instanceId,
     uid: parts[1],
     fileNumber: fileNumber,
-    reason: parts[3] == 'no_space'
-        ? FileReceiveFailureReason.noSpace
-        : FileReceiveFailureReason.io,
+    reason: switch (parts[3]) {
+      'no_space' => FileReceiveFailureReason.noSpace,
+      'disconnected' => null,
+      _ => FileReceiveFailureReason.io,
+    },
   );
 }
 

@@ -13,12 +13,17 @@
 ///   do NOT retry the send for those.
 
 import 'dart:io';
+import 'package:ffi/ffi.dart';
 import 'package:test/test.dart';
 import 'package:tencent_cloud_chat_sdk/native_im/adapter/tim_message_manager.dart';
 import 'package:tencent_cloud_chat_sdk/enum/V2TimAdvancedMsgListener.dart';
 import 'package:tencent_cloud_chat_sdk/enum/message_elem_type.dart';
 import 'package:tencent_cloud_chat_sdk/models/v2_tim_message.dart';
 import 'package:tencent_cloud_chat_sdk/models/v2_tim_message_download_progress.dart';
+import 'package:tencent_cloud_chat_sdk/tencent_cloud_chat_sdk_platform_interface.dart';
+import 'package:tim2tox_dart/ffi/tim2tox_ffi.dart';
+import 'package:tim2tox_dart/sdk/tim2tox_sdk_platform.dart';
+import 'package:tim2tox_dart/service/file_receive_failure.dart';
 import '../test_helper.dart';
 import '../test_fixtures.dart';
 
@@ -74,6 +79,84 @@ void main() {
       final bob = scenario.getNode('bob')!;
       bob.receivedMessages.clear();
     });
+
+    test('simultaneous outgoing transfers report separate completions', () async {
+      final platform =
+          TencentCloudChatSdkPlatform.instance as Tim2ToxSdkPlatform;
+      final service = platform.ffiService;
+      final peer = bob.getToxId();
+      final secondFile = File('$testDataDir/second_concurrent_file.txt');
+      // A full chunk near the end is above 99.5%, before the EOF callback.
+      await secondFile.writeAsBytes(List.filled(512 * 1024, 0x41));
+      addTearDown(() => secondFile.delete());
+
+      final sdkCompletions = <String, int>{};
+      final progressListener = V2TimAdvancedMsgListener(
+        onSendMessageProgress: (message, progress) {
+          final id = message.msgID;
+          if (progress == 100 && id != null) {
+            sdkCompletions.update(id, (count) => count + 1, ifAbsent: () => 1);
+          }
+        },
+      );
+      alice.runWithInstance(
+        () => TIMMessageManager.instance.addAdvancedMsgListener(progressListener),
+      );
+      addTearDown(() => alice.runWithInstance(
+            () => TIMMessageManager.instance.removeAdvancedMsgListener(
+              listener: progressListener,
+            ),
+          ));
+
+      final completions = <String, int>{};
+      final subscription = service.progressUpdates.listen((event) {
+        if (event.isSend && event.received == event.total && event.msgID != null) {
+          completions[event.msgID!] = event.total;
+        }
+      });
+      addTearDown(subscription.cancel);
+
+      final first = await alice.runWithInstanceAsync(
+        () => service.sendFile(peer, testFile.path),
+      );
+      final second = await alice.runWithInstanceAsync(
+        () => service.sendFile(peer, secondFile.path),
+      );
+      final firstId = first!.msgID!;
+      final secondId = second!.msgID!;
+      await waitUntilWithVirtualPump(
+        scenario,
+        () =>
+            completions.containsKey(firstId) && completions.containsKey(secondId),
+        timeout: const Duration(seconds: 45),
+        description: 'both outgoing offers have time to transfer',
+      );
+      expect(completions, containsPair(firstId, await testFile.length()));
+      expect(completions, containsPair(secondId, await secondFile.length()));
+      expect(sdkCompletions, {firstId: 1, secondId: 1});
+
+      final prefs = service.preferencesService!;
+      final previousLimit = await prefs.getAutoDownloadSizeLimit();
+      await prefs.setAutoDownloadSizeLimit(0);
+      addTearDown(() => prefs.setAutoDownloadSizeLimit(previousLimit));
+      final failures = <String>{};
+      final messages = service.messages.listen((row) {
+        final id = row.msgID;
+        if (row.isSelf && row.isFailed && id != null) failures.add(id);
+      });
+      addTearDown(messages.cancel);
+      final canceled = await alice.runWithInstanceAsync(
+        () => service.sendFile(peer, testFile.path),
+      );
+      await waitUntilWithVirtualPump(
+        scenario,
+        () => failures.contains(canceled!.msgID),
+        timeout: const Duration(seconds: 30),
+        description: 'receiver refuses the outgoing offer',
+      );
+      expect(failures, {canceled!.msgID});
+      expect(completions, isNot(contains(canceled.msgID)));
+    }, timeout: const Timeout(Duration(seconds: 100)));
 
     test('Send file to friend and receive', () async {
       // Setup Bob's message listener to receive file
@@ -329,5 +412,119 @@ void main() {
             .removeAdvancedMsgListener(listener: completionListener));
       }
     }, timeout: const Timeout(Duration(seconds: 240)));
+
+    test('peer disconnect clears an active transfer and allows a new transfer',
+        () async {
+      final platform =
+          TencentCloudChatSdkPlatform.instance as Tim2ToxSdkPlatform;
+      final service = platform.ffiService;
+      final peer = bob.getToxId();
+      final aliceHandle = alice.testInstanceHandle!;
+      final ffi = Tim2ToxFfi.open();
+      final peerPointer = peer.toNativeUtf8();
+      final int friendNumber;
+      try {
+        friendNumber =
+            ffi.getFriendNumberByUserIdForInstanceNative(aliceHandle, peerPointer);
+      } finally {
+        malloc.free(peerPointer);
+      }
+      expect(friendNumber, greaterThanOrEqualTo(0));
+
+      const interruptedName = 'interrupted_file.bin';
+      final interruptedFile = File('$testDataDir/$interruptedName');
+      final contents = await interruptedFile.open(mode: FileMode.write);
+      await contents.truncate(8 * 1024 * 1024);
+      await contents.close();
+      addTearDown(interruptedFile.delete);
+
+      final progress = <String, int>{};
+      String? partialPath;
+      final progressSub = service.progressUpdates.listen((event) {
+        if (event.isSend && event.msgID != null) {
+          progress[event.msgID!] = event.received;
+        }
+        if (!event.isSend &&
+            event.instanceId == bob.testInstanceHandle &&
+            event.received > 0 &&
+            (event.path?.endsWith(interruptedName) ?? false)) {
+          partialPath = event.path;
+        }
+      });
+      addTearDown(progressSub.cancel);
+
+      final failures = <String>[];
+      var receiveFailed = false;
+      final messageSub = service.messages.listen((row) {
+        if (row.isSelf && row.isFailed && row.msgID != null) {
+          failures.add(row.msgID!);
+        }
+        if (!row.isSelf && row.fileName == interruptedName && !row.isPending) {
+          receiveFailed = row.filePath?.isEmpty ?? true;
+        }
+      });
+      addTearDown(messageSub.cancel);
+
+      final interrupted = await alice.runWithInstanceAsync(
+        () => service.sendFile(peer, interruptedFile.path),
+      );
+      final interruptedId = interrupted!.msgID!;
+      await waitUntilWithVirtualPump(
+        scenario,
+        () => (progress[interruptedId] ?? 0) > 0 && partialPath != null,
+        description: 'the first transfer starts sending and receiving bytes',
+      );
+      final interruptedSize = await interruptedFile.length();
+      expect(progress[interruptedId], lessThan(interruptedSize));
+      final partial = File(partialPath!);
+      final marker = File(receiveMarkerPathFor(partial.path));
+      expect(partial.existsSync(), isTrue);
+      expect(marker.existsSync(), isTrue);
+
+      // Stalling Bob's network loop lets Alice observe a real Tox timeout
+      // while preserving Bob's peer identity for the reconnect.
+      final aliceOnly = TestScenario(virtualMode: true)..nodes.add(alice);
+      await waitUntilWithVirtualPump(
+        aliceOnly,
+        () => ffi.getFriendConnectionStatusNative(aliceHandle, friendNumber) == 0,
+        description: 'Alice sees Bob disconnect',
+        advanceMs: 250,
+      );
+      await waitUntilWithVirtualPump(
+        aliceOnly,
+        () => failures.contains(interruptedId),
+        timeout: const Duration(seconds: 8),
+        description: 'the disconnected transfer fails its outgoing message',
+      );
+
+      await waitUntilWithVirtualPump(
+        scenario,
+        () => ffi.getFriendConnectionStatusNative(aliceHandle, friendNumber) > 0,
+        description: 'Alice sees Bob reconnect',
+      );
+      await waitUntilWithVirtualPump(
+        scenario,
+        () => receiveFailed,
+        timeout: const Duration(seconds: 8),
+        description: 'the disconnected transfer fails its incoming message',
+      );
+      expect(partial.existsSync(), isFalse);
+      expect(marker.existsSync(), isFalse);
+      final next = await alice.runWithInstanceAsync(
+        () => service.sendFile(peer, testFile.path),
+      );
+      final nextId = next!.msgID!;
+      expect(next.isPending, isFalse);
+      final nextSize = await testFile.length();
+      await waitUntilWithVirtualPump(
+        scenario,
+        () => progress[nextId] == nextSize,
+        description: 'a new transfer completes after reconnect',
+      );
+      expect(failures, [interruptedId]);
+      expect(progress[interruptedId], lessThan(interruptedSize));
+    },
+        skip: shouldRunVirtual ? false : 'requires a controllable peer loop',
+        timeout: const Timeout(Duration(seconds: 120)));
   });
 }

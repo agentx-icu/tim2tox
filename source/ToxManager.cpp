@@ -436,7 +436,7 @@ void ToxManager::initialize(const Tox_Options* options,
     if (friend_status_cb_) {
         tox_callback_friend_status(tox_.get(), onFriendStatus);
     }
-    if (friend_connection_status_cb_) {
+    if (friend_connection_status_cb_ || file_peer_disconnected_cb_) {
         tox_callback_friend_connection_status(tox_.get(), onFriendConnectionStatus);
     }
     if (friend_read_receipt_cb_) {
@@ -559,6 +559,11 @@ void ToxManager::closeAdmission() {
     }
     state->cv.notify_all();
     V2TIM_LOG(kInfo, "[ToxManager] closeAdmission: no further Tox operations will be admitted");
+}
+
+bool ToxManager::isAdmissionClosed() const {
+    std::lock_guard<std::mutex> gate(pin_state_->mutex);
+    return pin_state_->closed;
 }
 
 std::shared_ptr<Tox> ToxManager::acquireTox() const {
@@ -845,7 +850,12 @@ void ToxManager::onFriendStatus(Tox* tox, uint32_t friend_number, TOX_USER_STATU
 
 void ToxManager::onFriendConnectionStatus(Tox* tox, uint32_t friend_number, TOX_CONNECTION connection_status, void* user_data) {
     ToxManager* manager = static_cast<ToxManager*>(user_data);
-    if (manager && manager->friend_connection_status_cb_) {
+    if (!manager) return;
+    if (connection_status == TOX_CONNECTION_NONE &&
+        manager->file_peer_disconnected_cb_) {
+        manager->file_peer_disconnected_cb_(friend_number);
+    }
+    if (manager->friend_connection_status_cb_) {
         manager->friend_connection_status_cb_(friend_number, connection_status);
     }
 }
@@ -1019,6 +1029,13 @@ void ToxManager::setFriendConnectionStatusCallback(FriendConnectionStatusCallbac
     auto iterate_lock = lockIterate();  // tox_callback_* bypasses toxcore's lock; keep it out of tox_iterate
     std::lock_guard<std::mutex> lock(mutex_);
     friend_connection_status_cb_ = std::move(cb);
+    if (tox_) tox_callback_friend_connection_status(tox_.get(), onFriendConnectionStatus);
+}
+
+void ToxManager::setFilePeerDisconnectedCallback(FilePeerDisconnectedCallback cb) {
+    auto iterate_lock = lockIterate();
+    std::lock_guard<std::mutex> lock(mutex_);
+    file_peer_disconnected_cb_ = std::move(cb);
     if (tox_) tox_callback_friend_connection_status(tox_.get(), onFriendConnectionStatus);
 }
 

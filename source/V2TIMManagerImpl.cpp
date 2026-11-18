@@ -5885,6 +5885,7 @@ int V2TIMManagerImpl::PublishGroupInfoField(const std::string& group_id, int fie
     if (field == V2TIM_GROUP_INFO_CHANGE_TYPE_NAME) {
         info.groupName = value.c_str();
     } else if (field == V2TIM_GROUP_INFO_CHANGE_TYPE_NOTIFICATION) {
+        info.modifyFlag = V2TIM_GROUP_INFO_MODIFY_FLAG_NOTIFICATION;
         info.notification = value.c_str();
     } else {
         return 0;

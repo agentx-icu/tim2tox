@@ -160,6 +160,8 @@ typedef _send_group_custom_c = ffi.Int32 Function(
     ffi.Pointer<pkgffi.Utf8>, ffi.Pointer<ffi.Uint8>, ffi.Int32);
 typedef _send_file_c = ffi.Int32 Function(
     ffi.Int64, ffi.Pointer<pkgffi.Utf8>, ffi.Pointer<pkgffi.Utf8>);
+typedef _send_file_tracked_c = ffi.Int64 Function(
+    ffi.Int64, ffi.Pointer<pkgffi.Utf8>, ffi.Pointer<pkgffi.Utf8>);
 typedef _send_avatar_c = ffi.Int32 Function(
   ffi.Int64,
   ffi.Pointer<pkgffi.Utf8>,
@@ -973,6 +975,36 @@ class Tim2ToxFfi {
           _send_file_c,
           int Function(int, ffi.Pointer<pkgffi.Utf8>,
               ffi.Pointer<pkgffi.Utf8>)>('tim2tox_ffi_send_file');
+
+  late final _sendFileTracked = _lookupTrackedSend();
+
+  int Function(int, ffi.Pointer<pkgffi.Utf8>, ffi.Pointer<pkgffi.Utf8>)?
+      _lookupTrackedSend() {
+    try {
+      return _lib.lookupFunction<
+          _send_file_tracked_c,
+          int Function(int, ffi.Pointer<pkgffi.Utf8>,
+              ffi.Pointer<pkgffi.Utf8>)>('tim2tox_ffi_send_file_tracked');
+    } on ArgumentError {
+      return null;
+    }
+  }
+
+  ({int result, int? transferId}) sendFileTracked(
+    int instanceId,
+    ffi.Pointer<pkgffi.Utf8> userId,
+    ffi.Pointer<pkgffi.Utf8> path,
+  ) {
+    final send = _sendFileTracked;
+    if (send == null) {
+      return (result: sendFileNative(instanceId, userId, path), transferId: null);
+    }
+    final transferId = send(instanceId, userId, path);
+    return transferId > 0
+        ? (result: 1, transferId: transferId)
+        : (result: transferId, transferId: null);
+  }
+
   late final int Function(
           int, ffi.Pointer<pkgffi.Utf8>, ffi.Pointer<ffi.Uint8>, int)
       sendAvatarNative = _lib.lookupFunction<

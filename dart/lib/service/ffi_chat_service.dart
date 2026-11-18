@@ -2033,6 +2033,8 @@ class FfiChatService {
   // replacement; [_lastSentPathByPeer] remains for legacy progress_send
   // correlation that doesn't yet thread a msgID through.
   final Map<String, String> _lastSentPathByPeer = {};
+  final _trackedFileSends =
+      <(int, int), ({String peerId, String path, String msgId})>{};
 
   /// Poll timer callback stored so [triggerPollOnce] can run it immediately (e.g. when file message received).
   void Function()? _pollTimerCallback;
@@ -4407,7 +4409,8 @@ class FfiChatService {
                   // Log file_request events for debugging - CRITICAL for file receiving
                   _logger?.log(
                       '[FfiChatService] Polled event type=file_request bytes=$n');
-                } else if (s.startsWith('progress_recv:')) {
+                } else if (s.startsWith('progress_recv:') ||
+                    s.startsWith('file_send_progress:')) {
                   // Skip logging progress_recv events - too frequent during file transfer
                 } else if (s.startsWith('c2c:') ||
                     s.startsWith('gtext:') ||
@@ -4938,6 +4941,9 @@ class FfiChatService {
 
                   // Progress update will be handled by FakeChatMessageProvider via progressUpdates stream
                 }
+              } else if (s.startsWith('file_send_progress:') ||
+                  s.startsWith('file_send_failed:')) {
+                _handleTrackedFileSendEvent(s);
               } else if (s.startsWith('progress_send:')) {
                 // progress_send:<uid>:<sent>:<total>
                 final parts = s.split(':');
@@ -5427,8 +5433,8 @@ class FfiChatService {
                       '[FfiChatService] file_done: rejected malformed event without logging fields');
                 }
               } else if (s.startsWith('file_recv_failed:')) {
-                // Checklist M5: native gave up on a receive (disk full / I/O
-                // error), already cancelled it and deleted the partial file.
+                // Native cancelled the receive and deleted its partial file
+                // after disconnect or a local storage failure.
                 final failed = parseFileRecvFailedEvent(s);
                 if (failed != null && _ownsEventInstance(failed.instanceId)) {
                   _handleNativeReceiveFailure(failed.uid, failed.fileNumber,
@@ -7589,6 +7595,7 @@ class FfiChatService {
     _friendOnlineStatus.remove(normalizedUid);
     _lastSentPathByPeer.remove(userId);
     _lastSentPathByPeer.remove(normalizedUid);
+    _trackedFileSends.removeWhere((_, send) => send.peerId == normalizedUid);
 
     // Best-effort delete of half-received files belonging to this friend.
     for (final path in {...affectedTempPaths, ...affectedActualPaths}) {
@@ -7811,28 +7818,39 @@ class FfiChatService {
         textMentionsSelf(text)) {
       _unreadMentionGroups.add(_unreadKey(gid));
     }
-    // Deduplicate: same message can be delivered twice (conference + group callback in C++)
-    final duplicate = _findRecentGroupHistoryMessage(
-        gid, from, text, contentKind,
-        pseudoMsgId: pseudoMsgId);
+    final timestamp = epochMs ?? DateTime.now().millisecondsSinceEpoch;
+    final sequence = _msgIDSequence++;
+    final msgID = '${timestamp}_${sequence}_${from}_$gid';
+    // The primary id is receiver-local (every peer mints its own), so the
+    // cross-peer alias is what lets a receipt from another member resolve to
+    // THIS row. Absent for routes with no Tox_Group_Message_Id.
+    final alias = pseudoMsgId == null
+        ? null
+        : groupMessageAlias(
+            groupId: gid,
+            senderPk: from,
+            pseudoMsgId: pseudoMsgId,
+          );
+    final msg = ChatMessage(
+      text: text,
+      fromUserId: from,
+      isSelf: from == _selfId,
+      timestamp: DateTime.fromMillisecondsSinceEpoch(timestamp),
+      groupId: gid,
+      msgID: msgID,
+      contentKind: contentKind,
+      sourceInstanceId: sourceInstanceId,
+      altMsgIds: [if (alias != null) alias],
+    );
+
+    final duplicate = _findRecentGroupHistoryMessage(gid, msg);
     if (duplicate != null) {
-      // THE PRODUCT'S NORMAL PATH LANDS HERE. In hybrid mode the native
-      // advanced listener persists the row first (MessageConverter has no
-      // cross-peer alias to give it), and this polled copy — the only one that
-      // carries the pseudo id — arrives second. Returning early without
-      // merging would leave the row alias-less forever, so every later receipt
-      // would fail to resolve and be dropped: the whole correlation would work
-      // in auto_tests (Platform path owns history there) and silently do
-      // nothing in the app. Merge the alias, and receipt the row exactly once.
-      final mergedAlias = _mergeGroupAliasIntoRow(gid, duplicate, from,
-          pseudoMsgId: pseudoMsgId);
-      // The advanced listener now stamps the alias itself (GH-4), so "newly
-      // merged" no longer means "not yet receipted": claim it explicitly.
-      final receiptAlias = mergedAlias ??
-          (pseudoMsgId == null
-              ? null
-              : groupMessageAlias(
-                  groupId: gid, senderPk: from, pseudoMsgId: pseudoMsgId));
+      // The shared wire identity already resolves exact re-deliveries. Only
+      // content-matched callbacks need to remember their other source id.
+      if (alias == null || toxGroupMessageAliasOf(duplicate) != alias) {
+        _absorbInboundCopy(gid, duplicate, msg);
+      }
+      final receiptAlias = alias;
       if (receiptAlias != null &&
           !duplicate.isSelf &&
           !_isReactionMessage(text) &&
@@ -7893,30 +7911,6 @@ class FfiChatService {
       unawaited(
           _persistKnownGroups()); // This will call _syncKnownGroupsToNative()
     }
-    final timestamp = epochMs ?? DateTime.now().millisecondsSinceEpoch;
-    final sequence = _msgIDSequence++;
-    final msgID = '${timestamp}_${sequence}_${from}_$gid';
-    // The primary id is receiver-local (every peer mints its own), so the
-    // cross-peer alias is what lets a receipt from another member resolve to
-    // THIS row. Absent for routes with no Tox_Group_Message_Id.
-    final alias = pseudoMsgId == null
-        ? null
-        : groupMessageAlias(
-            groupId: gid,
-            senderPk: from,
-            pseudoMsgId: pseudoMsgId,
-          );
-    final msg = ChatMessage(
-      text: text,
-      fromUserId: from,
-      isSelf: from == _selfId,
-      timestamp: DateTime.fromMillisecondsSinceEpoch(timestamp),
-      groupId: gid,
-      msgID: msgID,
-      contentKind: contentKind,
-      sourceInstanceId: sourceInstanceId,
-      altMsgIds: [if (alias != null) alias],
-    );
     _lastByPeer[gid] = msg; // reuse for group last message
     _appendHistory(gid, msg);
     final emitted = _emitInboundMessage(
@@ -8211,29 +8205,6 @@ class FfiChatService {
     }
 
     final now = DateTime.now();
-    const dedupWindow = Duration(seconds: 2);
-    final duplicate = _messageHistoryPersistence.getHistory(normalizedFrom).any(
-        (message) =>
-            !message.isSelf &&
-            message.fromUserId == normalizedFrom &&
-            message.text == text &&
-            message.contentKind == contentKind &&
-            message.timestamp.difference(now).abs() <= dedupWindow);
-    if (duplicate) {
-      // The hook (SDK-callback path) won the ingest race for this text and
-      // it NEVER sends receipts — receipt duty stays here on the poll path,
-      // which always delivers exactly once. The hash echo needs only the
-      // text, so no row/id coordination with the hook's copy is required.
-      if (normalizedFrom != _selfId && !_isReactionMessage(text)) {
-        unawaited(
-          _sendReceipt(
-              normalizedFrom, 'dup:$text'.hashCode.toString(), 'received',
-              inboundText: text),
-        );
-      }
-      return true;
-    }
-
     final msgID =
         '${now.millisecondsSinceEpoch}_${_msgIDSequence++}_$normalizedFrom';
     final msg = ChatMessage(
@@ -8245,6 +8216,26 @@ class FfiChatService {
       contentKind: contentKind,
       sourceInstanceId: sourceInstanceId,
     );
+    const dedupWindow = Duration(seconds: 2);
+    for (final row in _messageHistoryPersistence.getHistory(normalizedFrom)) {
+      if (row.isSelf ||
+          row.fromUserId != normalizedFrom ||
+          row.text != text ||
+          row.contentKind != contentKind ||
+          row.timestamp.difference(now).abs() > dedupWindow ||
+          !canMergeInboundContentCopies(row, msg)) {
+        continue;
+      }
+      // The advanced callback already persisted this copy. Claim the polling
+      // identity and let this path send the receipt for it.
+      _absorbInboundCopy(normalizedFrom, row, msg);
+      if (!msg.isSelf && !_isReactionMessage(text)) {
+        unawaited(_sendReceipt(normalizedFrom, msgID, 'received',
+            inboundText: text));
+      }
+      return true;
+    }
+
     _lastByPeer[normalizedFrom] = msg;
     if (_activePeerId != normalizedFrom && !msg.isSelf) {
       _unreadByPeer.update(
@@ -8446,42 +8437,29 @@ class FfiChatService {
     return true;
   }
 
-  ChatMessage? _findRecentGroupHistoryMessage(
-    String gid,
-    String from,
-    String text,
-    ChatMessageContentKind contentKind, {
-    int? pseudoMsgId,
-  }) {
-    final nowMs = DateTime.now().millisecondsSinceEpoch;
-    const windowMs = 5000;
+  ChatMessage? _findRecentGroupHistoryMessage(String gid, ChatMessage input) {
+    const window = Duration(seconds: 5);
     final list = _messageHistoryPersistence.getCachedList(gid);
     if (list == null || list.isEmpty) return null;
-    // GH-4: exact identity first. The advanced listener's copy carries the
-    // same `gmid:` alias (MessageConverter), whatever its timing.
-    final alias = pseudoMsgId == null
-        ? null
-        : groupMessageAlias(
-            groupId: gid, senderPk: from, pseudoMsgId: pseudoMsgId);
+
+    final alias = toxGroupMessageAliasOf(input);
     if (alias != null) {
-      for (var i = list.length - 1; i >= 0; i--) {
-        final m = list[i];
-        // Inbound only: our own row carries the same alias as its echo.
-        if (!m.isSelf && (m.msgID == alias || m.altMsgIds.contains(alias))) {
-          return m;
+      for (final row in list.reversed) {
+        if (!row.isSelf && (row.msgID == alias || row.altMsgIds.contains(alias))) {
+          return row;
         }
       }
     }
-    for (var i = list.length - 1; i >= 0 && i >= list.length - 20; i--) {
-      final m = list[i];
-      // A row with a DIFFERENT alias is a different message (a member sending
-      // the same "ok" twice); content+time only when identity is unknown.
-      if (alias != null && toxGroupMessageAliasOf(m) != null) continue;
-      if (m.fromUserId == from &&
-          m.text == text &&
-          m.contentKind == contentKind &&
-          (m.timestamp.millisecondsSinceEpoch - nowMs).abs() < windowMs) {
-        return m;
+    final firstCandidate = list.length > 20 ? list.length - 20 : 0;
+    for (var i = firstCandidate; i < list.length; i++) {
+      final row = list[i];
+      if (row.isSelf == input.isSelf &&
+          row.fromUserId == input.fromUserId &&
+          row.text == input.text &&
+          row.contentKind == input.contentKind &&
+          row.timestamp.difference(input.timestamp).abs() < window &&
+          canMergeInboundContentCopies(row, input)) {
+        return row;
       }
     }
     return null;
@@ -8727,104 +8705,32 @@ class FfiChatService {
   /// This deletes the persisted history file (JSON) but does NOT delete actual media files
   /// (images, videos, audio, documents) that may be referenced in the messages
   Future<void> clearC2CHistory(String userID) async {
-    userID = _canonicalSelfAware(userID);
-    // Normalize friend ID to 64 characters (public key length)
-    final normalizedUserID = _normalizeFriendId(userID);
-
-    // Eagerly drop any matching cache entry from the persistence-owned map.
-    // Persistence's `clearHistory` (called below) also clears in-memory state,
-    // but doing it up-front means a concurrent reader sees the clear
-    // immediately even while disk I/O is still in flight.
-    _messageHistoryPersistence.removeCachedHistory(normalizedUserID);
-    _messageHistoryPersistence.removeCachedHistory(userID);
-
-    // Also drop any stored variant (e.g. 76-char address key).
-    final keysToRemove = <String>[];
-    for (final key in _messageHistoryPersistence.cache.keys) {
-      final normalizedKey = key.length > 64 ? _normalizeFriendId(key) : key;
-      if (normalizedKey == normalizedUserID ||
-          key == userID ||
-          normalizedKey == userID ||
-          key == normalizedUserID) {
-        keysToRemove.add(key);
-      }
-    }
-    for (final key in keysToRemove) {
-      _messageHistoryPersistence.removeCachedHistory(key);
-    }
-
-    // Clear persisted history file using persistence service
-    // This deletes the JSON history file but preserves actual media files
-    // This also clears the persistence service's in-memory cache
-    try {
-      await _messageHistoryPersistence.clearHistory(normalizedUserID);
-    } catch (e, stackTrace) {
-      // Log error but don't throw - clearing should continue even if file deletion fails
-      _logger?.logError(
-          'Failed to clear persisted history for user $normalizedUserID',
-          e,
-          stackTrace);
-    }
-
-    // Also try to clear with original ID in case it was stored differently
-    if (userID != normalizedUserID) {
-      try {
-        await _messageHistoryPersistence.clearHistory(userID);
-      } catch (e, stackTrace) {
-        _logger?.logError(
-            'Failed to clear persisted history for user (original ID) $userID',
-            e,
-            stackTrace);
-      }
-    }
-
-    // Clear last message and unread count
-    _lastByPeer.remove(normalizedUserID);
-    _unreadByPeer.remove(normalizedUserID);
-    if (userID != normalizedUserID) {
-      _lastByPeer.remove(userID);
-      _unreadByPeer.remove(userID);
-    }
+    final peer = ConversationIdUtils.normalize(_canonicalSelfAware(userID));
+    await _clearConversationHistory(peer, unreadKey: peer);
   }
 
-  /// Clear group chat history
-  /// This is called by UIKit when user clicks "Clear Chat History" in group profile page
-  /// This deletes the persisted history file (JSON) but does NOT delete actual media files
-  /// (images, videos, audio, documents) that may be referenced in the messages
+  /// Clear persisted group messages and the matching conversation preview.
   Future<void> clearGroupHistory(String groupID) async {
-    print('[FfiChatService] clearGroupHistory: ENTRY - groupID=$groupID');
-    // Eagerly drop the cached list. `clearHistory` below also clears the cache
-    // and removes the on-disk file.
-    final bool removed =
-        _messageHistoryPersistence.getCachedList(groupID) != null;
-    _messageHistoryPersistence.removeCachedHistory(groupID);
-    print(
-        '[FfiChatService] clearGroupHistory: Removed from persistence cache: $removed');
+    await _clearConversationHistory(groupID, unreadKey: _unreadKey(groupID));
+  }
 
-    // Clear persisted history file using persistence service
-    // This deletes the JSON history file but preserves actual media files
-    // This also clears the persistence service's in-memory cache
-    try {
-      print(
-          '[FfiChatService] clearGroupHistory: Calling _messageHistoryPersistence.clearHistory');
-      await _messageHistoryPersistence.clearHistory(groupID);
-      print(
-          '[FfiChatService] clearGroupHistory: _messageHistoryPersistence.clearHistory completed');
-    } catch (e, stackTrace) {
-      print(
-          '[FfiChatService] clearGroupHistory: ERROR - clearHistory failed for groupID=$groupID: $e');
-      // Log error but don't throw - clearing should continue even if file deletion fails
-      _logger?.logError('Failed to clear persisted history for group $groupID',
-          e, stackTrace);
+  Future<void> _clearConversationHistory(
+    String historyKey, {
+    required String unreadKey,
+  }) async {
+    final previousPreview = _lastByPeer[historyKey];
+    await _messageHistoryPersistence.clearHistory(historyKey);
+    if (identical(_lastByPeer[historyKey], previousPreview)) {
+      _lastByPeer.remove(historyKey);
+      _unreadByPeer.remove(unreadKey);
+      return;
     }
-
-    // Clear last message and unread count
-    bool lastRemoved = _lastByPeer.remove(groupID) != null;
-    bool unreadRemoved = _unreadByPeer.remove(_unreadKey(groupID)) != null;
-    print(
-        '[FfiChatService] clearGroupHistory: Removed from _lastByPeer: $lastRemoved, _unreadByPeer: $unreadRemoved');
-    print(
-        '[FfiChatService] clearGroupHistory: EXIT - Completed for groupID=$groupID');
+    // The clear's synchronous cut emptied the cache. Its live rows now
+    // belong to messages that arrived during the durable delete.
+    final isActive = _activePeerId == unreadKey || _activePeerId == historyKey;
+    _unreadByPeer[unreadKey] = isActive
+        ? 0
+        : (_historyById[historyKey]?.where((m) => !m.isSelf && !m.isRead).length ?? 0);
   }
 
   /// Delete friend
@@ -8918,7 +8824,6 @@ class FfiChatService {
     if (msgIDs.isEmpty) return 0;
     final msgIDSet = msgIDs.toSet();
     int deletedCount = 0;
-    final modifiedConversations = <String>{};
 
     // Every identity of every row removed from memory. A crash between an
     // archive append and the main-file rewrite leaves one row in BOTH files,
@@ -8946,61 +8851,51 @@ class FfiChatService {
       return msgIDSet.contains(legacy);
     }
 
-    // Iterate through all conversation histories to find and delete messages.
-    for (final entry in _historyById.entries.toList()) {
-      final conversationId = entry.key;
-      final messages = entry.value;
-      final originalLength = messages.length;
-      final removedRows = <ChatMessage>[];
-      messages.removeWhere((msg) {
-        if (matches(msg)) {
-          deletedCount++;
-          removedRows.add(msg);
-          removedIdentities.addAll(MessageHistoryPersistence.identitiesOf(msg));
-          return true;
-        }
-        return false;
-      });
-      if (messages.length < originalLength) {
-        _messageHistoryPersistence.noteRemovedFromCache(
-            conversationId, removedRows);
-        modifiedConversations.add(conversationId);
+    final queued = _offlineQueuePersistence.queuedMsgIDs(dispatchableOnly: true);
+    if (queued.isNotEmpty &&
+        (msgIDSet.any(queued.contains) ||
+            _historyById.values.any((rows) => rows.any(
+                (row) => matches(row) &&
+                    MessageHistoryPersistence.identitiesOf(row)
+                        .any(queued.contains))))) {
+      throw QueuedMessageDeletionError();
+    }
 
-        final remaining = _historyById[conversationId];
-        if (remaining == null || remaining.isEmpty) {
-          // CR-05: the conversation is now empty. The stale on-disk JSON must
-          // not resurrect the deleted message on the next launch: delete the
-          // history file (and backup) and drop preview state. Rows older
-          // than the memory window are NOT part of this delete (queued ones
-          // are drained to the archive by the clear).
-          await _messageHistoryPersistence.clearHistory(conversationId,
-              keepArchive: true);
-          _lastByPeer.remove(conversationId);
-          _unreadByPeer.remove(conversationId);
-        } else {
-          // Persist the truncated list to disk. The in-memory cache mutation
-          // above (`messages.removeWhere`) already lands in the
-          // persistence-owned list — `_historyById` IS the persistence cache.
-          await _saveHistory(conversationId);
+    // Iterate over a key snapshot because a concurrent history load can add
+    // another conversation while a deletion waits for storage.
+    for (final conversationId in _historyById.keys.toList()) {
+      final removedRows = await _messageHistoryPersistence.removeCachedMessages(
+        conversationId,
+        matches,
+      );
+      if (removedRows.isEmpty) continue;
+      deletedCount += removedRows.length;
+      for (final row in removedRows) {
+        removedIdentities.addAll(MessageHistoryPersistence.identitiesOf(row));
+      }
 
-          // Recompute conversation-preview state from what remains.
-          ChatMessage newest = remaining.first;
-          int unread = 0;
-          for (final m in remaining) {
-            if (m.timestamp.isAfter(newest.timestamp)) newest = m;
-            if (!m.isSelf && !m.isRead) unread++;
-          }
-          _lastByPeer[conversationId] = newest;
-          // Preserve the active-conversation zero-out (setActivePeer drives
-          // _unreadByPeer to 0 for the active conversation).
-          if (_activePeerId == conversationId) {
-            _unreadByPeer[conversationId] = 0;
-          } else if (unread > 0) {
-            _unreadByPeer[conversationId] = unread;
-          } else {
-            _unreadByPeer.remove(conversationId);
-          }
-        }
+      final remaining = _historyById[conversationId];
+      final groupID = removedRows.first.groupId;
+      final unreadKey = groupID == null ? conversationId : _unreadKey(groupID);
+      if (remaining == null || remaining.isEmpty) {
+        _lastByPeer.remove(conversationId);
+        _unreadByPeer.remove(unreadKey);
+        continue;
+      }
+
+      ChatMessage newest = remaining.first;
+      var unread = 0;
+      for (final row in remaining) {
+        if (row.timestamp.isAfter(newest.timestamp)) newest = row;
+        if (!row.isSelf && !row.isRead) unread++;
+      }
+      _lastByPeer[conversationId] = newest;
+      if (_activePeerId == unreadKey || _activePeerId == conversationId) {
+        _unreadByPeer[unreadKey] = 0;
+      } else if (unread > 0) {
+        _unreadByPeer[unreadKey] = unread;
+      } else {
+        _unreadByPeer.remove(unreadKey);
       }
     }
 
@@ -10815,38 +10710,14 @@ class FfiChatService {
     return true;
   }
 
-  /// Stamps the cross-peer alias onto an already-persisted group row.
-  ///
-  /// Returns the alias only when it was NEWLY added, so the caller can send
-  /// the automatic receipt exactly once no matter how many times the same
-  /// message is re-delivered through the duplicate path.
-  String? _mergeGroupAliasIntoRow(
-    String gid,
-    ChatMessage row,
-    String from, {
-    required int? pseudoMsgId,
-  }) {
-    if (pseudoMsgId == null) return null;
-    final alias = groupMessageAlias(
-      groupId: gid,
-      senderPk: from,
-      pseudoMsgId: pseudoMsgId,
-    );
-    if (row.altMsgIds.contains(alias)) return null;
-    final history = _historyById[gid];
-    if (history == null) return null;
-    for (var i = 0; i < history.length; i++) {
-      if (!identical(history[i], row) && history[i].msgID != row.msgID) {
-        continue;
-      }
-      if (history[i].altMsgIds.contains(alias)) return null;
-      history[i] = history[i].copyWith(
-        altMsgIds: [...history[i].altMsgIds, alias],
-      );
-      unawaited(_saveHistory(gid));
-      return alias;
-    }
-    return null;
+  void _absorbInboundCopy(
+      String conversation, ChatMessage row, ChatMessage input) {
+    unawaited(_messageHistoryPersistence
+        .absorbDuplicateIds(conversation, row, input)
+        .catchError((Object error, StackTrace stack) {
+      _logger?.logError(
+          'Failed to persist message callback identity', error, stack);
+    }));
   }
 
   /// Our LOCAL id for the row a group receipt refers to.
@@ -11876,9 +11747,17 @@ class FfiChatService {
     // Friend is online - send immediately
     final pto = normalizedPeerId.toNativeUtf8();
     final pfp = effectiveSendPath.toNativeUtf8();
-    final result = _ffi.sendFileNative(_ffi.getCurrentInstanceId(), pto, pfp);
-    pkgffi.malloc.free(pto);
-    pkgffi.malloc.free(pfp);
+    final instanceId = _ffi.getCurrentInstanceId();
+    final ({int result, int? transferId}) dispatch;
+    try {
+      dispatch = addToChatHistory
+          ? _ffi.sendFileTracked(instanceId, pto, pfp)
+          : (result: _ffi.sendFileNative(instanceId, pto, pfp), transferId: null);
+    } finally {
+      pkgffi.malloc.free(pto);
+      pkgffi.malloc.free(pfp);
+    }
+    final result = dispatch.result;
     if (result <= 0) {
       // -4 == FRIEND_NOT_CONNECTED: friend was reported online by the
       // pre-check but went offline before the FFI call landed. Fall through
@@ -11929,20 +11808,16 @@ class FfiChatService {
     );
     // Update last message for this peer
     _lastByPeer[normalizedPeerId] = out;
-    // remember last sent path and msgID for progress correlation
-    _lastSentPathByPeer[normalizedPeerId] = filePath;
-    // Store msgID for this path to enable progress matching.
-    // R-2: always overwrite — the freshest send wins. The old containsKey
-    // guard meant a second send of the same file routed progress to the
-    // first (now-completed) msgID.
-    _pathToMsgID[filePath] = msgID;
-    // P2-23: precise per-message reverse lookup. _lastSentPathByPeer is a
-    // single-slot map keyed by peer, so back-to-back concurrent sends to
-    // the same peer overwrite each other and the progress_send handler
-    // can't tell which msgID a given chunk belongs to. Store
-    // (msgID -> path) so the progress handler can recover the right
-    // msgID from the path it just received a chunk for.
-    _msgIDToSentPath[msgID] = filePath;
+    final transferId = dispatch.transferId;
+    if (transferId != null) {
+      _trackedFileSends[(instanceId, transferId)] =
+          (peerId: normalizedPeerId, path: filePath, msgId: msgID);
+    } else {
+      // Older native libraries identify progress by peer only.
+      _lastSentPathByPeer[normalizedPeerId] = filePath;
+      _pathToMsgID[filePath] = msgID;
+      _msgIDToSentPath[msgID] = filePath;
+    }
     // Add to history FIRST, then trigger stream update
     // This ensures getHistory() returns the new message when stream listener refreshes
     _appendHistory(normalizedPeerId, out);
@@ -11952,6 +11827,54 @@ class FfiChatService {
   }
 
   // File transfer control methods
+  void _handleTrackedFileSendEvent(String event) {
+    final parts = event.split(':');
+    if (parts.length < 3) return;
+    final instanceId = int.tryParse(parts[1]);
+    final transferId = int.tryParse(parts[2]);
+    if (instanceId == null ||
+        transferId == null ||
+        !_ownsEventInstance(instanceId)) {
+      return;
+    }
+    final key = (instanceId, transferId);
+    final send = _trackedFileSends[key];
+    if (send == null) return;
+    if (parts[0] == 'file_send_failed') {
+      _trackedFileSends.remove(key);
+      final history = _historyById[send.peerId];
+      if (history == null) return;
+      final index = history.indexWhere((row) => row.msgID == send.msgId);
+      if (index < 0) return;
+      final failed = history[index].copyWith(isPending: false, isFailed: true);
+      history[index] = failed;
+      if (_lastByPeer[send.peerId]?.msgID == send.msgId) {
+        _lastByPeer[send.peerId] = failed;
+      }
+      _messages.add(failed);
+      unawaited(
+          _saveHistory(send.peerId).catchError((Object error, StackTrace st) {
+        _logger?.logError(
+            'Failed to persist outgoing file transfer failure', error, st);
+      }));
+      return;
+    }
+    if (parts.length != 5) return;
+    final sent = int.tryParse(parts[3]);
+    final total = int.tryParse(parts[4]);
+    if (sent == null || total == null) return;
+    if (sent >= total) _trackedFileSends.remove(key);
+    _progressCtrl.add((
+      instanceId: instanceId,
+      peerId: send.peerId,
+      path: send.path,
+      received: sent,
+      total: total,
+      isSend: true,
+      msgID: send.msgId,
+    ));
+  }
+
   Future<void> _cancelFileTransferBestEffort(
     String peerId,
     int fileNumber, {
@@ -13811,29 +13734,32 @@ class FfiChatService {
   /// delete of the transfer's path, which could hit a newer transfer that
   /// reuses the same deterministic path.
   void _handleNativeReceiveFailure(String uid, int fileNumber, int instanceId,
-      FileReceiveFailureReason reason) {
+      FileReceiveFailureReason? reason) {
     final normalizedUid = uid.length > 64 ? _normalizeFriendId(uid) : uid;
     final progress = _fileReceiveProgress[(normalizedUid, fileNumber)] ??
         _fileReceiveProgress[(uid, fileNumber)];
     final msgID = progress?.msgID ??
         _fileNumberToMsgID[(normalizedUid, fileNumber)] ??
         _fileNumberToMsgID[(uid, fileNumber)];
+    final reasonName = reason?.name ?? 'disconnected';
     if (msgID == null) {
       // Not a tracked chat file (e.g. an avatar transfer): nothing to show.
       _logger?.log(
-          '[FfiChatService] file_recv_failed: status=untracked reason=${reason.name}');
+          '[FfiChatService] file_recv_failed: status=untracked reason=$reasonName');
       return;
     }
     final trackedInstance = _fileTransferInstanceByMsgID[msgID];
     if (trackedInstance != null && trackedInstance != instanceId) {
       _logger?.log(
-          '[FfiChatService] file_recv_failed: status=instance_mismatch reason=${reason.name}');
+          '[FfiChatService] file_recv_failed: status=instance_mismatch reason=$reasonName');
       return;
     }
-    _emitReceiveFailure(uid, fileNumber, reason, msgID: msgID);
+    if (reason != null) {
+      _emitReceiveFailure(uid, fileNumber, reason, msgID: msgID);
+    }
     _markFileTransferFailed(uid, fileNumber, msgID);
     _logger?.log(
-        '[FfiChatService] file_recv_failed: status=failed reason=${reason.name}');
+        '[FfiChatService] file_recv_failed: status=failed reason=$reasonName');
   }
 
   /// Deletes the native "not finalized" marker of a received file (checklist
@@ -14153,6 +14079,7 @@ class FfiChatService {
     _clearIrcCallbacks();
     _clearDhtNodesResponseRegistration();
     _lastSentPathByPeer.clear();
+    _trackedFileSends.clear();
 
     if (_instanceId != null && _instanceId! != 0) {
       synchronized(_instanceServicesLock, () {
@@ -14365,6 +14292,11 @@ class FfiChatService {
       _disposeFuture = null;
     }
   }
+}
+
+class QueuedMessageDeletionError extends StateError {
+  QueuedMessageDeletionError()
+      : super('Cancel the queued send or wait for it to finish before deleting it.');
 }
 
 /// [FfiChatService.joinGroup] was asked to join a group we are already in.
