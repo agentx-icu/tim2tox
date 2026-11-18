@@ -304,7 +304,8 @@ void main() {
     await subscription.cancel();
   });
 
-  test('ordinary C2C ACTION force-emits with its polling instance', () async {
+  test('identical C2C ACTION events each emit with their polling instance',
+      () async {
     final liveMessages = <ChatMessage>[];
     final subscription = service.messages.listen(liveMessages.add);
     final advancedListener = V2TimAdvancedMsgListener();
@@ -327,13 +328,12 @@ void main() {
       );
       await Future<void>.delayed(Duration.zero);
 
-      expect(service.getHistory(_peer), hasLength(1));
-      expect(
-        service.getHistory(_peer).single.contentKind,
-        ChatMessageContentKind.action,
-      );
-      expect(liveMessages, hasLength(1));
-      expect(liveMessages.single.sourceInstanceId, 42);
+      expect(service.getHistory(_peer), hasLength(2));
+      expect(service.getHistory(_peer).map((row) => row.contentKind),
+          everyElement(ChatMessageContentKind.action));
+      expect(liveMessages, hasLength(2));
+      expect(liveMessages.map((row) => row.sourceInstanceId), everyElement(42));
+      expect(liveMessages.map((row) => row.msgID).toSet(), hasLength(2));
     } finally {
       TIMMessageManager.instance.removeAdvancedMsgListener(
         listener: advancedListener,
@@ -342,7 +342,7 @@ void main() {
     }
   });
 
-  test('ordinary group ACTION materializes once with action content kind',
+  test('identical conference ACTION events each remain in history',
       () async {
     const groupId = 'qtox-action-group';
     final liveMessages = <ChatMessage>[];
@@ -354,16 +354,14 @@ void main() {
     );
     expect(
       service.ingestActionEvent(_groupActionEvent(groupId, 'applauds')),
-      isFalse,
+      isTrue,
     );
     await Future<void>.delayed(Duration.zero);
 
-    expect(service.getHistory(groupId), hasLength(1));
-    expect(
-      service.getHistory(groupId).single.contentKind,
-      ChatMessageContentKind.action,
-    );
-    expect(liveMessages, hasLength(1));
+    expect(service.getHistory(groupId), hasLength(2));
+    expect(service.getHistory(groupId).map((row) => row.contentKind),
+        everyElement(ChatMessageContentKind.action));
+    expect(liveMessages, hasLength(2));
     await subscription.cancel();
   });
 

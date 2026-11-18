@@ -9,6 +9,8 @@ import 'package:test/test.dart';
 import 'package:tencent_cloud_chat_sdk/native_im/adapter/tim_manager.dart';
 import 'package:tencent_cloud_chat_sdk/native_im/adapter/tim_group_manager.dart';
 import 'package:tencent_cloud_chat_sdk/enum/V2TimGroupListener.dart';
+import 'package:tencent_cloud_chat_sdk/enum/group_change_info_type.dart';
+import 'package:tencent_cloud_chat_sdk/tencent_im_sdk_plugin.dart';
 import 'package:tencent_cloud_chat_sdk/models/v2_tim_group_info.dart';
 import 'package:ffi/ffi.dart' as pkgffi;
 import 'package:tim2tox_dart/ffi/tim2tox_ffi.dart' as ffi_lib;
@@ -324,11 +326,18 @@ void main() {
       );
 
       var bobReceivedInfoChange = false;
+      String? bobAnnouncement;
       final bobInfoChangeTypes = <int>[];
       final bobListener = V2TimGroupListener(
         onGroupInfoChanged: (groupID, changeInfos) {
           if (groupID == groupId) {
             bobInfoChangeTypes.addAll(changeInfos.map((c) => c.type ?? -1));
+            for (final change in changeInfos) {
+              if (change.type ==
+                  GroupChangeInfoType.V2TIM_GROUP_INFO_CHANGE_TYPE_NOTIFICATION) {
+                bobAnnouncement = change.value;
+              }
+            }
             bobReceivedInfoChange = true;
             bob.markCallbackReceived('onGroupInfoChanged');
           }
@@ -402,9 +411,6 @@ void main() {
             'Bob should observe group info change via callback or state query',
       );
 
-      bob.runWithInstance(
-          () => TIMManager.instance.removeGroupListener(listener: bobListener));
-
       // A new NGC group has the topic lock ON, so only the founder and
       // moderators may change the announcement. The native permission query
       // (what toxee gates the "edit announcement" button on) must say so up
@@ -434,6 +440,37 @@ void main() {
       expect(bobSetResult.code, equals(10007), // ERR_SVR_GROUP_PERMISSION_DENY
           reason: 'topic-lock refusal must be a permission error, got '
               '${bobSetResult.code} ${bobSetResult.desc}');
+
+      final groupManager = TencentImSDKPlugin.v2TIMManager.getGroupManager();
+      final clear = V2TimGroupInfo(
+        groupID: groupId,
+        groupType: 'group',
+        notification: '',
+      );
+      final deniedClear = await bob.runWithInstanceAsync(
+        () => groupManager.setGroupInfo(info: clear),
+      );
+      expect(deniedClear.code, 10007,
+          reason: 'clearing is a real topic edit, subject to the topic lock');
+      final deniedBinaryClear = await bob.runWithInstanceAsync(
+        () => TIMGroupManager.instance.setGroupInfo(info: clear),
+      );
+      expect(deniedBinaryClear.code, 10007);
+      final sentClear = await alice.runWithInstanceAsync(
+        () => groupManager.setGroupInfo(info: clear),
+      );
+      expect(sentClear.code, 0);
+      await waitUntilWithVirtualPump(
+        scenario,
+        () => bobAnnouncement == '',
+        timeout: const Duration(seconds: 15),
+        description: 'empty announcement reaches Bob',
+        advanceMs: 500,
+        iterationsPerInstance: 20,
+        wallSleep: const Duration(milliseconds: 30),
+      );
+      bob.runWithInstance(
+          () => TIMManager.instance.removeGroupListener(listener: bobListener));
     }, timeout: const Timeout(Duration(seconds: 120)));
   });
 }

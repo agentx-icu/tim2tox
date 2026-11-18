@@ -451,7 +451,7 @@ class BinaryReplacementHistoryHook {
       var matchIndex = existingHistory.indexWhere(sameId);
       if (matchIndex < 0 && chatMsg.text.isNotEmpty) {
         matchIndex = existingHistory.indexWhere((msg) {
-          if (chatMessagesShareGroupIdentity(msg, chatMsg) != null) {
+          if (!canMergeInboundContentCopies(msg, chatMsg)) {
             return false;
           }
           if (msg.text != chatMsg.text) return false;

@@ -330,7 +330,6 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
         chatMessageContentKindFromLocalCustomData(second.localCustomData);
   }
 
-  static final _nativeCallbackMessageId = RegExp(r'^msg_\d+_\d+_\d+$');
 
   bool _sharesMessageId(V2TimMessage first, V2TimMessage second) {
     final id = first.msgID;
@@ -1317,6 +1316,7 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
       // the authority on whether it is still failed.
       final String? rowId = chatMsg.msgID;
       if (chatMsg.isSelf && chatMsg.isFailed && rowId != null) {
+        _progressMsgCache.remove(rowId);
         final save = _persistFinalizedFailedMessage(
           message: v2Msg,
           receiver: v2Msg.userID ?? '',
@@ -1989,7 +1989,7 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
               // row. Two stream rows with different ids are distinct.
               if (msg == null ||
                   msg.isSelf == true ||
-                  !_nativeCallbackMessageId.hasMatch(msg.msgID ?? '')) {
+                  !isNativeCallbackMessageId(msg.msgID)) {
                 return false;
               }
               if (msg.sender == v2Msg.sender) {
@@ -2524,12 +2524,13 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
       }
 
       if (targetMessage != null && msgID != null) {
-        final progressValue = progress.total > 0
-            ? (progress.received / progress.total * 100).round()
-            : 0;
-
         if (progress.isSend) {
-          // Sending progress
+          // Reserve 100% for the native completion event.
+          final progressValue = progress.total > 0
+              ? (progress.received / progress.total * 100)
+                  .round()
+                  .clamp(0, isComplete ? 100 : 99)
+              : 0;
           _notifyAdvancedMsgListeners((listener) {
             listener.onSendMessageProgress?.call(
               targetMessage!,
@@ -7438,6 +7439,12 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
     } catch (e) {
       // The delete could not be performed. This is the ONLY non-zero path, and
       // it is the one where leaving the row on screen is correct.
+      if (e is QueuedMessageDeletionError) {
+        TencentCloudChat.instance.callbacks.onUserNotificationEvent(
+          TencentCloudChatComponentsEnum.message,
+          TencentCloudChatUserNotificationEvent(eventCode: -1, text: e.message),
+        );
+      }
       return V2TimCallback(
         code: -1,
         desc: 'deleteMessages failed: $e',
@@ -8034,7 +8041,8 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
 
       // Delete the message locally first so the sender sees the result
       // immediately even if the signal send fails.
-      await deleteMessages(msgIDs: [msgID]);
+      final localDelete = await deleteMessages(msgIDs: [msgID]);
+      if (localDelete.code != 0) return localDelete;
 
       // Notify listeners (sender-side onRecvMessageRevoked).
       _notifyAdvancedMsgListeners((listener) {
@@ -10341,7 +10349,7 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
       final jsonParam = jsonEncode({
         'group_get_members_info_list_param_group_id': groupID,
         'group_get_members_info_list_param_option': {
-          'group_member_get_info_option_role_flag': 0
+          'group_member_get_info_option_role_flag': filter,
         },
         'group_get_members_info_list_param_next_seq': nextSeqInt,
       });
@@ -10355,7 +10363,7 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
         if (callResult != 0) {
           Tools.freePointers([pJsonParam, pUserData]);
           // FFI call failed, fall back to message history
-          return _getGroupMemberListFallback(groupID, nextSeq, count, offset);
+          return _getGroupMemberListFallback(groupID, count, offset, filter);
         }
 
         V2TimValueCallback<V2TimGroupMemberInfoResult> result =
@@ -10415,7 +10423,7 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
       } catch (e) {
         Tools.freePointers([pJsonParam, pUserData]);
         // FFI call threw, fall back to message history
-        return _getGroupMemberListFallback(groupID, nextSeq, count, offset);
+        return _getGroupMemberListFallback(groupID, count, offset, filter);
       }
     } catch (e) {
       return V2TimValueCallback<V2TimGroupMemberInfoResult>(
@@ -10434,7 +10442,7 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
   /// (self + owner). Members who have never sent messages will be missing.
   Future<V2TimValueCallback<V2TimGroupMemberInfoResult>>
       _getGroupMemberListFallback(
-          String groupID, String nextSeq, int count, int offset) async {
+          String groupID, int count, int offset, int filter) async {
     final history = ffiService.getHistory(groupID);
     final memberSet = <String>{};
     final selfPublicKey = ffiService.selfId.length >= 64
@@ -10465,6 +10473,9 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
         role = 200; // Member
       }
       return V2TimGroupMemberFullInfo(userID: userID, role: role);
+    }).where((member) {
+      final roleFlag = member.role == 400 ? 0x01 : 0x04;
+      return filter == 0 || filter & roleFlag != 0;
     }).toList();
     final startIndex = offset;
     final endIndex = (startIndex + count).clamp(0, memberList.length);

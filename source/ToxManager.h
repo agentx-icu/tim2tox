@@ -128,16 +128,15 @@ public:
     // is already stopped by then (UnInitSDK joins the event thread before
     // ToxManager::shutdown), so the pinned instance has exactly one user left.
     std::shared_ptr<Tox> acquireTox() const;
+    bool isAdmissionClosed() const;
     void iterate(uint32_t timeout = 0);
     bool isShuttingDown() const;
     // Serialize a toxcore entry point that BYPASSES the per-instance lock
     // (tox_callback_* registration, toxav_new/toxav_kill's per-pktid handler
-    // registration) with tox_iterate(). NOT for ordinary tox_*() calls — those
-    // are serialized inside toxcore (experimental_thread_safety, see
-    // initialize()). Never call from a tox callback: the event thread holds
-    // this NON-recursive mutex for the whole iterate — so when called ON that
-    // thread (from inside a tox callback) it returns an unowned lock: the
-    // caller is already serialized with the iterate by construction.
+    // registration) or an operation that must publish application state before
+    // the next tox callback. Individual tox_* calls already lock internally.
+    // On the iterating thread the caller already owns this non-recursive mutex,
+    // so this returns an unowned lock. Release Tox pins before waiting for it.
     std::unique_lock<std::mutex> lockIterate() const {
         if (isIterateOwner()) {
             return std::unique_lock<std::mutex>();
@@ -368,6 +367,7 @@ public:
     using FriendStatusMessageCallback = std::function<void(uint32_t, const uint8_t*, size_t)>;
     using FriendStatusCallback = std::function<void(uint32_t, TOX_USER_STATUS)>;
     using FriendConnectionStatusCallback = std::function<void(uint32_t, TOX_CONNECTION)>;
+    using FilePeerDisconnectedCallback = std::function<void(uint32_t)>;
     using FriendReadReceiptCallback = std::function<void(uint32_t, uint32_t)>;
     using FriendTypingCallback = std::function<void(uint32_t, bool)>;
     using FileRecvCallback = std::function<void(uint32_t, uint32_t, uint32_t, uint64_t, const uint8_t*, size_t)>;
@@ -410,6 +410,7 @@ public:
     void setFriendStatusMessageCallback(FriendStatusMessageCallback cb);
     void setFriendStatusCallback(FriendStatusCallback cb);
     void setFriendConnectionStatusCallback(FriendConnectionStatusCallback cb);
+    void setFilePeerDisconnectedCallback(FilePeerDisconnectedCallback cb);
     void setFriendReadReceiptCallback(FriendReadReceiptCallback cb);
     void setFriendTypingCallback(FriendTypingCallback cb);
     void setFileRecvCallback(FileRecvCallback cb);
@@ -594,6 +595,7 @@ private:
     FriendStatusMessageCallback friend_status_message_cb_;
     FriendStatusCallback friend_status_cb_;
     FriendConnectionStatusCallback friend_connection_status_cb_;
+    FilePeerDisconnectedCallback file_peer_disconnected_cb_;
     FriendReadReceiptCallback friend_read_receipt_cb_;
     FriendTypingCallback friend_typing_cb_;
     FileRecvCallback file_recv_cb_;

@@ -100,8 +100,8 @@ TEST(QToxAvatarSourceContractTest, SendsAvatarDeletionAsEmptyKindOneTransfer) {
 TEST(QToxAvatarSourceContractTest, GenericFilesAreAlwaysData) {
     const std::string source = ReadSource(TIM2TOX_FFI_SOURCE_PATH);
     const std::string generic = SourceSection(
-        source, "int tim2tox_ffi_send_file(",
-        "int tim2tox_ffi_send_avatar(");
+        source, "static int SendFile(",
+        "int tim2tox_ffi_send_file(");
 
     EXPECT_NE(generic.find("TOX_FILE_KIND_DATA"), std::string::npos);
     EXPECT_EQ(generic.find("TOX_FILE_KIND_AVATAR"), std::string::npos);

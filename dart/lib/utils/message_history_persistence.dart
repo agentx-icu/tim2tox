@@ -149,6 +149,7 @@ class MessageHistoryPersistence {
   int _epoch = 0;
   final Map<String, int> _conversationGen = {};
   Future<void>? _clearAllBarrier;
+  final _activeClears = <String, Future<bool>>{};
 
   _OpToken _token(String normalizedId) =>
       (epoch: _epoch, gen: _conversationGen[normalizedId] ?? 0);
@@ -161,7 +162,11 @@ class MessageHistoryPersistence {
   /// (and after an in-progress [clearAllHistories]). The slot is claimed
   /// synchronously, before any await, so callers racing on the same tick
   /// still serialize in call order.
-  Future<T> _serialized<T>(String normalizedId, Future<T> Function() body) async {
+  Future<T> _serialized<T>(
+    String normalizedId,
+    Future<T> Function() body, {
+    void Function()? onFailure,
+  }) async {
     final prev = _writeFences[normalizedId] ?? Future<void>.value();
     final barrier = _clearAllBarrier;
     final completer = Completer<void>();
@@ -177,6 +182,9 @@ class MessageHistoryPersistence {
       await requireSupportedHistorySchema(primary, _historyFormatVersion);
       await requireSupportedHistorySchema(File('${primary.path}.bak'), _historyFormatVersion);
       return await body();
+    } catch (_) {
+      onFailure?.call();
+      rethrow;
     } finally {
       // The fence only SERIALIZES (the next operation ignores this one's
       // outcome), so it always completes normally: an errored fence nobody
@@ -202,9 +210,8 @@ class MessageHistoryPersistence {
     final seq = ++_deleteSeq;
     final ids = _recentlyDeleted.putIfAbsent(normalizedId, () => {});
     for (final row in rows) {
-      if (row.msgID != null) ids[row.msgID!] = seq;
-      for (final alias in row.altMsgIds) {
-        ids[alias] = seq;
+      for (final identity in identitiesOf(row)) {
+        ids[identity] = seq;
       }
     }
   }
@@ -2097,11 +2104,17 @@ class MessageHistoryPersistence {
     // that happened while it waited for the previous write.
     final deleteSeqAtStart = _deleteSeq;
     final token = _token(normalizedId);
+    final clearing = _activeClears[normalizedId];
     // C1: the lock slot is claimed synchronously inside [_serialized], so
     // concurrent callers serialize deterministically.
-    return _serialized(normalizedId,
-        () => _writeMainFile(normalizedId, messages, token, deleteSeqAtStart))
-        .catchError((Object error, StackTrace stack) {
+    return _serialized(normalizedId, () async {
+      // A save queued during a failed clear may only have seen arrivals
+      // after its cut. Use the restored window before replacing the file.
+      final rows = clearing != null && !await clearing
+          ? List<ChatMessage>.from(_historyById[normalizedId] ?? messages)
+          : messages;
+      await _writeMainFile(normalizedId, rows, token, deleteSeqAtStart);
+    }).catchError((Object error, StackTrace stack) {
       if (error is! HistorySchemaNewerThanAppException) {
         _armSaveRetry(normalizedId, error, stack);
       }
@@ -2121,9 +2134,13 @@ class MessageHistoryPersistence {
     final file = await _getHistoryFile(normalizedId);
     final backupFile = await _getBackupFile(normalizedId);
     final tempFile = await _getTempFile(normalizedId);
+    final deleting = _recentlyDeleted[normalizedId]
+            ?.values
+            .any((sequence) => sequence <= deleteSeqAtStart) ??
+        false;
 
-    // Create backup of existing file if it exists
-    if (await file.exists()) {
+    // A delete cannot leave a backup that would restore its removed rows.
+    if (!deleting && await file.exists()) {
       try {
         await file.copy(backupFile.path);
       } catch (e) {
@@ -2171,18 +2188,19 @@ class MessageHistoryPersistence {
     } finally {
       await raf.close();
     }
-    await _renameWithRetry(tempFile, file.path);
-    // Deletes that happened before this save was called are on disk now.
-    _clearTombstonesUpTo(normalizedId, deleteSeqAtStart);
-
-    // X10: delete the backup we just used as a safety net.
-    try {
-      if (await backupFile.exists()) {
-        await backupFile.delete();
-      }
-    } catch (_) {
-      // Best-effort cleanup; leave the stale .bak for the 7-day sweep.
+    if (deleting) {
+      // Refuse before committing the primary if recovery data cannot be removed.
+      await _deleteFileIfPresent(backupFile);
     }
+    await _renameWithRetry(tempFile, file.path);
+    if (!deleting) {
+      try {
+        await _deleteFileIfPresent(backupFile);
+      } catch (_) {
+        // A regular write can leave a stale backup for the cleanup sweep.
+      }
+    }
+    _clearTombstonesUpTo(normalizedId, deleteSeqAtStart);
     _saveRetryAttempts.remove(normalizedId);
     _saveRetryTimers.remove(normalizedId)?.cancel();
   }
@@ -3235,7 +3253,8 @@ class MessageHistoryPersistence {
     return removed;
   }
 
-  /// Drop the archive (file, queued rows, cache) of a conversation.
+  /// Drop the archive of a conversation. Quit-group migration is best effort;
+  /// an explicit clear uses the same deletion primitive with errors exposed.
   Future<void> _deleteArchive(String normalizedId) async {
     _pendingArchive.remove(normalizedId);
     if (_archiveCacheId == normalizedId) {
@@ -3243,12 +3262,17 @@ class MessageHistoryPersistence {
       _archiveCacheRows = null;
     }
     try {
-      final archiveFile = await _getArchiveFile(normalizedId);
-      if (await archiveFile.exists()) {
-        await archiveFile.delete();
-      }
-    } catch (_) {
-      // Best-effort, same as the main file.
+      await _deleteFileIfPresent(await _getArchiveFile(normalizedId));
+    } catch (_) {}
+  }
+
+  Future<void> _deleteFileIfPresent(File file) async {
+    try {
+      await file.delete();
+    } on FileSystemException catch (error) {
+      final code = error.osError?.errorCode;
+      // POSIX ENOENT, Windows ERROR_FILE_NOT_FOUND and ERROR_PATH_NOT_FOUND.
+      if (code != 2 && !(Platform.isWindows && code == 3)) rethrow;
     }
   }
 
@@ -3351,7 +3375,7 @@ class MessageHistoryPersistence {
       // group alias and did not match exactly above are two genuine
       // messages: a member sending "ok" twice within the window.
       final contentMatch = list.indexWhere((msg) =>
-          chatMessagesShareGroupIdentity(msg, message) == null &&
+          canMergeInboundContentCopies(msg, message) &&
           msg.text == message.text &&
           msg.fromUserId == message.fromUserId &&
           msg.contentKind == message.contentKind &&
@@ -3635,6 +3659,7 @@ class MessageHistoryPersistence {
       }
     }
     _appendDebouncePending.clear();
+    _activeClears.clear();
     _historyById.clear();
     _recentlyDeleted.clear();
     _pendingArchive.clear();
@@ -3942,135 +3967,110 @@ class MessageHistoryPersistence {
     return _historyById.keys.toSet();
   }
 
-  /// Clear history for a specific conversation
-  /// This deletes the JSON history file but does NOT delete actual media files
-  /// (images, videos, audio, documents) referenced in the messages
+  /// Clear saved messages while preserving referenced media files.
   ///
-  /// Also clears all cache entries that might match this conversation ID
-  /// (e.g., original ID and normalized ID variants)
-  ///
-  /// CRITICAL: This method scans all history files to find and delete any file
-  /// that contains messages for this conversation, even if the filename doesn't match
-  /// (e.g., due to ID normalization or sanitization differences)
-  ///
-  /// [conversationId] - Will be normalized before clearing
-  ///
-  /// [keepArchive] - keep rows older than the in-memory window. Only for the
-  /// "last in-memory row was deleted" case; clearing a conversation drops them.
+  /// Messages arriving after the clear starts form a new window. If storage
+  /// refuses the clear, restore the previous window before any queued save.
+  /// [keepArchive] retains rows older than the in-memory window.
   Future<void> clearHistory(String conversationId,
       {bool keepArchive = false}) async {
-    // Normalize conversationId for comparison
-    final normalizedConversationId =
-        ConversationIdUtils.normalize(conversationId);
-
-    // Cancel any in-flight debounced saves for this conversation — otherwise
-    // a queued save could resurrect the in-memory list we are about to clear.
-    _appendDebounceTimers.remove(conversationId)?.cancel();
-    _appendDebounceTimers.remove(normalizedConversationId)?.cancel();
-    _saveRetryTimers.remove(conversationId)?.cancel();
-    _saveRetryTimers.remove(normalizedConversationId)?.cancel();
-    _saveRetryAttempts.remove(conversationId);
-    _saveRetryAttempts.remove(normalizedConversationId);
-    _appendFirstDirtyAt.remove(conversationId);
-    _appendFirstDirtyAt.remove(normalizedConversationId);
-    final pendingDirect = _appendDebouncePending.remove(conversationId);
-    if (pendingDirect != null && !pendingDirect.isCompleted) {
-      pendingDirect.complete();
+    final id = ConversationIdUtils.normalize(conversationId);
+    final requestEpoch = _epoch;
+    var precedingClear = _activeClears[id];
+    while (precedingClear != null) {
+      await precedingClear;
+      if (_epoch != requestEpoch) return;
+      precedingClear = _activeClears[id];
     }
-    final pendingNormalized =
-        _appendDebouncePending.remove(normalizedConversationId);
-    if (pendingNormalized != null && !pendingNormalized.isCompleted) {
-      pendingNormalized.complete();
+    final clear = Completer<bool>();
+    _activeClears[id] = clear.future;
+    void finish(bool succeeded) {
+      if (identical(_activeClears[id], clear.future)) _activeClears.remove(id);
+      clear.complete(succeeded);
     }
 
-    // Clear in-memory cache for this ID and all variants
-    _historyById.remove(conversationId);
-
-    // Also clear any cache entries that might match this conversation
-    // (e.g., if there are multiple ID variants stored)
-    final keysToRemove = <String>[];
-    for (final key in _historyById.keys) {
-      // Normalize key for comparison
-      final normalizedKey = ConversationIdUtils.normalize(key);
-
-      // Check if key matches conversationId using normalized comparison
-      if (ConversationIdUtils.equals(key, conversationId) ||
-          ConversationIdUtils.equals(normalizedKey, normalizedConversationId)) {
-        keysToRemove.add(key);
+    // Cut the live window synchronously so arrivals after this call are not
+    // removed. Retain the discarded state until disk accepts the clear.
+    final keys = {
+      conversationId,
+      id,
+      ..._historyById.keys.where((key) => ConversationIdUtils.equals(key, id)),
+    };
+    final previousRows = <ChatMessage>[];
+    final previousOverflow = <ChatMessage>[];
+    final previousDeletes = <String, int>{};
+    var needsSave = _writeFences.containsKey(id);
+    for (final key in keys) {
+      previousRows.addAll(_historyById.remove(key) ?? const []);
+      if (!keepArchive) {
+        previousOverflow.addAll(_pendingArchive.remove(key) ?? const []);
       }
+      previousDeletes.addAll(_recentlyDeleted.remove(key) ?? const {});
+      final saving = _appendDebounceTimers.remove(key);
+      final retry = _saveRetryTimers.remove(key);
+      if (_dirtyAfterLoad.remove(key) || saving != null || retry != null) {
+        needsSave = true;
+      }
+      saving?.cancel();
+      retry?.cancel();
+      _saveRetryAttempts.remove(key);
+      _appendFirstDirtyAt.remove(key);
+      _appendDebouncePending.remove(key)?.complete();
+      _conversationGen[key] = (_conversationGen[key] ?? 0) + 1;
     }
-    for (final key in keysToRemove) {
-      _historyById.remove(key);
-    }
-
-    // Pre #3: invalidate every operation queued for this conversation BEFORE
-    // now. A load started before the clear used to install the old rows
-    // after the clear completed (and schedule a save of them); a save
-    // snapshot taken before it used to rewrite the file. Both now see a
-    // stale generation and do nothing. The file is gone below, so the
-    // tombstones (deletes not yet on disk) have nothing left to guard.
-    for (final id in <String>{normalizedConversationId, conversationId}) {
-      _conversationGen[id] = (_conversationGen[id] ?? 0) + 1;
-      _recentlyDeleted.remove(id);
-      _dirtyAfterLoad.remove(id);
-    }
-    if (!keepArchive) {
-      _pendingArchive.remove(normalizedConversationId);
-      _pendingArchive.remove(conversationId);
-    }
-    if (_archiveCacheId == normalizedConversationId ||
-        _archiveCacheId == conversationId) {
+    if (keys.contains(_archiveCacheId)) {
       _archiveCacheId = null;
       _archiveCacheRows = null;
     }
 
-    // The delete runs under the conversation lock: a write already running
-    // (a debounced save whose timer fired, mid rename with a pre-clear
-    // snapshot) finishes first and is then deleted; everything queued after
-    // this clear runs after the delete. A later incoming message is a
-    // legitimate new conversation.
-    //
-    // H7: filenames are deterministic — `_getHistoryFile` derives them from
-    // `ConversationIdUtils.normalize` + `sanitizeForFilename`, so no
-    // directory scan is needed.
-    await _serialized(normalizedConversationId, () async {
+    final token = _token(id);
+    await _serialized(id, () async {
+      if (_isStale(id, token)) {
+        finish(false);
+        return;
+      }
       if (keepArchive) {
-        // BEFORE the main file goes. Rows pushed out of the memory window are
-        // durable only once the archive holds them, and until then the MAIN
-        // FILE is the copy that still has them (a save that cannot append the
-        // archive aborts its own rewrite, precisely to keep that invariant).
-        // Draining afterwards and swallowing the failure deleted the last
-        // copy of those rows: nothing else drains `_pendingArchive` for a
-        // conversation with no cached list, and dispose only counts them.
-        // A failure now leaves the rows queued, the main file intact and the
-        // flush path ([flushPendingSaves]) owing the write — and propagates,
-        // so the caller does not report a delete it did not perform.
-        await _drainPendingArchive(
-            normalizedConversationId, await _resolveStorageRoots());
+        // The primary may still hold the only durable copy of queued overflow.
+        await _drainPendingArchive(id, await _resolveStorageRoots());
       }
-      try {
-        final file = await _getHistoryFile(normalizedConversationId);
-        try {
-          if (await file.exists()) {
-            await file.delete();
-          }
-        } catch (_) {
-          // Best-effort; memory cache is already cleared above.
-        }
-        // Also drop any backup file we may have left around.
-        try {
-          final backup = await _getBackupFile(normalizedConversationId);
-          if (await backup.exists()) {
-            await backup.delete();
-          }
-        } catch (_) {}
-        if (!keepArchive) {
-          await _deleteArchive(normalizedConversationId);
-        }
-      } catch (e) {
-        // Log error but don't throw - clearing should continue
-        // The file may not exist or may be locked, but we've cleared memory cache
+      // Remove potential recovery data before the primary.
+      await _deleteFileIfPresent(await _getBackupFile(id));
+      if (!keepArchive) {
+        await _deleteFileIfPresent(await _getArchiveFile(id));
       }
+      await _deleteFileIfPresent(await _getHistoryFile(id));
+      finish(true);
+    }, onFailure: () {
+      if (!_isStale(id, token)) {
+        if (previousDeletes.isNotEmpty) {
+          _recentlyDeleted[id] = {
+            ...previousDeletes,
+            ...?_recentlyDeleted[id],
+          };
+        }
+        final arrivals = _historyById[id];
+        final rows = _dedupeByIdentity([...previousRows, ...?arrivals]);
+        sortChatMessagesChronologically(rows);
+        final spill = rows.length - _maxMessagesInMemory;
+        if (previousOverflow.isNotEmpty || spill > 0) {
+          final archived = _pendingArchive.putIfAbsent(id, () => []);
+          archived.insertAll(0, previousOverflow);
+          if (spill > 0) {
+            archived.addAll(rows.take(spill));
+            rows.removeRange(0, spill);
+          }
+        }
+        if (rows.isNotEmpty || previousDeletes.isNotEmpty) {
+          _historyById[id] = rows;
+          if (needsSave ||
+              arrivals != null ||
+              previousOverflow.isNotEmpty ||
+              previousDeletes.isNotEmpty) {
+            _scheduleDebouncedSave(id);
+          }
+        }
+      }
+      finish(false);
     });
   }
 
@@ -4233,6 +4233,60 @@ class MessageHistoryPersistence {
     }
 
     return true;
+  }
+
+  /// Durably delete matching rows from the loaded history window.
+  ///
+  /// Put the rows and their tombstones back when the write is refused, provided
+  /// the same conversation generation still owns the list.
+  Future<List<ChatMessage>> removeCachedMessages(
+    String conversationId,
+    bool Function(ChatMessage) matches,
+  ) async {
+    final id = ConversationIdUtils.normalize(conversationId);
+    final rows = _historyById[id];
+    if (rows == null) return const <ChatMessage>[];
+    final removed = rows.where(matches).toList();
+    if (removed.isEmpty) return removed;
+
+    final token = _token(id);
+    final identities = removed.expand(identitiesOf).toSet();
+    // The live row may hold the only alias for its duplicate in the archive.
+    // Keep the live row available until the archive rewrite has committed.
+    await _removeArchivedRows(id, identities);
+    if (_isStale(id, token) || !identical(_historyById[id], rows)) {
+      return const <ChatMessage>[];
+    }
+    final oldTombstones = _recentlyDeleted[id];
+    final previous = {
+      for (final identity in identities) identity: oldTombstones?[identity],
+    };
+    rows.removeWhere(matches);
+    noteRemovedFromCache(id, removed);
+    final sequence = _deleteSeq;
+    try {
+      await saveHistory(id, rows);
+    } catch (_) {
+      if (!_isStale(id, token) && identical(_historyById[id], rows)) {
+        final tombstones = _recentlyDeleted[id];
+        for (final entry in previous.entries) {
+          if (tombstones?[entry.key] != sequence) continue;
+          final older = entry.value;
+          if (older == null) {
+            tombstones!.remove(entry.key);
+          } else {
+            tombstones![entry.key] = older;
+          }
+        }
+        if (tombstones?.isEmpty ?? false) _recentlyDeleted.remove(id);
+        final liveIds = rows.expand(identitiesOf).toSet();
+        rows.addAll(
+            removed.where((row) => !identitiesOf(row).any(liveIds.contains)));
+        sortChatMessagesChronologically(rows);
+      }
+      rethrow;
+    }
+    return removed;
   }
 
   /// Remove a message from the history

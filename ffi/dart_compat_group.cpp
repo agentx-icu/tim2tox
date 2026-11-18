@@ -2,6 +2,7 @@
 // Extracted from dart_compat_layer.cpp for modularization
 #include "dart_compat_internal.h"
 #include "V2TIMManagerImpl.h"
+#include <nlohmann/json.hpp>
 
 // Forward declarations for multi-instance support
 extern int64_t GetCurrentInstanceId();
@@ -1344,6 +1345,8 @@ extern "C" {
         // Create V2TIMGroupInfo
         V2TIMGroupInfo group_info;
         group_info.groupID = V2TIMString(group_id.c_str());
+        group_info.modifyFlag = static_cast<uint32_t>(
+            ExtractJsonInt(json_str, "group_modify_info_param_modify_flag", 0));
         if (!group_name.empty()) {
             group_info.groupName = V2TIMString(group_name.c_str());
         }
@@ -1398,11 +1401,19 @@ extern "C" {
             return 1; // Error
         }
         
-        // Parse other JSON parameters
+        // SDK requests carry role flags in the nested options object. Keep
+        // accepting the flat inputs used by older direct FFI clients.
         int filter = ExtractJsonInt(json_str, "group_get_members_info_list_param_option", 0);
-        // Try alternative field names
         if (filter == 0) {
             filter = ExtractJsonInt(json_str, "get_group_member_list_param_filter", 0);
+        }
+        const auto request = nlohmann::json::parse(json_str, nullptr, false);
+        const auto option = request.find("group_get_members_info_list_param_option");
+        if (option != request.end() && option->is_object()) {
+            const auto roles = option->find("group_member_get_info_option_role_flag");
+            if (roles != option->end() && roles->is_number_integer()) {
+                filter = roles->get<int>();
+            }
         }
         uint64_t next_seq = static_cast<uint64_t>(ExtractJsonInt(json_str, "group_get_members_info_list_param_next_seq", 0));
         if (next_seq == 0) {
@@ -1459,12 +1470,12 @@ extern "C" {
             }
         };
         
-        // Call V2TIM GetGroupMemberList (async)
+        DartGroupMemberInfoResultCallback callback(user_data);
         SafeGetV2TIMManager()->GetGroupManager()->GetGroupMemberList(
             V2TIMString(group_id.c_str()),
             static_cast<V2TIMGroupMemberFilter>(filter),
             next_seq,
-            new DartGroupMemberInfoResultCallback(user_data)
+            &callback
         );
         
         return 0; // TIM_SUCC (request accepted)
@@ -1943,11 +1954,11 @@ extern "C" {
             }
         };
         
-        // Call V2TIM GetGroupMembersInfo (async)
+        DartGroupMemberFullInfoVectorCallback callback(user_data);
         SafeGetV2TIMManager()->GetGroupManager()->GetGroupMembersInfo(
             V2TIMString(group_id.c_str()),
             member_id_vector,
-            new DartGroupMemberFullInfoVectorCallback(user_data)
+            &callback
         );
         
         return 0; // TIM_SUCC (request accepted)

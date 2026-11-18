@@ -59,6 +59,58 @@ void main() {
     });
   });
 
+  group('history deletion preserves data when storage refuses', () {
+    const conversationId = 'deletepeer';
+
+    ChatMessage message(String id, int timestamp) => ChatMessage(
+          msgID: id,
+          text: id,
+          fromUserId: conversationId,
+          isSelf: false,
+          timestamp: DateTime.fromMillisecondsSinceEpoch(timestamp),
+        );
+
+    test('failed clear preserves history and a concurrently saved append',
+        () async {
+      final persistence =
+          MessageHistoryPersistence(historyDirectory: tempDir.path);
+      await persistence.appendHistory(conversationId, message('original', 1));
+      await Directory('${tempDir.path}/$conversationId.archive.jsonl').create();
+
+      final refused = expectLater(
+          persistence.clearHistory(conversationId),
+          throwsA(isA<FileSystemException>()));
+      final append =
+          persistence.appendHistory(conversationId, message('arrived', 2));
+      final flush = persistence.flushPendingSaves();
+
+      await refused;
+      await append;
+      await flush;
+      final fresh = MessageHistoryPersistence(historyDirectory: tempDir.path);
+      expect((await fresh.loadHistory(conversationId)).map((m) => m.msgID),
+          ['original', 'arrived']);
+    });
+
+    test('refused backup removal leaves the primary row on disk', () async {
+      final persistence =
+          MessageHistoryPersistence(historyDirectory: tempDir.path);
+      await persistence.appendHistory(conversationId, message('original', 1));
+      await Directory('${tempDir.path}/$conversationId.json.bak').create();
+
+      await expectLater(
+          persistence.removeCachedMessages(conversationId, (_) => true),
+          throwsA(isA<FileSystemException>()));
+      expect(persistence.getHistory(conversationId).map((m) => m.msgID),
+          ['original']);
+      final fresh = MessageHistoryPersistence(historyDirectory: tempDir.path);
+      expect((await fresh.loadHistory(conversationId)).map((m) => m.msgID),
+          ['original']);
+      await Directory('${tempDir.path}/$conversationId.json.bak').delete();
+      await persistence.flushPendingSaves();
+    });
+  });
+
   group('CR-06: updateFilePathSafely refuses a missing path', () {
     test('returns false and leaves the path unchanged when missing', () async {
       const conversationId = 'cr06peer';
@@ -273,6 +325,43 @@ void main() {
   });
 
   group('Cross-path dedup: same inbound message via both hybrid paths', () {
+    for (final nativeFirst in [true, false]) {
+      test('repeated text keeps two one-to-one hybrid pairs (native first: '
+          '$nativeFirst)', () async {
+        const peer = 'paired-peer';
+        final persistence =
+            MessageHistoryPersistence(historyDirectory: tempDir.path);
+        final time = DateTime.fromMillisecondsSinceEpoch(1000000);
+        const nativeIds = ['msg_0_1000000000000_1', 'msg_0_1000000000000_2'];
+        const pollIds = ['1000001_1_$peer', '1000001_2_$peer'];
+        final ids = nativeFirst
+            ? [...nativeIds, ...pollIds]
+            : [...pollIds, ...nativeIds];
+        for (final id in ids) {
+          await persistence.appendHistory(
+            peer,
+            ChatMessage(
+              text: 'again',
+              fromUserId: peer,
+              isSelf: false,
+              timestamp: time,
+              msgID: id,
+            ),
+          );
+        }
+        await persistence.flushPendingSaves();
+        final reloaded =
+            MessageHistoryPersistence(historyDirectory: tempDir.path);
+        addTearDown(reloaded.dispose);
+        final history = await reloaded.loadHistory(peer);
+        expect(history, hasLength(2));
+        for (var index = 0; index < history.length; index++) {
+          expect(MessageHistoryPersistence.identitiesOf(history[index]),
+              unorderedEquals([nativeIds[index], pollIds[index]]));
+        }
+      });
+    }
+
     test('ACTION and NORMAL with identical text remain distinct', () async {
       const conversationId = 'qtox-kind-distinct';
       final persistence =

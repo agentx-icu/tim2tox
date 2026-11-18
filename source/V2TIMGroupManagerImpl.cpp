@@ -47,6 +47,20 @@ namespace {
 // (7013 = this KIND of group cannot do it at all, e.g. a legacy conference):
 // the UI tells the user different things for the two.
 constexpr int kErrSvrGroupPermissionDeny = 10007;
+
+bool MatchesGroupMemberFilter(uint32_t role, uint32_t filter) {
+    if (filter == V2TIM_GROUP_MEMBER_FILTER_ALL) return true;
+    switch (role) {
+        case V2TIM_GROUP_MEMBER_ROLE_SUPER:
+            return (filter & V2TIM_GROUP_MEMBER_FILTER_OWNER) != 0;
+        case V2TIM_GROUP_MEMBER_ROLE_ADMIN:
+            return (filter & V2TIM_GROUP_MEMBER_FILTER_ADMIN) != 0;
+        case V2TIM_GROUP_MEMBER_ROLE_MEMBER:
+            return (filter & V2TIM_GROUP_MEMBER_FILTER_COMMON) != 0;
+        default:
+            return false;
+    }
+}
 }  // namespace
 
 // Thread-local flag to prevent recursion when GetJoinedGroupList is called from tim2tox_ffi_get_known_groups
@@ -1358,6 +1372,8 @@ void V2TIMGroupManagerImpl::SetGroupInfo(const V2TIMGroupInfo& info,
     //  - Legacy conference title <-> group name; conferences have no topic, so
     //    their notification stays local.
     const bool is_conference = IsConferenceMapKey(group_number);
+    const bool updates_notification = !info.notification.Empty() ||
+        (info.modifyFlag & V2TIM_GROUP_INFO_MODIFY_FLAG_NOTIFICATION) != 0;
     if (is_conference && !info.groupName.Empty()) {
         const std::string title = info.groupName.CString();
         Tox_Err_Conference_Title err_title = TOX_ERR_CONFERENCE_TITLE_OK;
@@ -1374,7 +1390,7 @@ void V2TIMGroupManagerImpl::SetGroupInfo(const V2TIMGroupInfo& info,
         }
     }
 
-    if (!is_conference && !info.notification.Empty()) {
+    if (!is_conference && updates_notification) {
         // The old code dereferenced the raw fetch straight into setGroupTopic;
         // with no live session that was a null deref, so this refusal is new and
         // replaces a crash.
@@ -1422,7 +1438,7 @@ void V2TIMGroupManagerImpl::SetGroupInfo(const V2TIMGroupInfo& info,
             if (!info.groupID.Empty()) it->second.groupID = info.groupID;
             if (!info.groupType.Empty()) it->second.groupType = info.groupType;
             if (!info.groupName.Empty()) it->second.groupName = info.groupName;
-            if (!info.notification.Empty()) it->second.notification = info.notification;
+            if (updates_notification) it->second.notification = info.notification;
             if (!info.introduction.Empty()) it->second.introduction = info.introduction;
         } else {
             group_info_[info.groupID.CString()] = info;
@@ -1692,7 +1708,9 @@ void V2TIMGroupManagerImpl::GetGroupMemberList(
             selfInfoFallback.joinTime = static_cast<int64_t>(std::time(nullptr));
             selfOnlyList.PushBack(selfInfoFallback);
             V2TIMGroupMemberInfoResult resultFallback;
-            resultFallback.memberInfoList = selfOnlyList;
+            if (MatchesGroupMemberFilter(selfInfoFallback.role, filter)) {
+                resultFallback.memberInfoList = selfOnlyList;
+            }
             resultFallback.nextSequence = 0;
             {
                 std::lock_guard<std::mutex> lock(member_mutex_);
@@ -2044,7 +2062,12 @@ void V2TIMGroupManagerImpl::GetGroupMemberList(
     
     // Create result
     V2TIMGroupMemberInfoResult result;
-    result.memberInfoList = memberList;
+    for (size_t i = 0; i < memberList.Size(); ++i) {
+        const auto& member = memberList[i];
+        if (MatchesGroupMemberFilter(member.role, filter)) {
+            result.memberInfoList.PushBack(member);
+        }
+    }
     result.nextSequence = 0; // Tox doesn't support pagination, so always return 0
     
     // [tim2tox-debug] Record member list building for GetGroupMemberList

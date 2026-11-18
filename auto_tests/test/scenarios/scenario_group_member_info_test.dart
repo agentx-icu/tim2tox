@@ -8,7 +8,9 @@
 import 'package:test/test.dart';
 import 'package:tencent_cloud_chat_sdk/native_im/adapter/tim_manager.dart';
 import 'package:tencent_cloud_chat_sdk/native_im/adapter/tim_group_manager.dart';
+import 'package:tencent_cloud_chat_sdk/tencent_im_sdk_plugin.dart';
 import 'package:tencent_cloud_chat_sdk/enum/group_member_filter_enum.dart';
+import 'package:tencent_cloud_chat_sdk/enum/group_member_role.dart';
 import 'package:tencent_cloud_chat_sdk/enum/group_member_role_enum.dart';
 import 'package:tencent_cloud_chat_sdk/models/v2_tim_group_member_full_info.dart';
 import '../test_helper.dart';
@@ -146,6 +148,27 @@ void main() {
       final groupId = createResult.data!;
       await inviteAndJoinMember(groupId, bob,
           context: 'modify member nameCard');
+      final groupManager = TencentImSDKPlugin.v2TIMManager.getGroupManager();
+      const owner = GroupMemberFilterTypeEnum.V2TIM_GROUP_MEMBER_FILTER_OWNER;
+      const member = GroupMemberFilterTypeEnum.V2TIM_GROUP_MEMBER_FILTER_COMMON;
+      const expectedRoles = [
+        (owner, GroupMemberRoleType.V2TIM_GROUP_MEMBER_ROLE_OWNER),
+        (member, GroupMemberRoleType.V2TIM_GROUP_MEMBER_ROLE_MEMBER),
+      ];
+      for (final (filter, role) in expectedRoles) {
+        final byRole = await alice.runWithInstanceAsync(
+          () => groupManager.getGroupMemberList(
+            groupID: groupId,
+            filter: filter,
+            nextSeq: '0',
+          ),
+        );
+        expect(byRole.code, 0);
+        expect(
+          byRole.data!.memberInfoList!.map((entry) => entry.role),
+          [role],
+        );
+      }
       await pumpTestTick(scenario, advanceMs: 500, iterationsPerInstance: 1);
       final bobPublicKey = bob.getPublicKey();
       final setMemberInfoResult = await alice.runWithInstanceAsync(

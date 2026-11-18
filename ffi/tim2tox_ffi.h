@@ -537,6 +537,12 @@ int tim2tox_ffi_get_auto_accept_group_invites(int64_t instance_id);
 
 // File transfer (peer to peer): send a file to a friend
 int tim2tox_ffi_send_file(int64_t instance_id, const char* user_id, const char* file_path);
+// Returns a positive process-unique transfer ID, or the same errors as
+// tim2tox_ffi_send_file. Poll events are
+// file_send_progress:<instance>:<transfer>:<sent>:<total> and
+// file_send_failed:<instance>:<transfer>. Completion has sent equal to total.
+int64_t tim2tox_ffi_send_file_tracked(int64_t instance_id, const char* user_id,
+                                     const char* file_path);
 
 // Send a qTox-compatible avatar from caller-owned bytes. The bytes are copied
 // before this function returns. avatar_size must be in the range 1..10 MiB.

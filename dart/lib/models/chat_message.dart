@@ -181,6 +181,29 @@ bool? chatMessagesShareGroupIdentity(ChatMessage a, ChatMessage b) {
   return aliasA == aliasB;
 }
 
+final _nativeCallbackId = RegExp(r'^msg_\d+_\d+_\d+$');
+final _pollCallbackId = RegExp(r'^\d+_\d+_');
+
+bool isNativeCallbackMessageId(String? id) =>
+    id != null && _nativeCallbackId.hasMatch(id);
+
+/// Content can only reconcile callbacks when their known sources differ.
+/// Once one row has absorbed both sources, a later equal message must use a
+/// different row. Legacy rows with unknown ids keep the timing fallback.
+bool canMergeInboundContentCopies(ChatMessage a, ChatMessage b) {
+  if (chatMessagesShareGroupIdentity(a, b) != null) return false;
+  return (_callbackSources(a) & _callbackSources(b)) == 0;
+}
+
+int _callbackSources(ChatMessage row) {
+  var sources = 0;
+  for (final id in [row.msgID, ...row.altMsgIds]) {
+    if (isNativeCallbackMessageId(id)) sources |= 1;
+    if (id != null && _pollCallbackId.hasMatch(id)) sources |= 2;
+  }
+  return sources;
+}
+
 /// Sorts [messages] in place by timestamp, STABLY: rows with equal timestamps
 /// keep their relative input order (history lists are kept in arrival order,
 /// and that order is what is persisted). `List.sort` is not stable past 32
