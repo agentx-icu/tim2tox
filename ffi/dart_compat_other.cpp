@@ -124,6 +124,12 @@ extern "C" {
         return 0; // request accepted; outcome delivered via the callback
     }
 
+    int DartDoBackground(uint32_t /*unread_count*/, void* user_data) {
+        SendApiCallbackResult(user_data, V2TIMErrorCode::ERR_SDK_INTERFACE_NOT_SUPPORT,
+                              "Foreground/background push state is not supported on the Tox backend");
+        return 0;
+    }
+
     // Signature: int DartDoForeground(Pointer<Void> user_data)
     int DartDoForeground(void* user_data) {
         V2TIM_LOG(kInfo, "[dart_compat] DartDoForeground: no-op on Tox");

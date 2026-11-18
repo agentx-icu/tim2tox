@@ -7266,8 +7266,10 @@ class FfiChatService {
   /// dismissed-filter on top of this. Refuse/delete paths need the raw view
   /// so they can capture the current wording for each entry matching the
   /// target userId.
-  Future<List<({String userId, String wording})>>
-      _getFriendApplicationsUnfiltered() async {
+  ({
+    List<({String userId, String wording})> applications,
+    int unreadCount,
+  }) _getFriendApplicationsUnfiltered() {
     const initialCapacity = 32 * 1024;
     const maxCapacity = 16 * 1024 * 1024;
     const maxAttempts = 4;
@@ -7277,22 +7279,23 @@ class FfiChatService {
     var capacity = initialCapacity;
     for (var attempt = 0; attempt < maxAttempts; attempt++) {
       final buffer = pkgffi.malloc.allocate<ffi.Int8>(capacity);
+      final unreadCount = pkgffi.malloc<ffi.Int32>();
       try {
-        final bytesWritten = _ffi.getFriendApplicationsForInstance(
+        final bytesWritten = _ffi.getFriendApplicationsWithUnreadForInstance(
           instanceId,
           buffer,
           capacity,
+          unreadCount,
         );
         if (bytesWritten < 0) {
           final requiredCapacity = -bytesWritten;
           if (requiredCapacity <= capacity || requiredCapacity > maxCapacity) {
-            return [];
+            break;
           }
           capacity = requiredCapacity;
           continue;
         }
-        if (bytesWritten == 0) return [];
-        if (bytesWritten >= capacity) return [];
+        if (bytesWritten == 0 || bytesWritten >= capacity) break;
 
         final payload =
             buffer.cast<pkgffi.Utf8>().toDartString(length: bytesWritten);
@@ -7306,12 +7309,18 @@ class FfiChatService {
             applications.add((userId: userId, wording: wording));
           }
         }
-        return applications;
+        return (
+          applications: applications,
+          unreadCount: unreadCount.value < 0
+              ? applications.length
+              : unreadCount.value.clamp(0, applications.length),
+        );
       } finally {
+        pkgffi.malloc.free(unreadCount);
         pkgffi.malloc.free(buffer);
       }
     }
-    return [];
+    return (applications: [], unreadCount: 0);
   }
 
   /// Wordings surfaced by [getFriendApplications] per userId since startup.
@@ -7380,8 +7389,15 @@ class FfiChatService {
   }
 
   Future<List<({String userId, String wording})>>
-      getFriendApplications() async {
-    final raw = await _getFriendApplicationsUnfiltered();
+      getFriendApplications() async =>
+          (await getFriendApplicationSnapshot()).applications;
+
+  Future<({
+    List<({String userId, String wording})> applications,
+    int unreadCount,
+  })> getFriendApplicationSnapshot() async {
+    final snapshot = _getFriendApplicationsUnfiltered();
+    final raw = snapshot.applications;
 
     // Remember the wordings the UI is being shown so refuseFriendApplication
     // can fall back to them if the C++ queue clears the entry before the user
@@ -7400,6 +7416,11 @@ class FfiChatService {
     // 5s poll because there is no native "dismiss" call.
     final dismissed = await _getDismissedFriendApplications();
     final filtered = filterDismissedApplications(raw, dismissed);
+    final unreadStart = raw.length - snapshot.unreadCount;
+    final unreadCount = filterDismissedApplications(
+      raw.sublist(unreadStart),
+      dismissed,
+    ).length;
     if (raw.isNotEmpty || dismissed.isNotEmpty) {
       _logger?.log(
         '[FfiChatService] getFriendApplications '
@@ -7407,7 +7428,9 @@ class FfiChatService {
         'filteredCount=${filtered.length}',
       );
     }
-    if (_seededApplications.isEmpty) return filtered;
+    if (_seededApplications.isEmpty) {
+      return (applications: filtered, unreadCount: unreadCount);
+    }
     // Merge locally-seeded applications (L3 demo seam; no C++ backing), skipping
     // any whose (userId, wording) fingerprint already came from the live queue.
     final seen = filtered
@@ -7419,7 +7442,10 @@ class FfiChatService {
       final fp = _fingerprint(_normalizeApplicationUserId(s.userId), s.wording);
       if (seen.add(fp)) merged.add(s);
     }
-    return merged;
+    return (
+      applications: merged,
+      unreadCount: unreadCount + merged.length - filtered.length,
+    );
   }
 
   /// Mark all currently-pending friend applications from [userID] as dismissed
@@ -7445,7 +7471,7 @@ class FfiChatService {
     _seededApplications.removeWhere(
         (a) => _normalizeApplicationUserId(a.userId) == normalized);
     _seededApplicationNicknames.remove(normalized);
-    final apps = await _getFriendApplicationsUnfiltered();
+    final apps = _getFriendApplicationsUnfiltered().applications;
     final liveWordings = apps
         .where((a) => _normalizeApplicationUserId(a.userId) == normalized)
         .map((a) => a.wording)
@@ -11006,23 +11032,6 @@ class FfiChatService {
                 // which lives in altMsgIds, never in msgID.
                 : ((msg.msgID == msgID || msg.altMsgIds.contains(msgID)) &&
                     msg.isSelf);
-        if (hashWanted != null &&
-            msg.isSelf &&
-            !matched &&
-            i >= history.length - 4) {
-          _logger?.log(
-            '[FfiChatService] hash-receipt unmatched: want=' +
-                hashWanted.substring(0, 12) +
-                ' row=' +
-                _c2cTextHash(msg.text).substring(0, 12) +
-                ' flags r=' +
-                msg.isReceived.toString() +
-                '/rd=' +
-                msg.isRead.toString() +
-                ' txt=' +
-                msg.text.substring(0, msg.text.length.clamp(0, 24)),
-          );
-        }
         if (matched) {
           _bumpDiag('receiptsRowMatched');
           if (groupID != null) _bumpDiag('groupReceiptsRowMatched');

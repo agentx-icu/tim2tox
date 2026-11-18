@@ -330,6 +330,19 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
         chatMessageContentKindFromLocalCustomData(second.localCustomData);
   }
 
+  static final _nativeCallbackMessageId = RegExp(r'^msg_\d+_\d+_\d+$');
+
+  bool _sharesMessageId(V2TimMessage first, V2TimMessage second) {
+    final id = first.msgID;
+    final clientId = first.id;
+    return (id != null &&
+            id.isNotEmpty &&
+            (id == second.msgID || id == second.id)) ||
+        (clientId != null &&
+            clientId.isNotEmpty &&
+            (clientId == second.msgID || clientId == second.id));
+  }
+
   void _applyOutgoingActionSemantics(
     V2TimMessage message,
     ({String text, ChatMessageContentKind contentKind}) outgoing,
@@ -1513,34 +1526,10 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
         if (_debugLog)
           print(
               '[Tim2ToxSdkPlatform] First 3 messages in list: ${messageList.take(3).map((m) => 'id=${m.id}, msgID=${m.msgID}, text="${m.textElem?.text ?? ""}", timestamp=${m.timestamp}').join("; ")}');
-        final messageExists = messageList.any((msg) {
-          // Check if msgID matches
-          if (v2Msg.msgID != null && msg.msgID == v2Msg.msgID) {
-            if (_debugLog)
-              print('[Tim2ToxSdkPlatform] Matched by msgID: ${v2Msg.msgID}');
-            return true;
-          }
-          // Check if id matches msgID
-          if (v2Msg.msgID != null && msg.id == v2Msg.msgID) {
-            if (_debugLog)
-              print(
-                  '[Tim2ToxSdkPlatform] Matched by v2Msg.msgID == msg.id: ${v2Msg.msgID}');
-            return true;
-          }
-          // Check if msgID matches id
-          if (v2Msg.id != null && msg.msgID == v2Msg.id) {
-            if (_debugLog)
-              print(
-                  '[Tim2ToxSdkPlatform] Matched by v2Msg.id == msg.msgID: ${v2Msg.id}');
-            return true;
-          }
-          // Check if id matches id
-          if (v2Msg.id != null && msg.id == v2Msg.id && v2Msg.id!.isNotEmpty) {
-            if (_debugLog)
-              print('[Tim2ToxSdkPlatform] Matched by id: ${v2Msg.id}');
-            return true;
-          }
-
+        // UIKit stores newest first. An exact id anywhere in the list must
+        // win before considering the text of a newer optimistic send.
+        final exactMatch = messageList.any((msg) => _sharesMessageId(msg, v2Msg));
+        bool adoptOptimisticMessage(V2TimMessage msg) {
           // CRITICAL: Check for temporary messages (created_temp_id-*) that need to be matched
           // When FFI returns a new message with different msgID, we need to match it with
           // the temporary message created by UIKit. This prevents duplicate messages.
@@ -1549,6 +1538,10 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
               msg.id != null && msg.id!.startsWith('created_temp_id-');
           final isTempMsgID =
               msg.msgID != null && msg.msgID!.startsWith('created_temp_id-');
+          if (!(isTempMessage || isTempMsgID) ||
+              msg.status != MessageStatus.V2TIM_MSG_STATUS_SENDING) {
+            return false;
+          }
 
           // CRITICAL: Fallback matching by content (text + timestamp) for sent messages
           // FFI layer may generate different msgID than UIKit, so we need to match by content
@@ -1698,7 +1691,10 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
           }
 
           return false;
-        });
+        }
+
+        final messageExists =
+            exactMatch || messageList.any(adoptOptimisticMessage);
         if (_debugLog)
           print(
               '[Tim2ToxSdkPlatform] Message existence check result: $messageExists');
@@ -1974,7 +1970,7 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
 
         // For received messages (isSelf=false), check if the message already exists in _messageListMap
         // by content + sender + timestamp. This prevents duplicates caused by the same message arriving
-        // through BOTH the native FFI callback path (HandleFriendMessage → OnRecvNewMessage with m-prefix ID)
+        // through BOTH the native FFI callback path (OnRecvNewMessage with a msg_ ID)
         // AND the Dart stream path (_setupMessageListener with real ID).
         if (!chatMsg.isSelf) {
           final conversationID = v2Msg.groupID ?? v2Msg.userID ?? '';
@@ -1982,87 +1978,87 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
             final messageList = TencentCloudChat
                 .instance.dataInstance.messageData
                 .getMessageList(key: conversationID);
-            final duplicateMsg = messageList.cast<V2TimMessage?>().firstWhere(
-              (msg) {
-                if (msg == null) return false;
-                // Check msgID match first
-                if (v2Msg.msgID != null && msg.msgID == v2Msg.msgID)
-                  return true;
-                if (v2Msg.msgID != null && msg.id == v2Msg.msgID) return true;
-                if (v2Msg.id != null && msg.msgID == v2Msg.id) return true;
+            final exactIndex = messageList.indexWhere(
+              (msg) => _sharesMessageId(msg, v2Msg),
+            );
+            final groupId = chatMsg.groupId;
+            final groupAlias = toxGroupMessageAliasOf(chatMsg);
+            bool matchesNativeCopy(V2TimMessage? msg) {
+              // The incoming row came from FfiChatService. A content match
+              // can only reconcile it with an unclaimed native callback
+              // row. Two stream rows with different ids are distinct.
+              if (msg == null ||
+                  msg.isSelf == true ||
+                  !_nativeCallbackMessageId.hasMatch(msg.msgID ?? '')) {
+                return false;
+              }
+              if (msg.sender == v2Msg.sender) {
+                final nativeGroupMsgId =
+                    toxGroupMsgIdFromLocalCustomData(msg.localCustomData);
+                if (groupId != null &&
+                    groupAlias != null &&
+                    nativeGroupMsgId != null) {
+                  return groupAlias ==
+                      toxGroupMessageAlias(
+                        groupId: groupId,
+                        senderPk: chatMsg.fromUserId,
+                        pseudoMsgId: nativeGroupMsgId,
+                      );
+                }
+                final timeDiff =
+                    ((v2Msg.timestamp ?? 0) - (msg.timestamp ?? 0)).abs();
+                if (timeDiff <= 2) {
+                  // Text message matching
+                  final v2Text = v2Msg.textElem?.text ?? '';
+                  final msgText = msg.textElem?.text ?? '';
+                  if (v2Text.isNotEmpty &&
+                      msgText == v2Text &&
+                      _sameContentKind(v2Msg, msg)) {
+                    return true;
+                  }
 
-                // Bug C fix (codex-designed 2026-05-30): the upstream guard was
-                // `if (v2Msg.msgID != null && !startsWith('m')) return false`,
-                // i.e. "only content-dedup temp/optimistic ids". That assumption
-                // is structurally wrong for toxee: the SAME inbound message
-                // double-delivers through BOTH hybrid paths, each with a
-                // DIFFERENT *real* id (binary-replacement `msg_<n>_<nanos>_<seq>`
-                // vs poll `<millis>_<n>_<toxId>`) — neither is the `^m\d+-\d+$`
-                // temp form, so the old guard skipped content-dedup and the 2nd
-                // copy rendered as a live double-bubble (Bug C). The correct
-                // invariant is DIRECTION, not id-format: only INBOUND messages
-                // double-deliver. This whole block is already gated on
-                // `!chatMsg.isSelf` above, so the id-format guard is removed
-                // entirely — content dedup applies to all inbound copies here.
-                // (Self/optimistic adoption is handled on the isSelf path and is
-                // untouched.)
-                //
-                // Content-based matching: same sender, same content, close
-                // timestamp. Window TIGHTENED 10s → 2s (codex): timestamps are
-                // SECONDS (converters do `~/ 1000`); cross-path copies arrive
-                // ms apart, so 2s is ample while a 10s window risked swallowing
-                // two genuinely-distinct identical inbound messages.
-                if (msg.sender == v2Msg.sender) {
-                  final timeDiff =
-                      ((v2Msg.timestamp ?? 0) - (msg.timestamp ?? 0)).abs();
-                  if (timeDiff <= 2) {
-                    // Text message matching
-                    final v2Text = v2Msg.textElem?.text ?? '';
-                    final msgText = msg.textElem?.text ?? '';
-                    if (v2Text.isNotEmpty &&
-                        msgText == v2Text &&
-                        _sameContentKind(v2Msg, msg)) {
+                  // File message matching
+                  if (v2Msg.fileElem != null && msg.fileElem != null) {
+                    final v2FileName = v2Msg.fileElem?.fileName ?? '';
+                    final msgFileName = msg.fileElem?.fileName ?? '';
+                    if (v2FileName.isNotEmpty && v2FileName == msgFileName)
                       return true;
-                    }
+                  }
 
-                    // File message matching
-                    if (v2Msg.fileElem != null && msg.fileElem != null) {
-                      final v2FileName = v2Msg.fileElem?.fileName ?? '';
-                      final msgFileName = msg.fileElem?.fileName ?? '';
-                      if (v2FileName.isNotEmpty && v2FileName == msgFileName)
-                        return true;
-                    }
+                  // Image message matching
+                  if (v2Msg.imageElem != null && msg.imageElem != null) {
+                    final v2Path = v2Msg.imageElem?.path ?? '';
+                    final msgPath = msg.imageElem?.path ?? '';
+                    if (v2Path.isNotEmpty && v2Path == msgPath) return true;
+                  }
 
-                    // Image message matching
-                    if (v2Msg.imageElem != null && msg.imageElem != null) {
-                      final v2Path = v2Msg.imageElem?.path ?? '';
-                      final msgPath = msg.imageElem?.path ?? '';
-                      if (v2Path.isNotEmpty && v2Path == msgPath) return true;
-                    }
+                  // Video message matching
+                  if (v2Msg.videoElem != null && msg.videoElem != null) {
+                    final v2Path = v2Msg.videoElem?.videoPath ?? '';
+                    final msgPath = msg.videoElem?.videoPath ?? '';
+                    if (v2Path.isNotEmpty && v2Path == msgPath) return true;
+                  }
 
-                    // Video message matching
-                    if (v2Msg.videoElem != null && msg.videoElem != null) {
-                      final v2Path = v2Msg.videoElem?.videoPath ?? '';
-                      final msgPath = msg.videoElem?.videoPath ?? '';
-                      if (v2Path.isNotEmpty && v2Path == msgPath) return true;
-                    }
-
-                    // Sound message matching
-                    if (v2Msg.soundElem != null && msg.soundElem != null) {
-                      final v2Path = v2Msg.soundElem?.path ?? '';
-                      final msgPath = msg.soundElem?.path ?? '';
-                      if (v2Path.isNotEmpty && v2Path == msgPath) return true;
-                    }
+                  // Sound message matching
+                  if (v2Msg.soundElem != null && msg.soundElem != null) {
+                    final v2Path = v2Msg.soundElem?.path ?? '';
+                    final msgPath = msg.soundElem?.path ?? '';
+                    if (v2Path.isNotEmpty && v2Path == msgPath) return true;
                   }
                 }
-                return false;
-              },
-              orElse: () => null,
-            );
+              }
+              return false;
+            }
+
+            final duplicateMsg = exactIndex >= 0
+                ? messageList[exactIndex]
+                : messageList.cast<V2TimMessage?>().firstWhere(
+                      matchesNativeCopy,
+                      orElse: () => null,
+                    );
 
             if (duplicateMsg != null) {
-              // Message already exists (likely from native FFI callback with m-prefix ID).
-              // Update the existing message's msgID to the real ID so future dedup works correctly.
+              // Future stream updates should locate the row by its stream id.
               if (v2Msg.msgID != null && duplicateMsg.msgID != v2Msg.msgID) {
                 if (_debugLog)
                   print(
@@ -7049,7 +7045,7 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
   /// scoped to `conversationID` if given (else every conversation with history).
   /// Per the V2TIM contract, `totalCount` is the MESSAGE count for a single-
   /// conversation search and the CONVERSATION count for an all-conversation
-  /// search (codex). Matched messages are converted with conversation context so
+  /// search. Matched messages are converted with conversation context so
   /// self-sent C2C results carry the right userID.
   @override
   Future<V2TimValueCallback<V2TimMessageSearchResult>> searchLocalMessages({
@@ -7097,74 +7093,99 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
         );
       }
 
-      final bareIds = singleConv
-          ? <String>[ConversationIdUtils.extractBaseId(convFilter)]
-          : ffiService.getConversationIds().toList();
+      bool matchesSearch(ChatMessage message) {
+        final matchesContent = effKeywords.isEmpty
+            ? isSearchableMessage(message)
+            : chatMessageMatchesKeywords(
+                message,
+                keywords: effKeywords,
+                matchAll: matchAll,
+              );
+        if (!matchesContent) return false;
+        if (userIdFilter.isNotEmpty &&
+            !userIdFilter
+                .contains(ConversationIdUtils.normalize(message.fromUserId))) {
+          return false;
+        }
+        final seconds = message.timestamp.millisecondsSinceEpoch ~/ 1000;
+        return !hasTimeFilter ||
+            (seconds >= timeEndSecs - timePeriod && seconds <= timeEndSecs);
+      }
 
+      final persistence = ffiService.messageHistoryPersistence;
+      final bareIds = singleConv
+          ? <String>{
+              ffiService.isSelfPeer(convFilter)
+                  ? ffiService.selfPublicKey!
+                  : ConversationIdUtils.normalize(convFilter),
+            }
+          : await persistence.getSearchableConversationIds();
+      bareIds.removeAll(ffiService.historyPurgeGroups);
+      final results = <String, List<ChatMessage>>{};
+      var remaining = maxResults;
+      for (final id in bareIds) {
+        if (persistence.getCachedList(id) == null) {
+          await ffiService.loadHistory(id);
+        }
+        final matches = persistence
+            .getHistory(id)
+            .where(matchesSearch)
+            .take(remaining)
+            .toList();
+        if (matches.isNotEmpty) results[id] = matches;
+        remaining -= matches.length;
+        if (remaining == 0) break;
+      }
+
+      // Give recent history the same claim on the cap as before, across all
+      // conversations. Only scan older rows while there is room for them.
+      for (final id in bareIds) {
+        if (remaining == 0) break;
+        if (!await persistence.hasArchivedHistory(id)) continue;
+        final archived = await persistence.searchArchivedHistory(
+          id,
+          matches: matchesSearch,
+          limit: remaining,
+        );
+        if (archived.isEmpty) continue;
+        results.putIfAbsent(id, () => []).addAll(archived);
+        sortChatMessagesChronologically(results[id]!);
+        remaining -= archived.length;
+      }
+
+      final knownGroups = {...ffiService.knownGroups, ...ffiService.quitGroups};
       final items = <V2TimMessageSearchResultItem>[];
-      var totalMessageMatches = 0;
-      for (final bareId in bareIds) {
-        if (totalMessageMatches >= maxResults) break;
-        // Single-conv: echo the caller's exact conversationID back (the base-ID
-        // reconstruction only exists on the native bridge — codex). All-conv:
-        // rebuild from knownGroups membership.
+      for (final id in bareIds) {
+        final matches = results[id];
+        if (matches == null) continue;
         final prefixedConvId = singleConv
             ? convFilter
             : ConversationIdUtils.buildFullId(
-                bareId,
-                isGroup: ffiService.knownGroups.contains(bareId),
+                id,
+                isGroup: knownGroups.contains(id) ||
+                    matches.any((message) => message.groupId != null),
               );
         final isGroup = prefixedConvId.startsWith('group_');
-        final matches = <V2TimMessage>[];
-        for (final msg in ffiService.getHistory(bareId)) {
-          // Keyword path filters control-signals + keywords together; the
-          // sender/time-only path (empty keyword) still excludes control signals.
-          if (effKeywords.isNotEmpty) {
-            if (!chatMessageMatchesKeywords(
-              msg,
-              keywords: effKeywords,
-              matchAll: matchAll,
-            )) {
-              continue;
-            }
-          } else if (!isSearchableMessage(msg)) {
-            continue;
-          }
-          // Sender filter (userIDList) on the message's sender.
-          if (userIdFilter.isNotEmpty &&
-              !userIdFilter
-                  .contains(ConversationIdUtils.normalize(msg.fromUserId))) {
-            continue;
-          }
-          // Time window: [end - period, end] when a period was given.
-          if (hasTimeFilter) {
-            final tsSecs = msg.timestamp.millisecondsSinceEpoch ~/ 1000;
-            if (tsSecs < timeEndSecs - timePeriod || tsSecs > timeEndSecs) {
-              continue;
-            }
-          }
-          matches.add(chatMessageToV2TimMessage(
-            msg,
-            selfId,
-            forwardTargetUserID: isGroup ? null : bareId,
-            forwardTargetGroupID: isGroup ? bareId : null,
-          ));
-          if (++totalMessageMatches >= maxResults) break;
-        }
-        if (matches.isNotEmpty) {
-          items.add(V2TimMessageSearchResultItem(
-            conversationID: prefixedConvId,
-            messageCount: matches.length,
-            messageList: matches,
-          ));
-        }
+        items.add(V2TimMessageSearchResultItem(
+          conversationID: prefixedConvId,
+          messageCount: matches.length,
+          messageList: [
+            for (final message in matches)
+              chatMessageToV2TimMessage(
+                message,
+                selfId,
+                forwardTargetUserID: isGroup ? null : id,
+                forwardTargetGroupID: isGroup ? id : null,
+              ),
+          ],
+        ));
       }
 
       return V2TimValueCallback<V2TimMessageSearchResult>(
         code: 0,
         desc: 'success',
         data: V2TimMessageSearchResult(
-          totalCount: singleConv ? totalMessageMatches : items.length,
+          totalCount: singleConv ? maxResults - remaining : items.length,
           messageSearchResultItems: items,
         ),
       );
@@ -9025,9 +9046,9 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
   Future<V2TimValueCallback<V2TimFriendApplicationResult>>
       getFriendApplicationList() async {
     try {
-      final apps = await ffiService.getFriendApplications();
+      final snapshot = await ffiService.getFriendApplicationSnapshot();
       final seededNicks = ffiService.seededApplicationNicknames;
-      final appList = apps
+      final appList = snapshot.applications
           .map((app) => fakeFriendApplicationToV2TimFriendApplication(
                 FakeFriendApplication(
                   userID: app.userId,
@@ -9041,7 +9062,7 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
         code: 0,
         desc: 'success',
         data: V2TimFriendApplicationResult(
-          unreadCount: appList.length,
+          unreadCount: snapshot.unreadCount,
           friendApplicationList: appList,
         ),
       );
@@ -9388,12 +9409,17 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
     required String userID,
   }) async {
     try {
-      await ffiService.deleteFriendApplication(userID);
+      final applicationType =
+          type >= 0 && type < FriendApplicationTypeEnum.values.length
+              ? FriendApplicationTypeEnum.values[type]
+              : FriendApplicationTypeEnum.V2TIM_FRIEND_APPLICATION_COME_IN;
+      if (applicationType !=
+          FriendApplicationTypeEnum.V2TIM_FRIEND_APPLICATION_SEND_OUT) {
+        await ffiService.deleteFriendApplication(userID);
+      }
       return await _nativeDeleteFriendApplication(
         userID: userID,
-        type: type >= 0 && type < FriendApplicationTypeEnum.values.length
-            ? FriendApplicationTypeEnum.values[type]
-            : FriendApplicationTypeEnum.V2TIM_FRIEND_APPLICATION_COME_IN,
+        type: applicationType,
       );
     } catch (e) {
       return V2TimCallback(

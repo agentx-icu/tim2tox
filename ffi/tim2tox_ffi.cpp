@@ -2601,10 +2601,12 @@ int tim2tox_ffi_save_friend_status_message(const char* friend_id, const char* st
     return 1;
 }
 
-static int get_friend_applications_impl(V2TIMManager* manager, char* buffer, int buffer_len) {
+static int get_friend_applications_impl(V2TIMManager* manager, char* buffer, int buffer_len,
+                                        int32_t* unread_count = nullptr) {
     if (!manager) return 0;
     struct RCb : public V2TIMValueCallback<V2TIMFriendApplicationResult> {
         std::string out; std::mutex m; std::condition_variable cv; bool done=false;
+        int32_t unread = 0;
         void OnSuccess(const V2TIMFriendApplicationResult& r) override {
             std::string s;
             for (size_t i = 0; i < r.applicationList.Size(); ++i) {
@@ -2614,7 +2616,12 @@ static int get_friend_applications_impl(V2TIMManager* manager, char* buffer, int
                 AppendListField(s, a.addWording.CString());
                 s.push_back('\n');
             }
-            { std::lock_guard<std::mutex> lk(m); out.swap(s); done=true; }
+            {
+                std::lock_guard<std::mutex> lk(m);
+                out.swap(s);
+                unread = static_cast<int32_t>(r.unreadCount);
+                done = true;
+            }
             cv.notify_one();
         }
         void OnError(int, const V2TIMString&) override { std::lock_guard<std::mutex> lk(m); done=true; cv.notify_one(); }
@@ -2622,6 +2629,7 @@ static int get_friend_applications_impl(V2TIMManager* manager, char* buffer, int
     manager->GetFriendshipManager()->GetFriendApplicationList(&rcb);
     std::unique_lock<std::mutex> lk(rcb.m);
     rcb.cv.wait_for(lk, std::chrono::seconds(3), [&]{return rcb.done;});
+    if (unread_count) *unread_count = rcb.unread;
     return CopyPayloadOrReturnRequiredCapacity(rcb.out, buffer, buffer_len);
 }
 
@@ -2635,6 +2643,13 @@ int tim2tox_ffi_get_friend_applications_for_instance(int64_t instance_id, char* 
     V2TIMManager* manager = GetManagerForInstanceId(instance_id);
     if (!manager) return 0;
     return get_friend_applications_impl(manager, buffer, buffer_len);
+}
+
+int tim2tox_ffi_get_friend_applications_with_unread_for_instance(
+    int64_t instance_id, char* buffer, int buffer_len, int32_t* unread_count) {
+    if (unread_count) *unread_count = 0;
+    if (!IsInstanceInited(instance_id)) return 0;
+    return get_friend_applications_impl(GetManagerForInstanceId(instance_id), buffer, buffer_len, unread_count);
 }
 
 int tim2tox_ffi_accept_friend(const char* user_id) {

@@ -297,6 +297,11 @@ int tim2tox_ffi_get_friend_applications(char* buffer, int buffer_len);
 // convention as tim2tox_ffi_get_friend_applications.
 int tim2tox_ffi_get_friend_applications_for_instance(int64_t instance_id, char* buffer, int buffer_len);
 
+// As above, with the number of unread entries from the same snapshot. Entries
+// are returned in arrival order, with unread entries at the end.
+int tim2tox_ffi_get_friend_applications_with_unread_for_instance(
+    int64_t instance_id, char* buffer, int buffer_len, int32_t* unread_count);
+
 // Accept a friend application by userID; returns 1 if submitted
 int tim2tox_ffi_accept_friend(const char* user_id);
 

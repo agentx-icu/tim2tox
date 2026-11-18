@@ -86,12 +86,10 @@ void V2TIMFriendshipManagerImpl::NotifyFriendApplicationListAdded(const V2TIMFri
                       i, applicationList[i].userID.CString(), applicationList[i].addWording.CString());
             pending_applications_.PushBack(applicationList[i]);
             if (pending_applications_.Size() > 100) {
-                // 保持最多100条，简单丢弃最早的
-                V2TIMFriendApplicationVector trimmed;
-                for (size_t j = 1; j < pending_applications_.Size(); ++j) {
-                    trimmed.PushBack(pending_applications_[j]);
+                pending_applications_.Erase(0);
+                if (read_application_count_ != 0) {
+                    --read_application_count_;
                 }
-                pending_applications_ = trimmed;
             }
         }
         size_t after_size = pending_applications_.Size();
@@ -120,6 +118,9 @@ void V2TIMFriendshipManagerImpl::NotifyFriendApplicationListDeleted(const V2TIMS
                 if (pending_applications_[j].userID == uid) {
                     V2TIM_LOG(kInfo, "[NotifyFriendApplicationListDeleted] Removing application: userID={}", uid.CString());
                     pending_applications_.Erase(j);
+                    if (j < read_application_count_) {
+                        --read_application_count_;
+                    }
                     continue;
                 }
                 ++j;
@@ -1085,7 +1086,7 @@ void V2TIMFriendshipManagerImpl::GetFriendApplicationList(V2TIMValueCallback<V2T
     {
         std::lock_guard<std::mutex> lock(application_mutex_);
         result.applicationList = pending_applications_;
-        result.unreadCount = static_cast<uint32_t>(pending_applications_.Size());
+        result.unreadCount = pending_applications_.Size() - read_application_count_;
     }
     if (callback) callback->OnSuccess(result);
 }
@@ -1289,26 +1290,42 @@ void V2TIMFriendshipManagerImpl::RefuseFriendApplication(const V2TIMFriendApplic
     }
     if (callback) callback->OnSuccess(result);
 }
-void V2TIMFriendshipManagerImpl::DeleteFriendApplication(const V2TIMFriendApplication& application, V2TIMCallback* callback) {
-    V2TIM_LOG(kInfo, "DeleteFriendApplication called");
-    
-    V2TIM_LOG(kWarning, "DeleteFriendApplication: Friend application deletion is a client-side concept.");
-    if (!application.userID.Empty()) {
+void V2TIMFriendshipManagerImpl::DeleteFriendApplication(const V2TIMFriendApplication& application,
+                                                        V2TIMCallback* callback) {
+    // Tox keeps only incoming requests in this queue. An outgoing deletion
+    // cannot dismiss an incoming request from the same peer.
+    if (application.type != V2TIM_FRIEND_APPLICATION_SEND_OUT && !application.userID.Empty()) {
+        std::string user_id = application.userID.CString();
+        if (user_id.size() == TOX_ADDRESS_SIZE * 2) user_id.resize(TOX_PUBLIC_KEY_SIZE * 2);
+        std::transform(user_id.begin(), user_id.end(), user_id.begin(),
+                       [](unsigned char ch) { return std::toupper(ch); });
         V2TIMStringVector deleted_ids;
-        deleted_ids.PushBack(application.userID);
+        deleted_ids.PushBack(V2TIMString(user_id.c_str()));
         NotifyFriendApplicationListDeleted(deleted_ids);
     }
     if (callback) callback->OnSuccess();
 }
-void V2TIMFriendshipManagerImpl::SetFriendApplicationRead(V2TIMCallback* callback) { 
-    V2TIM_LOG(kInfo, "SetFriendApplicationRead called");
+
+void V2TIMFriendshipManagerImpl::SetFriendApplicationRead(V2TIMCallback* callback) {
     {
         std::lock_guard<std::mutex> lock(application_mutex_);
-        V2TIMFriendApplicationVector empty;
-        pending_applications_ = empty;
+        read_application_count_ = pending_applications_.Size();
     }
     if (callback) callback->OnSuccess();
 }
+void V2TIMFriendshipManagerImpl::ResetSessionState() {
+    {
+        std::lock_guard<std::mutex> lock(application_mutex_);
+        pending_applications_.Clear();
+        read_application_count_ = 0;
+    }
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        blacklist_.clear();
+        friend_info_db_.clear();
+    }
+}
+
 void V2TIMFriendshipManagerImpl::AddToBlackList(const V2TIMStringVector& userIDList, V2TIMValueCallback<V2TIMFriendOperationResultVector>* callback) {
     // CRITICAL: Copy userIDList immediately to avoid lifetime issues
     std::vector<std::string> user_id_strings;  // Store C-strings safely

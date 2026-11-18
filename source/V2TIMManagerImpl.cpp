@@ -2354,6 +2354,9 @@ void V2TIMManagerImpl::UnInitSDK() {
     ResetGroupSessionState();
     // Sent/received invites address this profile's friend numbers.
     if (signaling_manager_) signaling_manager_->ResetSessionState();
+    // The child managers retain their listener registrations across sessions.
+    if (friendship_manager_) friendship_manager_->ResetSessionState();
+    if (conversation_manager_) conversation_manager_->ResetSessionState();
     // The session is over: whatever it posted and Dart has not handled yet is
     // now recognisably stale (Dart compares the stamp with
     // tim2tox_ffi_get_session_epoch), and what it could not post at all
