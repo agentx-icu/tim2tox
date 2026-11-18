@@ -8,10 +8,14 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:test/test.dart';
+import 'package:tencent_cloud_chat_sdk/native_im/adapter/tim_group_manager.dart';
+import 'package:tencent_cloud_chat_sdk/native_im/adapter/tim_offline_push_manager.dart';
+import 'package:tencent_cloud_chat_sdk/native_im/bindings/native_imsdk_bindings_generated.dart';
 import 'package:tencent_cloud_chat_sdk/native_im/bindings/native_library_manager.dart';
 import 'package:tencent_cloud_chat_sdk/enum/V2TimSDKListener.dart';
 import 'package:tim2tox_dart/ffi/tim2tox_ffi.dart' as ffi_lib;
 import '../test_fixtures.dart';
+import '../test_helper.dart';
 
 void main() {
   group('Library Loading Tests', () {
@@ -125,6 +129,22 @@ void main() {
         onTimeout: () => fail('Callback did not arrive through the registered port'),
       );
     }, timeout: const Timeout(Duration(seconds: 10)));
+
+    test('binary cloud-only operations return unsupported', () async {
+      final node = await createTestNode('unsupported_cloud_operations');
+      addTearDown(node.dispose);
+      await node.initSDK();
+      final unsupported = TIMErrCode.ERR_SDK_INTERFACE_NOT_SUPPORT.value;
+
+      final background = await node.runWithInstanceAsync(
+        () => TIMOfflinePushManager.instance.doBackground(unreadCount: 4),
+      );
+      expect(background.code, unsupported);
+      final groupRead = await node.runWithInstanceAsync(
+        TIMGroupManager.instance.setGroupApplicationRead,
+      );
+      expect(groupRead.code, unsupported);
+    });
 
   });
 }

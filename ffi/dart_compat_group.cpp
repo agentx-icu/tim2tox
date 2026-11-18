@@ -1953,6 +1953,12 @@ extern "C" {
         return 0; // TIM_SUCC (request accepted)
     }
     
+    int DartMarkGroupPendencyRead(uint64_t /*time_stamp*/, void* user_data) {
+        SendApiCallbackResult(user_data, V2TIMErrorCode::ERR_SDK_INTERFACE_NOT_SUPPORT,
+                              "Group application read state is not supported on the Tox backend");
+        return 0;
+    }
+
     // DartSearchGroups: Search groups by keyword
     // Signature: int DartSearchGroups(Pointer<Char> json_search_groups_param, Pointer<Void> user_data)
     int DartSearchGroups(const char* json_search_groups_param, void* user_data) {

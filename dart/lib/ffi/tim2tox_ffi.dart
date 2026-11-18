@@ -52,6 +52,9 @@ typedef _set_self_info_c = ffi.Int32 Function(
     ffi.Pointer<pkgffi.Utf8>, ffi.Pointer<pkgffi.Utf8>);
 typedef _get_friend_apps_c = ffi.Int32 Function(
     ffi.Pointer<ffi.Int8>, ffi.Int32);
+typedef _GetFriendApplicationsWithUnread = int Function(
+    int, ffi.Pointer<ffi.Int8>, int, ffi.Pointer<ffi.Int32>);
+
 typedef _get_friend_apps_for_instance_c = ffi.Int32 Function(
     ffi.Int64, ffi.Pointer<ffi.Int8>, ffi.Int32);
 typedef _accept_friend_c = ffi.Int32 Function(ffi.Pointer<pkgffi.Utf8>);
@@ -723,6 +726,35 @@ class Tim2ToxFfi {
           _get_friend_apps_for_instance_c,
           int Function(int, ffi.Pointer<ffi.Int8>,
               int)>('tim2tox_ffi_get_friend_applications_for_instance');
+  late final _GetFriendApplicationsWithUnread? _getFriendApplicationsWithUnread =
+      _lookupFriendApplicationsWithUnread();
+
+  _GetFriendApplicationsWithUnread? _lookupFriendApplicationsWithUnread() {
+    try {
+      return _lib.lookupFunction<
+          ffi.Int32 Function(ffi.Int64, ffi.Pointer<ffi.Int8>, ffi.Int32,
+              ffi.Pointer<ffi.Int32>),
+          _GetFriendApplicationsWithUnread>(
+        'tim2tox_ffi_get_friend_applications_with_unread_for_instance',
+      );
+    } on ArgumentError {
+      return null;
+    }
+  }
+
+  int getFriendApplicationsWithUnreadForInstance(
+    int instanceId,
+    ffi.Pointer<ffi.Int8> buffer,
+    int capacity,
+    ffi.Pointer<ffi.Int32> unreadCount,
+  ) {
+    final query = _getFriendApplicationsWithUnread;
+    if (query != null) return query(instanceId, buffer, capacity, unreadCount);
+    // Legacy libraries counted every visible application as unread.
+    unreadCount.value = -1;
+    return getFriendApplicationsForInstance(instanceId, buffer, capacity);
+  }
+
   late final int Function(ffi.Pointer<pkgffi.Utf8>) acceptFriend = _lib
       .lookupFunction<_accept_friend_c, int Function(ffi.Pointer<pkgffi.Utf8>)>(
           'tim2tox_ffi_accept_friend');

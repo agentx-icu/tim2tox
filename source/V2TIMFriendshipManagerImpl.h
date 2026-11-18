@@ -40,6 +40,7 @@ public:
     void RefuseFriendApplication(const V2TIMFriendApplication& application, V2TIMValueCallback<V2TIMFriendOperationResult>* callback) override;
     void DeleteFriendApplication(const V2TIMFriendApplication& application, V2TIMCallback* callback) override;
     void SetFriendApplicationRead(V2TIMCallback* callback) override;
+    void ResetSessionState();
 
     // --- Blacklist Management ---
     void AddToBlackList(const V2TIMStringVector& userIDList, V2TIMValueCallback<V2TIMFriendOperationResultVector>* callback) override;
@@ -112,6 +113,8 @@ private:
     // 申请列表本地缓存
     std::mutex application_mutex_;
     V2TIMFriendApplicationVector pending_applications_;
+    // Applications are appended in arrival order. The read entries form a prefix.
+    size_t read_application_count_ = 0;
 
     // Joinable thread for delayed RefreshCache after AcceptFriendApplication (no detach to avoid UAF).
     std::thread refresh_after_accept_thread_;

@@ -1,6 +1,7 @@
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:crypto/crypto.dart';
 import 'package:test/test.dart';
 import 'package:tencent_cloud_chat_sdk/enum/V2TimAdvancedMsgListener.dart';
 import 'package:tencent_cloud_chat_sdk/native_im/adapter/tim_message_manager.dart';
@@ -43,6 +44,7 @@ void main() {
   late Directory tempDir;
   late MessageHistoryPersistence persistence;
   late FfiChatService service;
+  late MockLoggerService logger;
 
   setUpAll(setupTestEnvironment);
   tearDownAll(teardownTestEnvironment);
@@ -52,9 +54,10 @@ void main() {
     persistence = MessageHistoryPersistence(
       historyDirectory: '${tempDir.path}/history',
     );
+    logger = MockLoggerService();
     service = FfiChatService(
       preferencesService: MockPreferencesService(),
-      loggerService: MockLoggerService(),
+      loggerService: logger,
       bootstrapService: MockBootstrapService(),
       messageHistoryPersistence: persistence,
       queueFilePath: '${tempDir.path}/offline_queue.json',
@@ -182,6 +185,47 @@ void main() {
     expect(service.getHistory(_peer), hasLength(1));
     expect(service.getHistory(_peer).single.text, original.text);
     expect(service.getHistory(_peer).single.isReceived, isTrue);
+  });
+
+  test('receipt lookup keeps message text and hashes out of logs', () async {
+    const firstText = 'private-note-example';
+    const secondText = 'ordinary receipt target';
+    ChatMessage sent(String id, String text, int milliseconds) => ChatMessage(
+          text: text,
+          fromUserId: 'self',
+          isSelf: true,
+          timestamp: DateTime.fromMillisecondsSinceEpoch(milliseconds),
+          msgID: id,
+        );
+
+    await persistence.appendHistory(_peer, sent('first', firstText, 1000));
+    await persistence.appendHistory(_peer, sent('target', secondText, 2000));
+    final firstHash = sha256.convert(utf8.encode(firstText)).toString();
+    final targetHash = sha256.convert(utf8.encode(secondText)).toString();
+    final liveUpdate =
+        service.messages.first.timeout(const Duration(seconds: 5));
+
+    expect(
+      service.ingestC2cBinaryEvent(
+        _event({
+          'type': 'receipt',
+          'msgID': 'bind:$targetHash',
+          'receiptType': 'received',
+          'sender': _peer,
+        }, route: 1),
+      ),
+      isTrue,
+    );
+
+    final updated = await liveUpdate;
+    expect(updated.msgID, 'target');
+    expect(updated.isReceived, isTrue);
+    expect(service.getHistory(_peer).first.isReceived, isFalse);
+    final logs = logger.logs.join('\n');
+    expect(logs, isNot(contains(firstText)));
+    expect(logs, isNot(contains(secondText)));
+    expect(logs, isNot(contains(firstHash.substring(0, 12))));
+    expect(logs, isNot(contains(targetHash.substring(0, 12))));
   });
 
   test('route 0 accepts an exact legacy receipt control', () async {

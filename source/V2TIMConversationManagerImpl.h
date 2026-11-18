@@ -37,6 +37,7 @@ class V2TIMConversationManagerImpl : public V2TIMConversationManager {
 public:
     explicit V2TIMConversationManagerImpl(V2TIMManagerImpl* owner);
     ~V2TIMConversationManagerImpl() override;
+    void ResetSessionState();
 
     // 会话监听器管理
     void AddConversationListener(V2TIMConversationListener* listener) override;

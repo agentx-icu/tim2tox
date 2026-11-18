@@ -127,12 +127,9 @@ extern "C" {
             return 1; // Error
         }
         
-        // Call V2TIM GetConversationList (async) with default pagination (nextSeq=0, count=100)
-        SafeGetV2TIMManager()->GetConversationManager()->GetConversationList(
-            0,  // nextSeq
-            100, // count
-            new DartConversationResultCallback(user_data)
-        );
+        // GetConversationList completes inline and does not retain the callback.
+        DartConversationResultCallback callback(user_data);
+        SafeGetV2TIMManager()->GetConversationManager()->GetConversationList(0, 100, &callback);
         
         return 0; // TIM_SUCC (request accepted)
     }
@@ -164,11 +161,8 @@ extern "C" {
             SendApiCallbackResult(user_data, ERR_SDK_NOT_INITIALIZED, "Conversation manager not initialized");
             return 1;
         }
-        conv_manager->GetConversationList(
-            static_cast<uint64_t>(next_seq),
-            static_cast<uint32_t>(count),
-            new DartConversationResultCallback(user_data)
-        );
+        DartConversationResultCallback callback(user_data);
+        conv_manager->GetConversationList(next_seq, count, &callback);
         (void)json_filter;
         return 0;
     }

@@ -511,68 +511,83 @@ extern "C" {
         return 0; // TIM_SUCC (request accepted)
     }
     
-    // DartGetFriendApplicationList: Get friend application list
-    // Signature: int DartGetFriendApplicationList(Pointer<Char> json_get_pendency_list_param, Pointer<Void> user_data)
-    // Note: json_get_pendency_list_param is not used in tim2tox implementation, but required by Dart binding
-    int DartGetFriendApplicationList(const char* json_get_pendency_list_param, void* user_data) {
-        if (!user_data) {
-            V2TIM_LOG(kError, "[dart_compat] DartGetFriendApplicationList: ERROR - user_data is null");
-            fflush(stderr);
-            return 1; // Error
-        }
-        
-        // Helper class for V2TIMValueCallback<V2TIMFriendApplicationResult>
+    int DartGetFriendApplicationList(const char* /*json_get_pendency_list_param*/, void* user_data) {
+        if (!user_data) return 1;
+
         class DartFriendApplicationResultCallback : public V2TIMValueCallback<V2TIMFriendApplicationResult> {
+        public:
+            explicit DartFriendApplicationResultCallback(void* user_data) : user_data_(user_data) {}
+
+            void OnSuccess(const V2TIMFriendApplicationResult& result) override {
+                std::ostringstream json;
+                json << "{\"pendency_page_unread_num\":" << result.unreadCount
+                     << ",\"pendency_page_pendency_info_array\":[";
+                for (size_t i = 0; i < result.applicationList.Size(); ++i) {
+                    if (i > 0) json << ",";
+                    const auto& application = result.applicationList[i];
+                    json << "{\"friend_add_pendency_info_identifier\":\""
+                         << EscapeJsonString(application.userID.CString())
+                         << "\",\"friend_add_pendency_info_nick_name\":\""
+                         << EscapeJsonString(application.nickName.CString())
+                         << "\",\"friend_add_pendency_info_face_url\":\""
+                         << EscapeJsonString(application.faceUrl.CString())
+                         << "\",\"friend_add_pendency_info_add_time\":" << application.addTime
+                         << ",\"friend_add_pendency_info_add_source\":\""
+                         << EscapeJsonString(application.addSource.CString())
+                         << "\",\"friend_add_pendency_info_add_wording\":\""
+                         << EscapeJsonString(application.addWording.CString())
+                         // The C SDK enum begins at zero while V2TIM begins at one.
+                         << "\",\"friend_add_pendency_info_type\":" << (static_cast<int>(application.type) - 1)
+                         << "}";
+                }
+                json << "]}";
+                SendApiCallbackResult(user_data_, 0, "", json.str());
+            }
+
+            void OnError(int error_code, const V2TIMString& error_message) override {
+                SendApiCallbackResult(user_data_, error_code, error_message.CString());
+            }
+
         private:
             void* user_data_;
-            
-        public:
-            DartFriendApplicationResultCallback(void* user_data) : user_data_(user_data) {}
-            
-            void OnSuccess(const V2TIMFriendApplicationResult& result) override {
-                // Convert to JSON
-                std::ostringstream json;
-                json << "{";
-                json << "\"unreadCount\":" << result.unreadCount << ",";
-                json << "\"applicationList\":[";
-                for (size_t i = 0; i < result.applicationList.Size(); i++) {
-                    if (i > 0) {
-                        json << ",";
-                    }
-                    const V2TIMFriendApplication& app = result.applicationList[i];
-                    json << "{";
-                    // Get CString() (has built-in protection)
-                    std::string user_id = app.userID.CString();
-                    std::string add_wording = app.addWording.CString();
-                    json << "\"userID\":\"" << EscapeJsonString(user_id) << "\",";
-                    json << "\"type\":" << static_cast<int>(app.type) << ",";
-                    json << "\"addWording\":\"" << EscapeJsonString(add_wording) << "\"";
-                    // TODO: Add more application fields
-                    json << "}";
-                }
-                json << "]";
-                json << "}";
-                
-                std::map<std::string, std::string> result_fields;
-                result_fields["friendApplicationResult"] = json.str();
-                std::string data_json = BuildJsonObject(result_fields);
-                SendApiCallbackResult(user_data_, 0, "", data_json);
-            }
-            
-            void OnError(int error_code, const V2TIMString& error_message) override {
-                std::string error_msg = error_message.CString();
-                SendApiCallbackResult(user_data_, error_code, error_msg);
-            }
         };
-        
-        // Call V2TIM GetFriendApplicationList (async)
-        SafeGetV2TIMManager()->GetFriendshipManager()->GetFriendApplicationList(
-            new DartFriendApplicationResultCallback(user_data)
-        );
-        
-        return 0; // TIM_SUCC (request accepted)
+
+        DartFriendApplicationResultCallback callback(user_data);
+        SafeGetV2TIMManager()->GetFriendshipManager()->GetFriendApplicationList(&callback);
+        return 0;
     }
-    
+
+    int DartDeleteFriendApplication(const char* json_delete_pendency_param, void* user_data) {
+        if (!json_delete_pendency_param || !user_data) return 1;
+        const std::string params(json_delete_pendency_param);
+        const auto ids = ParseJsonStringArray(
+            ExtractJsonValue(params, "friendship_delete_pendency_param_identifier_array", true));
+        const int type = ExtractJsonInt(params, "friendship_delete_pendency_param_type", -1, true);
+        if (ids.empty() || type < 0 || type > 2) return 1;
+
+        auto* manager = SafeGetV2TIMManager()->GetFriendshipManager();
+        for (const auto& id : ids) {
+            V2TIMFriendApplication application;
+            application.userID = V2TIMString(id.c_str());
+            application.type = static_cast<V2TIMFriendApplicationType>(type + 1);
+            manager->DeleteFriendApplication(application, nullptr);
+        }
+        SendApiCallbackResult(user_data, 0, "");
+        return 0;
+    }
+
+    int DartSetFriendApplicationRead(uint64_t /*time_stamp*/, void* user_data) {
+        if (!user_data) return 1;
+        DartCallback callback(
+            user_data,
+            [user_data]() { SendApiCallbackResult(user_data, 0, ""); },
+            [user_data](int code, const V2TIMString& message) {
+                SendApiCallbackResult(user_data, code, message.CString());
+            });
+        SafeGetV2TIMManager()->GetFriendshipManager()->SetFriendApplicationRead(&callback);
+        return 0;
+    }
+
     // DartAcceptFriendApplication: Accept friend application
     // Signature: int DartAcceptFriendApplication(Pointer<Char> json_accept_friend_param, Pointer<Void> user_data)
     int DartAcceptFriendApplication(const char* json_accept_friend_param, void* user_data) {

@@ -1344,6 +1344,11 @@ TEST(ToxSessionPinTest, TheSecondBatchOfPerFeatureManagerSitesPinsItsCallSequenc
     EXPECT_NE(refresh.find("CreateConversationFromFriend(tox, friend_number)"),
               std::string::npos)
         << "RefreshConversationCache must pass its pinned handle down";
+    const std::size_t owner_pin = refresh.find("manager_impl->AcquireToxSession()");
+    ASSERT_NE(owner_pin, std::string::npos);
+    EXPECT_LT(owner_pin, refresh.find("refresh_debounce_mutex_"));
+    EXPECT_LT(owner_pin, refresh.find("deleted_ids_mutex_"))
+        << "Refresh must pin before capturing another profile's deleted IDs";
     const std::string get_conv = SourceSection(
         conversation,
         "void V2TIMConversationManagerImpl::GetConversation(const V2TIMString& conversationID,",

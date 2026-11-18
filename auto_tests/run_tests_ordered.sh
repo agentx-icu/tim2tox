@@ -654,6 +654,8 @@ PHASE13_BINARY_REPLACEMENT=(
   "test/scenarios_binary/scenario_native_callback_dispatch_test.dart"
   "test/scenarios_binary/scenario_custom_callback_handler_test.dart"
   "test/scenarios_binary/scenario_binary_friend_refuse_test.dart"
+  "test/scenarios_binary/scenario_binary_friend_application_state_test.dart"
+  "test/scenarios_binary/scenario_binary_conversation_pagination_test.dart"
   # CR-01/CR-04: BinaryReplacementHistoryHook uninstall generation + selfId
   # replay. This is the arbiter for the "both paths must not double-write
   # history / double-fire callbacks" invariant in CLAUDE.md.

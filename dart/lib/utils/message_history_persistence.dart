@@ -2958,26 +2958,9 @@ class MessageHistoryPersistence {
     final token = _token(normalizedId);
     return _serialized(normalizedId, () async {
       if (_isStale(normalizedId, token)) return <ChatMessage>[];
-      final rows = <ChatMessage>[];
+      final List<ChatMessage> rows;
       try {
-        final archiveFile = await _getArchiveFile(normalizedId);
-        if (await archiveFile.exists()) {
-          final storageRoots = await _resolveStorageRoots();
-          for (final line in await archiveFile.readAsLines()) {
-            if (line.trim().isEmpty) continue;
-            try {
-              final m = jsonDecode(line) as Map<String, dynamic>;
-              final fp = m['filePath'];
-              if (fp is String && fp.isNotEmpty) {
-                m['filePath'] = _resolvePath(fp, storageRoots);
-              }
-              final msg = ChatMessage.fromJson(m);
-              rows.add(msg.isPending ? msg.copyWith(isPending: false) : msg);
-            } catch (_) {
-              // Torn final line after a crash, or a damaged row: skip it.
-            }
-          }
-        }
+        rows = await _readArchivedRows(normalizedId).toList();
       } catch (e, st) {
         _logger?.logError(
           '[MessageHistoryPersistence] archive read failed for $normalizedId',
@@ -2996,6 +2979,87 @@ class MessageHistoryPersistence {
       _archiveCacheId = normalizedId;
       _archiveCacheRows = sortedRows;
       return _archivedView(normalizedId, sortedRows);
+    });
+  }
+
+  Stream<ChatMessage> _readArchivedRows(String normalizedId) async* {
+    final archiveFile = await _getArchiveFile(normalizedId);
+    if (!await archiveFile.exists()) return;
+    final storageRoots = await _resolveStorageRoots();
+    final lines = archiveFile
+        .openRead()
+        .transform(utf8.decoder)
+        .transform(const LineSplitter());
+    await for (final line in lines) {
+      if (line.trim().isEmpty) continue;
+      try {
+        final data = jsonDecode(line) as Map<String, dynamic>;
+        final filePath = data['filePath'];
+        if (filePath is String && filePath.isNotEmpty) {
+          data['filePath'] = _resolvePath(filePath, storageRoots);
+        }
+        final message = ChatMessage.fromJson(data);
+        yield message.isPending ? message.copyWith(isPending: false) : message;
+      } catch (_) {
+        // A torn or damaged row does not hide subsequent valid rows.
+      }
+    }
+  }
+
+  /// Scan archived history without building the scrollback cache. At most
+  /// [limit] matching rows and their identities are kept, even for a large
+  /// archive. Recent rows and queued overflow can overlap the archive on disk.
+  Future<List<ChatMessage>> searchArchivedHistory(
+    String conversationId, {
+    required bool Function(ChatMessage) matches,
+    required int limit,
+  }) {
+    if (limit <= 0) return Future.value(<ChatMessage>[]);
+    final id = ConversationIdUtils.normalize(conversationId);
+    final token = _token(id);
+    return _serialized(id, () async {
+      if (_isStale(id, token)) return <ChatMessage>[];
+      final excluded = <String>{
+        for (final row in _historyById[id] ?? const <ChatMessage>[])
+          ...identitiesOf(row),
+        ...?_recentlyDeleted[id]?.keys,
+      };
+      final accepted = <ChatMessage>[];
+      final primaryIds = <String>{};
+      final aliases = <(bool, String)>{};
+      void addMatch(ChatMessage row) {
+        if (!matches(row)) return;
+        final ids = identitiesOf(row);
+        if (ids.any(excluded.contains) ||
+            primaryIds.contains(ids.first) ||
+            ids.any((id) => aliases.contains((row.isSelf, id)))) {
+          return;
+        }
+        primaryIds.add(ids.first);
+        aliases.addAll(ids.map((id) => (row.isSelf, id)));
+        accepted.add(row);
+      }
+
+      try {
+        await for (final row in _readArchivedRows(id)) {
+          if (_isStale(id, token)) return <ChatMessage>[];
+          addMatch(row);
+          if (accepted.length == limit) break;
+        }
+      } catch (error, stack) {
+        _logger?.logError('Archived history search failed', error, stack);
+      }
+      for (final row in _pendingArchive[id] ?? const <ChatMessage>[]) {
+        if (accepted.length == limit) break;
+        addMatch(row);
+      }
+      if (_isStale(id, token)) return <ChatMessage>[];
+      final deleted = _recentlyDeleted[id];
+      if (deleted != null) {
+        accepted
+            .removeWhere((row) => identitiesOf(row).any(deleted.containsKey));
+      }
+      return accepted;
     });
   }
 
@@ -3116,18 +3180,32 @@ class MessageHistoryPersistence {
   /// (#22: after the last in-memory row of a conversation was deleted, its
   /// main file is gone and only the archive remains; [getConversationIds]
   /// does not list it, so a delete of an archived row there was skipped).
-  Future<Set<String>> getArchivedConversationIds() async {
+  Future<Set<String>> getArchivedConversationIds() =>
+      _getStoredConversationIds(includeRecent: false);
+
+  /// Includes cached, cold and archive-only conversations.
+  Future<Set<String>> getSearchableConversationIds() =>
+      _getStoredConversationIds(includeRecent: true);
+
+  Future<Set<String>> _getStoredConversationIds(
+      {required bool includeRecent}) async {
     final ids = <String>{
+      if (includeRecent) ..._historyById.keys,
       for (final entry in _pendingArchive.entries)
         if (entry.value.isNotEmpty) entry.key,
     };
     try {
       final dir = await _getHistoryDirectory();
-      const suffix = '.archive.jsonl';
       await for (final entity in dir.list(followLinks: false)) {
         if (entity is! File) continue;
         final name = p.basename(entity.path);
-        if (!name.endsWith(suffix)) continue;
+        final suffix = switch (name) {
+          _ when name.endsWith('.archive.jsonl') => '.archive.jsonl',
+          _ when includeRecent && name.endsWith('.json.bak') => '.json.bak',
+          _ when includeRecent && name.endsWith('.json') => '.json',
+          _ => null,
+        };
+        if (suffix == null) continue;
         final id = name.substring(0, name.length - suffix.length);
         if (id.isNotEmpty) ids.add(ConversationIdUtils.normalize(id));
       }
