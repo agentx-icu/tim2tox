@@ -9,6 +9,7 @@ import 'dart:io';
 import 'package:path_provider/path_provider.dart';
 
 import '../models/chat_message.dart';
+import 'profile_storage_codec.dart';
 
 part '_offline_message_queue_file_store.dart';
 
@@ -88,11 +89,35 @@ class OfflineMessageQueuePersistence {
   /// Not `final`: a host that cannot know the account until the Tox profile is
   /// open re-points it through [rebindQueueFile] during the pre-boot window.
   String? _queueFilePath;
+  String? _defaultAccountKey;
+  ProfileStorageCodec? _storageCodec;
 
   // In-memory cache: peerId -> List<OfflineMessageItem>.
   final Map<String, List<OfflineMessageItem>> _offlineQueue = {};
 
   Future<void> _mutationFence = Future<void>.value();
+
+  /// Select the encryption key and migrate every known recovery artifact. This
+  /// is serialized with queue loads and mutations. Only an explicitly bound
+  /// path or a profile-owned default may be encrypted; the historical shared
+  /// fallback has no owner marker and is left available for explicit adoption.
+  Future<void> installStorageCodec(ProfileStorageCodec? codec,
+      {String? defaultAccountKey}) {
+    if (defaultAccountKey != null &&
+        !RegExp(r'^[0-9a-fA-F]{64}$').hasMatch(defaultAccountKey)) {
+      throw ArgumentError('invalid account public key');
+    }
+    return _runSerialized(() async {
+      if (_queueFilePath == null && _defaultAccountKey != defaultAccountKey) {
+        _offlineQueue.clear();
+      }
+      _storageCodec = codec;
+      _defaultAccountKey = defaultAccountKey;
+      if (codec == null) return;
+      final store = _OfflineMessageQueueFileStore(await _getQueueFile(), codec);
+      await store.migrateArtifacts();
+    });
+  }
 
   /// Re-point this queue at a per-account [queueFilePath] after construction.
   ///
@@ -134,6 +159,10 @@ class OfflineMessageQueuePersistence {
       return file;
     }
     final appDir = await getApplicationSupportDirectory();
+    final account = _defaultAccountKey;
+    if (account != null) {
+      return File('${appDir.path}/tim2tox_accounts/$account/offline_message_queue.json');
+    }
     return File('${appDir.path}/offline_message_queue.json');
   }
 
@@ -181,7 +210,7 @@ class OfflineMessageQueuePersistence {
   }) {
     return _runSerialized(() async {
       final file = await _getQueueFile();
-      final fileStore = _OfflineMessageQueueFileStore(file);
+      final fileStore = _OfflineMessageQueueFileStore(file, _storageCodec);
 
       if (clearOnLoad) {
         await fileStore.deleteArtifacts();
@@ -370,7 +399,7 @@ class OfflineMessageQueuePersistence {
   Future<void> clearQueueFile() {
     return _runSerialized(() async {
       final file = await _getQueueFile();
-      final fileStore = _OfflineMessageQueueFileStore(file);
+      final fileStore = _OfflineMessageQueueFileStore(file, _storageCodec);
       await fileStore.publishEmptyPrimary();
       _offlineQueue.clear();
       await fileStore.publishPrimaryToBackup();
@@ -397,6 +426,6 @@ class OfflineMessageQueuePersistence {
     Map<String, List<OfflineMessageItem>> snapshot,
   ) async {
     final file = await _getQueueFile();
-    await _OfflineMessageQueueFileStore(file).writeSnapshot(snapshot);
+    await _OfflineMessageQueueFileStore(file, _storageCodec).writeSnapshot(snapshot);
   }
 }

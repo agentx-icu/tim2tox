@@ -478,6 +478,7 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
   // Stream subscriptions
   StreamSubscription<bool>? _connectionStatusSubscription;
   StreamSubscription<ChatMessage>? _messagesSubscription;
+  StreamSubscription<ChatMessage>? _messageUpdatesSubscription;
   StreamSubscription<FakeConversation>? _conversationSubscription;
   StreamSubscription<FakeUnreadTotal>? _unreadSubscription;
   StreamSubscription<List<FakeUser>>? _contactsSubscription;
@@ -1010,6 +1011,22 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
       }
     };
     _messagesSubscription?.cancel();
+    _messageUpdatesSubscription?.cancel();
+    _messageUpdatesSubscription = ffiService.messageUpdates.listen((message) {
+      final updated = chatMessageToV2TimMessage(message, ffiService.selfId);
+      if (BinaryReplacementHistoryHook.ownsInboundMessageHistory) {
+        for (final id in message.altMsgIds) {
+          if (isNativeCallbackMessageId(id)) {
+            updated.msgID = id;
+            break;
+          }
+        }
+      }
+      _notifyAdvancedMsgListeners(
+        (listener) => listener.onRecvMessageModified?.call(updated),
+        dispatchInstanceId: message.sourceInstanceId,
+      );
+    });
     ffiService.onFailureCleared = _onQueuedFailureCleared;
     _messagesSubscription = ffiService.messages.listen((chatMsg) async {
       if (_debugLog)
@@ -3277,6 +3294,7 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
   void dispose() {
     _connectionStatusSubscription?.cancel();
     _messagesSubscription?.cancel();
+    _messageUpdatesSubscription?.cancel();
     _conversationSubscription?.cancel();
     _unreadSubscription?.cancel();
     _contactsSubscription?.cancel();

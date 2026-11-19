@@ -238,9 +238,9 @@ void tim2tox_ffi_save_tox_profile(void);
 // again before every init. That is deliberate: a value that survived would key
 // whichever account happened to be opened next.
 //
-// passphrase == NULL or passphrase_len == 0 clears it => plaintext savedata,
-// byte-identical to the legacy behaviour. Buffer is copied; the caller keeps
-// ownership and should zero it afterwards.
+// passphrase == NULL or passphrase_len == 0 clears it => plaintext savedata.
+// Profiles that used protected chat storage retain their storage key trailer.
+// Buffer is copied; the caller keeps ownership and should zero it afterwards.
 //
 // Returns 1 on success, 0 if there is no manager instance.
 int tim2tox_ffi_set_profile_passphrase(const uint8_t* passphrase, size_t passphrase_len);
@@ -263,6 +263,16 @@ int tim2tox_ffi_get_profile_passphrase_state(void);
 // disk is unchanged, and the host may keep the previous password (or retry).
 int tim2tox_ffi_rekey_live_profile_passphrase(const uint8_t* passphrase, size_t passphrase_len,
                                               int64_t session_epoch);
+
+// Both calls require the exact instance ID and epoch of the open profile.
+// Prepare returns 1 for a durable storage key, 0 for legacy plaintext without
+// a key, or -1 on failure. Encrypt grows the payload by 40 bytes. Crypt returns
+// the output length or -1 on error or failed authentication.
+int tim2tox_ffi_prepare_profile_storage(int64_t instance_id, int64_t session_epoch);
+int tim2tox_ffi_crypt_profile_storage(int64_t instance_id, int64_t session_epoch,
+                                     uint8_t kind, int encrypt,
+                                     const uint8_t* input, size_t input_size,
+                                     uint8_t* output, size_t output_capacity);
 
 // Get friend list as newline-separated lines:
 // "<userID>\t<nickName>\t<online>\n"
@@ -585,6 +595,10 @@ int tim2tox_ffi_add_bootstrap_node(int64_t instance_id, const char* host, int po
 // message id (the one the toxcore delivery-ACK path reports) into
 // msg_id_out (NUL-terminated; pass >= 64 bytes).
 int tim2tox_ffi_send_c2c_text_ex(const char* user_id, const char* text, char* msg_id_out, int msg_id_out_len);
+// 0 = text send failed, 1 = text queued, 2 = text and annotation queued.
+// A queued annotation does not imply the receiver supports it or has read it.
+int tim2tox_ffi_send_annotated_text(const char* target, const char* text, const char* annotation,
+                                   int group, int action, char* msg_id_out, int msg_id_out_len);
 
 // TEST SEAM: SDK-listener registration count on the default singleton.
 int tim2tox_ffi_debug_sdk_listener_count(void);

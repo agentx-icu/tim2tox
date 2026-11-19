@@ -75,6 +75,10 @@ class _DeleteFailingFile implements File {
   Future<bool> exists() => delegate.exists();
 
   @override
+  Future<String> readAsString({Encoding encoding = utf8}) =>
+      delegate.readAsString(encoding: encoding);
+
+  @override
   Future<FileSystemEntity> delete({bool recursive = false}) {
     deleteAttempted = true;
     throw FileSystemException('simulated delete failure', path);

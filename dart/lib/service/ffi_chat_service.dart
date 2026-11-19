@@ -23,6 +23,7 @@ import '../utils/control_message_envelope.dart';
 import '../utils/binary_replacement_history_hook.dart';
 import '../utils/message_history_persistence.dart';
 import '../utils/offline_message_queue_persistence.dart';
+import '../utils/profile_storage_codec.dart';
 import 'polling_event_ownership.dart';
 import 'file_receive_cleanup.dart';
 import 'file_receive_failure.dart';
@@ -1711,6 +1712,104 @@ class FfiChatService {
   }
 
   Stream<ChatMessage> get messages => _messages.stream;
+
+  final _messageUpdates = StreamController<ChatMessage>.broadcast();
+
+  /// Metadata updates for existing messages, without a new-message event.
+  Stream<ChatMessage> get messageUpdates => _messageUpdates.stream;
+
+  static const _annotationLifetime = Duration(seconds: 30);
+  static const _maxTrackedAnnotations = 64;
+  static const _maxAnnotationBytes = 1200;
+  final _inboundAnnotations = <({String conversation, String id}),
+      ({bool receivedText, String? data, DateTime expiry})>{};
+
+  static bool _validAnnotation(String data) {
+    if (data.length > _maxAnnotationBytes ||
+        utf8.encode(data).length > _maxAnnotationBytes) {
+      return false;
+    }
+    try {
+      return jsonDecode(data) is Map<String, dynamic>;
+    } on FormatException {
+      return false;
+    }
+  }
+
+  static void _validateOutgoingAnnotation(String? data) {
+    if (data == null || data.isEmpty) return;
+    if (!_validAnnotation(data)) {
+      throw ArgumentError('Message annotation must be a JSON object of at most '
+          '$_maxAnnotationBytes UTF-8 bytes.');
+    }
+  }
+
+  void _trackAnnotation(String conversation, String id, {String? data}) {
+    final now = DateTime.now();
+    _inboundAnnotations.removeWhere((_, slot) => !slot.expiry.isAfter(now));
+    final key = (conversation: conversation, id: id);
+    final previous = _inboundAnnotations[key];
+    if (previous == null && _inboundAnnotations.length == _maxTrackedAnnotations) {
+      _inboundAnnotations.remove(_inboundAnnotations.keys.first);
+    }
+    if ((data == null && previous?.receivedText == true) ||
+        (data != null && previous?.data != null)) {
+      return;
+    }
+    final receivedText = data == null || previous?.receivedText == true;
+    final annotation = data ?? previous?.data;
+    _inboundAnnotations[key] = (
+      receivedText: receivedText,
+      data: annotation,
+      expiry: previous?.expiry ?? now.add(_annotationLifetime),
+    );
+    if (!receivedText || annotation == null) return;
+    // The target was observed during this live session. Find it by identity,
+    // never by content or by its current position in the history window.
+    final rows = _messageHistoryPersistence.getCachedList(conversation);
+    if (rows == null) return;
+    final index = rows.lastIndexWhere((row) => !row.isSelf &&
+        (row.msgID == id || row.altMsgIds.contains(id)));
+    if (index == -1) return;
+    final row = rows[index];
+    final update = row.copyWith(cloudCustomData: annotation);
+    rows[index] = update;
+    if (_lastByPeer[conversation]?.msgID == row.msgID) {
+      _lastByPeer[conversation] = update;
+    }
+    unawaited(_saveHistory(conversation).catchError((Object error, StackTrace stack) {
+      _logger?.logError('Could not persist a message annotation', error, stack);
+    }));
+    if (!_messageUpdates.isClosed) _messageUpdates.add(update);
+  }
+
+  /// Consumes a manager-authenticated annotation event for this instance.
+  bool ingestMessageAnnotationEvent(String event) {
+    const prefix = 'annotation:';
+    if (!event.startsWith(prefix)) return false;
+    final headerEnd = event.indexOf(':', prefix.length);
+    if (headerEnd < 0) return false;
+    final fields = event.substring(prefix.length, headerEnd).split('|');
+    if (fields.length != 3 || !_toxPublicKeyPattern.hasMatch(fields[1])) {
+      return false;
+    }
+    final data = event.substring(headerEnd + 1);
+    if (!_validAnnotation(data)) return false;
+    final (groupId, sender, id) = (fields[0], fields[1], fields[2]);
+    if (groupId.isEmpty) {
+      if (!isNativeCallbackMessageId(id) || isBlocked(sender)) return false;
+      _trackAnnotation(sender, id, data: data);
+    } else {
+      final groupMessageId = int.tryParse(id);
+      if (groupMessageId == null || groupMessageId < 0 ||
+          groupMessageId > 0xffffffff || _quitGroups.contains(groupId)) {
+        return false;
+      }
+      _trackAnnotation(groupId, groupMessageAlias(
+          groupId: groupId, senderPk: sender, pseudoMsgId: groupMessageId), data: data);
+    }
+    return true;
+  }
 
   /// A magic-prefix control signal (`__revoke__:` / `__face__:` / …) rather
   /// than a displayable message.
@@ -3559,7 +3658,12 @@ class FfiChatService {
     try {
       ownerKey = getSelfToxId();
     } catch (_) {}
+    if (_profileStorageCodec != null &&
+        (ownerKey == null || ownerKey.length < 64)) {
+      throw const ProfileStorageException('profile storage requires a Tox identity');
+    }
     await _messageHistoryPersistence.openSession(ownerKey: ownerKey);
+    await _messageHistoryPersistence.installStorageCodec(_profileStorageCodec);
     try {
       final quitGroups = historyPurgeGroups;
       final allHistories = await _messageHistoryPersistence.loadAllHistories(
@@ -3582,6 +3686,8 @@ class FfiChatService {
         }
       }
     } on HistorySchemaNewerThanAppException {
+      rethrow;
+    } on ProfileStorageException {
       rethrow;
     } catch (e) {
       // Silently handle errors
@@ -3624,6 +3730,10 @@ class FfiChatService {
   /// init THIS service performed. [rekeyLiveProfilePassphrase] hands it back so
   /// the native side refuses to re-key any other session's profile.
   int _profileSessionEpoch = 0;
+  int _profileStorageInstanceId = 0;
+  bool _storagePasswordStaged = false;
+  ProfileStorageCodec? _profileStorageCodec;
+  Future<void> _profileStorageMigration = Future<void>.value();
 
   /// The Dart-side session state [init] opens before any native work.
   void _beginSession() {
@@ -3681,6 +3791,7 @@ class FfiChatService {
 
   Future<void> init({String? profileDirectory}) async {
     _beginSession();
+    _inboundAnnotations.clear();
     // A different profile may be about to be opened on this object; anything
     // latched from a previous one is now wrong. See [_selfToxIdCacheByInstance].
     _selfToxIdCacheByInstance.clear();
@@ -3734,9 +3845,20 @@ class FfiChatService {
       _sessionEpoch = 0; // older native lib
     }
     try {
-      _profileSessionEpoch = _ffi.getSessionEpoch(0);
+      _profileStorageInstanceId = _instanceId ?? 0;
+      _profileSessionEpoch = _ffi.getSessionEpoch(_profileStorageInstanceId);
     } on Object catch (_) {
       _profileSessionEpoch = 0; // older native lib
+    }
+    try {
+      _profileStorageCodec = _openProfileStorageCodec(
+          passwordExpected: _storagePasswordStaged);
+      _profileStorageMigration = Future<void>.value();
+    } catch (_) {
+      _ffi.uninit();
+      rethrow;
+    } finally {
+      _storagePasswordStaged = false;
     }
     await _applyFileRecvDirectory();
     // register callback mode (preferred)
@@ -4148,7 +4270,9 @@ class FfiChatService {
   bool setProfilePassphraseBytes(Uint8List? passphrase) =>
       _withPassphraseBuffer(passphrase, (buf, len) {
         try {
-          return _ffi.setProfilePassphrase(buf, len) == 1;
+          final staged = _ffi.setProfilePassphrase(buf, len) == 1;
+          if (staged) _storagePasswordStaged = len != 0;
+          return staged;
         } catch (e) {
           _logger?.logWarning(
               '[FfiChatService] setProfilePassphrase unavailable in this '
@@ -4219,9 +4343,18 @@ class FfiChatService {
   bool rekeyLiveProfilePassphraseBytes(Uint8List? passphrase) =>
       _withPassphraseBuffer(passphrase, (buf, len) {
         try {
-          return _ffi.rekeyLiveProfilePassphrase(
-                  buf, len, _profileSessionEpoch) ==
-              1;
+          final enableStorage = len != 0 && _profileSessionEpoch > 0 &&
+              _profileStorageCodec == null;
+          if (enableStorage && _ffi.prepareProfileStorage(
+                _profileStorageInstanceId, _profileSessionEpoch) < 0) {
+            return false;
+          }
+          final rekeyed = _ffi.rekeyLiveProfilePassphrase(
+                  buf, len, _profileSessionEpoch) == 1;
+          if (rekeyed && enableStorage) {
+            _startProfileStorageMigration();
+          }
+          return rekeyed;
         } catch (e) {
           _logger?.logWarning(
               '[FfiChatService] rekeyLiveProfilePassphrase unavailable: $e');
@@ -4233,6 +4366,84 @@ class FfiChatService {
   /// [setProfilePassphrase] for why the bytes API is preferred.
   bool rekeyLiveProfilePassphrase(String? passphrase) =>
       _withEncodedPassphrase(passphrase, rekeyLiveProfilePassphraseBytes);
+
+  /// Completion of the local data migration triggered by enabling a password
+  /// for the first time on a live profile. The synchronous re-key API reports
+  /// the native profile commit; a host can await this separately before saying
+  /// legacy chat data has been encrypted.
+  Future<void> waitForProfileStorageMigration() => _profileStorageMigration;
+
+  void _startProfileStorageMigration() {
+    final migration = Future<void>.sync(() async {
+      final codec = _openProfileStorageCodec(passwordExpected: true)!;
+      _profileStorageCodec = codec;
+      await Future.wait<void>([
+        _messageHistoryPersistence.installStorageCodec(codec),
+        _installQueueStorageCodec(),
+      ]);
+    });
+    _profileStorageMigration = migration;
+    unawaited(migration.then<void>((_) {}, onError: (Object error, StackTrace stack) {
+      _logger?.logError('Could not encrypt legacy profile storage', error, stack);
+    }));
+  }
+
+  ProfileStorageCodec? _openProfileStorageCodec({required bool passwordExpected}) {
+    final epoch = _profileSessionEpoch;
+    final instanceId = _profileStorageInstanceId;
+    if (epoch <= 0 && !passwordExpected) return null;
+    final int state;
+    try {
+      state = _ffi.prepareProfileStorage(instanceId, epoch);
+    } catch (_) {
+      if (!passwordExpected) return null; // native library predates encryption
+      throw const ProfileStorageException('the native library cannot protect chat storage');
+    }
+    if (state == 0 && !passwordExpected) return null;
+    if (state != 1) {
+      throw const ProfileStorageException('could not initialize the profile storage key');
+    }
+    return ProfileStorageCodec((kind, seal, bytes) {
+      const overhead = 40;
+      final outputLength = seal ? bytes.length + overhead : bytes.length - overhead;
+      if (outputLength < 0) {
+        throw const ProfileStorageException('invalid encrypted payload length');
+      }
+      final input = pkgffi.malloc<ffi.Uint8>(bytes.isEmpty ? 1 : bytes.length);
+      try {
+        input.asTypedList(bytes.length).setAll(0, bytes);
+        final output = pkgffi.malloc<ffi.Uint8>(outputLength == 0 ? 1 : outputLength);
+        try {
+          final written = _ffi.cryptProfileStorage(instanceId, epoch, kind, seal ? 1 : 0,
+              input, bytes.length, output, outputLength);
+          if (written != outputLength) {
+            throw const ProfileStorageException('profile storage authentication failed');
+          }
+          return Uint8List.fromList(output.asTypedList(written));
+        } finally {
+          output.asTypedList(outputLength).fillRange(0, outputLength, 0);
+          pkgffi.malloc.free(output);
+        }
+      } finally {
+        input.asTypedList(bytes.length).fillRange(0, bytes.length, 0);
+        pkgffi.malloc.free(input);
+      }
+    });
+  }
+
+  Future<void> _installQueueStorageCodec() async {
+    final codec = _profileStorageCodec;
+    if (codec == null) {
+      await _offlineQueuePersistence.installStorageCodec(null);
+      return;
+    }
+    final toxId = getSelfToxId();
+    if (toxId == null || toxId.length < 64) {
+      throw const ProfileStorageException('profile storage requires a Tox identity');
+    }
+    await _offlineQueuePersistence.installStorageCodec(codec,
+        defaultAccountKey: toxId.substring(0, 64).toUpperCase());
+  }
 
   /// Whether the native layer currently holds a savedata passphrase.
   /// Returns null when the native library predates the export.
@@ -4529,17 +4740,10 @@ class FfiChatService {
               } else if (s.startsWith('c2caction:') ||
                   s.startsWith('gaction:')) {
                 ingestActionEvent(s, sourceInstanceId: sourceInstanceId);
+              } else if (s.startsWith('annotation:')) {
+                ingestMessageAnnotationEvent(s);
               } else if (s.startsWith('c2c:')) {
-                final idx = s.indexOf(':', 4);
-                if (idx > 4 && idx + 1 < s.length) {
-                  final from = s.substring(4, idx);
-                  final text = s.substring(idx + 1);
-                  _ingestInboundC2cText(
-                    from: from,
-                    text: text,
-                    sourceInstanceId: sourceInstanceId,
-                  );
-                }
+                ingestC2cTextEvent(s, sourceInstanceId: sourceInstanceId);
               } else if (s.startsWith('gtext:')) {
                 // gtext:<groupID>|<sender>[|m<pseudoId>]:<text>
                 final headerEnd = s.indexOf(':', 6);
@@ -6723,18 +6927,8 @@ class FfiChatService {
     }
   }
 
-  /// Sends a C2C text. [cloudCustomData] (optional) is the structured V2TIM
-  /// metadata the UIKit composer builds for a REPLY
-  /// (`{"messageReply":{messageID,messageAbstract,...}}`); it is persisted on the
-  /// sender-side ChatMessage so the quote survives a reload (previously the quote
-  /// lived only on the in-memory message and was lost on cold start).
-  ///
-  /// SCOPE (deliberate, documented): it is NOT sent over Tox (`_ffi.sendText`
-  /// carries plain text only — the peer never sees the quote). Both the C2C and
-  /// GROUP offline paths now persist it on both the pending bubble and the
-  /// durable OfflineMessageItem; the drain flips that same row to delivered.
-  /// The over-the-wire delivery is still out of scope for this sender-side
-  /// persistence fix.
+  /// Sends C2C text with optional JSON metadata. If the peer is offline, the
+  /// text and metadata share one durable queue entry and are replayed together.
   Future<void> sendText(String peerId, String text,
       {String? cloudCustomData}) async {
     await sendTextWithResult(
@@ -6763,6 +6957,7 @@ class FfiChatService {
     // Consume any armed reply-quote/forward cloudCustomData (the composer reply
     // flow routes through the provider interface, which can't pass it directly).
     cloudCustomData = _consumeArmedCloudCustomData(cloudCustomData);
+    _validateOutgoingAnnotation(cloudCustomData);
     // Normalize friend ID to 64 characters (public key length)
     final normalizedPeerId = _normalizeFriendId(peerId);
     if (isSelfPeer(peerId)) {
@@ -6811,7 +7006,10 @@ class FfiChatService {
     // Friend is online - send immediately (via the _ex export so the NATIVE
     // send id — which the toxcore delivery-ACK path reports — can be
     // aliased onto this row).
-    final nativeMsgID = _sendC2cTextByKindCheckedEx(
+    final annotated = _sendAnnotatedTextChecked(
+      normalizedPeerId, text, outgoing.contentKind, cloudCustomData, group: false,
+    );
+    final nativeMsgID = annotated != null ? annotated.nativeId : _sendC2cTextByKindCheckedEx(
       normalizedPeerId,
       text,
       outgoing.contentKind,
@@ -6833,8 +7031,8 @@ class FfiChatService {
       isPending: false,
       msgID: msgID,
       altMsgIds: [if (nativeMsgID != null) nativeMsgID],
-      // Reply quote (sender-side persistence). Null for a plain send.
       cloudCustomData: cloudCustomData,
+      annotationDelivered: annotated?.queued ?? false,
       needReadReceipt: _consumeArmedNeedReadReceipt(),
       contentKind: outgoing.contentKind,
     );
@@ -7904,6 +8102,9 @@ class FfiChatService {
       }
       _logger?.log(
           '[FfiChatService] ingestInboundGroupText: Skipping duplicate group message: gid=$gid, from=$from');
+      if (alias != null && !duplicate.isSelf && !_isControlSignalText(text)) {
+        _trackAnnotation(gid, alias);
+      }
       return !alreadyReflected;
     }
     final added = _knownGroups.add(gid);
@@ -7951,6 +8152,9 @@ class FfiChatService {
       // just minted, so a local-id receipt can neither tally nor even be
       // recognised as a control on the author's side.
       unawaited(_sendReceipt(from, alias ?? msgID, 'received', groupID: gid));
+    }
+    if (alias != null && !msg.isSelf && !_isControlSignalText(text)) {
+      _trackAnnotation(gid, alias);
     }
     return true;
   }
@@ -8035,20 +8239,7 @@ class FfiChatService {
   bool ingestActionEvent(String event, {int? sourceInstanceId}) {
     const c2cPrefix = 'c2caction:';
     if (event.startsWith(c2cPrefix)) {
-      final headerEnd = event.indexOf(':', c2cPrefix.length);
-      if (headerEnd <= c2cPrefix.length) return false;
-      final sender = event.substring(c2cPrefix.length, headerEnd);
-      if (!RegExp(r'^[0-9A-Fa-f]{64}$').hasMatch(sender)) return false;
-      final body = event.substring(headerEnd + 1);
-      if (body.isEmpty) return false;
-      if (_tryConsumeLegacyActionControl(body, sender: sender)) return true;
-      return _ingestInboundC2cText(
-        from: sender,
-        text: body,
-        contentKind: ChatMessageContentKind.action,
-        sourceInstanceId: sourceInstanceId,
-        forceEmit: true,
-      );
+      return ingestC2cTextEvent(event, sourceInstanceId: sourceInstanceId);
     }
 
     const groupPrefix = 'gaction:';
@@ -8080,6 +8271,31 @@ class FfiChatService {
       );
     }
     return false;
+  }
+
+  /// Consumes a plain or ACTION C2C line. The optional native id accompanies
+  /// the first text fragment of an annotation bracket.
+  bool ingestC2cTextEvent(String event, {int? sourceInstanceId}) {
+    final action = event.startsWith('c2caction:');
+    if (!action && !event.startsWith('c2c:')) return false;
+    final prefixLength = action ? 'c2caction:'.length : 'c2c:'.length;
+    final headerEnd = event.indexOf(':', prefixLength);
+    if (headerEnd <= prefixLength || headerEnd + 1 >= event.length) return false;
+    final header = event.substring(prefixLength, headerEnd).split('|');
+    final sender = header.first;
+    if (!_toxPublicKeyPattern.hasMatch(sender) || header.length > 2) return false;
+    final annotationId = header.length == 2 ? header.last : null;
+    if (annotationId != null && !isNativeCallbackMessageId(annotationId)) return false;
+    final body = event.substring(headerEnd + 1);
+    if (action && _tryConsumeLegacyActionControl(body, sender: sender)) return true;
+    return _ingestInboundC2cText(
+      from: sender,
+      text: body,
+      contentKind: action ? ChatMessageContentKind.action : ChatMessageContentKind.normal,
+      sourceInstanceId: sourceInstanceId,
+      forceEmit: action,
+      annotationTargetId: annotationId,
+    );
   }
 
   bool _tryConsumeLegacyActionControl(
@@ -8195,6 +8411,7 @@ class FfiChatService {
     ChatMessageContentKind contentKind = ChatMessageContentKind.normal,
     int? sourceInstanceId,
     bool forceEmit = false,
+    String? annotationTargetId,
   }) {
     final normalizedFrom = from.length > 64 ? _normalizeFriendId(from) : from;
     if (normalizedFrom != _selfId && isBlocked(normalizedFrom)) {
@@ -8212,13 +8429,24 @@ class FfiChatService {
       fromUserId: normalizedFrom,
       isSelf: normalizedFrom == _selfId,
       timestamp: now,
-      msgID: msgID,
+      msgID: annotationTargetId ?? msgID,
+      altMsgIds: [if (annotationTargetId != null) msgID],
       contentKind: contentKind,
       sourceInstanceId: sourceInstanceId,
     );
     const dedupWindow = Duration(seconds: 2);
     for (final row in _messageHistoryPersistence.getHistory(normalizedFrom)) {
+      if (!row.isSelf && annotationTargetId != null &&
+          (row.msgID == annotationTargetId || row.altMsgIds.contains(annotationTargetId))) {
+        _absorbInboundCopy(normalizedFrom, row, msg);
+        if (!_isControlSignalText(text)) _trackAnnotation(normalizedFrom, annotationTargetId);
+        if (!_isReactionMessage(text)) {
+          unawaited(_sendReceipt(normalizedFrom, msgID, 'received', inboundText: text));
+        }
+        return true;
+      }
       if (row.isSelf ||
+          annotationTargetId != null ||
           row.fromUserId != normalizedFrom ||
           row.text != text ||
           row.contentKind != contentKind ||
@@ -8246,6 +8474,9 @@ class FfiChatService {
     }
     _appendHistory(normalizedFrom, msg);
     _emitInboundMessage(msg, force: forceEmit || _isControlSignalText(text));
+    if (annotationTargetId != null && !msg.isSelf && !_isControlSignalText(text)) {
+      _trackAnnotation(normalizedFrom, annotationTargetId);
+    }
     if (!msg.isSelf && !_isReactionMessage(text)) {
       unawaited(
         _sendReceipt(normalizedFrom, msgID, 'received', inboundText: text),
@@ -9118,6 +9349,45 @@ class FfiChatService {
     } on Object {
       _sendC2cTextByKindChecked(normalizedPeerId, text, contentKind);
       return null;
+    }
+  }
+
+  ({String? nativeId, bool queued})? _sendAnnotatedTextChecked(
+    String recipient,
+    String text,
+    ChatMessageContentKind contentKind,
+    String? data, {
+    required bool group,
+  }) {
+    // An old queue file can contain arbitrary sender-local metadata. Preserve
+    // its text even if that value is too large or not a valid wire annotation.
+    if (data == null || !_validAnnotation(data)) return null;
+    final SendAnnotatedText? send;
+    try {
+      send = _ffi.sendAnnotatedText;
+    } on Object {
+      // Older native library or a test double with no annotated-send export.
+      return null;
+    }
+    if (send == null) return null;
+    _validateTextTransportPayload(text);
+    final to = recipient.toNativeUtf8();
+    final body = text.toNativeUtf8();
+    final annotation = data.toNativeUtf8();
+    final out = pkgffi.malloc.allocate<ffi.Int8>(128);
+    try {
+      final result = send(to, body, annotation, group ? 1 : 0,
+          contentKind == ChatMessageContentKind.action ? 1 : 0, out, 128);
+      if (result != 1 && result != 2) {
+        throw _TextTransportSendError('Annotated text send failed (rc=$result)');
+      }
+      final id = out.cast<pkgffi.Utf8>().toDartString();
+      return (nativeId: id.isEmpty ? null : id, queued: result == 2);
+    } finally {
+      pkgffi.malloc.free(to);
+      pkgffi.malloc.free(body);
+      pkgffi.malloc.free(annotation);
+      pkgffi.malloc.free(out);
     }
   }
 
@@ -11185,12 +11455,13 @@ class FfiChatService {
   // C2C queue, which share the same persistence backing store.
   String _groupOfflineQueueKey(String groupId) => 'group:$groupId';
 
-  Future<void> sendGroupText(String groupId, String text) async {
-    await sendGroupTextWithResult(groupId, text);
+  Future<void> sendGroupText(String groupId, String text,
+      {String? cloudCustomData}) async {
+    await sendGroupTextWithResult(groupId, text, cloudCustomData: cloudCustomData);
   }
 
   Future<ChatMessage> sendGroupTextWithResult(String groupId, String text,
-      {String? clientMessageID}) async {
+      {String? clientMessageID, String? cloudCustomData}) async {
     final outgoing = parseOutgoingChatText(text);
     _validateOutgoingText(outgoing);
     text = outgoing.text;
@@ -11198,7 +11469,8 @@ class FfiChatService {
     // routes group sends through the same provider.sendText, which can't pass
     // it). Always consume — even on the offline branch — so an armed value can
     // never leak into a later send.
-    final cloudCustomData = _consumeArmedCloudCustomData(null);
+    cloudCustomData = _consumeArmedCloudCustomData(cloudCustomData);
+    _validateOutgoingAnnotation(cloudCustomData);
     // P0-C1: parallel of the C2C offline-queue behavior. Group messages
     // used to be sent fire-and-forget even when we had no DHT connection
     // — Tox would silently drop them with no path for recovery, and the
@@ -11231,7 +11503,10 @@ class FfiChatService {
         needReadReceipt: _consumeArmedNeedReadReceipt(),
       );
     }
-    _sendGroupTextByKindChecked(groupId, text, outgoing.contentKind);
+    final annotated = _sendAnnotatedTextChecked(
+      groupId, text, outgoing.contentKind, cloudCustomData, group: true,
+    );
+    if (annotated == null) _sendGroupTextByKindChecked(groupId, text, outgoing.contentKind);
     // Read the cross-peer id IMMEDIATELY after the synchronous send: it is
     // thread-local and only describes the send that just happened.
     final alias = _groupSendAlias(groupId);
@@ -11246,6 +11521,7 @@ class FfiChatService {
       groupId: groupId,
       msgID: msgID,
       cloudCustomData: cloudCustomData,
+      annotationDelivered: annotated?.queued ?? false,
       needReadReceipt: _consumeArmedNeedReadReceipt(),
       contentKind: outgoing.contentKind,
       altMsgIds: [if (alias != null) alias],
@@ -11399,7 +11675,10 @@ class FfiChatService {
       // See the C2C drain: set once the send succeeded, before the removal.
       var sent = false;
       try {
-        _sendGroupTextByKindChecked(groupId, item.text, item.contentKind);
+        final annotated = _sendAnnotatedTextChecked(
+          groupId, item.text, item.contentKind, item.cloudCustomData, group: true,
+        );
+        if (annotated == null) _sendGroupTextByKindChecked(groupId, item.text, item.contentKind);
         sent = true;
         _markDispatched(item);
         // The row was created while offline, so it has no cross-peer alias:
@@ -11440,6 +11719,7 @@ class FfiChatService {
                 _offlineRowMatchesItem(msg, item, itemMs)) {
               history[i] = msg.copyWith(
                 altMsgIds: [...msg.altMsgIds, drainedAlias],
+                annotationDelivered: annotated?.queued,
               );
               stampedSettledRow = !msg.isPending;
               break;
@@ -11477,7 +11757,8 @@ class FfiChatService {
                 _offlineRowMatchesItem(msg, item, itemMs)) {
               // The alias was stamped before the awaits above; this only
               // clears the pending (or failed) flag.
-              history[i] = msg.copyWith(isPending: false, isFailed: false);
+              history[i] = msg.copyWith(isPending: false, isFailed: false,
+                  annotationDelivered: annotated?.queued);
               _lastByPeer[groupId] = history[i];
               try {
                 await _saveHistory(groupId);
@@ -13386,11 +13667,22 @@ class FfiChatService {
       }
     }
 
-    _sendC2cTextByKindChecked(
-      normalizedPeerId,
-      item.text,
-      item.contentKind,
+    final annotated = _sendAnnotatedTextChecked(
+      normalizedPeerId, item.text, item.contentKind, item.cloudCustomData, group: false,
     );
+    if (annotated == null) {
+      _sendC2cTextByKindChecked(normalizedPeerId, item.text, item.contentKind);
+    }
+    ChatMessage settled(ChatMessage row) {
+      final nativeId = annotated?.nativeId;
+      return row.copyWith(
+        isPending: false,
+        isFailed: false,
+        annotationDelivered: annotated?.queued,
+        altMsgIds: nativeId != null && !row.altMsgIds.contains(nativeId)
+            ? [...row.altMsgIds, nativeId] : null,
+      );
+    }
 
     // #25 Option B: durably clear the queue entry NOW (after send, before the
     // history reconcile) so a crash can't make the next drain re-send.
@@ -13403,7 +13695,7 @@ class FfiChatService {
       if (at >= 0) {
         final current = history[at];
         if (current.isFailed) _reportFailureCleared(current.msgID);
-        final updatedMsg = current.copyWith(isPending: false, isFailed: false);
+        final updatedMsg = settled(current);
         history[at] = updatedMsg;
         _lastByPeer[normalizedPeerId] = updatedMsg;
         try {
@@ -13448,8 +13740,8 @@ class FfiChatService {
         // marked failed (the item survived because its removal did not reach
         // disk) is delivered now: clear the failure and re-emit that change.
         final wasFailed = existing.isFailed;
-        final updatedMsg = existing.isPending || wasFailed
-            ? existing.copyWith(isPending: false, isFailed: false)
+        final updatedMsg = existing.isPending || wasFailed || annotated != null
+            ? settled(existing)
             : existing;
         history[existingIndex] = updatedMsg;
         _lastByPeer[normalizedPeerId] = updatedMsg;
@@ -13482,7 +13774,7 @@ class FfiChatService {
           msgID =
               '${item.timestamp.millisecondsSinceEpoch}_${sequence}_$_selfId';
         }
-        final msg = ChatMessage(
+        final msg = settled(ChatMessage(
           text: item.text,
           fromUserId: _selfId,
           isSelf: true,
@@ -13492,7 +13784,7 @@ class FfiChatService {
           msgID: msgID,
           cloudCustomData: item.cloudCustomData,
           contentKind: item.contentKind,
-        );
+        ));
         _lastByPeer[normalizedPeerId] = msg;
         _appendHistory(normalizedPeerId, msg);
         _messages.add(msg);
@@ -13611,6 +13903,7 @@ class FfiChatService {
   //
   // The histories are loaded before it: rows still queued show pending again.
   Future<void> _loadOfflineQueue() async {
+    await _installQueueStorageCodec();
     await _offlineQueuePersistence.loadQueue(clearOnLoad: false);
     for (final id in _historyById.keys.toList()) {
       final changed = _restoreQueuedPending(id);
@@ -14132,6 +14425,12 @@ class FfiChatService {
     // lose the "conversation read" state.
     await _drainReadBarrierWritesForDispose();
 
+    // The migration calls the native cipher between file writes. Finish it
+    // while the profile key is still live; failures are retryable on open.
+    try {
+      await _profileStorageMigration;
+    } catch (_) {}
+
     await _scratchFiles.dispose();
 
     // Cancel any in-flight file transfers — must happen after the poller has
@@ -14259,6 +14558,8 @@ class FfiChatService {
       }
     }
     await _messages.close();
+    _inboundAnnotations.clear();
+    await _messageUpdates.close();
     await _connectionStatus.close();
     await _progressCtrl.close();
     await _fileRequestCtrl.close();
