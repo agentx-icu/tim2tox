@@ -26,6 +26,7 @@
 #include <algorithm>
 #include <atomic>
 #include <fstream>
+#include <filesystem>
 #include <memory>
 #include <sstream>
 #include <string>
@@ -132,6 +133,62 @@ TEST(ToxSessionPinTest, AcquireRefusesWhenThereIsNoSession) {
     EXPECT_EQ(manager.acquireTox(), nullptr)
         << "no Tox has been created yet: the operation must refuse, not "
            "receive a handle";
+}
+
+TEST(ToxSessionPinTest, ProfileStorageKeySurvivesRekeyAndRejectsTampering) {
+    const auto dir = std::filesystem::temp_directory_path() /
+        ("tim2tox-storage-key-" + std::to_string(
+             std::chrono::steady_clock::now().time_since_epoch().count()));
+    ASSERT_TRUE(std::filesystem::create_directory(dir));
+    struct RemoveDirectory {
+        std::filesystem::path path;
+        ~RemoveDirectory() {
+            std::error_code error;
+            std::filesystem::remove_all(path, error);
+        }
+    } remove_directory{dir};
+    const auto path = (dir / "account.tox").string();
+    const uint8_t first_password[] = {'o', 'l', 'd'};
+    const uint8_t new_password[] = {'n', 'e', 'w'};
+    const uint8_t message[] = {'s', 'e', 'c', 'r', 'e', 't'};
+    std::vector<uint8_t> sealed(sizeof(message) + 40);
+    auto manager = MakeLiveManager();
+    if (!manager) GTEST_SKIP() << "tox_new unavailable on this host";
+    EXPECT_EQ(manager->prepareProfileStorage(path), 0);
+    ASSERT_TRUE(manager->rekeyAndSave(path, first_password, sizeof(first_password)));
+    ASSERT_EQ(manager->prepareProfileStorage(path), 1);
+    ASSERT_EQ(manager->cryptProfileStorage(1, true, message, sizeof(message),
+                                          sealed.data(), sealed.size()), sealed.size());
+    EXPECT_FALSE(manager->rekeyAndSave((dir / "absent" / "profile.tox").string(),
+                                      new_password, sizeof(new_password)));
+    EXPECT_TRUE(manager->rekeyAndSave(path, new_password, sizeof(new_password)));
+    manager.reset();
+
+    ToxManager old_password;
+    old_password.setProfilePassphrase(first_password, sizeof(first_password));
+    EXPECT_EQ(old_password.loadFromEx(path), ToxManager::LoadOutcome::kBadPassphrase);
+    ToxManager reopened;
+    reopened.setProfilePassphrase(new_password, sizeof(new_password));
+    ASSERT_TRUE(reopened.loadFrom(path));
+    ASSERT_EQ(reopened.prepareProfileStorage(path), 1);
+    std::vector<uint8_t> plain(sizeof(message));
+    ASSERT_EQ(reopened.cryptProfileStorage(1, false, sealed.data(), sealed.size(),
+                                           plain.data(), plain.size()), plain.size());
+    EXPECT_TRUE(std::equal(plain.begin(), plain.end(), std::begin(message)));
+    EXPECT_EQ(reopened.cryptProfileStorage(2, false, sealed.data(), sealed.size(),
+                                           plain.data(), plain.size()), -1);
+    sealed.back() ^= 1;
+    EXPECT_EQ(reopened.cryptProfileStorage(1, false, sealed.data(), sealed.size(),
+                                           plain.data(), plain.size()), -1);
+    sealed.back() ^= 1;
+
+    ASSERT_TRUE(reopened.rekeyAndSave(path, nullptr, 0));
+    ToxManager unprotected;
+    ASSERT_TRUE(unprotected.loadFrom(path));
+    ASSERT_EQ(unprotected.prepareProfileStorage(path), 1);
+    EXPECT_EQ(unprotected.cryptProfileStorage(1, false, sealed.data(), sealed.size(),
+                                              plain.data(), plain.size()), plain.size());
+    EXPECT_TRUE(std::equal(plain.begin(), plain.end(), std::begin(message)));
 }
 
 TEST(ToxSessionPinTest, PinnedHandleOutlivesShutdown) {

@@ -141,6 +141,9 @@ extern void SetReceiverGroupMessageIdOverride(int64_t id);
 extern void ClearReceiverGroupMessageIdOverride(void);
 extern void SetLastGroupSendMessageId(int64_t id);
 extern void SetLastGroupSendSelfKey(const char* hex);
+extern void PublishMessageAnnotation(int64_t instance_id, int64_t session_epoch, const std::string& group,
+                                     const std::string& sender, const std::string& id,
+                                     std::string_view data);
 #include <string> // For std::string
 #include <filesystem>
 #include <sys/stat.h>
@@ -163,6 +166,18 @@ extern void SetLastGroupSendSelfKey(const char* hex);
 namespace {
 
 using tim2tox::control::Type;
+namespace annotation = tim2tox::annotation;
+
+// Accessed only when bracketing an annotated send. A process-wide serial
+// distinguishes successive brackets even if the same peer is used after a
+// reconnect or an earlier send left an unfinished bracket.
+std::atomic<uint64_t> g_annotation_serial{1};
+
+bool SendFriendAnnotationFrame(Tox* tox, uint32_t friend_number, std::string_view body) {
+    const auto frame = tim2tox::control::Encode(Type::kMessageAnnotation, body);
+    return frame && tox_friend_send_lossless_packet(
+                        tox, friend_number, frame->data(), frame->size(), nullptr);
+}
 
 uint64_t PendingDeliveryKey(uint32_t friend_number, uint32_t tox_message_number) {
     return (static_cast<uint64_t>(friend_number) << 32) |
@@ -2052,6 +2067,8 @@ bool V2TIMManagerImpl::InitSDK(uint32_t sdkAppID, const V2TIMSDKConfig& config) 
                 } else if (packet->type == Type::kGroupIdentity) {
                     this->HandleGroupIdentityAnnouncement(
                         friend_number, body, packet->body.size());
+                } else if (packet->type == Type::kMessageAnnotation) {
+                    this->HandleFriendAnnotation(friend_number, packet->body);
                 } else {
                     this->HandleFriendControlMessage(
                         friend_number, packet->type, body, packet->body.size());
@@ -2394,6 +2411,7 @@ void V2TIMManagerImpl::ResetGroupSessionState() {
         group_wire_readiness_.Clear();
         accepted_invites_.clear();
         online_identity_friends_.clear();
+        inbound_friend_annotations_.Clear();
         pending_identity_challenges_.clear();
         dart_known_chat_id_.clear();
         dart_known_type_.clear();
@@ -2487,6 +2505,23 @@ V2TIMManagerImpl::LiveProfileSession V2TIMManagerImpl::SnapshotLiveProfileSessio
     std::lock_guard<std::mutex> lock(tox_manager_mutex_);
     return LiveProfileSession{tox_manager_, save_path_,
                               session_epoch_.load(std::memory_order_acquire)};
+}
+
+int V2TIMManagerImpl::PrepareLiveProfileStorage(int64_t expected_session_epoch) {
+    const auto session = SnapshotLiveProfileSession();
+    if (!session.manager || session.save_path.empty() || expected_session_epoch <= 0 ||
+        session.epoch != expected_session_epoch) return -1;
+    return session.manager->prepareProfileStorage(session.save_path);
+}
+
+int V2TIMManagerImpl::CryptLiveProfileStorage(int64_t expected_session_epoch, uint8_t kind,
+                                            bool encrypt, const uint8_t* input, size_t input_size,
+                                            uint8_t* output, size_t output_capacity) {
+    const auto session = SnapshotLiveProfileSession();
+    if (!session.manager || expected_session_epoch <= 0 ||
+        session.epoch != expected_session_epoch) return -1;
+    return session.manager->cryptProfileStorage(kind, encrypt, input, input_size,
+                                                output, output_capacity);
 }
 
 bool V2TIMManagerImpl::HasProfilePassphrase() const {
@@ -2686,12 +2721,27 @@ V2TIMString V2TIMManagerImpl::SendC2CActionMessage(
         text, userID, V2TIMBuffer(), callback, true);
 }
 
+V2TIMString V2TIMManagerImpl::SendAnnotatedText(
+    const V2TIMString& text, const V2TIMString& target, const V2TIMBuffer& data,
+    bool group, bool action, bool& annotation_queued) {
+    annotation_queued = false;
+    if (!data.Data() || !annotation::HasData({
+            reinterpret_cast<const char*>(data.Data()), data.Size()})) {
+        return "";
+    }
+    return group ? SendGroupTextMessageWithType(text, target, V2TIM_PRIORITY_NORMAL,
+                                                data, nullptr, action, &annotation_queued)
+                 : SendC2CTextMessageWithType(text, target, data, nullptr, action,
+                                              &annotation_queued);
+}
+
 V2TIMString V2TIMManagerImpl::SendC2CTextMessageWithType(
     const V2TIMString& text,
     const V2TIMString& userID,
     const V2TIMBuffer& cloudCustomData,
     V2TIMSendCallback* callback,
-    bool force_action) {
+    bool force_action,
+    bool* annotation_queued) {
     // ===================================================================
     // Step 1: Validate parameters
     // ===================================================================
@@ -2800,7 +2850,7 @@ V2TIMString V2TIMManagerImpl::SendC2CTextMessageWithType(
     
     // 检查是否有引用回复信息
     std::string replyJson = MessageReplyUtil::ExtractReplyJsonFromCloudCustomData(cloudCustomData);
-    if (prepared->type == TOX_MESSAGE_TYPE_NORMAL && !replyJson.empty()) {
+    if (!annotation_queued && prepared->type == TOX_MESSAGE_TYPE_NORMAL && !replyJson.empty()) {
         // 构建包含引用回复的消息
         std::string messageWithReply = MessageReplyUtil::BuildMessageWithReply(replyJson, finalMessageText);
         
@@ -2854,6 +2904,11 @@ V2TIMString V2TIMManagerImpl::SendC2CTextMessageWithType(
         return "";
     }
     TOX_ERR_FRIEND_SEND_MESSAGE send_err = TOX_ERR_FRIEND_SEND_MESSAGE_OK;
+    const uint64_t annotation_nonce = annotation_queued
+        ? g_annotation_serial.fetch_add(1, std::memory_order_relaxed) : 0;
+    const bool annotation_started = annotation_queued && fragments->size() <= UINT16_MAX &&
+        SendFriendAnnotationFrame(tox, friend_number, annotation::Begin(
+            annotation_nonce, static_cast<uint16_t>(fragments->size())));
     std::vector<uint32_t> tox_message_numbers;
     tox_message_numbers.reserve(fragments->size());
     V2TIM_LOG(kInfo, "SendC2CTextMessage sending {} fragments", fragments->size());
@@ -2869,6 +2924,12 @@ V2TIMString V2TIMManagerImpl::SendC2CTextMessageWithType(
             break;
         }
         tox_message_numbers.push_back(tox_message_number);
+    }
+    if (annotation_started && send_err == TOX_ERR_FRIEND_SEND_MESSAGE_OK &&
+        tox_message_numbers.size() == fragments->size() && !session.Expired()) {
+        *annotation_queued = SendFriendAnnotationFrame(tox, friend_number,
+            annotation::Commit(annotation_nonce, {
+                reinterpret_cast<const char*>(cloudCustomData.Data()), cloudCustomData.Size()}));
     }
     V2TIM_LOG(kInfo, "SendC2CTextMessage completed with status {}", send_err);
 
@@ -3138,7 +3199,8 @@ V2TIMString V2TIMManagerImpl::SendGroupTextMessageWithType(
     V2TIMMessagePriority priority,
     const V2TIMBuffer& cloudCustomData,
     V2TIMSendCallback* callback,
-    bool force_action) {
+    bool force_action,
+    bool* annotation_queued) {
     V2TIM_LOG(kInfo, "[V2TIMManagerImpl::SendGroupTextMessage] ========== ENTRY ==========");
     V2TIM_LOG(kInfo, "[V2TIMManagerImpl::SendGroupTextMessage] groupID={}, text_length={}", groupID.CString(), text.Length());
     
@@ -3184,7 +3246,7 @@ V2TIMString V2TIMManagerImpl::SendGroupTextMessageWithType(
     
     // 检查是否有引用回复信息
     std::string replyJson = MessageReplyUtil::ExtractReplyJsonFromCloudCustomData(cloudCustomData);
-    if (prepared->type == TOX_MESSAGE_TYPE_NORMAL && !replyJson.empty()) {
+    if (!annotation_queued && prepared->type == TOX_MESSAGE_TYPE_NORMAL && !replyJson.empty()) {
         // 构建包含引用回复的消息
         std::string messageWithReply = MessageReplyUtil::BuildMessageWithReply(replyJson, finalMessageText);
         
@@ -3306,7 +3368,7 @@ V2TIMString V2TIMManagerImpl::SendGroupTextMessageWithType(
     // Publish the FIRST fragment's cross-peer id for the Dart caller. Reset up
     // front so a conference send or a failure cannot leave a stale id behind
     // for the next caller to mis-stamp onto its row.
-    bool first_pseudo_id_published = false;
+    std::optional<Tox_Group_Message_Id> first_pseudo_id;
     SetLastGroupSendMessageId(-1);
     // Publish the identity peers will attribute this message to. An NGC peer
     // is known by a PER-GROUP key, not by its long-term Tox ID, so the author
@@ -3369,9 +3431,9 @@ V2TIMString V2TIMManagerImpl::SendGroupTextMessageWithType(
             &message_id,
             &send_err);
         if (success) {
-            if (!first_pseudo_id_published) {
+            if (!first_pseudo_id) {
                 SetLastGroupSendMessageId(static_cast<int64_t>(message_id));
-                first_pseudo_id_published = true;
+                first_pseudo_id = message_id;
             }
             continue;
         }
@@ -3380,6 +3442,16 @@ V2TIMString V2TIMManagerImpl::SendGroupTextMessageWithType(
         // fallback: the two number spaces overlap, so that fallback sent the
         // text into an unrelated conference.
         break;
+    }
+
+    if (annotation_queued && success && first_pseudo_id && !session.Expired()) {
+        std::string payload;
+        annotation::AppendNetworkInteger(payload, *first_pseudo_id, 4);
+        payload.append(reinterpret_cast<const char*>(cloudCustomData.Data()), cloudCustomData.Size());
+        const auto packet = WrapTim2ToxGroupPacket(tim2tox::group_packet::kMessageAnnotation,
+            reinterpret_cast<const uint8_t*>(payload.data()), payload.size());
+        *annotation_queued = tox_group_send_custom_packet(
+            tox, group_number, true, packet.data(), packet.size(), nullptr);
     }
 
     V2TIM_LOG(kInfo, "[V2TIMManagerImpl::SendGroupTextMessage] groupSendMessage returned: success={}, message_id={}, send_err={}",
@@ -6274,6 +6346,7 @@ void V2TIMManagerImpl::NoteFriendConnectionForIdentity(uint32_t friend_number, b
         std::lock_guard<std::mutex> lock(mutex_);
         online_identity_friends_.erase(friend_number);
         if (!friend_hex.empty()) {
+            inbound_friend_annotations_.Erase(friend_hex);
             DropFriendIdentityClaimsLocked(friend_hex);
             // The challenges go with the claims. An offline friend cannot
             // answer one (it travelled over the friend channel), so leaving
@@ -6307,6 +6380,7 @@ void V2TIMManagerImpl::PurgeFriendIdentityState(uint32_t friend_number, const st
     }();
     std::lock_guard<std::mutex> lock(mutex_);
     online_identity_friends_.erase(friend_number);
+    inbound_friend_annotations_.Erase(friend_hex);
     if (friend_hex.empty()) return;
     DropFriendIdentityClaimsLocked(friend_hex);
     for (auto it = pending_identity_challenges_.begin(); it != pending_identity_challenges_.end();) {
@@ -7584,6 +7658,12 @@ void V2TIMManagerImpl::HandleGroupCustomPacket(
     // packets on this shared channel are their protocols, not messages.
     const uint8_t* payload = nullptr;
     size_t payload_length = 0;
+    if (UnwrapTim2ToxGroupPacket(tim2tox::group_packet::kMessageAnnotation, data,
+                                length, &payload, &payload_length)) {
+        HandleGroupAnnotation(group_number, peer_id, {
+            reinterpret_cast<const char*>(payload), payload_length});
+        return;
+    }
     if (!UnwrapTim2ToxGroupPacket(kTim2ToxGroupPacketCustomMessage, data, length,
                                   &payload, &payload_length) ||
         payload_length == 0) {
@@ -7902,7 +7982,8 @@ void V2TIMManagerImpl::HandleGroupPrivateMessage(Tox_Group_Number group_number, 
 void V2TIMManagerImpl::NotifyFriendActionMessage(
     const V2TIMString& sender_user_id,
     const uint8_t* text,
-    size_t length) {
+    size_t length,
+    const V2TIMString& annotation_id) {
     if (text == nullptr || length == 0) return;
 
     V2TIMUserFullInfo sender_info;
@@ -7918,11 +7999,13 @@ void V2TIMManagerImpl::NotifyFriendActionMessage(
     ReceiverInstanceOverrideGuard receiver_instance_guard(
         GetInstanceIdFromManager(this));
     ReceiverTextKindOverrideGuard text_kind_guard(1);
+    ReceiverCustomRouteOverrideGuard annotation_guard(
+        annotation_id.Empty() ? 0 : static_cast<uint8_t>(Type::kMessageAnnotation));
     for (V2TIMSimpleMsgListener* listener : listeners_to_notify) {
         if (!listener) continue;
         try {
             listener->OnRecvC2CTextMessage(
-                "", sender_info, action_text);
+                annotation_id, sender_info, action_text);
         } catch (...) {
             V2TIM_LOG(
                 kWarning,
@@ -8049,7 +8132,8 @@ void V2TIMManagerImpl::DeliverFriendMessage(
     V2TIMMessage& message,
     const V2TIMString& sender_user_id,
     const uint8_t* sender_public_key,
-    uint8_t custom_route) {
+    uint8_t custom_route,
+    bool annotation_target) {
     Tox* tox = GetToxManager()->getTox();
     auto* msg_manager = static_cast<V2TIMMessageManagerImpl*>(GetMessageManager());
     if (!tox || !msg_manager || sender_public_key == nullptr) {
@@ -8088,6 +8172,8 @@ void V2TIMManagerImpl::DeliverFriendMessage(
         sender_info.userID = sender_user_id;
         if (elem->elemType == V2TIM_ELEM_TYPE_TEXT) {
             auto* text_elem = static_cast<V2TIMTextElem*>(elem);
+            ReceiverCustomRouteOverrideGuard annotation_guard(
+                annotation_target ? static_cast<uint8_t>(Type::kMessageAnnotation) : 0);
             for (V2TIMSimpleMsgListener* listener : listeners_to_notify) {
                 if (listener) {
                     try {
@@ -8119,6 +8205,63 @@ void V2TIMManagerImpl::DeliverFriendMessage(
     }
 }
 
+bool V2TIMManagerImpl::ObserveFriendAnnotationText(
+    const std::string& sender, std::string_view local_id) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return inbound_friend_annotations_.Observe(sender, local_id, annotation::FriendBatches::Clock::now());
+}
+
+void V2TIMManagerImpl::HandleFriendAnnotation(uint32_t friend_number, std::string_view body) {
+    if (body.size() < 9 || !running_) return;
+    const bool begin = body[0] == '\x01' && body.size() == 11;
+    const bool commit = body[0] == '\x02' && annotation::HasData(body.substr(9));
+    if (!begin && !commit) return;
+    auto* manager = GetToxManager();
+    Tox* tox = manager ? manager->getTox() : nullptr;
+    uint8_t key[TOX_PUBLIC_KEY_SIZE];
+    if (!tox || !tox_friend_get_public_key(tox, friend_number, key, nullptr)) return;
+    const std::string sender = ToxUtil::tox_bytes_to_hex(key, sizeof(key));
+    const auto nonce = annotation::ReadNetworkInteger(body.substr(1, 8));
+    const auto now = annotation::FriendBatches::Clock::now();
+    std::optional<std::string> target;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (begin) {
+            const auto count = static_cast<uint16_t>(annotation::ReadNetworkInteger(body.substr(9)));
+            inbound_friend_annotations_.Start(sender, nonce, count, now);
+            return;
+        }
+        target = inbound_friend_annotations_.Finish(sender, nonce, now);
+    }
+    if (target) {
+        PublishMessageAnnotation(GetInstanceIdFromManager(this), GetSessionEpoch(), "",
+                                 sender, *target, body.substr(9));
+    }
+}
+
+void V2TIMManagerImpl::HandleGroupAnnotation(Tox_Group_Number group_number,
+                                             Tox_Group_Peer_Number peer_id,
+                                             std::string_view body) {
+    if (body.size() <= 4 || !annotation::HasData(body.substr(4))) return;
+    auto* manager = GetToxManager();
+    if (!manager) return;
+    Tox_Err_Group_Peer_Query peer_error;
+    if (manager->isGroupPeerOurs(group_number, peer_id, &peer_error)) return;
+    uint8_t key[TOX_PUBLIC_KEY_SIZE];
+    if (!manager->getGroupPeerPublicKey(group_number, peer_id, key, &peer_error) ||
+        peer_error != TOX_ERR_GROUP_PEER_QUERY_OK) return;
+    std::string group;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        const auto it = group_number_to_group_id_.find(group_number);
+        if (it == group_number_to_group_id_.end()) return;
+        group = it->second.CString();
+    }
+    PublishMessageAnnotation(GetInstanceIdFromManager(this), GetSessionEpoch(), group,
+        ToxUtil::tox_bytes_to_hex(key, sizeof(key)),
+        std::to_string(annotation::ReadNetworkInteger(body.substr(0, 4))), body.substr(4));
+}
+
 void V2TIMManagerImpl::HandleFriendMessage(uint32_t friend_number, TOX_MESSAGE_TYPE type, const uint8_t* message_data, size_t length) {
     V2TIM_LOG(kInfo, "HandleFriendMessage received type {} with length {}", type, length);
     
@@ -8146,10 +8289,16 @@ void V2TIMManagerImpl::HandleFriendMessage(uint32_t friend_number, TOX_MESSAGE_T
     senderUserID = sender_hex_id;
 
     if (type == TOX_MESSAGE_TYPE_ACTION) {
-        NotifyFriendActionMessage(senderUserID, message_data, length);
+        const auto id = MakeMessageId();
+        const bool annotation_target = ObserveFriendAnnotationText(hex_id, id);
+        NotifyFriendActionMessage(senderUserID, message_data, length,
+                                   annotation_target ? V2TIMString(id.c_str()) : V2TIMString());
         return;
     }
-    if (!msgManager) return;
+    if (!msgManager) {
+        ObserveFriendAnnotationText(hex_id, {});
+        return;
+    }
 
     // --- Create V2TIMMessage Object --- 
     V2TIMMessage v2_message; // Will be populated based on type
@@ -8214,11 +8363,17 @@ void V2TIMManagerImpl::HandleFriendMessage(uint32_t friend_number, TOX_MESSAGE_T
         }
     } else {
         V2TIM_LOG(kWarning, "Received unhandled C2C message type {}", type);
+        ObserveFriendAnnotationText(hex_id, {});
         return; // Don't notify for unsupported types
     }
 
     if (message_created) {
-        DeliverFriendMessage(v2_message, senderUserID, sender_pubkey, 0);
+        const bool is_text = !v2_message.elemList.Empty() &&
+            v2_message.elemList[0]->elemType == V2TIM_ELEM_TYPE_TEXT;
+        const bool annotation_target = ObserveFriendAnnotationText(hex_id,
+            is_text ? std::string_view(v2_message.msgID.CString(), v2_message.msgID.Length())
+                    : std::string_view());
+        DeliverFriendMessage(v2_message, senderUserID, sender_pubkey, 0, annotation_target);
     }
 }
 

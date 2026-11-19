@@ -23,6 +23,7 @@ enum Kind : uint8_t {
     kReceipt = 2,        // private: receipt JSON for the author
     kIdentityProof = 3,  // private: MM-6 identity proof
     kRendezvous = 4,     // broadcast or private: opaque rendezvous payload
+    kMessageAnnotation = 5,  // broadcast: wire message id and annotation JSON
 };
 
 // Header + payload.

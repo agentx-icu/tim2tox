@@ -265,6 +265,7 @@ class ChatMessage {
     this.fileHash, // SHA256 hash of file content (optional)
     this.altMsgIds = const [], // ids of cross-path duplicates absorbed here
     this.cloudCustomData, // structured reply/forward metadata (JSON string)
+    this.annotationDelivered = false,
     this.needReadReceipt = false, // sender asked for read receipts (groups)
     this.contentKind = ChatMessageContentKind.normal,
     this.sourceInstanceId,
@@ -308,16 +309,13 @@ class ChatMessage {
 
   /// Structured per-message metadata as a JSON string (the V2TIM
   /// `cloudCustomData`). Carries the reply quote
-  /// (`{"messageReply":{messageID,messageAbstract,messageSender,...}}`) that the
-  /// UIKit composer builds when replying to a message. Persisted sender-side so
-  /// the quote survives a reload (previously it lived only on the in-memory
-  /// V2TimMessage and was lost on cold start).
-  ///
-  /// WIRE LIMITATION: toxee's Tox send (`_ffi.sendText`) carries plain text
-  /// only, so this is NOT delivered to the peer today — it is a local
-  /// sender-side record. The peer-receives-the-quote leg needs a Tox
-  /// wire-format change (out of scope). Null for plain messages.
+  /// (`{"messageReply":{messageID,messageAbstract,messageSender,...}}`) and
+  /// app-specific annotations. Null for plain messages.
   final String? cloudCustomData;
+
+  /// Whether the sender's transport accepted the annotation for transmission.
+  /// This does not confirm reception or support on the remote client.
+  final bool annotationDelivered;
   final bool needReadReceipt;
 
   final ChatMessageContentKind contentKind;
@@ -356,6 +354,7 @@ class ChatMessage {
         // Backward compatible: gated so plain messages serialize byte-identically
         // (existing on-disk history has no cloudCustomData key).
         if (cloudCustomData != null) 'cloudCustomData': cloudCustomData,
+        if (annotationDelivered) 'annotationDelivered': true,
         // Backward compatible: gated like cloudCustomData, so rows without the
         // flag keep serializing byte-identically.
         if (needReadReceipt) 'needReadReceipt': true,
@@ -391,6 +390,7 @@ class ChatMessage {
                 const [],
         // Backward compatible: pre-existing history has no cloudCustomData key.
         cloudCustomData: json['cloudCustomData'] as String?,
+        annotationDelivered: json['annotationDelivered'] == true,
         needReadReceipt: json['needReadReceipt'] as bool? ?? false,
         isFailed: json['isFailed'] as bool? ?? false,
         isCancelled: json['isCancelled'] as bool? ?? false,
@@ -409,6 +409,7 @@ class ChatMessage {
     String? fileHash,
     List<String>? altMsgIds,
     String? cloudCustomData,
+    bool? annotationDelivered,
     bool? needReadReceipt,
     ChatMessageContentKind? contentKind,
     int? sourceInstanceId,
@@ -434,6 +435,7 @@ class ChatMessage {
       fileHash: fileHash ?? this.fileHash,
       altMsgIds: altMsgIds ?? this.altMsgIds,
       cloudCustomData: cloudCustomData ?? this.cloudCustomData,
+      annotationDelivered: annotationDelivered ?? this.annotationDelivered,
       needReadReceipt: needReadReceipt ?? this.needReadReceipt,
       contentKind: contentKind ?? this.contentKind,
       sourceInstanceId: sourceInstanceId ?? this.sourceInstanceId,

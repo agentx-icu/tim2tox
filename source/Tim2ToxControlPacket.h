@@ -22,6 +22,7 @@ enum class Type : uint8_t {
     // sha256(group chat_id || our per-group public key). See
     // V2TIMManagerImpl::AnnounceGroupIdentities.
     kGroupIdentity = 4,
+    kMessageAnnotation = 5,
 };
 
 struct Packet {

@@ -1,4 +1,5 @@
 #include "Tim2ToxControlPacket.h"
+#include "Tim2ToxMessageAnnotation.h"
 #include "Tim2ToxPacketIds.h"
 
 #include <gtest/gtest.h>
@@ -56,6 +57,42 @@ TEST(Tim2ToxControlPacketTest, DecodesKnownTypeAndBody) {
     ASSERT_TRUE(decoded.has_value());
     EXPECT_EQ(decoded->type, Type::kReceipt);
     EXPECT_TRUE(decoded->body == expected_body);
+}
+
+TEST(Tim2ToxControlPacketTest, CarriesAnnotationOnReservedTypeFive) {
+    const auto annotation = static_cast<Type>(5);
+    const std::string body("\x02\x00\x00\x00\x00\x00\x00\x00\x01{\"quote\":1}", 20);
+    const auto frame = Encode(annotation, body);
+    ASSERT_TRUE(frame.has_value());
+    ASSERT_EQ(frame->at(6), 5);
+    const auto decoded = Decode(*frame);
+    ASSERT_TRUE(decoded.has_value());
+    EXPECT_EQ(decoded->type, annotation);
+    EXPECT_EQ(decoded->body, body);
+    EXPECT_FALSE(Encode(annotation, std::string(TOX_MAX_CUSTOM_PACKET_SIZE, 'x')));
+}
+
+TEST(Tim2ToxControlPacketTest, AnnotationBracketCannotUseTextFromFailedOrInterleavedSend) {
+    using tim2tox::annotation::FriendBatches;
+    FriendBatches batches;
+    const auto now = FriendBatches::Clock::now();
+
+    batches.Start("alice", 1, 2, now);
+    EXPECT_TRUE(batches.Observe("alice", "first", now));
+    EXPECT_FALSE(batches.Finish("alice", 1, now));  // second fragment absent
+
+    batches.Start("alice", 2, 1, now);
+    EXPECT_TRUE(batches.Observe("alice", "first", now));
+    EXPECT_FALSE(batches.Observe("alice", "extra", now));
+    EXPECT_FALSE(batches.Finish("alice", 2, now));
+
+    batches.Start("alice", 3, 2, now);
+    EXPECT_FALSE(batches.Observe("bob", "other sender", now));
+    EXPECT_TRUE(batches.Observe("alice", "exact row", now));
+    EXPECT_FALSE(batches.Observe("alice", "later fragment", now));
+    EXPECT_FALSE(batches.Finish("alice", 2, now));  // wrong nonce
+    EXPECT_EQ(batches.Finish("alice", 3, now), "exact row");
+    EXPECT_FALSE(batches.Finish("alice", 3, now));  // replay
 }
 
 TEST(Tim2ToxControlPacketTest, EncodesGenericCustomWithTim2ToxPacketId) {
