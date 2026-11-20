@@ -124,6 +124,26 @@ TEST_F(InitSdkProfileAtRest, PlaintextProfileIsReWrittenEncryptedDuringInit) {
     EXPECT_EQ(Init("correct horse battery staple"), 1);
 }
 
+TEST_F(InitSdkProfileAtRest, ProtectedProfileIdentityIsAvailableBeforeLoginOffline) {
+    std::string identity;
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        ASSERT_EQ(Init("offline password"), 1);
+        // TCP-only, fresh profile: no relay or peer has been connected and no
+        // Login call has populated the callback identity cache.
+        ASSERT_EQ(tim2tox_ffi_get_self_connection_status(), 0);
+        char login[256] = {};
+        EXPECT_EQ(tim2tox_ffi_get_login_user(login, sizeof(login)), 0);
+        ASSERT_EQ(tim2tox_ffi_prepare_profile_storage(
+                      0, tim2tox_ffi_get_session_epoch(0)), 1);
+        char address[256] = {};
+        ASSERT_EQ(tim2tox_ffi_get_self_tox_id(address, sizeof(address)), 76);
+        if (attempt == 0) identity = address;
+        EXPECT_EQ(address, identity);
+        tim2tox_ffi_uninit();
+        EXPECT_EQ(tim2tox_ffi_get_self_tox_id(address, sizeof(address)), 0);
+    }
+}
+
 TEST_F(InitSdkProfileAtRest, InitFailsWhenTheEncryptedReWriteCannotReachDisk) {
     MakePlaintextProfile();
     const auto plaintext = ReadAll(profile_);
