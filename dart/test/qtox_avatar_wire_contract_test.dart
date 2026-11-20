@@ -134,6 +134,7 @@ void main() {
 
   test('set and update use raw SHA-256 file_id and lowercase hex filename', () {
     final body = _functionBody(nativeSource, _sendAvatarSignature);
+    expect(body, contains('context->size = context->memory.size();'));
 
     expect(
       body,
@@ -162,12 +163,31 @@ void main() {
       body,
       matches(
         RegExp(
-          r'tox_file_send\([\s\S]*?TOX_FILE_KIND_AVATAR[\s\S]*?file_id\.data\(\)[\s\S]*?wire_name\.data\(\)[\s\S]*?wire_name\.size\(\)',
+          r'DispatchFileOffer\(\s*peer,\s*TOX_FILE_KIND_AVATAR,\s*file_id\.data\(\),\s*wire_name,\s*std::move\(context\)\)',
         ),
       ),
-      reason: 'toxcore receives the raw 32-byte file_id and a separate '
-          'lowercase hex filename.',
+      reason: 'The shared dispatcher receives the raw 32-byte file_id, '
+          'lowercase hex filename, and the context owning the avatar bytes.',
     );
+  });
+
+  test(
+      'shared dispatcher forwards file metadata and owns the published context',
+      () {
+    final body = _functionBody(nativeSource, 'int DispatchFileOffer(');
+    expect(
+      body,
+      matches(RegExp(
+        r'tox_file_send\(\s*tox,\s*peer\.friend_number,\s*kind,\s*context->size,\s*file_id,\s*reinterpret_cast<const uint8_t\*>\(wire_name\.data\(\)\),\s*wire_name\.size\(\),\s*&error\)',
+      )),
+      reason: 'The dispatcher must forward the exact kind, payload size, raw '
+          'file ID, and wire filename chosen by DATA and AVATAR callers.',
+    );
+    expect(
+        body,
+        matches(RegExp(
+          r'StoreSendContext\(\s*peer\.instance_id,\s*FileTransferKey\(peer\.friend_number,\s*file_number\),\s*std::move\(context\)\)',
+        )));
   });
 
   test('same-hash offers remain observable to the receiver', () {
@@ -226,17 +246,16 @@ void main() {
     );
     final genericSend = _functionBody(
       nativeSource,
-      'int tim2tox_ffi_send_file(',
+      'static int SendFile(',
     );
     final genericUsesNullFileId = RegExp(
-      r'tox_file_send\([\s\S]*file_size,\s*nullptr,',
+      r'DispatchFileOffer\(\s*peer,\s*TOX_FILE_KIND_DATA,\s*nullptr,',
     ).hasMatch(genericSend);
 
     expect(
       sendIfNeeded.contains('sendFile(') && genericUsesNullFileId,
       isFalse,
-      reason: 'Current avatar sync delegates to generic sendFile, whose '
-          'tox_file_send call supplies a null file_id.',
+      reason: 'Avatar sync must not use the generic DATA/null file_id path.',
     );
     expect(
       sendAll.contains('sendFile(') && genericUsesNullFileId,
@@ -275,7 +294,16 @@ void main() {
   });
 
   test('generic images always remain TOX_FILE_KIND_DATA', () {
-    final body = _functionBody(nativeSource, 'int tim2tox_ffi_send_file(');
+    // Both public entry points delegate to SendFile; the wire kind belongs to
+    // that implementation, while tox_file_send itself lives in the dispatcher.
+    final legacy = _functionBody(nativeSource, 'int tim2tox_ffi_send_file(');
+    final tracked =
+        _functionBody(nativeSource, 'int64_t tim2tox_ffi_send_file_tracked(');
+    expect(legacy, contains('SendFile(instance_id, user_id, file_path, 0)'));
+    expect(tracked,
+        contains('SendFile(instance_id, user_id, file_path, transfer_id)'));
+    final body = _functionBody(nativeSource, 'static int SendFile(');
+    expect(body, contains('context->size = file_size;'));
 
     expect(
       body.contains('TOX_FILE_KIND_AVATAR'),
@@ -288,10 +316,11 @@ void main() {
       body,
       matches(
         RegExp(
-          r'tox_file_send\([\s\S]*?TOX_FILE_KIND_DATA[\s\S]*?file_size,\s*nullptr,',
+          r'DispatchFileOffer\(\s*peer,\s*TOX_FILE_KIND_DATA,\s*nullptr,\s*wire_name,\s*std::move\(context\)\)',
         ),
       ),
-      reason: 'Generic DATA transfers always use a null file_id.',
+      reason: 'Both generic DATA entry points dispatch a null file_id with '
+          'the file-backed owned context.',
     );
   });
 }

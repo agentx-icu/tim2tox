@@ -81,11 +81,24 @@ void main() {
     );
     expect(positionOf('file_io::RemoveUtf8(opened_path)', toxControl),
         greaterThan(toxControl));
-    expect(positionOf('if (control == 2) { // CANCEL', toxControl),
-        greaterThan(toxControl));
+    final cancel = positionOf('if (control == 2) { // CANCEL', toxControl);
+    expect(cancel, greaterThan(toxControl));
     expect(positionOf('instance_it->second.erase(it);', toxControl),
         greaterThan(toxControl));
-    expect(body, isNot(contains('EraseSendContext(instance_id, key);')));
+    // Failed controls return before cancellation cleanup. Resume/pause must
+    // retain send contexts, but a successful CANCEL must notify tracked sends
+    // before releasing their owned file/memory buffers.
+    expect(positionOf('return -4;', toxControl), lessThan(cancel));
+    expect(body.substring(0, cancel),
+        isNot(contains('EraseSendContext(instance_id, key);')));
+    final notify = positionOf(
+        'EnqueueTrackedSendFailure(instance_id, FindSendContext(instance_id, key));',
+        cancel);
+    final erase = positionOf('EraseSendContext(instance_id, key);', cancel);
+    expect(notify, lessThan(erase));
+    expect(
+        erase, lessThan(positionOf('instance_it->second.erase(it);', cancel)));
+    expect(RegExp(r'EraseSendContext\(').allMatches(body), hasLength(1));
   });
 
   test('poll parser routes live file control prefixes into the handler', () {
