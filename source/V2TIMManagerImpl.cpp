@@ -2662,8 +2662,13 @@ V2TIMString V2TIMManagerImpl::GetLoginUser() {
 }
 
 V2TIMString V2TIMManagerImpl::GetSelfToxAddress() {
-    std::lock_guard<std::mutex> lock(mutex_);
-    return logged_in_user_;
+    // Identity belongs to the loaded profile, not to Login or a DHT callback.
+    // Pin the session so a concurrent UnInitSDK cannot free the Tox handle.
+    const ToxSessionGuard session = AcquireToxSession();
+    if (!session.tox()) return {};
+    uint8_t address[TOX_ADDRESS_SIZE];
+    tox_self_get_address(session.tox(), address);
+    return ToxUtil::tox_bytes_to_hex(address, sizeof(address)).c_str();
 }
 
 V2TIMLoginStatus V2TIMManagerImpl::GetLoginStatus() {

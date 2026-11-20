@@ -17,3 +17,14 @@ Changing the profile password re-wraps the same data key as part of the atomic p
 Byte-preserving profile backups retain the key, including exports that decrypt or re-encrypt the full savedata with a different password. Keep a matching profile backup alongside backed-up history and queue files. A profile exported before the data key was created cannot unlock those files. Other Tox clients and older Tim2Tox native builds can ignore the trailer when reading a profile and strip it when saving the profile. Restoring history after such a save requires a matching profile backup with the trailer intact.
 
 Tim2Tox migrates the history and queue artifacts it owns, including known backup and staging files inside its configured account paths. An old queue in the shared application support directory has no identity marker. A protected session without an explicit queue path uses a directory keyed by its Tox public key. A host with evidence of who owns an older shared queue can copy it into that account's configured path before opening the service. Host preferences, attachments, independently created backups, and other files are outside these two stores.
+
+Profile identity is available as soon as native initialization loads the profile,
+including offline and before login. Enabling the first password during a live
+session transfers sends enqueued by that session into the protected account queue.
+Publishing the destination commits the active queue to the protected path; cleanup
+of the shared source and its backup follows and can be retried if it fails. Drains
+continue to update the protected queue even after a cleanup failure. Existing destination entries are merged by message
+ID so a retry does not duplicate a send. Unattributed entries loaded from an older
+shared queue remain in that shared file and are not adopted by the protected profile.
+Starting a new profile session resets attribution, including when a service and
+its persistence object are reused for another account.

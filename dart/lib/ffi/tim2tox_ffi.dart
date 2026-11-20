@@ -680,7 +680,7 @@ class Tim2ToxFfi {
               ffi.Pointer<ffi.Int8>, int)>('tim2tox_ffi_get_login_user');
 
   /// Returns the 76-hex-char Tox address (self public key + nospam + checksum)
-  /// for the current instance, or empty until the first DHT connection lands.
+  /// for the loaded profile, including before login or a DHT connection.
   /// Use this — not [getLoginUser] — when callers need the Tox identity.
   late final int Function(ffi.Pointer<ffi.Int8>, int) getSelfToxId =
       _lib.lookupFunction<

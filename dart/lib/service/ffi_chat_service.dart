@@ -1244,7 +1244,7 @@ class FfiChatService {
 
   /// Returns the 76-hex-char Tox address (self public key + nospam + checksum)
   /// for this account, or `null` when the underlying Tox instance has no
-  /// identity yet (before [login] has resolved) or the FFI call fails.
+  /// loaded profile yet or the FFI call fails. Available before [login], offline.
   ///
   /// **Use this when persisting an account identity or showing the Tox ID to
   /// the user** — [selfId] returns the V2TIM login `userId` string passed to
@@ -3646,12 +3646,11 @@ class FfiChatService {
     // dispose() (a re-init of this service object after logout).
     //
     // The owner key binds the DEFAULT directory to a Tox identity. init()
-    // has already opened the Tox profile by the time this runs, so on an
-    // UNENCRYPTED profile `getSelfToxId()` answers here and the default
-    // directory is owner-bound from the first load; on an encrypted one (and
-    // on the legacy login paths, which open an account row carrying no Tox
-    // ID) it is still null and the store stays ownerless until
-    // [installAccountStorage] re-points it. Awaited: an owner change hands the
+    // has already opened the Tox profile by the time this runs, so
+    // `getSelfToxId()` answers here, including encrypted
+    // profiles before login or a network connection. The default directory is
+    // owner-bound from the first load. Older native libraries may still return
+    // null until login. Awaited: an owner change hands the
     // outgoing session's writes over to the directory that session was bound
     // to before dropping them.
     String? ownerKey;
@@ -3792,6 +3791,7 @@ class FfiChatService {
   Future<void> init({String? profileDirectory}) async {
     _beginSession();
     _inboundAnnotations.clear();
+    await _offlineQueuePersistence.openSession();
     // A different profile may be about to be opened on this object; anything
     // latched from a previous one is now wrong. See [_selfToxIdCacheByInstance].
     _selfToxIdCacheByInstance.clear();
