@@ -2,8 +2,16 @@ name: History persistence
 
 on:
   pull_request:
+    paths:
+      - 'dart/**'
+      - 'ffi/**'
+      - '.github/workflows/history-persistence.yml'
   push:
     branches: [master]
+    paths:
+      - 'dart/**'
+      - 'ffi/**'
+      - '.github/workflows/history-persistence.yml'
   workflow_dispatch:
 
 permissions:
@@ -11,7 +19,7 @@ permissions:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' || github.event_name == 'push' }}
 
 jobs:
   history-persistence:
