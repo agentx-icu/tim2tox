@@ -3388,6 +3388,12 @@ class FfiChatService {
     }
   }
 
+  /// The stored Tox group kind, or null before the native SDK knows it.
+  String? storedGroupKind(String groupId) {
+    if (groupId.isEmpty) return null;
+    return _nativeGroupType(_ffi.getCurrentInstanceId(), groupId);
+  }
+
   /// The kind native holds for [groupId] (replayed from preferences at
   /// start, or learned this session), or null when it has none.
   String? _nativeGroupType(int instanceId, String groupId) {
@@ -12123,28 +12129,17 @@ class FfiChatService {
     if (send == null) return;
     if (parts[0] == 'file_send_failed') {
       _trackedFileSends.remove(key);
-      final history = _historyById[send.peerId];
-      if (history == null) return;
-      final index = history.indexWhere((row) => row.msgID == send.msgId);
-      if (index < 0) return;
-      final failed = history[index].copyWith(isPending: false, isFailed: true);
-      history[index] = failed;
-      if (_lastByPeer[send.peerId]?.msgID == send.msgId) {
-        _lastByPeer[send.peerId] = failed;
-      }
-      _messages.add(failed);
-      unawaited(
-          _saveHistory(send.peerId).catchError((Object error, StackTrace st) {
-        _logger?.logError(
-            'Failed to persist outgoing file transfer failure', error, st);
-      }));
+      _recordFileSendOutcome(send.peerId, send.msgId, failed: true);
       return;
     }
     if (parts.length != 5) return;
     final sent = int.tryParse(parts[3]);
     final total = int.tryParse(parts[4]);
     if (sent == null || total == null) return;
-    if (sent >= total) _trackedFileSends.remove(key);
+    if (sent == total && total >= 0) {
+      _trackedFileSends.remove(key);
+      _recordFileSendOutcome(send.peerId, send.msgId, failed: false);
+    }
     _progressCtrl.add((
       instanceId: instanceId,
       peerId: send.peerId,
@@ -12154,6 +12149,28 @@ class FfiChatService {
       isSend: true,
       msgID: send.msgId,
     ));
+  }
+
+  void _recordFileSendOutcome(
+    String peerId,
+    String msgId, {
+    required bool failed,
+  }) {
+    final history = _historyById[peerId];
+    if (history == null) return;
+    final index = history.indexWhere((row) => row.msgID == msgId);
+    if (index < 0 || history[index].isCancelled) return;
+    final terminal = history[index].copyWith(
+      isPending: false,
+      isFailed: failed,
+      isOutgoingFileComplete: !failed,
+    );
+    history[index] = terminal;
+    if (_lastByPeer[peerId]?.msgID == msgId) _lastByPeer[peerId] = terminal;
+    _messages.add(terminal);
+    unawaited(_saveHistory(peerId).catchError((Object error, StackTrace st) {
+      _logger?.logError('Failed to persist outgoing file transfer result', error, st);
+    }));
   }
 
   Future<void> _cancelFileTransferBestEffort(

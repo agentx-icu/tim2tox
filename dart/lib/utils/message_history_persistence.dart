@@ -3951,9 +3951,13 @@ class MessageHistoryPersistence {
         isReceived: isReceived, isRead: isRead);
     // Likewise a cancelled send stays cancelled (it must never look sent).
     final isCancelled = existing.isCancelled || msg.isCancelled;
+    final isOutgoingFileComplete = !isFailed &&
+        !isCancelled &&
+        (existing.isOutgoingFileComplete || msg.isOutgoingFileComplete);
     if (sameAliases &&
         isFailed == winner.isFailed &&
         isCancelled == winner.isCancelled &&
+        isOutgoingFileComplete == winner.isOutgoingFileComplete &&
         isReceived == winner.isReceived &&
         isRead == winner.isRead &&
         needReadReceipt == winner.needReadReceipt &&
@@ -3964,6 +3968,7 @@ class MessageHistoryPersistence {
       altMsgIds: aliases,
       isFailed: isFailed,
       isCancelled: isCancelled,
+      isOutgoingFileComplete: isOutgoingFileComplete,
       isReceived: isReceived,
       isRead: isRead,
       needReadReceipt: needReadReceipt,
@@ -4048,6 +4053,10 @@ class MessageHistoryPersistence {
     final isReceived = updated.isReceived || existing.isReceived;
     // Either read means read
     final isRead = updated.isRead || existing.isRead;
+    // Terminal transfer records survive duplicate copies of the same row.
+    final isFailed = _mergedFailure(existing, updated,
+        isReceived: isReceived, isRead: isRead, sent: sentThisSession);
+    final isCancelled = updated.isCancelled || existing.isCancelled;
 
     final mergedMsgID = updated.msgID ?? existing.msgID;
     // Union every id either copy carried, minus the one that becomes primary,
@@ -4080,9 +4089,11 @@ class MessageHistoryPersistence {
       isPending: isPending,
       // A failed send stays failed through a merge of its duplicate copies,
       // unless it was delivered.
-      isFailed: _mergedFailure(existing, updated,
-          isReceived: isReceived, isRead: isRead, sent: sentThisSession),
-      isCancelled: updated.isCancelled || existing.isCancelled,
+      isFailed: isFailed,
+      isCancelled: isCancelled,
+      isOutgoingFileComplete: !isFailed &&
+          !isCancelled &&
+          (existing.isOutgoingFileComplete || updated.isOutgoingFileComplete),
       isReceived: isReceived,
       isRead: isRead,
       msgID: mergedMsgID,
