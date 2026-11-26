@@ -65,7 +65,11 @@ void main() {
 
 
   test('both history merge paths keep a failure unless it was delivered', () {
-    expect(persistence, contains('isFailed: _mergedFailure(existing, updated,'));
+    final merge = persistence.substring(
+      persistence.indexOf('ChatMessage _mergeMessages('),
+    );
+    expect(merge, contains('final isFailed = _mergedFailure(existing, updated,'));
+    expect(merge, contains('isFailed: isFailed,'));
     final prefer = persistence.substring(
       persistence.indexOf('static ChatMessage _preferLoadedCopy('),
     );

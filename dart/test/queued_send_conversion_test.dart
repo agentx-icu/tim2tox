@@ -24,6 +24,7 @@ V2TimMessage _own({required int status, String? localCustomData, bool? peerRead}
     V2TimMessage.fromJson({
       'message_sender': _self,
       'message_server_time': 1760000000,
+      'message_risk_type_identified': 0,
     })
       ..elemType = MessageElemType.V2TIM_ELEM_TYPE_TEXT
       ..msgID = 'm1'
