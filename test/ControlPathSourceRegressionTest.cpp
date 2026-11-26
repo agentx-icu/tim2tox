@@ -181,7 +181,7 @@ TEST(ControlPathSourceRegressionTest,
     EXPECT_LT(route_guard, simple_callback);
     EXPECT_NE(
         legacy_receive.find(
-            "DeliverFriendMessage(v2_message, senderUserID, sender_pubkey, 0)"),
+            "DeliverFriendMessage(v2_message, senderUserID, sender_pubkey, 0,"),
         std::string::npos);
 }
 

@@ -75,6 +75,12 @@ typedef _join_group_c = ffi.Int32 Function(
     ffi.Pointer<pkgffi.Utf8>, ffi.Pointer<pkgffi.Utf8>);
 typedef _send_group_text_c = ffi.Int32 Function(
     ffi.Pointer<pkgffi.Utf8>, ffi.Pointer<pkgffi.Utf8>);
+typedef _send_annotated_text_c = ffi.Int32 Function(
+    ffi.Pointer<pkgffi.Utf8>, ffi.Pointer<pkgffi.Utf8>, ffi.Pointer<pkgffi.Utf8>,
+    ffi.Int32, ffi.Int32, ffi.Pointer<ffi.Int8>, ffi.Int32);
+typedef SendAnnotatedText = int Function(
+    ffi.Pointer<pkgffi.Utf8>, ffi.Pointer<pkgffi.Utf8>, ffi.Pointer<pkgffi.Utf8>,
+    int, int, ffi.Pointer<ffi.Int8>, int);
 typedef _get_pending_group_invites_c = ffi.Int32 Function(
     ffi.Pointer<ffi.Int8>, ffi.Int32);
 typedef _reject_group_invite_c = ffi.Int32 Function(ffi.Pointer<pkgffi.Utf8>);
@@ -674,7 +680,7 @@ class Tim2ToxFfi {
               ffi.Pointer<ffi.Int8>, int)>('tim2tox_ffi_get_login_user');
 
   /// Returns the 76-hex-char Tox address (self public key + nospam + checksum)
-  /// for the current instance, or empty until the first DHT connection lands.
+  /// for the loaded profile, including before login or a DHT connection.
   /// Use this — not [getLoginUser] — when callers need the Tox identity.
   late final int Function(ffi.Pointer<ffi.Int8>, int) getSelfToxId =
       _lib.lookupFunction<
@@ -699,6 +705,17 @@ class Tim2ToxFfi {
   late final int Function() getProfilePassphraseState =
       _lib.lookupFunction<_get_profile_passphrase_state_c,
           int Function()>('tim2tox_ffi_get_profile_passphrase_state');
+
+  late final int Function(int, int) prepareProfileStorage =
+      _lib.lookupFunction<ffi.Int32 Function(ffi.Int64, ffi.Int64), int Function(int, int)>(
+          'tim2tox_ffi_prepare_profile_storage');
+
+  late final int Function(int, int, int, int, ffi.Pointer<ffi.Uint8>, int,
+      ffi.Pointer<ffi.Uint8>, int) cryptProfileStorage = _lib.lookupFunction<
+          ffi.Int32 Function(ffi.Int64, ffi.Int64, ffi.Uint8, ffi.Int32,
+              ffi.Pointer<ffi.Uint8>, ffi.Size, ffi.Pointer<ffi.Uint8>, ffi.Size),
+          int Function(int, int, int, int, ffi.Pointer<ffi.Uint8>, int,
+              ffi.Pointer<ffi.Uint8>, int)>('tim2tox_ffi_crypt_profile_storage');
 
   /// Applies the staged passphrase to the RUNNING session and persists it.
   /// See `tim2tox_ffi_rekey_live_profile_passphrase` for why this is separate
@@ -839,6 +856,14 @@ class Tim2ToxFfi {
           _send_group_text_c,
           int Function(ffi.Pointer<pkgffi.Utf8>,
               ffi.Pointer<pkgffi.Utf8>)>('tim2tox_ffi_send_group_text');
+  late final SendAnnotatedText? sendAnnotatedText = () {
+    try {
+      return _lib.lookupFunction<_send_annotated_text_c, SendAnnotatedText>(
+          'tim2tox_ffi_send_annotated_text');
+    } on ArgumentError {
+      return null;
+    }
+  }();
   late final int Function(ffi.Pointer<pkgffi.Utf8>, ffi.Pointer<pkgffi.Utf8>)
       sendGroupAction = _lib.lookupFunction<
           _send_group_text_c,

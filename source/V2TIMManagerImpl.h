@@ -20,6 +20,7 @@
 #include "V2TIMSignalingManager.h"
 #include "V2TIMCommunityManager.h"
 #include "Tim2ToxControlPacket.h"
+#include "Tim2ToxMessageAnnotation.h"
 #include "GroupWireReadiness.h"
 #include "RendezvousGroups.h"
 
@@ -85,10 +86,9 @@ public:
     V2TIMLoginStatus GetLoginStatus() override;
 
     /// Returns the actual self Tox address (76-hex-char public key + nospam +
-    /// checksum), populated by HandleSelfConnectionStatus once the Tox stack
-    /// establishes a connection. Distinct from GetLoginUser(), which returns
-    /// the login alias (the userID passed to Login). Returns an empty string
-    /// when not yet known.
+    /// checksum) from the loaded profile, even offline and before Login.
+    /// Distinct from GetLoginUser(), which returns the login alias. Returns
+    /// an empty string when there is no live Tox session.
     V2TIMString GetSelfToxAddress();
 
     /** Return true if this instance has group_id in its group mapping (used for join/peer sync). */
@@ -105,6 +105,9 @@ public:
     V2TIMString SendGroupTextMessage(const V2TIMString& text, const V2TIMString& groupID, V2TIMMessagePriority priority, V2TIMSendCallback* callback) override;
     V2TIMString SendGroupTextMessage(const V2TIMString& text, const V2TIMString& groupID, V2TIMMessagePriority priority, const V2TIMBuffer& cloudCustomData, V2TIMSendCallback* callback) override;
     V2TIMString SendGroupActionMessage(const V2TIMString& text, const V2TIMString& groupID, V2TIMMessagePriority priority, V2TIMSendCallback* callback);
+    V2TIMString SendAnnotatedText(const V2TIMString& text, const V2TIMString& target,
+                                 const V2TIMBuffer& annotation, bool group, bool action,
+                                 bool& annotation_queued);
     V2TIMString SendGroupPrivateTextMessage(const V2TIMString& groupID, const V2TIMString& receiverPublicKey64, const V2TIMString& text, V2TIMSendCallback* callback);
     // Deliver a "received"/"read" receipt for one group message to its AUTHOR
     // only (NGC custom private packet under the tim2tox group-packet header).
@@ -488,6 +491,11 @@ public:
      */
     bool ReKeyLiveProfilePassphrase(const uint8_t* passphrase, size_t length,
                                     int64_t expected_session_epoch);
+
+    int PrepareLiveProfileStorage(int64_t expected_session_epoch);
+    int CryptLiveProfileStorage(int64_t expected_session_epoch, uint8_t kind,
+                                bool encrypt, const uint8_t* input, size_t input_size,
+                                uint8_t* output, size_t output_capacity);
 
     /** True when a savedata passphrase is staged (diagnostics / test assertions). */
     bool HasProfilePassphrase() const;
@@ -975,8 +983,13 @@ private:
     void HandleFriendMessage(uint32_t friend_number, TOX_MESSAGE_TYPE type, const uint8_t* message, size_t length);
     void HandleFriendCustomMessage(uint32_t friend_number, const uint8_t* data, size_t length);
     void HandleFriendControlMessage(uint32_t friend_number, tim2tox::control::Type packet_type, const uint8_t* data, size_t length);
-    void DeliverFriendMessage(V2TIMMessage& message, const V2TIMString& sender_user_id, const uint8_t* sender_public_key, uint8_t custom_route);
-    void NotifyFriendActionMessage(const V2TIMString& sender_user_id, const uint8_t* text, size_t length);
+    void HandleFriendAnnotation(uint32_t friend_number, std::string_view body);
+    void HandleGroupAnnotation(Tox_Group_Number group_number, Tox_Group_Peer_Number peer_id,
+                               std::string_view body);
+    bool ObserveFriendAnnotationText(const std::string& sender, std::string_view local_id);
+    tim2tox::annotation::FriendBatches inbound_friend_annotations_;  // guarded by mutex_
+    void DeliverFriendMessage(V2TIMMessage& message, const V2TIMString& sender_user_id, const uint8_t* sender_public_key, uint8_t custom_route, bool annotation_target = false);
+    void NotifyFriendActionMessage(const V2TIMString& sender_user_id, const uint8_t* text, size_t length, const V2TIMString& annotation_id);
     void NotifyGroupActionMessage(const V2TIMString& group_id, const V2TIMString& sender_user_id, const uint8_t* text, size_t length);
     void HandleFriendReadReceipt(uint32_t friend_number, uint32_t tox_message_number);
     void TrackPendingDelivery(uint32_t friend_number, const std::vector<uint32_t>& tox_message_numbers, const V2TIMString& msg_id, const V2TIMString& user_id);
@@ -1009,8 +1022,8 @@ private:
     void ResetGroupSessionState();
     void ClearPendingDeliveriesForFriend(uint32_t friend_number);
     void PrunePendingDeliveriesLocked(std::chrono::steady_clock::time_point now);
-    V2TIMString SendC2CTextMessageWithType(const V2TIMString& text, const V2TIMString& userID, const V2TIMBuffer& cloudCustomData, V2TIMSendCallback* callback, bool force_action);
-    V2TIMString SendGroupTextMessageWithType(const V2TIMString& text, const V2TIMString& groupID, V2TIMMessagePriority priority, const V2TIMBuffer& cloudCustomData, V2TIMSendCallback* callback, bool force_action);
+    V2TIMString SendC2CTextMessageWithType(const V2TIMString& text, const V2TIMString& userID, const V2TIMBuffer& cloudCustomData, V2TIMSendCallback* callback, bool force_action, bool* annotation_queued = nullptr);
+    V2TIMString SendGroupTextMessageWithType(const V2TIMString& text, const V2TIMString& groupID, V2TIMMessagePriority priority, const V2TIMBuffer& cloudCustomData, V2TIMSendCallback* callback, bool force_action, bool* annotation_queued = nullptr);
     V2TIMString SendC2CCustomMessageWithType(const V2TIMBuffer& customData, const V2TIMString& userID, uint8_t controlType, V2TIMSendCallback* callback);
     void HandleSelfConnectionStatus(TOX_CONNECTION connection_status);
     void HandleFriendRequest(const uint8_t* public_key, const uint8_t* message, size_t length);

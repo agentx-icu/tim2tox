@@ -11,11 +11,13 @@ class HistorySchemaNewerThanAppException implements Exception {
       '(stored: $version, supported: $supportedVersion). Update to continue.';
 }
 
-Future<void> requireSupportedHistorySchema(File file, int supported) async {
+Future<void> requireSupportedHistorySchema(File file, int supported,
+    {String Function(String)? unwrap}) async {
   if (!await file.exists()) return;
   dynamic decoded;
   try {
-    decoded = jsonDecode(await file.readAsString());
+    final raw = await file.readAsString();
+    decoded = jsonDecode(unwrap?.call(raw) ?? raw);
   } on FormatException {
     // Ordinary corrupt-file recovery still belongs to the history store.
     return;

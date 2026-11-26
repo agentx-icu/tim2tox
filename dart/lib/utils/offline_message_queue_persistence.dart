@@ -9,6 +9,7 @@ import 'dart:io';
 import 'package:path_provider/path_provider.dart';
 
 import '../models/chat_message.dart';
+import 'profile_storage_codec.dart';
 
 part '_offline_message_queue_file_store.dart';
 
@@ -88,11 +89,110 @@ class OfflineMessageQueuePersistence {
   /// Not `final`: a host that cannot know the account until the Tox profile is
   /// open re-points it through [rebindQueueFile] during the pre-boot window.
   String? _queueFilePath;
+  String? _defaultAccountKey;
+  ProfileStorageCodec? _storageCodec;
 
   // In-memory cache: peerId -> List<OfflineMessageItem>.
   final Map<String, List<OfflineMessageItem>> _offlineQueue = {};
 
+  // Only entries enqueued here are attributable to this live session. Loading
+  // a shared legacy file must not claim its entries for the current profile.
+  final _liveQueuedItems = <(String, OfflineMessageItem)>{};
+  Future<void> Function()? _pendingSharedCleanup;
+
   Future<void> _mutationFence = Future<void>.value();
+
+  /// Begin a native profile session. Reusing this store must not attribute
+  /// sends from the previous profile to the newly opened one.
+  Future<void> openSession() => _runSerialized(() async {
+        await _finishSharedCleanup();
+        _liveQueuedItems.clear();
+      });
+
+  /// Select the encryption key and migrate every known recovery artifact. This
+  /// is serialized with queue loads and mutations. Only an explicitly bound
+  /// path or a profile-owned default may be encrypted; the historical shared
+  /// fallback has no owner marker. Only sends enqueued by this live session
+  /// can be transferred from it when a profile first enables protection.
+  Future<void> installStorageCodec(ProfileStorageCodec? codec,
+      {String? defaultAccountKey}) {
+    if (defaultAccountKey != null &&
+        !RegExp(r'^[0-9a-fA-F]{64}$').hasMatch(defaultAccountKey)) {
+      throw ArgumentError('invalid account public key');
+    }
+    return _runSerialized(() async {
+      await _finishSharedCleanup();
+      final changingDefault =
+          _queueFilePath == null && _defaultAccountKey != defaultAccountKey;
+      if (changingDefault &&
+          _defaultAccountKey == null &&
+          defaultAccountKey != null &&
+          codec != null &&
+          _liveQueuedItems.isNotEmpty) {
+        await _migrateLiveDefaultQueue(codec, defaultAccountKey);
+        return;
+      }
+      if (codec != null) {
+        final file = await _getQueueFileForAccount(defaultAccountKey);
+        await _OfflineMessageQueueFileStore(file, codec).migrateArtifacts();
+      }
+      if (changingDefault) {
+        _offlineQueue.clear();
+        _liveQueuedItems.clear();
+      }
+      _storageCodec = codec;
+      _defaultAccountKey = defaultAccountKey;
+    });
+  }
+
+  // Runs under _mutationFence. Publish the protected destination before
+  // touching the source or switching the drain's cache and file path.
+  Future<void> _migrateLiveDefaultQueue(
+      ProfileStorageCodec codec, String accountKey) async {
+    final file = await _getQueueFileForAccount(accountKey);
+    final destination =
+        OfflineMessageQueuePersistence(queueFilePath: file.path);
+    await destination.installStorageCodec(codec);
+    final merged = await destination.loadQueue();
+    final remaining = _snapshotQueue(_offlineQueue);
+    for (final entry in _offlineQueue.entries) {
+      for (final item in entry.value) {
+        if (!_liveQueuedItems.contains((entry.key, item))) continue;
+        final target = merged.putIfAbsent(entry.key, () => []);
+        final index = target.indexWhere((other) =>
+            item.msgID != null ? other.msgID == item.msgID : other == item);
+        if (index < 0) {
+          target.add(item);
+        } else {
+          target[index] = item;
+        }
+        remaining[entry.key]!.remove(item);
+      }
+    }
+    remaining.removeWhere((_, items) => items.isEmpty);
+    final source =
+        _OfflineMessageQueueFileStore(await _getQueueFile(), _storageCodec);
+    await destination.saveQueue(merged);
+    // Destination publication is the commit point. Even if source cleanup
+    // fails, a subsequent drain must update the protected copy, not the source.
+    _storageCodec = codec;
+    _defaultAccountKey = accountKey;
+    _replaceCache(merged);
+    // Preserve unattributed legacy entries, but remove plaintext live sends
+    // from BOTH recovery snapshots so they cannot be replayed a second time.
+    _pendingSharedCleanup = () async {
+      await source.writeSnapshot(remaining);
+      await source.publishPrimaryToBackup();
+    };
+    await _finishSharedCleanup();
+  }
+
+  Future<void> _finishSharedCleanup() async {
+    final cleanup = _pendingSharedCleanup;
+    if (cleanup == null) return;
+    await cleanup();
+    _pendingSharedCleanup = null;
+  }
 
   /// Re-point this queue at a per-account [queueFilePath] after construction.
   ///
@@ -119,12 +219,15 @@ class OfflineMessageQueuePersistence {
     }
     return _runSerialized(() async {
       _offlineQueue.clear();
+      _liveQueuedItems.clear();
       _queueFilePath = queueFilePath;
     });
   }
 
   /// Get the file path for offline message queue.
-  Future<File> _getQueueFile() async {
+  Future<File> _getQueueFile() => _getQueueFileForAccount(_defaultAccountKey);
+
+  Future<File> _getQueueFileForAccount(String? account) async {
     if (_queueFilePath != null && _queueFilePath!.isNotEmpty) {
       final file = File(_queueFilePath!);
       final parent = file.parent;
@@ -134,6 +237,10 @@ class OfflineMessageQueuePersistence {
       return file;
     }
     final appDir = await getApplicationSupportDirectory();
+    if (account != null) {
+      return File(
+          '${appDir.path}/tim2tox_accounts/$account/offline_message_queue.json');
+    }
     return File('${appDir.path}/offline_message_queue.json');
   }
 
@@ -181,11 +288,12 @@ class OfflineMessageQueuePersistence {
   }) {
     return _runSerialized(() async {
       final file = await _getQueueFile();
-      final fileStore = _OfflineMessageQueueFileStore(file);
+      final fileStore = _OfflineMessageQueueFileStore(file, _storageCodec);
 
       if (clearOnLoad) {
         await fileStore.deleteArtifacts();
         _offlineQueue.clear();
+        _liveQueuedItems.clear();
         return <String, List<OfflineMessageItem>>{};
       }
 
@@ -230,6 +338,7 @@ class OfflineMessageQueuePersistence {
 
       await fileStore.deleteStagingArtifacts();
       _offlineQueue.clear();
+      _liveQueuedItems.clear();
       return <String, List<OfflineMessageItem>>{};
     });
   }
@@ -242,6 +351,7 @@ class OfflineMessageQueuePersistence {
       list.add(item);
       await _writeSnapshot(snapshot);
       _replaceCache(snapshot);
+      _liveQueuedItems.add((peerId, item));
     });
   }
 
@@ -315,8 +425,10 @@ class OfflineMessageQueuePersistence {
       final index = list?.indexOf(old) ?? -1;
       if (list == null || index < 0) return false;
       list[index] = updated;
+      final live = _liveQueuedItems.contains((peerId, old));
       await _writeSnapshot(snapshot);
       _replaceCache(snapshot);
+      if (live) _liveQueuedItems.add((peerId, updated));
       return true;
     });
   }
@@ -327,6 +439,7 @@ class OfflineMessageQueuePersistence {
       final snapshot = <String, List<OfflineMessageItem>>{};
       await _writeSnapshot(snapshot);
       _offlineQueue.clear();
+      _liveQueuedItems.clear();
     });
   }
 
@@ -370,9 +483,10 @@ class OfflineMessageQueuePersistence {
   Future<void> clearQueueFile() {
     return _runSerialized(() async {
       final file = await _getQueueFile();
-      final fileStore = _OfflineMessageQueueFileStore(file);
+      final fileStore = _OfflineMessageQueueFileStore(file, _storageCodec);
       await fileStore.publishEmptyPrimary();
       _offlineQueue.clear();
+      _liveQueuedItems.clear();
       await fileStore.publishPrimaryToBackup();
       await fileStore.deleteArtifacts();
     });
@@ -388,6 +502,8 @@ class OfflineMessageQueuePersistence {
   }
 
   void _replaceCache(Map<String, List<OfflineMessageItem>> snapshot) {
+    _liveQueuedItems.retainWhere(
+        (entry) => snapshot[entry.$1]?.contains(entry.$2) ?? false);
     _offlineQueue
       ..clear()
       ..addAll(_snapshotQueue(snapshot));
@@ -397,6 +513,7 @@ class OfflineMessageQueuePersistence {
     Map<String, List<OfflineMessageItem>> snapshot,
   ) async {
     final file = await _getQueueFile();
-    await _OfflineMessageQueueFileStore(file).writeSnapshot(snapshot);
+    await _OfflineMessageQueueFileStore(file, _storageCodec)
+        .writeSnapshot(snapshot);
   }
 }

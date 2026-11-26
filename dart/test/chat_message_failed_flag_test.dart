@@ -90,9 +90,12 @@ void main() {
 
 
   test('a later successful replay clears an earlier failure', () {
-    expect(service, contains('existing.copyWith(isPending: false, isFailed: false)'));
+    expect(service, contains('? settled(existing)'));
+    expect(service, matches(RegExp(
+        r'ChatMessage settled\(ChatMessage row\)[\s\S]*?isPending: false,\s*isFailed: false,')));
     expect(service, contains('(msg.isPending || msg.isFailed) &&\n            msg.filePath == filePath'));
-    expect(service, contains('history[i] = msg.copyWith(isPending: false, isFailed: false);'));
+    expect(service, matches(RegExp(
+        r'history\[i\] = msg\.copyWith\(\s*isPending: false,\s*isFailed: false\b')));
   });
 
   test('a duplicate carrying a failure keeps it on the absorbed row', () {

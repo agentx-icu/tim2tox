@@ -17,6 +17,7 @@ import 'package:path_provider/path_provider.dart';
 import '../interfaces/logger_service.dart';
 import '../models/chat_message.dart';
 import 'conversation_id_utils.dart';
+import 'profile_storage_codec.dart';
 
 /// Message history persistence service
 ///
@@ -24,10 +25,8 @@ import 'conversation_id_utils.dart';
 /// When [historyDirectory] is set (e.g. per-account path from app), uses that directory; otherwise
 /// uses app support dir with optional instanceId for multi-instance.
 ///
-/// NOTE (M3): Messages are persisted as plaintext JSON. At-rest encryption
-/// (e.g. AES-GCM keyed off the Tox profile password or OS keychain/keystore)
-/// is a known gap and tracked separately. Do not add new sensitive fields
-/// here without revisiting that limitation.
+/// A session with an installed profile storage codec protects the snapshots
+/// and archive records under the account key at the file boundary.
 class MessageHistoryPersistence {
   final int? _instanceId;
 
@@ -39,6 +38,77 @@ class MessageHistoryPersistence {
   /// through [_getHistoryDirectory].
   String? _historyDirectory;
   final LoggerService? _logger;
+  ProfileStorageCodec? _storageCodec;
+  Future<void>? _storageInstallBarrier;
+
+  /// Installs the codec and upgrades legacy history in this identity's
+  /// directory. Existing operations finish before the switch, and new ones
+  /// wait until the migration reaches a file boundary.
+  Future<void> installStorageCodec(ProfileStorageCodec? codec) async {
+    final previous = _storageInstallBarrier;
+    final pending = _writeFences.values.toList(growable: false);
+    final clearing = _clearAllBarrier;
+    final installed = Completer<void>();
+    _storageInstallBarrier = installed.future;
+    try {
+      if (previous != null) await previous;
+      if (clearing != null) await clearing;
+      await _awaitFences(pending);
+      _storageCodec = codec;
+      if (codec != null) {
+        await _migrateHistoryArtifacts(await _getHistoryDirectory());
+      }
+    } finally {
+      installed.complete();
+      if (identical(_storageInstallBarrier, installed.future)) {
+        _storageInstallBarrier = null;
+      }
+    }
+  }
+
+  Future<void> _migrateHistoryArtifacts(Directory directory) async {
+    final codec = _storageCodec;
+    if (codec == null || !await directory.exists()) return;
+    final processed = <String>{};
+    await for (final file in directory.list(followLinks: false)) {
+      if (file is! File) continue;
+      final name = p.basename(file.path);
+      if (name.endsWith('.encrypting')) {
+        // A crashed conversion only leaves sealed derived data here; the
+        // original remains authoritative until the atomic rename.
+        await _deleteFileIfPresent(file);
+      } else if (RegExp(r'\.archive\.jsonl(?:$|\.)').hasMatch(name)) {
+        await codec.migrateArchive(file);
+      } else if (name.endsWith('.json') || name.endsWith('.json.bak')) {
+        final mainPath = name.endsWith('.bak')
+            ? file.path.substring(0, file.path.length - 4)
+            : file.path;
+        if (processed.add(mainPath)) {
+          await codec.migrateSnapshotPair(
+              File(mainPath), File('$mainPath.bak'), ProfileStorageCodec.history);
+        }
+      } else if (RegExp(r'^[^.].*\.json(?:$|\.)').hasMatch(name)) {
+        await codec.migrateSnapshot(file, ProfileStorageCodec.history);
+      }
+    }
+  }
+
+  String _openHistorySnapshot(String raw) => ProfileStorageCodec.openSnapshot(
+      ProfileStorageCodec.history, raw, _storageCodec);
+
+  String _sealHistorySnapshot(String plaintext) =>
+      _storageCodec?.sealSnapshot(ProfileStorageCodec.history, plaintext) ??
+      plaintext;
+
+  Future<String> _readHistorySnapshot(File file) async =>
+      _openHistorySnapshot(await file.readAsString());
+
+  Future<void> _requireSupportedHistory(File file) => requireSupportedHistorySchema(
+      file, _historyFormatVersion, unwrap: _openHistorySnapshot);
+
+  Stream<String> _archiveLines(File file, {bool tolerateDamagedRecords = false}) =>
+      ProfileStorageCodec.archiveLines(file, _storageCodec,
+          tolerateDamagedRecords: tolerateDamagedRecords);
 
   /// Writes this store could not land, for a host that wants to TELL the user
   /// rather than leave it in the log.
@@ -169,6 +239,7 @@ class MessageHistoryPersistence {
   }) async {
     final prev = _writeFences[normalizedId] ?? Future<void>.value();
     final barrier = _clearAllBarrier;
+    final storageInstall = _storageInstallBarrier;
     final completer = Completer<void>();
     _writeFences[normalizedId] = completer.future;
     try {
@@ -178,9 +249,15 @@ class MessageHistoryPersistence {
         // Fences complete normally; defensive only.
       }
       if (barrier != null) await barrier;
+      if (storageInstall != null) await storageInstall;
       final primary = await _getHistoryFile(normalizedId);
-      await requireSupportedHistorySchema(primary, _historyFormatVersion);
-      await requireSupportedHistorySchema(File('${primary.path}.bak'), _historyFormatVersion);
+      await _requireSupportedHistory(primary);
+      await _requireSupportedHistory(File('${primary.path}.bak'));
+      if (_storageCodec == null &&
+          await ProfileStorageCodec.isProtectedArchive(
+              await _getArchiveFile(normalizedId))) {
+        throw const ProfileStorageException('this archive requires its profile key');
+      }
       return await body();
     } catch (_) {
       onFailure?.call();
@@ -444,6 +521,8 @@ class MessageHistoryPersistence {
   /// for a DIFFERENT identity (which this never overrides).
   Future<String?> adoptDefaultHistoryDirectory(
       {required String ownerKey}) async {
+    final installingStorage = _storageInstallBarrier;
+    if (installingStorage != null) await installingStorage;
     final owner = _normalizeOwnerKey(ownerKey);
     if (owner == null) {
       throw ArgumentError.value(
@@ -527,6 +606,8 @@ class MessageHistoryPersistence {
     required Directory into,
   }) async {
     if (!await from.exists()) return true;
+    await _migrateHistoryArtifacts(from);
+    await _migrateHistoryArtifacts(into);
     var merged = 0;
     var failed = 0;
     final alreadyMerged = await _readMergedManifest(from, into);
@@ -811,6 +892,17 @@ class MessageHistoryPersistence {
 
   Future<String?> _digestOfFile(File file) async {
     try {
+      // Keep manifest provenance stable when an existing file is encrypted.
+      // Old manifests hash the plaintext representation, so hash recovered
+      // bytes for protected artifacts too.
+      if (_storageCodec != null && file.path.endsWith('.archive.jsonl') &&
+          await ProfileStorageCodec.isProtectedArchive(file)) {
+        return await _digestOfStream(_archiveLines(file).map((line) => utf8.encode('$line\n')));
+      }
+      if (_storageCodec != null &&
+          (file.path.endsWith('.json') || file.path.endsWith('.json.bak'))) {
+        return _digestOfBytes(utf8.encode(await _readHistorySnapshot(file)));
+      }
       return await _digestOfStream(file.openRead());
     } catch (_) {
       return null;
@@ -851,6 +943,7 @@ class MessageHistoryPersistence {
   /// this merge's own, which is the provenance the replace path relies on.
   Future<String> _copyOntoDestination(File from, File dest) async {
     final temp = File('${dest.path}.tmp');
+    final logicalDigest = _storageCodec == null ? null : await _digestOfFile(from);
     final raf = await temp.open(mode: FileMode.write);
     final collector = _DigestCollector();
     final hasher = sha256.startChunkedConversion(collector);
@@ -865,7 +958,7 @@ class MessageHistoryPersistence {
       await raf.close();
     }
     await _renameWithRetry(temp, dest.path);
-    return collector.value.toString();
+    return logicalDigest ?? collector.value.toString();
   }
 
   /// Identifies a SOURCE file for the manifest: a digest, plus size and mtime
@@ -983,7 +1076,7 @@ class MessageHistoryPersistence {
       _mergeHistoryFiles(File from, File into,
           {bool destRowsAreOurs = false}) async {
     for (final file in [from, into, File('${into.path}.bak')]) {
-      await requireSupportedHistorySchema(file, _historyFormatVersion);
+      await _requireSupportedHistory(file);
     }
     // Rows this session has deleted must not come back through the merge: the
     // destination copy made by an earlier, partially failed pass still holds
@@ -1016,7 +1109,7 @@ class MessageHistoryPersistence {
     dynamic decodedFrom;
     List<ChatMessage> source;
     try {
-      decodedFrom = jsonDecode(await from.readAsString());
+      decodedFrom = jsonDecode(await _readHistorySnapshot(from));
       source = rowsOf(decodedFrom);
     } catch (e, st) {
       // Nothing can be done with a source we cannot read. It stays where it is
@@ -1034,7 +1127,7 @@ class MessageHistoryPersistence {
     dynamic decodedInto;
     List<ChatMessage> target;
     try {
-      decodedInto = jsonDecode(await into.readAsString());
+      decodedInto = jsonDecode(await _readHistorySnapshot(into));
       target = rowsOf(decodedInto);
     } catch (e, st) {
       // A DESTINATION we cannot decode must not make readable source rows
@@ -1056,7 +1149,7 @@ class MessageHistoryPersistence {
         dynamic decodedBackup;
         if (await backup.exists()) {
           try {
-            decodedBackup = jsonDecode(await backup.readAsString());
+            decodedBackup = jsonDecode(await _readHistorySnapshot(backup));
           } catch (_) {
             decodedBackup = null;
           }
@@ -1127,7 +1220,7 @@ class MessageHistoryPersistence {
     final temp = File('${into.path}.tmp');
     final raf = await temp.open(mode: FileMode.write);
     try {
-      await raf.writeFrom(bytes);
+      await raf.writeString(_sealHistorySnapshot(jsonString));
       await raf.flush();
     } finally {
       await raf.close();
@@ -1169,6 +1262,12 @@ class MessageHistoryPersistence {
   /// failed file, which is better than silently transferring replacement
   /// characters.
   Future<String> _appendMissingArchiveLines(File from, File into) async {
+    final codec = _storageCodec;
+    if (codec != null) return _appendMissingProtectedArchiveLines(from, into, codec);
+    if (await ProfileStorageCodec.isProtectedArchive(into) ||
+        await ProfileStorageCodec.isProtectedArchive(from)) {
+      throw const ProfileStorageException('cannot merge a locked archive');
+    }
     final collector = _DigestCollector();
     final hasher = sha256.startChunkedConversion(collector);
     final seen = <String>{};
@@ -1210,6 +1309,32 @@ class MessageHistoryPersistence {
       await raf?.flush();
     } finally {
       await raf?.close();
+    }
+    hasher.close();
+    return collector.value.toString();
+  }
+
+  Future<String> _appendMissingProtectedArchiveLines(
+      File from, File into, ProfileStorageCodec codec) async {
+    final collector = _DigestCollector();
+    final hasher = sha256.startChunkedConversion(collector);
+    final seen = <String>{};
+    await codec.migrateArchive(into);
+    await for (final line in _archiveLines(into)) {
+      hasher.add(utf8.encode('$line\n'));
+      if (line.trim().isNotEmpty) seen.add(_digestOfBytes(utf8.encode(line)));
+    }
+    RandomAccessFile? writer;
+    try {
+      await for (final line in _archiveLines(from)) {
+        if (line.trim().isEmpty || !seen.add(_digestOfBytes(utf8.encode(line)))) continue;
+        writer ??= await _openArchiveAppender(into);
+        await writer.writeString('${codec.sealArchiveLine(line)}\n');
+        hasher.add(utf8.encode('$line\n'));
+      }
+      await writer?.flush();
+    } finally {
+      await writer?.close();
     }
     hasher.close();
     return collector.value.toString();
@@ -1378,7 +1503,7 @@ class MessageHistoryPersistence {
     final tombstones = _recentlyDeleted[normalizedId];
     if (tombstones == null || tombstones.isEmpty) return false;
     try {
-      final decoded = jsonDecode(await file.readAsString());
+      final decoded = jsonDecode(await _readHistorySnapshot(file));
       final raw = decoded is Map<String, dynamic> ? decoded['messages'] : decoded;
       if (raw is! List) return false;
       for (final row in raw) {
@@ -1561,6 +1686,8 @@ class MessageHistoryPersistence {
   ///
   /// Idempotent: rebinding to the directory already in use is a no-op.
   Future<void> rebindHistoryDirectory(String historyDirectory) async {
+    final installingStorage = _storageInstallBarrier;
+    if (installingStorage != null) await installingStorage;
     if (historyDirectory.isEmpty) {
       throw ArgumentError.value(
         historyDirectory,
@@ -2183,7 +2310,7 @@ class MessageHistoryPersistence {
     // moment of a kernel/process crash means permanent data loss.
     final raf = await tempFile.open(mode: FileMode.write);
     try {
-      await raf.writeString(jsonString);
+      await raf.writeString(_sealHistorySnapshot(jsonString));
       await raf.flush();
     } finally {
       await raf.close();
@@ -2319,7 +2446,9 @@ class MessageHistoryPersistence {
 
       String jsonString;
       try {
-        jsonString = await file.readAsString();
+        jsonString = await _readHistorySnapshot(file);
+      } on ProfileStorageException {
+        rethrow;
       } catch (e) {
         // File read failed, try backup
         return await _loadFromBackup(normalizedId, token,
@@ -2450,6 +2579,8 @@ class MessageHistoryPersistence {
         skippedRows: skippedRows,
       );
     } on HistorySchemaNewerThanAppException {
+      rethrow;
+    } on ProfileStorageException {
       rethrow;
     } catch (e) {
       // Try to load from backup on any error
@@ -2644,7 +2775,7 @@ class MessageHistoryPersistence {
         return [];
       }
 
-      final jsonString = await backupFile.readAsString();
+      final jsonString = await _readHistorySnapshot(backupFile);
       final decoded = jsonDecode(jsonString);
 
       // Use the same loading logic as loadHistory
@@ -2721,7 +2852,7 @@ class MessageHistoryPersistence {
       try {
         final backupFile = await _getBackupFile(normalizedId);
         if (await backupFile.exists()) {
-          final backupContent = await backupFile.readAsString();
+          final backupContent = _sealHistorySnapshot(await _readHistorySnapshot(backupFile));
           final tempFile = await _getTempFile(normalizedId);
           final raf = await tempFile.open(mode: FileMode.write);
           try {
@@ -2813,6 +2944,8 @@ class MessageHistoryPersistence {
       }
     } on HistorySchemaNewerThanAppException {
       rethrow;
+    } on ProfileStorageException {
+      rethrow;
     } catch (e) {
       // Return whatever we've loaded so far
     }
@@ -2895,6 +3028,8 @@ class MessageHistoryPersistence {
       return MapEntry(conversationKey, messages);
     } on HistorySchemaNewerThanAppException {
       rethrow;
+    } on ProfileStorageException {
+      rethrow;
     } catch (_) {
       return null;
     }
@@ -2918,10 +3053,11 @@ class MessageHistoryPersistence {
       if (fp is String && fp.isNotEmpty) {
         m['filePath'] = _relativizePath(fp, storageRoots);
       }
-      buffer.writeln(jsonEncode(m));
+      final row = jsonEncode(m);
+      buffer.writeln(_storageCodec?.sealArchiveLine(row) ?? row);
     }
     final archiveFile = await _getArchiveFile(normalizedId);
-    final raf = await archiveFile.open(mode: FileMode.append);
+    final raf = await _openArchiveAppender(archiveFile);
     try {
       await raf.writeString(buffer.toString());
       await raf.flush();
@@ -2942,6 +3078,37 @@ class MessageHistoryPersistence {
     if (_archiveCacheId == normalizedId) {
       _archiveCacheId = null;
       _archiveCacheRows = null;
+    }
+  }
+
+  Future<RandomAccessFile> _openArchiveAppender(File file) async {
+    final codec = _storageCodec;
+    if (codec == null) return file.open(mode: FileMode.append);
+    await codec.migrateArchive(file);
+    var tail = -1;
+    if (await file.exists()) {
+      final length = await file.length();
+      if (length > 0) {
+        final reader = await file.open();
+        try {
+          await reader.setPosition(length - 1);
+          tail = await reader.readByte();
+        } finally {
+          await reader.close();
+        }
+      }
+    }
+    final writer = await file.open(mode: FileMode.append);
+    try {
+      if (tail < 0) {
+        await writer.writeString('${ProfileStorageCodec.archiveHeader}\n');
+      } else if (tail != 0x0a) {
+        await writer.writeByte(0x0a);
+      }
+      return writer;
+    } catch (_) {
+      await writer.close();
+      rethrow;
     }
   }
 
@@ -3004,10 +3171,7 @@ class MessageHistoryPersistence {
     final archiveFile = await _getArchiveFile(normalizedId);
     if (!await archiveFile.exists()) return;
     final storageRoots = await _resolveStorageRoots();
-    final lines = archiveFile
-        .openRead()
-        .transform(utf8.decoder)
-        .transform(const LineSplitter());
+    final lines = _archiveLines(archiveFile, tolerateDamagedRecords: true);
     await for (final line in lines) {
       if (line.trim().isEmpty) continue;
       try {
@@ -3134,7 +3298,7 @@ class MessageHistoryPersistence {
         final archiveFile = await _getArchiveFile(normalizedId);
         if (await archiveFile.exists()) {
           final kept = <String>[];
-          for (final line in await archiveFile.readAsLines()) {
+          await for (final line in _archiveLines(archiveFile)) {
             if (line.trim().isEmpty) continue;
             try {
               final msg = ChatMessage.fromJson(
@@ -3156,7 +3320,13 @@ class MessageHistoryPersistence {
               final tempFile = File('${archiveFile.path}.tmp');
               final raf = await tempFile.open(mode: FileMode.write);
               try {
-                await raf.writeString('${kept.join('\n')}\n');
+                final codec = _storageCodec;
+                if (codec != null) {
+                  await raf.writeString('${ProfileStorageCodec.archiveHeader}\n');
+                }
+                for (final line in kept) {
+                  await raf.writeString('${codec?.sealArchiveLine(line) ?? line}\n');
+                }
                 await raf.flush();
               } finally {
                 await raf.close();
@@ -3807,6 +3977,7 @@ class MessageHistoryPersistence {
           (identical(winner, msg)
               ? existing.cloudCustomData
               : msg.cloudCustomData),
+      annotationDelivered: existing.annotationDelivered || msg.annotationDelivered,
     );
   }
 
@@ -3939,6 +4110,7 @@ class MessageHistoryPersistence {
       // erased by the merge. Without this, the persisted reply loses its
       // messageReply metadata even though sendText set it (L3-reply-text).
       cloudCustomData: updated.cloudCustomData ?? existing.cloudCustomData,
+      annotationDelivered: updated.annotationDelivered || existing.annotationDelivered,
       // Read-receipt intent: like cloudCustomData, only ONE cross-path copy
       // carries it (the FfiChatService send sets it; the binary-replacement
       // copy does not) — either copy having asked for receipts wins.
@@ -4100,9 +4272,11 @@ class MessageHistoryPersistence {
     final inFlight = _writeFences.values.toList(growable: false);
     final barrier = Completer<void>();
     final previousBarrier = _clearAllBarrier;
+    final installingStorage = _storageInstallBarrier;
     _clearAllBarrier = barrier.future;
     try {
       if (previousBarrier != null) await previousBarrier;
+      if (installingStorage != null) await installingStorage;
       await _awaitFences(inFlight);
       final historyDir = await _getHistoryDirectory();
       if (await historyDir.exists()) {

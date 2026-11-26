@@ -207,8 +207,8 @@ public:
     // session is live, so an OS kill of a backgrounded app cannot leave the
     // secret key, friend list and nospam readable on disk.
     //
-    // Empty passphrase (the default) == the historical behaviour: plaintext
-    // savedata, byte-identical to before. This is opt-in per session.
+    // Empty passphrase writes plaintext savedata. Profiles that previously
+    // protected chat storage retain their storage key trailer.
     void setProfilePassphrase(const uint8_t* passphrase, size_t length);
     bool hasProfilePassphrase() const;
 
@@ -222,6 +222,13 @@ public:
     // Refused (false) from inside a tox callback: it cannot defer like
     // saveTo(), because the caller needs the answer now.
     bool rekeyAndSave(const std::string& path, const uint8_t* passphrase, size_t length);
+
+    // 1: storage key ready (durably stored in the profile), 0: legacy
+    // plaintext without a key, -1: unavailable or the save failed.
+    int prepareProfileStorage(const std::string& path);
+    // Ciphertext = 24-byte nonce + authenticated payload + 16-byte tag.
+    int cryptProfileStorage(uint8_t kind, bool encrypt, const uint8_t* input,
+                           size_t input_size, uint8_t* output, size_t output_capacity) const;
 
     // Whether the profile the last successful loadFromEx() opened was an
     // encrypted container (false for plaintext, or before any load).
@@ -575,10 +582,12 @@ private:
     // mutex_. Zeroed before it is overwritten or cleared so the old secret does
     // not linger in freed heap. See setProfilePassphrase().
     std::vector<uint8_t> profile_passphrase_;
+    std::vector<uint8_t> profile_storage_key_;  // guarded by mutex_, changed under save_mutex_
     bool last_load_was_encrypted_{false};  // guarded by mutex_
     // The body of saveTo() once the in-callback deferral is settled; the
     // caller holds save_mutex_.
-    bool saveLocked(const std::string& path, bool final_save) const;
+    bool saveLocked(const std::string& path, bool final_save,
+                    const std::vector<uint8_t>* new_storage_key = nullptr) const;
     // setProfilePassphrase() for a caller that already holds save_mutex_.
     void setProfilePassphraseLocked(const uint8_t* passphrase, size_t length);
     // Serializes whole saveTo() calls with each other AND with a passphrase

@@ -20,7 +20,7 @@ class _ReadQueueResult {
 /// become package API. The public service remains responsible for mutation
 /// ordering and cache updates.
 class _OfflineMessageQueueFileStore {
-  _OfflineMessageQueueFileStore(this.file)
+  _OfflineMessageQueueFileStore(this.file, this.codec)
       : backupFile = File('${file.path}.bak'),
         tempFile = File('${file.path}.tmp'),
         backupTempFile = File('${file.path}.bak.tmp');
@@ -29,6 +29,27 @@ class _OfflineMessageQueueFileStore {
   final File backupFile;
   final File tempFile;
   final File backupTempFile;
+  final ProfileStorageCodec? codec;
+
+  Future<void> migrateArtifacts() async {
+    final protection = codec;
+    if (protection == null) return;
+    await protection.migrateSnapshotPair(
+        file, backupFile, ProfileStorageCodec.queue);
+    for (final artifact in [tempFile, backupTempFile]) {
+      await protection.migrateSnapshot(artifact, ProfileStorageCodec.queue);
+    }
+  }
+
+  Future<void> _requireSnapshotAccess() async {
+    // Preserve locked data even through a low-level save before loadQueue().
+    for (final artifact in [file, backupFile]) {
+      if (await artifact.exists()) {
+        ProfileStorageCodec.openSnapshot(
+            ProfileStorageCodec.queue, await artifact.readAsString(), codec);
+      }
+    }
+  }
 
   Future<_ReadQueueResult> tryReadSnapshot(File source) async {
     if (!await source.exists()) {
@@ -38,6 +59,8 @@ class _OfflineMessageQueueFileStore {
     }
     try {
       return _ReadQueueResult.success(await _readSnapshot(source));
+    } on ProfileStorageException {
+      rethrow;
     } catch (error) {
       return _ReadQueueResult.failure(error);
     }
@@ -46,11 +69,12 @@ class _OfflineMessageQueueFileStore {
   Future<void> writeSnapshot(
     Map<String, List<OfflineMessageItem>> snapshot,
   ) async {
+    await _requireSnapshotAccess();
     if (await file.exists()) {
       await _copyPrimaryToBackup();
     }
 
-    await _writeStringAtomically(file, tempFile, jsonEncode(_toJson(snapshot)));
+    await _writeStringAtomically(file, tempFile, _snapshotText(snapshot));
 
     try {
       await _copyPrimaryToBackup();
@@ -66,11 +90,12 @@ class _OfflineMessageQueueFileStore {
   /// backup must then be refreshed with [publishPrimaryToBackup] before either
   /// file is physically removed.
   Future<void> publishEmptyPrimary() async {
+    await _requireSnapshotAccess();
     final emptySnapshot = <String, List<OfflineMessageItem>>{};
     await _writeStringAtomically(
       file,
       tempFile,
-      jsonEncode(_toJson(emptySnapshot)),
+      _snapshotText(emptySnapshot),
     );
   }
 
@@ -89,6 +114,7 @@ class _OfflineMessageQueueFileStore {
   }
 
   Future<void> deleteArtifacts() async {
+    await _requireSnapshotAccess();
     await _deleteIfExists(file);
     await _deleteIfExists(backupFile);
     await deleteStagingArtifacts();
@@ -97,7 +123,8 @@ class _OfflineMessageQueueFileStore {
   Future<Map<String, List<OfflineMessageItem>>> _readSnapshot(
     File source,
   ) async {
-    final content = await source.readAsString();
+    final content = ProfileStorageCodec.openSnapshot(
+        ProfileStorageCodec.queue, await source.readAsString(), codec);
     if (content.isEmpty) {
       throw const FormatException('empty queue file');
     }
@@ -125,6 +152,11 @@ class _OfflineMessageQueueFileStore {
       for (final entry in snapshot.entries)
         entry.key: entry.value.map(_itemToJson).toList(),
     };
+  }
+
+  String _snapshotText(Map<String, List<OfflineMessageItem>> snapshot) {
+    final content = jsonEncode(_toJson(snapshot));
+    return codec?.sealSnapshot(ProfileStorageCodec.queue, content) ?? content;
   }
 
   OfflineMessageItem _itemFromJson(dynamic raw) {

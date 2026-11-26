@@ -21,6 +21,7 @@ bool IsKnownType(Type type) {
         case Type::kReaction:
         case Type::kGenericCustom:
         case Type::kGroupIdentity:
+        case Type::kMessageAnnotation:
             return true;
     }
     return false;

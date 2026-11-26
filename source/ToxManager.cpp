@@ -8,6 +8,7 @@
 // on-disk format is unchanged and an older build still opens a profile written
 // by a newer one.
 #include "../third_party/c-toxcore/toxencryptsave/toxencryptsave.h"
+#include <sodium.h>
 #include <fstream>
 #include <filesystem> // For std::filesystem::rename (Windows atomic-replace fallback)
 #include <chrono>
@@ -21,6 +22,7 @@
 #include <cstdlib> // For std::getenv, std::strtol (TOX_TCP_RELAY_PORT)
 #include <cstdio> // For std::remove
 #include <cerrno> // For errno, EINTR
+#include <limits>
 #ifndef _WIN32
 #include <unistd.h> // For ::write, ::fsync, ::close
 #include <fcntl.h>  // For ::open, O_* flags
@@ -31,6 +33,15 @@
 #endif
 
 namespace {
+// toxcore stops at its END section. Tim2Tox appends a private trailer to the
+// authenticated savedata so the storage key and the profile password commit
+// in ONE atomic replace. Other Tox clients can read this profile, but will
+// omit the extension if they save it themselves.
+constexpr uint8_t kStorageTrailer[] = {'T', 'i', 'm', '2', 'T', 'o', 'x', 'K', 'e', 'y', 0, 1};
+constexpr size_t kStorageKeyBytes = crypto_aead_xchacha20poly1305_ietf_KEYBYTES;
+constexpr size_t kStorageNonceBytes = crypto_aead_xchacha20poly1305_ietf_NPUBBYTES;
+constexpr size_t kStorageTagBytes = crypto_aead_xchacha20poly1305_ietf_ABYTES;
+
 // Zeroes a byte buffer when the scope exits, INCLUDING on the exception path --
 // a plain end-of-function wipe is skipped by a throw, which is exactly when a
 // half-processed secret is most likely to be sitting in the buffer.
@@ -156,6 +167,7 @@ ToxManager::~ToxManager() {
         volatile uint8_t* p = profile_passphrase_.data();
         for (size_t i = 0; i < profile_passphrase_.size(); ++i) p[i] = 0;
     }
+    const ScopedSecretWipe wipe_storage_key(profile_storage_key_);
     // Explicitly shutdown to ensure proper cleanup order
     // This prevents issues during static destruction at application termination
     // Use try-catch to prevent exceptions during termination from causing crashes
@@ -2084,18 +2096,77 @@ bool ToxManager::rekeyAndSave(const std::string& path, const uint8_t* passphrase
     std::lock_guard<std::mutex> save_lock(save_mutex_);
     std::vector<uint8_t> previous;
     ScopedSecretWipe wipe_previous(previous);
+    std::vector<uint8_t> new_storage_key;
+    ScopedSecretWipe wipe_storage_key(new_storage_key);
     {
         std::lock_guard<std::mutex> lock(mutex_);
         previous = profile_passphrase_;
+        if (passphrase && length != 0 && profile_storage_key_.empty()) {
+            new_storage_key.resize(kStorageKeyBytes);
+            randombytes_buf(new_storage_key.data(), new_storage_key.size());
+        }
     }
     setProfilePassphraseLocked(passphrase, length);
-    if (saveLocked(path, /*final_save=*/false)) return true;
+    if (saveLocked(path, /*final_save=*/false,
+                   new_storage_key.empty() ? nullptr : &new_storage_key)) {
+        if (!new_storage_key.empty()) {
+            std::lock_guard<std::mutex> lock(mutex_);
+            profile_storage_key_.swap(new_storage_key);
+        }
+        return true;
+    }
     setProfilePassphraseLocked(previous.empty() ? nullptr : previous.data(), previous.size());
     V2TIM_LOG(kError,
               "[ToxManager] rekeyAndSave: the re-keyed profile did not reach {}; the previous "
               "passphrase is back in force and the file is unchanged",
               path);
     return false;
+}
+
+int ToxManager::prepareProfileStorage(const std::string& path) {
+    if (isIterateOwner()) return -1;
+    std::lock_guard<std::mutex> save_lock(save_mutex_);
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!tox_) return -1;
+        if (!profile_storage_key_.empty()) return 1;
+        if (profile_passphrase_.empty()) return 0;
+    }
+    std::vector<uint8_t> new_key(kStorageKeyBytes);
+    ScopedSecretWipe wipe_key(new_key);
+    randombytes_buf(new_key.data(), new_key.size());
+    if (!saveLocked(path, /*final_save=*/false, &new_key)) return -1;
+    std::lock_guard<std::mutex> lock(mutex_);
+    profile_storage_key_.swap(new_key);
+    return 1;
+}
+
+int ToxManager::cryptProfileStorage(uint8_t kind, bool encrypt, const uint8_t* input,
+                                   size_t input_size, uint8_t* output,
+                                   size_t output_capacity) const {
+    constexpr size_t overhead = kStorageNonceBytes + kStorageTagBytes;
+    if (!input || !output || kind < 1 || kind > 3 ||
+        input_size > static_cast<size_t>(std::numeric_limits<int>::max()) - overhead ||
+        (!encrypt && input_size < overhead)) {
+        return -1;
+    }
+    const size_t output_size = encrypt ? input_size + overhead : input_size - overhead;
+    if (output_capacity < output_size) return -1;
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!tox_ || profile_storage_key_.size() != kStorageKeyBytes) return -1;
+    unsigned long long written = 0;
+    if (encrypt) {
+        randombytes_buf(output, kStorageNonceBytes);
+        const int rc = crypto_aead_xchacha20poly1305_ietf_encrypt(
+            output + kStorageNonceBytes, &written, input, input_size, &kind, 1,
+            nullptr, output, profile_storage_key_.data());
+        return rc == 0 && written + kStorageNonceBytes == output_size
+                   ? static_cast<int>(output_size) : -1;
+    }
+    const int rc = crypto_aead_xchacha20poly1305_ietf_decrypt(
+        output, &written, nullptr, input + kStorageNonceBytes, input_size - kStorageNonceBytes,
+        &kind, 1, input, profile_storage_key_.data());
+    return rc == 0 && written == output_size ? static_cast<int>(written) : -1;
 }
 
 bool ToxManager::saveTo(const std::string& path, bool* queued, bool final_save) const {
@@ -2156,7 +2227,8 @@ bool ToxManager::saveTo(const std::string& path, bool* queued, bool final_save) 
     return saveLocked(path, final_save);
 }
 
-bool ToxManager::saveLocked(const std::string& path, bool final_save) const {
+bool ToxManager::saveLocked(const std::string& path, bool final_save,
+                           const std::vector<uint8_t>* new_storage_key) const {
     try {
         auto data = getSaveData(final_save ? kFinalSaveQuiesceAttempts : 2);
         if (data.empty()) return false;
@@ -2173,9 +2245,22 @@ bool ToxManager::saveLocked(const std::string& path, bool final_save) const {
         {
             std::vector<uint8_t> passphrase;
             ScopedSecretWipe wipe_passphrase(passphrase);
+            std::vector<uint8_t> storage_key;
+            ScopedSecretWipe wipe_storage_key(storage_key);
             {
                 std::lock_guard<std::mutex> lock(mutex_);
                 passphrase = profile_passphrase_;
+                storage_key = new_storage_key ? *new_storage_key : profile_storage_key_;
+            }
+            if (!storage_key.empty()) {
+                std::vector<uint8_t> with_trailer;
+                ScopedSecretWipe wipe_trailer(with_trailer);
+                with_trailer.reserve(data.size() + sizeof(kStorageTrailer) + storage_key.size());
+                with_trailer.insert(with_trailer.end(), data.begin(), data.end());
+                with_trailer.insert(with_trailer.end(), std::begin(kStorageTrailer),
+                                    std::end(kStorageTrailer));
+                with_trailer.insert(with_trailer.end(), storage_key.begin(), storage_key.end());
+                data.swap(with_trailer);
             }
             if (!passphrase.empty()) {
                 std::vector<uint8_t> encrypted(data.size() + TOX_PASS_ENCRYPTION_EXTRA_LENGTH);
@@ -2395,6 +2480,17 @@ ToxManager::LoadOutcome ToxManager::loadFromEx(const std::string& path) {
             data.swap(decrypted);
         }
 
+        std::vector<uint8_t> storage_key;
+        ScopedSecretWipe wipe_storage_key(storage_key);
+        size_t savedata_size = data.size();
+        constexpr size_t trailer_size = sizeof(kStorageTrailer) + kStorageKeyBytes;
+        if (savedata_size >= trailer_size &&
+            std::memcmp(data.data() + savedata_size - trailer_size,
+                        kStorageTrailer, sizeof(kStorageTrailer)) == 0) {
+            storage_key.assign(data.end() - kStorageKeyBytes, data.end());
+            savedata_size -= trailer_size;
+        }
+
         // 创建新的 Tox 选项。
         // 必须零初始化：新版 c-toxcore 的 tox_options_default() 在赋默认值之前
         // 会先调用 tox_options_set_proxy_host(options, nullptr)，该函数读取
@@ -2405,13 +2501,14 @@ ToxManager::LoadOutcome ToxManager::loadFromEx(const std::string& path) {
         tox_options_default(&options);
         options.savedata_type = TOX_SAVEDATA_TYPE_TOX_SAVE;
         options.savedata_data = data.data();
-        options.savedata_length = data.size();
+        options.savedata_length = savedata_size;
 
         // 初始化 Tox（若存档损坏会抛异常，此处捕获并返回 kCorrupt）
-        initialize(&options, data.data(), data.size());
+        initialize(&options, data.data(), savedata_size);
         if (getTox() != nullptr) {
             std::lock_guard<std::mutex> lock(mutex_);
             last_load_was_encrypted_ = source_was_encrypted;
+            profile_storage_key_.swap(storage_key);
             return LoadOutcome::kOk;
         }
         return source_was_encrypted ? LoadOutcome::kEncryptedLoadFailed

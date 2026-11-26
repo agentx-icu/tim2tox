@@ -476,6 +476,7 @@ inline EventClass Classify(const std::string& line) {
     if (HasPrefix(line, "c2c:") || HasPrefix(line, "c2caction:") ||
         HasPrefix(line, "c2cbin:") || HasPrefix(line, "gtext:") ||
         HasPrefix(line, "gaction:") || HasPrefix(line, "gcustombin:") ||
+        HasPrefix(line, "annotation:") ||
         HasPrefix(line, "rendezvous_packet:")) {
         return kChat;
     }
@@ -497,14 +498,16 @@ static void RecordDrop(EventClass cls, int64_t instance_id, const std::string& l
 
 class SimpleMsgListenerImpl : public V2TIMSimpleMsgListener {
 public:
-    void enqueue_text_line_for_instance(int64_t instance_id, const std::string& s) {
+    void enqueue_text_line_for_instance(int64_t instance_id, const std::string& s,
+                                       int64_t source_epoch = 0) {
         using namespace text_queue;
         const EventClass cls = Classify(s);
         // Which SESSION produced this record. Resolved before the queue lock
         // (it may take the instance registry's) and stored with the record:
         // an unpolled record of account A must never be handed to account B
         // after B's login reused the same instance id.
-        const int64_t session_epoch = CurrentSessionEpochForInstance(instance_id);
+        const int64_t session_epoch = source_epoch > 0 ? source_epoch
+            : CurrentSessionEpochForInstance(instance_id);
         std::lock_guard<std::mutex> lock(m_);
         // Make room under the soft caps: oldest lossy events first, then (not
         // for a lossy newcomer — a typing update never displaces a message)
@@ -541,11 +544,18 @@ public:
         }
         enqueue_text_line_for_instance(instance_id, s);
     }
-    void OnRecvC2CTextMessage(const V2TIMString&, const V2TIMUserFullInfo& sender, const V2TIMString& text) override {
+    void OnRecvC2CTextMessage(const V2TIMString& id, const V2TIMUserFullInfo& sender, const V2TIMString& text) override {
         const char* prefix = GetReceiverTextKindOverride() == 1
             ? "c2caction:"
             : "c2c:";
-        std::string line = std::string(prefix) + sender.userID.CString() + ":" + text.CString();
+        std::string line = std::string(prefix) + sender.userID.CString();
+        if (GetReceiverCustomRouteOverride() ==
+                static_cast<int>(tim2tox::control::Type::kMessageAnnotation) && !id.Empty()) {
+            line += "|";
+            line += id.CString();
+        }
+        line += ":";
+        line += text.CString();
         enqueue_text_line(line);
     }
     void OnRecvC2CCustomMessage(const V2TIMString&, const V2TIMUserFullInfo& sender, const V2TIMBuffer& customData) override {
@@ -1096,6 +1106,15 @@ static bool IsInstanceInited(int64_t id) {
 // Helper function implementation - defined after G is complete
 void enqueue_conn_event(const char* event) {
     G.simple_listener.enqueue_text_line(event);
+}
+
+void PublishMessageAnnotation(int64_t instance_id, int64_t session_epoch, const std::string& group,
+                              const std::string& sender, const std::string& id,
+                              std::string_view data) {
+    if (instance_id == kInstanceIdDestroyed || session_epoch <= 0) return;
+    std::string line = "annotation:" + group + "|" + sender + "|" + id + ":";
+    line.append(data);
+    G.simple_listener.enqueue_text_line_for_instance(instance_id, line, session_epoch);
 }
 
 ToxManager::FileControlCallback ToxManager::getFileControlCallback() const {
@@ -2383,6 +2402,21 @@ static void CopyMsgIdOut(const V2TIMString& msg_id, char* out, int out_len) {
     out[n] = '\0';
 }
 
+int tim2tox_ffi_send_annotated_text(const char* target, const char* text, const char* annotation,
+                                  int group, int action, char* msg_id_out, int msg_id_out_len) {
+    if (msg_id_out && msg_id_out_len > 0) msg_id_out[0] = '\0';
+    if (!IsCurrentInstanceInited() || !target || !text || !annotation) return 0;
+    auto* manager = GetCurrentInstance();
+    if (!manager) return 0;
+    bool annotation_queued = false;
+    const V2TIMBuffer data(reinterpret_cast<const uint8_t*>(annotation), strlen(annotation));
+    const auto id = manager->SendAnnotatedText(text, target, data, group != 0, action != 0,
+                                              annotation_queued);
+    if (id.Empty()) return 0;
+    CopyMsgIdOut(id, msg_id_out, msg_id_out_len);
+    return annotation_queued ? 2 : 1;
+}
+
 // _ex variants: same send as the non-_ex exports but surface the NATIVE
 // msg_id (previously discarded), so Dart can alias its row to the id the
 // toxcore delivery-ACK path reports. NEW exports — the existing symbols and
@@ -2569,6 +2603,30 @@ int tim2tox_ffi_get_profile_passphrase_state(void) {
     V2TIMManagerImpl* manager_impl = GetCurrentInstance();
     if (!manager_impl) return -1;
     return manager_impl->HasProfilePassphrase() ? 1 : 0;
+}
+
+int tim2tox_ffi_prepare_profile_storage(int64_t instance_id, int64_t session_epoch) {
+    auto* manager = GetExactInstanceFromId(instance_id);
+    if (!manager) return -1;
+    try {
+        return manager->PrepareLiveProfileStorage(session_epoch);
+    } catch (...) {
+        return -1;
+    }
+}
+
+int tim2tox_ffi_crypt_profile_storage(int64_t instance_id, int64_t session_epoch,
+                                     uint8_t kind, int encrypt,
+                                     const uint8_t* input, size_t input_size,
+                                     uint8_t* output, size_t output_capacity) {
+    auto* manager = GetExactInstanceFromId(instance_id);
+    if (!manager) return -1;
+    try {
+        return manager->CryptLiveProfileStorage(session_epoch, kind, encrypt != 0, input,
+                                                input_size, output, output_capacity);
+    } catch (...) {
+        return -1;
+    }
 }
 
 int tim2tox_ffi_rekey_live_profile_passphrase(const uint8_t* passphrase, size_t passphrase_len,
