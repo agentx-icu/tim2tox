@@ -257,6 +257,7 @@ class ChatMessage {
     this.isFailed = false,
     this.isCancelled = false,
     this.isReceived = false,
+    this.isOutgoingFileComplete = false,
     this.isRead = false,
     this.msgID,
     this.version = 1, // Message format version for migration support
@@ -290,6 +291,9 @@ class ChatMessage {
   /// never delivered, and never re-queued after a restart.
   final bool isCancelled;
   final bool isReceived;
+
+  /// Native transfer finished sending the file. This is not a read receipt.
+  final bool isOutgoingFileComplete;
   final bool isRead;
   final String? msgID;
 
@@ -346,6 +350,7 @@ class ChatMessage {
         'contentKind': contentKind.name,
         'isPending': isPending,
         'isReceived': isReceived,
+        if (isOutgoingFileComplete) 'isOutgoingFileComplete': true,
         'isRead': isRead,
         'msgID': msgID,
         'version': version,
@@ -378,6 +383,7 @@ class ChatMessage {
         contentKind: chatMessageContentKindFromJson(json['contentKind']),
         isPending: json['isPending'] as bool? ?? false,
         isReceived: json['isReceived'] as bool? ?? false,
+        isOutgoingFileComplete: json['isOutgoingFileComplete'] == true,
         isRead: json['isRead'] as bool? ?? false,
         msgID: json['msgID'] as String?,
         version: json['version'] as int? ??
@@ -398,6 +404,7 @@ class ChatMessage {
 
   ChatMessage copyWith({
     bool? isReceived,
+    bool? isOutgoingFileComplete,
     bool? isRead,
     bool? isPending,
     bool? isFailed,
@@ -426,6 +433,8 @@ class ChatMessage {
       isFailed: isFailed ?? this.isFailed,
       isCancelled: isCancelled ?? this.isCancelled,
       isReceived: isReceived ?? this.isReceived,
+      isOutgoingFileComplete:
+          isOutgoingFileComplete ?? this.isOutgoingFileComplete,
       isRead: isRead ?? this.isRead,
       msgID: msgID,
       version: version,
